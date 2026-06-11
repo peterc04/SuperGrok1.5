@@ -94,8 +94,53 @@ namespace wgs = ::sg::sm90::wgs;
 #ifndef SG_TUNED_VIT_TILE_M
 #define SG_TUNED_VIT_TILE_M 1088
 #endif
+// ── dW split-K factor (the validated decoder/mamba multi-CTA-tiling win, carried
+//    to ViT). The 10 dW yield only ~52 output tiles → ~60% of 132 SMs idle in the
+//    P2 dW phase. Split-K chunks each tile's K-contraction across G CTAs so the
+//    grid sees (n_dw·G) work items → idle SMs do work; a deterministic ascending-
+//    chunk reduce sums the G partials (no float atomics, fixed order → parity +
+//    A/A/A bit-determinism hold). G=4 → 52·4≈208 items ≥ 132 SMs (full saturation,
+//    matching SG_TUNED_DEC_DW_SPLITK). G==1 routes to the single-CTA path (no
+//    scratch) — the byte-identical pre-split behaviour. ─────────────────────────
+#ifndef SG_TUNED_VIT_DW_SPLITK
+#define SG_TUNED_VIT_DW_SPLITK 4
+#endif
 
 namespace vittc {
+
+constexpr int kVitDwSplitK = SG_TUNED_VIT_DW_SPLITK;
+static_assert(kVitDwSplitK >= 1, "SG_TUNED_VIT_DW_SPLITK must be >= 1");
+
+// ── Muon 2D-weight table (the matrices Newton-Schulz orthogonalizes). The eager
+//    Muon auto-splits params by p.ndim: ndim==2 → NS, everything else → AdamW
+//    (muon.py _split_by_ndim; muon.h:75-76). For the small ViT the ndim==2 weights
+//    are exactly these 11 (the flat named_parameters() tensor index + rows + cols);
+//    cls_token (ndim==3), all biases + LayerNorm γ/β (ndim==1) take the AdamW 1D
+//    tail. The kernel's Muon P2.7 loops THIS table running the grid-cooperative NS
+//    per matrix; P3 routes tensor t to the NS apply iff it is in the table, else the
+//    AdamW tail. Indices MUST match vit_layout / named_parameters() order. ──
+constexpr int kVitNumMuon2D = 11;
+struct VitMuon2D { int tidx; int rows; int cols; };
+__device__ __constant__ VitMuon2D kVitMuon2D[kVitNumMuon2D] = {
+    { 1, vit::kD,      vit::kPatch },   // patch_proj.weight  [128,49]
+    { 3, vit::kSeq,    vit::kD     },   // pos.weight         [17,128]
+    { 4, 3*vit::kD,    vit::kD     },   // L0 in_proj_weight  [384,128]
+    { 6, vit::kD,      vit::kD     },   // L0 out_proj.weight [128,128]
+    {12, vit::kDff,    vit::kD     },   // L0 ff.0.weight     [512,128]
+    {14, vit::kD,      vit::kDff   },   // L0 ff.2.weight     [128,512]
+    {16, 3*vit::kD,    vit::kD     },   // L1 in_proj_weight  [384,128]
+    {18, vit::kD,      vit::kD     },   // L1 out_proj.weight [128,128]
+    {24, vit::kDff,    vit::kD     },   // L1 ff.0.weight     [512,128]
+    {26, vit::kD,      vit::kDff   },   // L1 ff.2.weight     [128,512]
+    {30, vit::kVocab,  vit::kD     },   // out.weight         [97,128]
+};
+// Is tensor index `t` one of the Muon 2D matrices (orthogonalized in P2.7)? P3 uses
+// this to route ONLY the 1D / non-2D weights to the AdamW tail for Muon.
+__device__ __forceinline__ bool vit_is_muon_2d(int t) {
+    #pragma unroll
+    for (int mi = 0; mi < kVitNumMuon2D; ++mi) if (kVitMuon2D[mi].tidx == t) return true;
+    return false;
+}
 
 #ifdef SG_VIT_PROFILE
 // Diagnostic-only (SG_VIT_PROFILE; never shipped): summed clock64 cycles spent in
@@ -1115,6 +1160,157 @@ __device__ __forceinline__ void vittc_dw_run_tile(
         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
     tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
         mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SPLIT-K dW (multi-CTA tiling — the validated decoder/mamba win, ported to
+//  ViT). The 10 dW yield only ~52 output tiles → ~60% of 132 SMs idle in P2.
+//  Split-K turns each output tile into G work items (one per K-chunk): each CTA
+//  computes a PARTIAL over its K-chunk into a per-(tile,chunk) scratch slot; a
+//  grid barrier; then a DETERMINISTIC ascending-chunk reduce sums the G partials
+//  into grad — no float atomics, fixed order, so parity + A/A/A bit-determinism
+//  hold (each partial is the SAME ascending-k fp32 wgmma accumulate; Σ_chunk ==
+//  full-K sum reassociated into G fp32 blocks). G==1 routes to the single-CTA
+//  vittc_dw_run_tile above (no scratch). Slot (gt,kc) at
+//  dw_part[(gt*G+kc) * (64*kVitMaxTileN) + row*kVitMaxTileN + col].
+//
+//  ViT delta vs the decoder split-K: the patch_proj tile (kind==1) contracts over
+//  K=Tp patch rows (not a multiple of 16); the SAME floor-balanced atom partition
+//  over KS=ceil(Tp/16) atoms works because the patch srcA/srcB already zero-guard
+//  k>=Tp (padded atoms contribute 0). kind==0 tiles contract over K=T or K=B
+//  (exact multiples of 16), exactly like the decoder.
+// ════════════════════════════════════════════════════════════════════════
+constexpr int kVitMaxTileN = SG_TUNED_TILE_N;                       // widest dW N-tile
+constexpr int kVitDwTileFloats = wgs::kWgmmaAtomM * kVitMaxTileN;   // 64*N per (gt,kc) slot
+
+// COMPILE-TIME max #dW output tiles (the 10 dW have fixed Nout/Kin; ViT dims are
+// compile-time → constant). Mirrors vittc_dw_total_tiles at N=kVitMaxTileN.
+//   patch_proj(d×patch) + per-layer[qkv(3d×d),attn_out(d×d),ff0(dff×d),ff2(d×dff)]
+//   ×kLayers + head(V×d).
+constexpr int kVitDwTilesPerLayer =
+      ((3*vit::kD + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // qkv
+    + ((vit::kD   + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // attn_out
+    + ((vit::kDff + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // ff0
+    + ((vit::kD   + 63)/64) * ((vit::kDff + kVitMaxTileN - 1)/kVitMaxTileN);  // ff2
+constexpr int kVitDwPatchTiles =
+      ((vit::kD + 63)/64) * ((vit::kPatch + kVitMaxTileN - 1)/kVitMaxTileN);  // patch_proj
+constexpr int kVitDwHeadTiles =
+      ((vit::kVocab + 63)/64) * ((vit::kD + kVitMaxTileN - 1)/kVitMaxTileN);  // head
+constexpr int kVitDwMaxTiles =
+      kVitDwPatchTiles + vit::kLayers * kVitDwTilesPerLayer + kVitDwHeadTiles;
+
+// Split-K dW partial-scratch float count (host carves it from the workspace tail).
+// 0 when G==1 → no extra scratch (the single-CTA path is byte-identical).
+__host__ __device__ __forceinline__ int64_t vit_dw_part_floats(int G) {
+    return (G > 1) ? (int64_t)kVitDwMaxTiles * G * kVitDwTileFloats : 0;
+}
+
+// Decode global dW tile index gt → (spec index s, m_atom, n_tile). Single-source
+// (the SAME walk vittc_dw_run_tile + vittc_dw_total_tiles use).
+template <int N>
+__device__ __forceinline__ void vittc_dw_decode(
+        const VitDwSpec spec[10], int gt, int& s, int& m_atom, int& n_tile) {
+    int acc = 0;
+    for (s = 0; s < 10; ++s) {
+        const int ma = (spec[s].Nout + 63) / 64;
+        const int nt = (spec[s].Kin + N - 1) / N;
+        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; return; }
+        acc += ma * nt;
+    }
+    s = 9; m_atom = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+}
+
+// PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. FLOOR-BALANCED
+// atom partition: chunk kc = [k0,k1) atoms with k0=floor(kc·KS/G),
+// k1=floor((kc+1)·KS/G) — near-equal, summing to KS EXACTLY for ANY KS≥G (no
+// `G | KS` requirement, so it works at the production batch where B/16 or
+// ceil(Tp/16) need not divide G). A CEIL split would leave a trailing EMPTY chunk
+// whose slot stays unwritten → the reduce sums garbage; floor never empties a
+// chunk for KS≥G, and a KS<G empty chunk is explicitly zeroed. Fresh ScaleD=0 per
+// chunk → true partial; writes the full 64×N tile (LOCAL rows) to the slot.
+template <int N>
+__device__ __forceinline__ void vittc_dw_run_tile_splitk(
+        const VitDwSpec spec[10], int gt, int kc, int G,
+        const __nv_bfloat16* __restrict__ dh0,
+        float* __restrict__ dw_part, __nv_bfloat16* sA, __nv_bfloat16* sB) {
+    int s, m_atom, n_tile;
+    vittc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+    const VitDwSpec& sp = spec[s];
+    const int mbase = m_atom * 64;
+    const int n0 = n_tile * N;
+    const int Nout = sp.Nout, Kin = sp.Kin;
+    // KS = total k-atoms. kind==1 (patch_proj): K=Tp patch rows padded UP to /16.
+    // kind==0: K=T or K=B (already multiples of 16).
+    const int KS = (sp.kind == 1)
+        ? (((sp.K + wgs::kWgmmaAtomK - 1) / wgs::kWgmmaAtomK))   // ceil(Tp/16)
+        : (sp.K / wgs::kWgmmaAtomK);
+    const int k0 = (int)(((int64_t)kc       * KS) / G);          // floor-balanced
+    const int k1 = (int)(((int64_t)(kc + 1) * KS) / G);
+    const int kc_steps = k1 - k0;
+    float* slot = dw_part + ((int64_t)gt * G + kc) * kVitDwTileFloats;
+    // Empty-chunk guard (KS<G): a k_steps=0 GEMM would emit the uninitialized
+    // accumulator → zero the slot + return (the reduce sums all G slots).
+    if (kc_steps <= 0) {
+        for (int i = threadIdx.x; i < 64 * N; i += blockDim.x) slot[i] = 0.0f;
+        __syncthreads();
+        return;
+    }
+    auto out = [&] (int m, int n, float v) {
+        const int lr = m - mbase;
+        if (lr >= 0 && lr < 64 && n < N) slot[(int64_t)lr * N + n] = v; };
+    if (sp.kind == 1) {
+        // patch_proj: A[m=out,k=patchrow]=dh0[token row of patchrow, out] (transposed);
+        // B[n=in,k=patchrow]=X_patch[patchrow,in]. The k index here is the LOCAL chunk
+        // atom-step; the global patch row is (k0*16 + k). Pad rows (>=Tp) → 0.
+        const int Tp = sp.K;
+        const __nv_bfloat16* X = sp.X;
+        auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
+            const int gk = k0 * wgs::kWgmmaAtomK + k;
+            if (m >= Nout || gk >= Tp) return __float2bfloat16(0.f);
+            const int si = gk / vit::kNPatch, p = gk % vit::kNPatch;
+            const int trow = si * vit::kSeq + (1 + p);
+            return dh0[(int64_t)trow * vit::kD + m]; };
+        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+            const int gk = k0 * wgs::kWgmmaAtomK + k;
+            int nn = n0 + n; if (nn >= Kin || gk >= Tp) return __float2bfloat16(0.f);
+            return X[(int64_t)gk * Kin + nn]; };
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
+            mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+        return;
+    }
+    // kind==0: A[m=out,k=t]=dY[t,out]; B[n=in,k=t]=X[t,in] (both transposed reads).
+    const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
+    auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
+        return m < Nout ? dY[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Nout + m] : __float2bfloat16(0.f); };
+    auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+        int nn = n0 + n; return nn < Kin ? X[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Kin + nn] : __float2bfloat16(0.f); };
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
+        mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+}
+
+// Deterministic reduce: output tile gt (% nCTA) sums its G chunk-partials
+// ascending-kc → grad. SAME (gt → geometry) decode as the partial.
+template <int N>
+__device__ __forceinline__ void vittc_dw_reduce_splitk(
+        const VitDwSpec spec[10], int n_dw, int G, const float* __restrict__ dw_part,
+        float* __restrict__ grad, int cta, int nCTA) {
+    for (int gt = cta; gt < n_dw; gt += nCTA) {
+        int s, m_atom, n_tile;
+        vittc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+        const VitDwSpec& sp = spec[s];
+        const int mbase = m_atom * 64;
+        const int n0 = n_tile * N;
+        const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
+        const int Nrow = (sp.Nout - mbase) < 64 ? (sp.Nout - mbase) : 64;
+        const int64_t base = (int64_t)gt * G * kVitDwTileFloats;
+        for (int idx = threadIdx.x; idx < Nrow * n_real; idx += blockDim.x) {
+            const int row = idx / n_real, col = idx % n_real;
+            float accv = 0.0f;
+            for (int kc = 0; kc < G; ++kc)
+                accv += dw_part[base + (int64_t)kc * kVitDwTileFloats + (int64_t)row * N + col];
+            grad[sp.grad_off + (int64_t)(mbase + row) * sp.Kin + n0 + col] = accv;
+        }
+    }
 }
 
 // Biases db. For the 8 transformer linears + head: db = Σ_K dY (per output row).

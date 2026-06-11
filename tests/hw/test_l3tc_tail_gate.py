@@ -82,6 +82,26 @@ def _grokadamw_factory(g, params, c):
                        grad_clip=c.get("grokadamw_grad_clip", 1.0))
 
 
+def _muon_factory(g, params, c):
+    # train_muon: Muon(muon_params=2D, params_1d=1D, lr=muon_lr (0.02),
+    # momentum=muon_momentum (0.95), weight_decay). The constructor AUTO-SPLITS a
+    # single positional `params` iterable by p.ndim (2D → NS, else → AdamW), exactly
+    # matching the kernel's kVitMuon2D routing — so we pass m.parameters() as ONE list.
+    return g.Muon(list(params), lr=c.get("muon_lr", 0.02),
+                  momentum=c.get("muon_momentum", 0.95),
+                  weight_decay=c["weight_decay"])
+
+
+def _prodigy_factory(g, params, c):
+    # train_prodigy: Prodigy(lr=prodigy_lr (1.0), weight_decay, d0=1e-6, d_coef=1.0,
+    # betas=(0.9,0.999)). The race uses the defaults; the gate drives the EXACT same
+    # optimizer (its state is exp_avg/exp_avg_sq/s + instance scalars _d_lr/_r_ema/
+    # _s_ema). The kernel's `extra` slice == Prodigy's `s` trajectory accumulator.
+    return g.Prodigy(params, lr=c.get("prodigy_lr", 1.0),
+                     weight_decay=c["weight_decay"],
+                     betas=(c["beta1"], c["beta2"]))
+
+
 def _neuralgrok_canonical_mv(grad, opt_obj, step):
     """The (m, v) the NeuralGrok tail MUST produce, by the canonical header math.
 
@@ -204,6 +224,13 @@ _CELLS = {
                                factory=_neuralgrok_factory),
     "neuralgrok/vit":     dict(model="vit", opt="neuralgrok",
                                factory=_neuralgrok_factory),
+    # neuralgrok (mamba — wave-2): the mamba TC launcher dispatches opt_id=6
+    # (OptId::NeuralGrok) over the mamba TC-reduced grad; the psi pack is scattered
+    # into the `extra` slice host-side (model-independent). Same tail math as
+    # decoder/vit, so the (1b) reference is canonical neuralgrok.h + the clip-inert
+    # guard (run_cell_gate handles both via the opt=="neuralgrok" branches).
+    "neuralgrok/mamba":   dict(model="mamba", opt="neuralgrok",
+                               factory=_neuralgrok_factory),
     # grokadamw (decoder): CONVERTED. All THREE eager mechanisms land in the bf16 TC
     # path (apply_optimizer<GrokAdamW> + the kernel's P2.5/P3): (i) per-tensor
     # layer-wise β1 = β1·(1-γ)^layer with rebased bc1 (kernel P3, task id t == the
@@ -218,20 +245,54 @@ _CELLS = {
     # stays blocked (this conversion is decoder-only per the cell order).
     "grokadamw/decoder": dict(model="decoder", opt="grokadamw",
                               factory=_grokadamw_factory),
+    # grokadamw (vit): CONVERTED (wave-2 vit lane). The SAME 3-mechanism conversion
+    # on the vit TC kernel — fused_vit_megakernel_tc now carries the IDENTICAL P2.5
+    # global grad-norm clip + P3 per-tensor layer-wise β1 (t == flat kVitOffsets layer
+    # index; cls_token is t=0, vs decoder's 30 tensors). Same caveat: this single-step
+    # gate is NECESSARY but NOT SUFFICIENT (BLIND to the clip — ‖g‖₂<1 at step 1 ⇒ inert);
+    # the load-bearing check is the MULTI-STEP parity (_multistep_grokadamw_parity, run
+    # for both decoder + vit). vit×grokadamw was previously in _BLOCKED_EVIDENCE.
+    "grokadamw/vit": dict(model="vit", opt="grokadamw",
+                          factory=_grokadamw_factory),
+    # grokadamw (mamba — wave-2): the mamba TC kernel gained the IDENTICAL P2.5 global
+    # grad-norm clip + P3 per-tensor layer-wise β1 as decoder/vit. The mamba launcher
+    # routes opt_id=3. Single-step gate is NECESSARY but BLIND to the clip (‖g‖₂ at
+    # step 1 < grad_clip ⇒ clip inert); the multi-step parity (clip fires later) is
+    # the load-bearing check, mirrored from decoder _multistep_grokadamw_parity.
+    "grokadamw/mamba": dict(model="mamba", opt="grokadamw",
+                            factory=_grokadamw_factory),
+    # prodigy (decoder): CONVERTED (wave-2 decoder lane). STAGED global-d, computed
+    # IN-KERNEL (P2.6 phase, between the grad reduction B2 and the optimizer tail P3)
+    # — still a SINGLE persistent wgmma launch. The single-step state gate checks the
+    # kernel's [m|v|s_track] against the REAL eager Prodigy's exp_avg/exp_avg_sq/s
+    # (run_cell_gate has a prodigy branch: the third buffer is `s`, not `ema`). At
+    # step 1 param_init==params ⇒ r=0 ⇒ d stays at d0=1e-6 (matching eager _d_lr=d0),
+    # so the single-step state gate is NECESSARY but NOT SUFFICIENT — it is BLIND to
+    # the d-adaptation (which fires at step≥2). Honest registration rests on the
+    # MULTI-STEP parity (_prodigy_multistep_parity: the kernel's d tracks eager; a
+    # d-frozen-at-d0 control diverges, proving d-adaptation is load-bearing).
+    "prodigy/decoder": dict(model="decoder", opt="prodigy", factory=_prodigy_factory),
+    # prodigy (vit): CONVERTED (wave-2 vit lane). The SAME STAGED global-d P2.6 phase
+    # on the vit TC kernel. Same caveat: this single-step gate is necessary-not-
+    # sufficient (at step 1 param_init==params ⇒ r=0 ⇒ d=d0, so the d-adaptation has
+    # not fired yet); the load-bearing check is the MULTI-STEP parity (the d fires by
+    # step≥2; _prodigy_multistep_parity --model vit).
+    "prodigy/vit": dict(model="vit", opt="prodigy", factory=_prodigy_factory),
+    # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz on
+    # the 11 2D weights (in-kernel P2.7); 1D weights → AdamW tail. param_tol=2e-3 for
+    # the NS 2D path (OPTSTAGES §8); the (1b) STATE check stays 1e-4 (the momentum buf
+    # is buf=μ·buf+g, NO NS, so it must match eager exactly — the load-bearing check).
+    "muon/vit": dict(model="vit", opt="muon", factory=_muon_factory, param_tol=2e-3),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
 # so the reason is reproducible. NOT registered in _FUSED_L3_REAL; the gate's
 # has_l3_real precondition would (correctly) refuse to run them as "converted".
-#  * grokadamw/vit: the decoder cell is CONVERTED (above); vit is the SAME 3-mechanism
-#    conversion but on the vit TC kernel — it would need the identical P2.5 global-norm
-#    clip + P3 per-tensor β1 wired into fused_vit_megakernel.cuh (the vit kernel's P3
-#    work-steal loop must rebase β1/bc1 by its own flat layer index, and the vit
-#    launcher must carry γ/grad_clip — already in FusedScalars). Deferred: this
-#    conversion cycle is decoder-only per the stated cell order.
-_BLOCKED_EVIDENCE = {
-    "grokadamw/vit":     dict(model="vit",     opt="grokadamw", factory=_grokadamw_factory),
-}
+#  * grokadamw/vit is now CONVERTED (wave-2 vit lane — registered in _CELLS above): the
+#    identical P2.5 global-norm clip + P3 per-tensor β1 are wired into the vit TC kernel
+#    (fused_vit_megakernel_tc), the vit launcher already routes opt_id=3, and γ/grad_clip
+#    thread via FusedScalars. So _BLOCKED_EVIDENCE is now empty for this lane.
+_BLOCKED_EVIDENCE = {}
 
 
 def _build_cell(model, seed=42):
@@ -359,10 +420,18 @@ def run_cell_gate(cell_key, verbose=True):
     abs_err = (p_after - p_ref).abs().max().item()
     denom = p_ref.abs().max().item() + 1e-30
     rel_err = abs_err / denom
-    param_ok = rel_err < 1e-4   # fp32 reorder tol; a dropped mechanism blows past this
+    # Per-cell PARAM tolerance. Default 1e-4 (fp32 reorder; a dropped mechanism blows
+    # past it). MUON's 2D-weight params go through a 5-iteration Newton-Schulz whose
+    # fp32 vs the eager fp32 NS accumulate to ~2e-3 rel (INTEGRATION-OPTSTAGES §8 sets
+    # the muon NS oracle tol at <2e-3, NOT 1e-9) — so muon uses 2e-3 for (1a). The (1b)
+    # STATE check stays TIGHT (1e-4): the momentum buffer (m) is buf=μ·buf+g, NO NS, so
+    # it must match eager exactly — that is the load-bearing "runs the real optimizer"
+    # check, and a dropped/garbage momentum still fails it at 1e-4.
+    param_tol = spec.get("param_tol", 1e-4)
+    param_ok = rel_err < param_tol
     if verbose:
         print(f"  (1a) params vs REAL eager: max|Δp|={abs_err:.3e} rel={rel_err:.3e} "
-              f"(tol 1e-4) {'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
+              f"(tol {param_tol:.0e}) {'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
 
     # ── (1b) STATE vs REAL eager — THE DECISIVE CHECK. At step 1 every Adam-family
     # tail collapses to ≈sign(g_amp) in the PARAM update (m/bc1=g_amp, sqrt(v/bc2)=
@@ -382,12 +451,33 @@ def run_cell_gate(cell_key, verbose=True):
     off = 0
     for _, p in named_ref:
         n = p.numel(); stt = opt_ref.state.get(p, {})
-        if "exp_avg" in stt:
+        # MUON: the eager optimizer keeps the 2D-matrix momentum under the
+        # "momentum_buffer" key (muon.py:196, the Newton-Schulz group), NOT "exp_avg"
+        # — only the 1D AdamW group uses "exp_avg". The kernel stores BOTH in the same
+        # m-slice (st.exp_avg): the running momentum buf=μ·buf+g for the 2D weights and
+        # the AdamW m for the 1D weights. So the (1b) m-reference must read whichever
+        # key the eager optimizer actually populated for THIS tensor. Without this, the
+        # 11 NS matrices read 0 (no "exp_avg" key) and the check reports a phantom 21.x
+        # mismatch even though the kernel's 2D momentum is bit-identical to eager. This
+        # makes (1b) RIGOROUS for Muon (it now validates the real NS-group momentum),
+        # not weaker — a wrong-magnitude buf (which NS would orthogonalize to the same
+        # direction, hiding in (1a) params) fails HERE. Non-Muon cells lack the
+        # "momentum_buffer" key, so the exp_avg branch is unchanged for them.
+        if "momentum_buffer" in stt:
+            r_m[off:off + n].copy_(stt["momentum_buffer"].reshape(-1))
+        elif "exp_avg" in stt:
             r_m[off:off + n].copy_(stt["exp_avg"].reshape(-1))
         if "exp_avg_sq" in stt:
             r_v[off:off + n].copy_(stt["exp_avg_sq"].reshape(-1)); have_v = True
         if "ema" in stt:
             r_ema[off:off + n].copy_(stt["ema"].reshape(-1)); have_ema = True
+        # PRODIGY: the kernel's third state slice (extra) holds Prodigy's `s`
+        # trajectory accumulator (s_track), not an EMA. The REAL eager Prodigy keeps
+        # it under the "s" key. Map it into the r_ema comparison slot so the (1b)
+        # STATE check validates the kernel's s_track += d·g against eager (the
+        # apply-tail's third write — load-bearing for the d-trajectory at step≥2).
+        if "s" in stt:
+            r_ema[off:off + n].copy_(stt["s"].reshape(-1)); have_ema = True
         off += n
     def _rel(a, b):
         d = (a - b).abs().max().item(); return d / (b.abs().max().item() + 1e-30)

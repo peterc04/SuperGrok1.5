@@ -3479,7 +3479,18 @@ PYBIND11_MODULE(_ops, m) {
  // trips the caller's one-shot TypeError latch, loud degrade). ≤0 ⇒ no clip
  // (inert for every non-GrokAdamW cell); the decoder GrokAdamW cell passes the
  // optimizer's grad_clip (=1.0) so the kernel's P2.5 global-norm clip fires.
- py::arg("grad_clip") = 0.0f);
+ py::arg("grad_clip") = 0.0f,
+ // Prodigy estimator scalars (decoder L3-TC, STAGED global-d). Trailing defaulted
+ // args → back-compat preserved (eager/inert for every non-Prodigy cell). The
+ // decoder Prodigy cell passes d0/d_coef/beta3 so the kernel's P2.6 d-reduction
+ // matches the eager multi-tensor estimator.
+ py::arg("d0") = 1e-6f, py::arg("d_coef") = 1.0f, py::arg("beta3") = 0.0f,
+ // Muon 1D-group AdamW hyperparameters (ViT L3-TC, STAGED NS). Trailing defaulted
+ // args → back-compat preserved (eager Muon adamw_* defaults, inert for every
+ // non-Muon cell). The vit Muon cell passes adamw_lr/adamw_betas so the kernel's
+ // Muon P3 1D AdamW tail matches the eager non-2D group.
+ py::arg("aux_lr") = 1e-3f, py::arg("aux_beta1") = 0.9f,
+ py::arg("aux_beta2") = 0.98f);
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);

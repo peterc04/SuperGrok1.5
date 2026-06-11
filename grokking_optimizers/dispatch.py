@@ -709,6 +709,17 @@ _FUSED_L3_REAL = frozenset({
     # tail — the mamba launcher's opt_id switch does not include NeuralGrok).
     ("transformer_decoder", "neuralgrok"),
     ("vit", "neuralgrok"),
+    # neuralgrok (mamba — wave-2 mamba lane): the mamba TC launcher gained the
+    # OptId::NeuralGrok case (mega_mamba_real_adamw_tc_launcher.cu) and the mamba
+    # dispatch.cpp cap widened to the generic mb_opt_id>=0 (mirrors decoder/vit). The
+    # psi-net pack is model-INDEPENDENT (fused_train_step scatters psi_pack() into the
+    # `extra` slice for any model), and apply_optimizer<NeuralGrok> is a pure
+    # elementwise tail over the deterministically-reduced grad — so the SAME psi-net
+    # MLP runs on the mamba TC-reduced grad. State-gate clean by the same argument as
+    # decoder/vit (kernel + eager consume the SAME grad + psi weights). The amplifier
+    # host-training cadence is the eager NeuralGrok's concern; the L3-TC step runs the
+    # deployed psi MLP faithfully (the gate anchors (1b) to canonical neuralgrok.h).
+    ("mamba3", "neuralgrok"),
     # grokadamw (decoder): CONVERTED. The THREE eager mechanisms ALL land now (the
     # ema cold-start was already staged in apply_optimizer<GrokAdamW>); the cell is
     # no longer a hollow pass:
@@ -733,6 +744,57 @@ _FUSED_L3_REAL = frozenset({
     #        path feeds (train_loss, val_loss) to GrokAdamW.step(), so eager α stays
     #        at α_init = the kernel's static α for ALL steps. Faithful, not dropped.
     ("transformer_decoder", "grokadamw"),
+    # grokadamw (vit): CONVERTED (wave-2 vit lane). Same 3 mechanisms on the vit TC
+    # kernel — fused_vit_megakernel_tc gained the IDENTICAL P2.5 global grad-norm clip
+    # + P3 per-tensor layer-wise β1 (t == flat kVitOffsets index; cls_token t=0), and
+    # the vit launcher already dispatches opt_id=3. Single-step state-gate + multi-step
+    # parity validated (the clip is the step-1-inert mechanism the single-step gate is
+    # blind to, so the multi-step parity is the load-bearing check, exactly as decoder).
+    ("vit", "grokadamw"),
+    # grokadamw (mamba — wave-2 mamba lane): the mamba TC kernel gained the IDENTICAL
+    # 3-mechanism support as decoder/vit — P2.5 GLOBAL grad-norm clip (deterministic
+    # ascending-CTA reduce over the reduced grad → clip_coef) + P3 per-tensor
+    # layer-wise β1 = β1·(1-γ)^t (t == flat kMambaOffsets index, rebased bc1) +
+    # adaptive-α (static in-context = the LIVE α the host computes pre-launch and
+    # forwards via FusedScalars). γ/grad_clip thread through FusedScalars. The mamba
+    # TC launcher dispatches opt_id=3 (OptId::GrokAdamW). ema = the `extra` slice
+    # (cold-start seed at step 1, identical to decoder). Single persistent wgmma
+    # launch — the clip + β1-rebase are IN-KERNEL stages, no extra launch.
+    ("mamba3", "grokadamw"),
+    # prodigy (decoder): CONVERTED (wave-2 decoder lane). STAGED global-d. The
+    # adaptive learning rate d (a cross-ALL-tensors reduction over EVERY element of
+    # EVERY tensor) is computed IN-KERNEL as a new phase (P2.6, between the grad
+    # reduction B2 and the optimizer tail P3) — NOT a separate launch, so it stays a
+    # SINGLE persistent megakernel. The phase byte-matches the live eager multi-tensor
+    # estimator (prodigy_sm90.cuh:465-544 → prodigy.py): per-CTA (r,s) owner-computes
+    # reduction (no float atomic, deterministic) → beta3-EMA decay of the PERSISTED
+    # (r_ema,s_ema) scalars → d = max(d_prev, d_coef·r_ema/|s_ema|). The cell extends
+    # the state buffer to carry the trajectory anchor param_init + the 3 persisted
+    # estimator scalars (fused_train_step sizes it 4*total+4). At step 1 param_init==
+    # params ⇒ r=0 ⇒ d=d0 (cold-start matches eager _d_lr=d0); the d-adaptation fires
+    # at step≥2, so the single-step state-gate is necessary-not-sufficient and the
+    # MULTI-STEP parity (kernel tracks eager; a d-frozen control diverges) is the
+    # load-bearing check, exactly as grokadamw's clip. mamba×prodigy stays blocked
+    # (no mamba prodigy P2.6 wiring yet).
+    ("transformer_decoder", "prodigy"),
+    # prodigy (vit): CONVERTED (wave-2 vit lane). The SAME STAGED global-d P2.6 phase
+    # on the vit TC kernel (fused_vit_megakernel_tc): per-CTA (r,s) owner-computes
+    # reduction over kVitSizes/kVitOffsets → beta3-EMA decay of the persisted (r_ema,
+    # s_ema) → d=max(d_prev,d_coef·r_ema/|s_ema|). The vit launcher binds s_track/
+    # param_init/prodigy_persist + routes opt_id=5; fused_train_step's 4*total+4 state
+    # sizing + param_init seeding are model-agnostic (keyed on opt_name=="prodigy"), so
+    # they apply to vit unchanged. Same MULTI-STEP load-bearing check (d fires step≥2).
+    ("vit", "prodigy"),
+    # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz.
+    # The NS orthogonalization of the 2D weights (kVitMuon2D: 11 matrices) is an
+    # IN-KERNEL phase (P2.7, between B2 and P3) — all CTAs cooperate on one matrix at a
+    # time (buf=μ·buf+g with buf the PERSISTENT m-slice, ‖buf‖→inv_norm→X, then 5×NS
+    # {A=XXᵀ, AX, AAX, combine}), then the muon.h apply; the 1D/non-2D weights take the
+    # AdamW tail in P3 (muon.py auto-split by p.ndim). Still a SINGLE persistent launch
+    # (no separate NS launch — the in-kernel grid-cooperative form places one CTA/SM:
+    # VitTcSmem is static ~7KB, NS buffers are HBM). The vit launcher binds the momentum
+    # to st.exp_avg + routes opt_id=7. mamba×muon stays blocked (no mamba P2.7).
+    ("vit", "muon"),
 })
 
 _FUSED_REGISTRY = {}
@@ -942,6 +1004,48 @@ def _opt_scalars_from(optimizer, step):
             out["gamma"] = float(g["gamma"])
         if "grad_clip" in g:
             out["grad_clip"] = float(g["grad_clip"])
+    # prodigy (decoder L3-TC, STAGED global-d): the kernel's P2.6 d-reduction reads
+    # st.d0/st.d_coef/st.beta3. Prodigy's param_groups carry d0/d_coef; beta3 is
+    # sqrt(beta2) (the canonical persistent-EMA decay, prodigy.py:178). Distinguish
+    # from the other branches by the d0 key (only Prodigy has it). Forward them so
+    # the kernel's estimator matches the eager multi-tensor path byte-for-byte.
+    elif "d0" in g and "d_coef" in g:
+        import math as _math
+        out["d0"] = float(g["d0"])
+        out["d_coef"] = float(g["d_coef"])
+        out["beta3"] = _math.sqrt(beta2)
+    elif "momentum" in g and "betas" not in g:
+        # muon (vit L3-TC, STAGED grid-cooperative NS): the kernel's P2.7 reads the
+        # momentum as st.beta1 (buf = β1·buf + g, muon.h:43-44). Muon's 2D param_group
+        # carries `momentum` (0.95), NOT `betas` (so `betas` defaulted to (0.9,0.999)
+        # above — WRONG for the buf decay). Override beta1 = momentum. lr is already the
+        # 2D group's muon_lr (param_groups[0]); wd flows through; the kernel computes
+        # neg_lr_scale/decay_factor on-device from lr+wd.
+        out["beta1"] = float(g["momentum"])
+        out["bc1"] = 1.0 - out["beta1"] ** step
+        # The 1D/non-2D weights are a SEPARATE eager AdamW group (muon.py:115-125) with
+        # INDEPENDENT hyperparameters: adamw_lr/adamw_betas/adamw_eps. The single
+        # FusedScalars lr/beta1/beta2 carry the 2D-group values (0.02/0.95/...), so the
+        # 1D AdamW tail (kernel P3, OptId::Muon branch) reads the aux_* fields instead.
+        # Find the adamw group (group_type=="adamw", or the group that has `betas` —
+        # the 2D group has `momentum` and no `betas`). Forward its lr/betas → aux_*;
+        # eps maps to the shared `eps` (above). If there is no 1D group (all-2D model),
+        # aux_* keep the eager-default ABI values (harmless — no 1D tensors to apply to).
+        aux_g = None
+        for pg in optimizer.param_groups:
+            if pg.get("group_type") == "adamw" or "betas" in pg:
+                aux_g = pg
+                break
+        if aux_g is not None:
+            a_betas = aux_g.get("betas", (0.9, 0.98))
+            out["aux_lr"] = float(aux_g.get("lr", 1e-3))
+            out["aux_beta1"] = float(a_betas[0])
+            out["aux_beta2"] = float(a_betas[1])
+            # eps: the 1D AdamW group's adamw_eps. The kernel's 1D tail uses st.eps
+            # (the shared `eps` scalar). Bind it from the adamw group so the tail's eps
+            # matches eager (both default 1e-8; explicit so a non-default adamw_eps is
+            # honored). The 2D NS path does not use eps, so this is safe to override.
+            out["eps"] = float(aux_g.get("eps", eps))
     return out
 
 
@@ -1096,6 +1200,10 @@ _L3_WGMMA_CELLS = frozenset({
     # tail differs. mamba×neuralgrok is NOT here (no mamba TC neuralgrok tail).
     ("transformer_decoder", "neuralgrok"),
     ("vit", "neuralgrok"),
+    # neuralgrok (mamba — wave-2): bf16 TC launcher routes opt_id=6
+    # (OptId::NeuralGrok) over the mamba TC-reduced grad; psi pack scattered into the
+    # `extra` slice host-side (model-independent). gemm_impl_for_cell → "wgmma".
+    ("mamba3", "neuralgrok"),
     # grokadamw (decoder): CONVERTED. All THREE eager mechanisms now land in the
     # bf16 TC path (opt_id=3 → apply_optimizer<GrokAdamW>): (i) per-tensor
     # layer-wise β1=β1·(1-γ)^layer + rebased bc1 (kernel P3, t==flat layer index);
@@ -1107,6 +1215,37 @@ _L3_WGMMA_CELLS = frozenset({
     # (the clip fires by ~step 50; kernel tracks eager to fp32-reorder tol). vit is
     # NOT here yet (this conversion is decoder-only per the cell order).
     ("transformer_decoder", "grokadamw"),
+    # grokadamw (vit): CONVERTED (wave-2 vit lane). The SAME 3-mechanism conversion
+    # on the vit TC kernel: fused_vit_megakernel_tc now has the IDENTICAL P2.5 global
+    # grad-norm clip (deterministic ascending-CTA Σg² → clip_coef) and the P3 per-tensor
+    # layer-wise β1=β1·(1-γ)^t + rebased bc1 (t == flat kVitOffsets layer index, cls_token
+    # is t=0). The vit launcher already routes opt_id=3 (OptId::GrokAdamW). γ/grad_clip
+    # thread via FusedScalars. Validated: single-step state-gate + the MULTI-STEP parity
+    # (the clip is inert at step 1 but fires by ~step 50; kernel-with-clip tracks eager,
+    # kernel-without reproduces the ~2e-4 divergence).
+    ("vit", "grokadamw"),
+    # grokadamw (mamba — wave-2): bf16 TC launcher routes opt_id=3 (OptId::GrokAdamW)
+    # over the mamba TC-reduced grad; the kernel's P2.5 global grad-norm clip + P3
+    # per-tensor layer-wise β1 land in fused_mamba_megakernel_tc (ported from
+    # decoder/vit). gemm_impl_for_cell → "wgmma".
+    ("mamba3", "grokadamw"),
+    # prodigy (decoder): CONVERTED (wave-2 decoder lane). STAGED global-d, computed
+    # IN-KERNEL (P2.6, between B2 and P3) — still a SINGLE persistent wgmma launch.
+    # dispatch.cpp's wgmma_tail_opt_id("prodigy")=5 routes it onto the TC driver; the
+    # decoder launcher (mega_decoder_real_adamw_tc_launcher.cu) binds param_init /
+    # prodigy_persist / s_track and dispatches OptId::Prodigy. The d-estimate reduction
+    # byte-matches the eager multi-tensor estimator. mamba×prodigy is NOT here (no
+    # mamba prodigy stage).
+    ("transformer_decoder", "prodigy"),
+    # prodigy (vit): CONVERTED (wave-2 vit lane). The SAME STAGED global-d P2.6 phase
+    # on the vit TC kernel; the vit launcher binds param_init/prodigy_persist/s_track
+    # and dispatches OptId::Prodigy (opt_id=5). Single persistent wgmma launch.
+    ("vit", "prodigy"),
+    # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz —
+    # in-kernel P2.7 (NS orthogonalization of the 11 2D weights, all CTAs per matrix),
+    # 1D weights → AdamW tail in P3. Single persistent wgmma launch (opt_id=7); the vit
+    # launcher binds the momentum to the persistent m-slice (st.exp_avg).
+    ("vit", "muon"),
 })
 
 
@@ -1258,10 +1397,21 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         # for grad would corrupt the weights). All allocated ONCE and reused
         # (reallocating state per step would reset momentum → never grok).
         flat = torch.empty(total, dtype=torch.float32, device=device)
-        state = torch.zeros(3 * total + 1, dtype=torch.float32, device=device)
+        # State layout is [m|v|extra]+loss = 3*total+1 for every cell EXCEPT prodigy
+        # (decoder L3-TC, STAGED global-d), which needs a LARGER buffer carrying its
+        # trajectory anchor + persisted estimator scalars:
+        #   [m | v | extra/s_track | loss | param_init(total) | r_ema | s_ema | d_lr]
+        #   = 4*total + 4. The TC launcher carves param_init at loss_slot+1 and the
+        # 3 scalars after it (matches dispatch.cpp's prodigy state-size check). The
+        # extras zero-init; param_init is seeded = params at step 1 below (so r=0 at
+        # step 1 ⇒ d stays at d0, matching eager). d_lr's zero-init is overridden by
+        # the kernel's step-1 d0 cold-start (st.d0), so d_lr starts at d0 like eager.
+        _state_floats = (4 * total + 4) if opt_name == "prodigy" else (3 * total + 1)
+        state = torch.zeros(_state_floats, dtype=torch.float32, device=device)
         grad_out = torch.zeros(total, dtype=torch.float32, device=device)
         names = [n for n, _ in named]
-        cache = dict(flat=flat, state=state, grad_out=grad_out, names=names)
+        cache = dict(flat=flat, state=state, grad_out=grad_out, names=names,
+                     param_init_seeded=False)
         state_cache[model_c] = cache
     elif cache["names"] != [n for n, _ in named]:
         raise RuntimeError(
@@ -1279,6 +1429,18 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         n = p.numel()
         flat[off:off + n].copy_(p.data.reshape(-1))
         off += n
+
+    # PRODIGY trajectory anchor (p0): seed param_init = the CURRENT params ONCE, at
+    # the FIRST step this cell is driven (mirrors eager prodigy.py's
+    # state["param_init"] = p.detach().clone() at the first step). param_init lives at
+    # state[3*total+1 : 4*total+1] (right after the loss slot, before the 3 persisted
+    # estimator scalars). Seeding from `flat` (which holds the current params) makes
+    # r = Σ d²·<g, p0−p> = 0 at step 1 ⇒ d stays at d0 — the eager-faithful cold
+    # start. Guarded so step≥2 never overwrites the anchor (the distance from p0 is
+    # the whole point of the estimator). The flag persists in the cache across steps.
+    if opt_name == "prodigy" and not cache.get("param_init_seeded", False):
+        state[3 * total + 1:4 * total + 1].copy_(flat)
+        cache["param_init_seeded"] = True
 
     # Pack the per-sample input ++ targets into ONE contiguous `input` tensor, the
     # packing dispatch.cpp reads for this model (int tokens vs float patches).
@@ -1392,6 +1554,30 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         _extra_scalars["gamma"] = scalars["gamma"]
     if "grad_clip" in scalars:
         _extra_scalars["grad_clip"] = scalars["grad_clip"]
+    # prodigy decoder L3-TC (STAGED global-d): the kernel's P2.6 d-reduction reads
+    # st.d0/st.d_coef/st.beta3. _opt_scalars_from sets these only for prodigy;
+    # omitting them leaves the inert FusedScalars defaults (d_coef=1, beta3=0) —
+    # which would DROP the persistent EMA and the candidate scale (the d-estimate
+    # would be the instantaneous form, diverging from eager at step≥2). Forward them.
+    if "d0" in scalars:
+        _extra_scalars["d0"] = scalars["d0"]
+    if "d_coef" in scalars:
+        _extra_scalars["d_coef"] = scalars["d_coef"]
+    if "beta3" in scalars:
+        _extra_scalars["beta3"] = scalars["beta3"]
+    # muon vit L3-TC (STAGED NS): the 1D/non-2D weights take a SEPARATE eager AdamW
+    # group with INDEPENDENT lr/betas (adamw_lr/adamw_betas). _opt_scalars_from sets
+    # aux_lr/aux_beta1/aux_beta2 only for muon; omitting them leaves the eager-default
+    # ABI values and the 1D tail would silently use the 2D-group lr/beta1 (the bug the
+    # 2D/1D split diagnostic caught: 1D param rel 19.0). Forward them so the kernel's
+    # Muon P3 1D AdamW tail matches the eager non-2D group (it device-computes the
+    # aux bias-corrections from aux_beta^step).
+    if "aux_lr" in scalars:
+        _extra_scalars["aux_lr"] = scalars["aux_lr"]
+    if "aux_beta1" in scalars:
+        _extra_scalars["aux_beta1"] = scalars["aux_beta1"]
+    if "aux_beta2" in scalars:
+        _extra_scalars["aux_beta2"] = scalars["aux_beta2"]
     ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],

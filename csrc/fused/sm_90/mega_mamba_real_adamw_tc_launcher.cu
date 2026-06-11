@@ -157,6 +157,20 @@ cudaError_t mega_mamba_real_adamw_tc(
         case OptId::Grokfast:
             return launch_fused_mamba_megakernel_tc<OptId::Grokfast>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::GrokAdamW:
+            // 3-mechanism GrokAdamW (wave-2 mamba): the kernel's P2.5 global grad-norm
+            // clip + P3 per-tensor layer-wise β1 land in fused_mamba_megakernel_tc<Opt>
+            // (mirrors the decoder/vit TC kernels). γ/grad_clip thread through
+            // FusedScalars (apply_scalars). ema = the `extra` slice (cold-start seed).
+            return launch_fused_mamba_megakernel_tc<OptId::GrokAdamW>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::NeuralGrok:
+            // psi-net MLP tail (wave-2 mamba): apply_optimizer<NeuralGrok> reads the
+            // psi pack the host scattered into the `extra` slice (st.psi_W1/b1/W2 bound
+            // above) + alpha/beta from FusedScalars. Pure elementwise — no precompute,
+            // no cross-CTA reduction, so it inherits the deterministic grad reduce.
+            return launch_fused_mamba_megakernel_tc<OptId::NeuralGrok>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC
     }

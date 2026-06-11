@@ -101,7 +101,18 @@ cudaError_t mega_vit_real_adamw_tc(
     st.psi_W1     = extra_slice + kPsiW1Off;   // neuralgrok psi-net pack
     st.psi_b1     = extra_slice + kPsiB1Off;
     st.psi_W2     = extra_slice + kPsiW2Off;
-    apply_scalars(st, scalars);
+    // PRODIGY (STAGED global-d) state bindings — the ViT twin of the decoder TC
+    // launcher's. The cell extends the state buffer to
+    //   [m | v | extra/s_track | loss | param_init(total) | r_ema | s_ema | d_lr]
+    //   = 4*total + 4 (host sizes it in dispatch.fused_train_step). The `extra` slice
+    // doubles as Prodigy's `s` trajectory accumulator (the apply reads st.s_track,
+    // not st.ema — they alias here, harmless: Prodigy has no slow-grad EMA). loss_out
+    // points at state+3*total (dispatch's loss_slot), so param_init = loss_out + 1
+    // and the 3 persisted estimator scalars [r_ema | s_ema | d_lr] follow it.
+    st.s_track         = extra_slice;            // Prodigy `s` (per-element accumulator)
+    st.param_init      = loss_out + 1;           // state + 3*total + 1
+    st.prodigy_persist = loss_out + 1 + total;   // [r_ema | s_ema | d_lr]
+    apply_scalars(st, scalars);   // FULL scalar set (+ d0/d_coef/beta3 for Prodigy)
     st.lr = lr;
 
     ViTInputCtx in;
@@ -126,6 +137,22 @@ cudaError_t mega_vit_real_adamw_tc(
                 ctx, params, in, grad, lr, step, st, stream, nCTA);
         case OptId::NeuralGrok:
             return launch_fused_vit_megakernel_tc<OptId::NeuralGrok>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::Prodigy:
+            // STAGED global-d: the SAME single persistent launch — the d-estimate
+            // cross-tensor reduction is an IN-KERNEL phase (P2.6, between B2 and P3),
+            // not a separate launch. st carries param_init/prodigy_persist/d0/d_coef/
+            // beta3; the kernel decays+accumulates the EMA, updates d, applies.
+            return launch_fused_vit_megakernel_tc<OptId::Prodigy>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::Muon:
+            // STAGED grid-cooperative Newton-Schulz: the SAME single persistent launch —
+            // the NS orthogonalization of the 2D weights is an IN-KERNEL phase (P2.7,
+            // between B2 and P3), looping the matrices with grid barriers. The momentum
+            // buffer is the PERSISTENT m-slice (st.exp_avg, bound above); st.beta1 is the
+            // Muon momentum; the 1D/non-2D weights take the AdamW tail in P3 (reading
+            // st.exp_avg/exp_avg_sq). The per-matrix NS scratch lives in the workspace.
+            return launch_fused_vit_megakernel_tc<OptId::Muon>(
                 ctx, params, in, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;

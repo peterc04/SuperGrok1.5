@@ -53,7 +53,20 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // mechanism (ii)). Trailing defaulted arg (≤0 ⇒ no clip = inert for
                 // every non-GrokAdamW cell). Keep in sync with the definition in
                 // dispatch.cpp + the pybind py::arg list (bindings.cpp).
-                float grad_clip = 0.0f);
+                float grad_clip = 0.0f,
+                // Prodigy estimator scalars (decoder L3-TC, STAGED global-d).
+                // Trailing defaulted args (eager/inert for every non-Prodigy cell:
+                // d_coef=1, beta3=0). Keep in sync with the dispatch.cpp definition
+                // + the pybind py::arg list (bindings.cpp).
+                float d0 = 1e-6f, float d_coef = 1.0f, float beta3 = 0.0f,
+                // Muon 1D-group AdamW hyperparameters (ViT L3-TC, STAGED NS). The
+                // eager Muon's non-2D AdamW group has INDEPENDENT lr/betas
+                // (adamw_lr/adamw_betas, muon.py:115-125); these carry them to the
+                // kernel's Muon P3 1D tail. Trailing defaulted args = eager Muon
+                // adamw_* defaults (inert for every non-Muon cell). Keep in sync
+                // with the dispatch.cpp definition + the pybind py::arg list.
+                float aux_lr = 1e-3f, float aux_beta1 = 0.9f,
+                float aux_beta2 = 0.98f);
 
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}

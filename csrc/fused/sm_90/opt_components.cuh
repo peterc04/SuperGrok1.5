@@ -116,6 +116,32 @@ struct FusedOptState {
     // rebase_state unchanged (a scalar). Defaults are the inert no-op (γ=0 ⇒ a
     // single global β1; grad_clip<=0 ⇒ no clip; clip_coef=1 ⇒ grad unscaled).
     float gamma = 0.0f, grad_clip = 0.0f, clip_coef = 1.0f;
+    // Prodigy (decoder L3-TC conversion, STAGED global-d). The d-estimate's
+    // INPUTS that the in-kernel reduction stage (fused_decoder_megakernel_tc's
+    // Prodigy branch, between B2 and P3) consumes/produces:
+    //   * param_init — the trajectory anchor p0 (flat blob parallel to params),
+    //     seeded = params at step 1 by the host; r = Σ d²·<g, p0−p> needs it.
+    //     rebase_state offsets it per tensor (added below).
+    //   * d0 / d_coef / beta3 — the estimator scalars (host-bound via FusedScalars):
+    //     d0 seeds d_prev at step 1 (the persisted d_lr slot zero-inits to 0, but
+    //     eager inits _d_lr=d0=1e-6 — the cold-start the single-step gate needs);
+    //     beta3=sqrt(β2) decays the persistent (r_ema,s_ema); d_coef scales the
+    //     candidate d. Defaults are the inert/eager values (d_coef=1 ⇒ no scale).
+    //   * prodigy_persist — device pointer to the 3 PERSISTED estimator scalars
+    //     [r_ema | s_ema | d_lr] that carry across steps (host owns the buffer; the
+    //     stage decays + accumulates + writes d back each step). NOT rebased.
+    // st.s_track (Prodigy's `s` buffer) + st.d_factor (the reduced d the apply
+    // reads) already exist above. Defaults leave every non-Prodigy cell untouched.
+    const float* param_init = nullptr;
+    float* prodigy_persist  = nullptr;   // [r_ema | s_ema | d_lr]  (persisted)
+    float d0 = 1e-6f, d_coef = 1.0f, beta3 = 0.0f;
+    // Muon (ViT L3-TC, STAGED NS): the 1D-weight AdamW group's INDEPENDENT
+    // hyperparameters (eager adamw_lr/adamw_betas, muon.py:115-125). The 2D group's
+    // lr/momentum ride the main lr/beta1 fields (P2.7 NS + apply); the 1D AdamW
+    // tail (P3) reads aux_lr/aux_beta1/aux_beta2 instead (bc1/bc2 device-computed
+    // = 1-aux_beta^step). Defaults = eager Muon adamw_* defaults; non-Muon cells
+    // never read these (byte-identical).
+    float aux_lr = 1e-3f, aux_beta1 = 0.9f, aux_beta2 = 0.98f;
 };
 
 // =========================================================================
@@ -165,6 +191,26 @@ struct FusedScalars {
     //    (additive ABI, same contract as the original C2-gap widening above).
     float gamma     = 0.0f;   // GrokAdamW layer-wise β1 decay rate: β1_i=β1*(1-γ)^i
     float grad_clip = 0.0f;   // GrokAdamW global grad-norm clip (<=0 ⇒ no clip)
+    // ── Prodigy append-only widening (decoder L3-TC conversion, STAGED global-d).
+    //    The estimator scalars; defaults are eager/inert so every other cell is
+    //    byte-identical. d0 seeds d_prev at step 1; beta3=sqrt(β2) decays the
+    //    persisted (r_ema,s_ema); d_coef scales the candidate d (1 ⇒ no scale).
+    float d0     = 1e-6f;     // Prodigy d0 (step-1 d_prev cold-start)
+    float d_coef = 1.0f;      // Prodigy d_coef (candidate-d scale)
+    float beta3  = 0.0f;      // Prodigy EMA decay = sqrt(beta2) (0 ⇒ no persistence)
+    // ── Muon append-only widening (ViT L3-TC, STAGED NS). The eager Muon manages
+    //    TWO param groups with INDEPENDENT hyperparameters: a 2D-matrix group
+    //    (lr/momentum carried by the main lr/beta1 fields, consumed by the P2.7 NS
+    //    + apply) and a 1D-weight AdamW group (muon.py:115-125: adamw_lr,
+    //    adamw_betas, shared weight_decay). A single global scalar set cannot map
+    //    the main lr/beta1 onto BOTH groups, so the 1D AdamW tail (P3) reads these
+    //    aux_* fields instead. aux_bc1/bc2 are NOT carried — the muon branch
+    //    computes them on-device (1-aux_beta^step), shrinking the mirror surface.
+    //    Defaults mirror the eager Muon adamw_* defaults; every non-Muon caller is
+    //    byte-identical (only the OptId::Muon P3 branch reads aux_*).
+    float aux_lr    = 1e-3f;  // Muon 1D-group AdamW lr (eager adamw_lr)
+    float aux_beta1 = 0.9f;   // Muon 1D-group AdamW betas[0] (eager adamw_betas[0])
+    float aux_beta2 = 0.98f;  // Muon 1D-group AdamW betas[1] (eager adamw_betas[1])
 };
 
 // Fold the runtime scalars into a FusedOptState (pointers are bound separately
@@ -192,6 +238,15 @@ __host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
     st.grad_clip    = s.grad_clip;   // GrokAdamW global grad-norm clip threshold
     // st.clip_coef is NOT host-bound: the kernel computes it on-device (P2.5) from
     // the reduced grad's global L2 norm and st.grad_clip, then applies it in P3.
+    st.d0           = s.d0;          // Prodigy d0 (step-1 d_prev cold-start)
+    st.d_coef       = s.d_coef;      // Prodigy candidate-d scale
+    st.beta3        = s.beta3;       // Prodigy EMA decay (sqrt(beta2))
+    st.aux_lr       = s.aux_lr;      // Muon 1D-group AdamW lr (eager adamw_lr)
+    st.aux_beta1    = s.aux_beta1;   // Muon 1D-group AdamW betas[0]
+    st.aux_beta2    = s.aux_beta2;   // Muon 1D-group AdamW betas[1]
+    // st.d_factor is NOT host-bound for the STAGED-d cell: the kernel's Prodigy
+    // reduction stage computes it on-device (between B2 and P3) and stashes it.
+    // st.param_init / st.prodigy_persist are device pointers bound by the cell.
 }
 
 // Dispatch to the REAL per-element optimizer step. Each branch is a genuine,
@@ -256,9 +311,18 @@ __device__ __forceinline__ void apply_optimizer(
         //       the static st.alpha bound here. Faithful, not dropped (verified:
         //       fused_train_step/fused_optimizer_step/race never pass losses).
         //
-        // COLD-START: eager seeds ema=grad0 (clipped) — grokadamw.py _group_cache.
+        // COLD-START: eager seeds ema = the UNCLIPPED grad0, NOT the clipped grad.
+        // grokadamw.py _group_cache clones state["ema"] = p.grad.clone() (the raw
+        // gradient) BEFORE grokadamw_fused_step's in-place clip_grad_norms_device_
+        // side (bindings.cpp:215) runs — so the cold-start seed is the UNCLIPPED
+        // grad while the EMA filter input + amplification use the CLIPPED grad. The
+        // prior `st.ema[idx]=gc` seeded the CLIPPED grad, which is byte-identical
+        // when the clip is INERT (clip_coef==1 ⇒ gc==grad) — every currently-green
+        // config — but diverges the m/ema state when the clip FIRES (the forced-fire
+        // multi-step parity surfaced this: kernel ema/clipped==1.0 vs eager 1/coef).
+        // Fix: seed the UNCLIPPED grad; keep the filter + g_amp on gc.
         const float gc = grad[idx] * st.clip_coef;   // (ii) global-clipped grad
-        if (step == 1) st.ema[idx] = gc;              // cold-start on CLIPPED grad
+        if (step == 1) st.ema[idx] = grad[idx];       // cold-start on UNCLIPPED grad
         // EMA filter + amplification (csrc/algorithms/grokadamw.h math), on gc.
         const float ema_new = st.alpha * st.ema[idx] + (1.0f - st.alpha) * gc;
         st.ema[idx] = ema_new;

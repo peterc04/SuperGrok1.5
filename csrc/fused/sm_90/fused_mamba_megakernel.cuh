@@ -115,6 +115,9 @@ mamba_rebase_state(const FusedOptState& s, int64_t off) {
     if (t.mu)         t.mu         += off;
     if (t.orth)       t.orth       += off;
     if (t.smart_grad) t.smart_grad += off;
+    if (t.param_init) t.param_init += off;   // Prodigy trajectory anchor p0 (per-tensor
+                                             // slice). prodigy_persist is a GLOBAL 3-
+                                             // scalar [r_ema|s_ema|d_lr] — NOT rebased.
     return t;
 }
 
@@ -383,12 +386,23 @@ __host__ __device__ __forceinline__ int64_t mb_tc_acts_floats(int T) {
 __host__ __device__ __forceinline__ int64_t mb_tc_dw_part_floats() {
     return (mbtc::kMbDwSplitK > 1) ? mbtc::mb_dw_part_floats(mbtc::kMbDwSplitK) : 0;
 }
+// STAGED-optimizer cross-CTA reduction scratch (Prodigy d-estimate). Mirrors the
+// decoder's dec_tc_opt_reduce_floats: the Prodigy P2.6 stage publishes per-CTA (r,s)
+// slots (2*nCTA) + a reduced-d broadcast slot (1) — an owner-computes tree
+// (opt_stages_precompute.cuh), NO float atomic. Sized for the LARGEST nCTA (one
+// CTA/SM = #SMs); tiny (≤ 2*132+1 ≈ 1 KB) and carved UNCONDITIONALLY so the opt-
+// agnostic cached launcher workspace fits every OptId. Unused by AdamW/Lion/… (their
+// P3 never touches this region), so adding it leaves those cells byte-identical.
+__host__ __device__ __forceinline__ int64_t mb_tc_opt_reduce_floats(int nCTA) {
+    return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
+}
 __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA) {
     return mb_tc_acts_floats(T)
          + (int64_t)nCTA * mbtc::mb_tile_scratch_floats()
          + (int64_t)nCTA * mbtc::kPartElems
          + nCTA + 1
          + mb_tc_dw_part_floats()                       // split-K dW partials (G>1)
+         + mb_tc_opt_reduce_floats(nCTA)                // STAGED-opt (Prodigy) reduce slots
 #if SG_MB_TC_PROFILE
          + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
 #endif
@@ -512,6 +526,55 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
     SG_MBTC_PROF_TIC(_pt);             // open P3 (optimizer tail)
 
+    // ── P2.5 (GrokAdamW ONLY): GLOBAL grad-norm clip coefficient. PORT of the
+    //    decoder/vit TC kernels' P2.5 (fused_decoder_megakernel.cuh:461-512) — the
+    //    eager grokadamw clips the WHOLE grad set to grad_clip via a GLOBAL L2 norm
+    //    (clip_grad_norms_device_side → total_norm = sqrt(Σ_i ‖g_i‖²), clip_coef =
+    //    grad_clip/(total_norm+1e-6) when total_norm>grad_clip, else 1) BEFORE the
+    //    apply. Replicated on the REDUCED grad with a deterministic ascending
+    //    reduction (NO float atomic — COMPONENT_CONTRACT): each CTA sums a contiguous
+    //    element-range into a per-CTA partial slot, CTA0 sums the partials in
+    //    ASCENDING CTA order → total_norm → clip_coef, broadcast via a workspace slot.
+    //    grad is NOT mutated (the return_grad oracle + the eager-side clip both see
+    //    the unclipped reduced grad); the coefficient is applied per-element inside
+    //    apply_optimizer<GrokAdamW>. Guarded so every other opt's P3 is byte-identical
+    //    (no extra barrier/work). loss_part (nCTA) + loss_out (1) are free scratch
+    //    here: the reduced loss is already in *tok.loss_out (a separate pointer).
+    if constexpr (Opt == OptId::GrokAdamW) {
+        float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
+        float* coef_bc = loss_out;           // [1] broadcast clip_coef
+        const int64_t total = kMambaTotalElems;
+        const int64_t base = total / nCTA, rem = total % nCTA;
+        const int64_t e0 = (int64_t)cta * base + (cta < rem ? cta : rem);
+        const int64_t ecnt = base + (cta < rem ? 1 : 0);
+        float tsum = 0.0f;
+        for (int64_t i = threadIdx.x; i < ecnt; i += blockDim.x) {
+            const float gv = grad[e0 + i];
+            tsum += gv * gv;
+        }
+        // Block reduction via the smem the TC GEMM already owns (sm.red, fp32).
+        float* red = sm.red;
+        red[threadIdx.x] = tsum;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) sq_part[cta] = red[0];
+        bar.sync();   // B2.5a: all per-CTA sum-of-squares partials complete
+        if (cta == 0 && threadIdx.x == 0) {
+            double ss = 0.0;
+            for (int c = 0; c < nCTA; ++c) ss += (double)sq_part[c];
+            const float total_norm = sqrtf((float)ss);
+            float coef = 1.0f;
+            if (st.grad_clip > 0.0f && total_norm > st.grad_clip)
+                coef = st.grad_clip / (total_norm + 1e-6f);
+            *coef_bc = coef;
+        }
+        bar.sync();   // B2.5b: clip_coef broadcast slot ready for all CTAs
+        st.clip_coef = *coef_bc;   // every CTA reads the single global coefficient
+    }
+
     // ── P3: the REAL optimizer tail over the reduced grad (work-steal 28). ──
     st.lr = lr;
     {
@@ -521,7 +584,20 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
              t = q.next_block(&task_slot)) {
             const int n = kMambaSizes[t];
             const int64_t off = (int64_t)kMambaOffsets[t];
-            const FusedOptState ts = mamba_rebase_state<Opt>(st, off);
+            FusedOptState ts = mamba_rebase_state<Opt>(st, off);
+            // (i) PER-TENSOR LAYER-WISE β1 (GrokAdamW only) — PORT of the decoder
+            //     P3 (fused_decoder_megakernel.cuh:587-591): β1_i = β1·(1-γ)^t, where
+            //     t == the tensor's flat named_parameters() layer index (the work-steal
+            //     task id maps 1:1 to kMambaOffsets order == the eager enumeration
+            //     order, so t IS the eager layer index). bc1 must be rebased TOO
+            //     (= 1-β1_i^step) or m_hat=m/bc1 mismatches eager; bc2 stays global
+            //     (β2 is not layer-wise). This is the mechanism that fails the STEP-1
+            //     STATE gate when dropped (decoder observed m-rel 0.895).
+            if constexpr (Opt == OptId::GrokAdamW) {
+                const float b1 = st.beta1 * powf(1.0f - st.gamma, (float)t);
+                ts.beta1 = b1;
+                ts.bc1   = 1.0f - powf(b1, (float)step);
+            }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;
             for (int i = threadIdx.x; i < n; i += blockDim.x)

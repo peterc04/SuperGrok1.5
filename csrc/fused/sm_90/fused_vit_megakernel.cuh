@@ -49,6 +49,11 @@
 
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/opt_components.cuh"
+// STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction). Pulls in the
+// canonical prodigy.h reduction math + the deterministic block reductions; the vit
+// TC megakernel's Prodigy branch drives prodigy_precompute_reduce_phaseA + an EMA
+// owner-update between B2 and P3 (the ViT twin of the decoder's P2.6 block).
+#include "csrc/fused/sm_90/opt_stages_precompute.cuh"
 #include "csrc/fused/sm_90/vit_layout.cuh"
 #include "csrc/fused/sm_90/model_stage_vit.cuh"
 #include "csrc/backends/cuda/sm_90/warp_specialize.cuh"
@@ -120,6 +125,7 @@ vit_rebase_state(const FusedOptState& s, int64_t off) {
     if (t.mu)         t.mu         += off;
     if (t.orth)       t.orth       += off;
     if (t.smart_grad) t.smart_grad += off;
+    if (t.param_init) t.param_init += off;   // Prodigy trajectory anchor p0
     return t;
 }
 
@@ -342,11 +348,44 @@ struct VitTcSmem {
 __host__ __device__ __forceinline__ int64_t vit_tc_acts_floats(int T, int B) {
     return (vittc::vit_acts_bf16_count(T, B) + 1) / 2;
 }
+// dW split-K partial floats (0 when G==1 → no extra scratch, the single-CTA path).
+__host__ __device__ __forceinline__ int64_t vit_tc_dw_part_floats() {
+    return vittc::vit_dw_part_floats(vittc::kVitDwSplitK);
+}
+// STAGED-optimizer cross-CTA reduction scratch (Prodigy d-estimate). The Prodigy
+// stage publishes per-CTA (r,s) slots (2*nCTA) + a reduced-d slot (1) — an owner-
+// computes tree (opt_stages_precompute.cuh), NO float atomic. Sized for the LARGEST
+// nCTA (one CTA/SM = #SMs); tiny (≤ 2*132+1 floats) and carved UNCONDITIONALLY so
+// the opt-agnostic launcher allocates one workspace fitting every OptId. Unused by
+// AdamW/Lion/… (their P3 never touches it) → those cells stay byte-identical.
+__host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA) {
+    return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
+}
+// ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. The NS chain
+//    runs ONE 2D weight at a time over all CTAs; the scratch holds X/A/AX/AAX/orth
+//    for the LARGEST 2D weight + the per-CTA Frobenius-norm partials + inv_norm. The
+//    momentum buffer (muon_buf) is NOT here — it PERSISTS across steps as optimizer
+//    state, bound to the m slice (st.exp_avg). Largest vit 2D weight: ff0/ff2 = 512×
+//    128 = 65536 numel; largest rows = 512 ⇒ A = 512×512. Carved UNCONDITIONALLY
+//    (≈ 4·65536 + 512² + nCTA + 1 floats ≈ 2 MB) so the opt-agnostic launcher fits
+//    every OptId; unused by every non-Muon cell (byte-identical). ──
+//    kVitMuonMaxNumel = max over 2D weights of rows*cols; kVitMuonMaxRows = max rows.
+static constexpr int kVitMuonMaxNumel = vit::kDff * vit::kD;     // 512*128 = 65536 (ff0/ff2)
+static constexpr int kVitMuonMaxRows  = vit::kDff;               // 512 (ff0 rows)
+__host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
+    // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
+    return (int64_t)4 * kVitMuonMaxNumel
+         + (int64_t)kVitMuonMaxRows * kVitMuonMaxRows
+         + nCTA + 1;
+}
 __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA) {
     return vit_tc_acts_floats(T, B)
          + (int64_t)nCTA * vittc::vit_tile_scratch_total_f32()
          + (int64_t)nCTA * vittc::kLnVecElems
-         + nCTA + 1;
+         + nCTA + 1
+         + vit_tc_dw_part_floats()           // split-K dW partials (G>1)
+         + vit_tc_opt_reduce_floats(nCTA)    // STAGED-opt (Prodigy) reduce slots
+         + vit_tc_muon_floats(nCTA);         // STAGED-opt (Muon) NS per-matrix scratch
 }
 
 #ifdef SG_VIT_PROFILE
@@ -384,6 +423,18 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
     float* loss_part  = lnvec_base + (int64_t)nCTA * vittc::kLnVecElems;
     float* loss_out   = loss_part + nCTA;
+    // Split-K dW partials (G>1): the (gt,kc) 64×N partial tiles, carved AFTER the
+    // loss slot (matches vit_tc_workspace_floats's term order). G==1 → dw_part unused.
+    float* dw_part    = loss_out + 1;
+    const int kDwG    = vittc::kVitDwSplitK;
+    // STAGED-opt cross-CTA reduce slots (Prodigy d), carved AFTER the dW partials
+    // (matches vit_tc_workspace_floats's term order). Unused unless Opt==Prodigy.
+    float* opt_reduce = dw_part + vit_tc_dw_part_floats();
+    // Muon NS per-matrix scratch, carved AFTER the Prodigy reduce slots (matches
+    // vit_tc_workspace_floats's term order). Unused unless Opt==Muon. Layout:
+    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kVitMuonMaxNumel)
+    //   [muon_A (kVitMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+    float* muon_base = opt_reduce + vit_tc_opt_reduce_floats(nCTA);
 
     vittc::VitActs acts = vittc::vit_acts_bind(acts_base, T, B);
     vittc::VitTileScratch sc = vittc::vit_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -395,6 +446,21 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //    are written-once → no pre-zero). ──
     for (int i = threadIdx.x; i < vittc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+    // STAGED-opt (Prodigy) reduce slots: INTEGRATION-OPTSTAGES.md §1 REQUIRES
+    // prodigy_partials + prodigy_d zero-initialized before launch (the owner-computes
+    // tree reads EVERY slot in ascending order; a CTA that claims no tensor in phaseA
+    // still has its (r,s) slot read, and the persistent device workspace is NOT
+    // re-zeroed between launches — so a stale slot from a prior step's reduction, or
+    // garbage from the caching allocator, would make the cross-tensor d non-determi-
+    // nistic / NaN). phaseA's block_reduce DOES write each slot, but zeroing here is
+    // the contract guarantee + defends the prodigy_d broadcast slot. Guarded to the
+    // Prodigy instantiation so every other cell is byte-identical (no extra work).
+    if constexpr (Opt == OptId::Prodigy) {
+        const int64_t n_opt = vit_tc_opt_reduce_floats(nCTA);   // 2*nCTA + 1
+        for (int64_t i = (int64_t)cta * blockDim.x + threadIdx.x; i < n_opt;
+             i += (int64_t)nCTA * blockDim.x)
+            opt_reduce[i] = 0.0f;
+    }
     bar.sync();   // B0
 
     // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
@@ -449,8 +515,19 @@ fused_vit_megakernel_tc(PersistentContext ctx,
 #ifdef SG_VIT_PROFILE
     __syncthreads(); unsigned long long _dwa = (threadIdx.x == 0) ? clock64() : 0;
 #endif
-    for (int gt = cta; gt < n_dw; gt += nCTA)
-        vittc::vittc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, acts.dh0, grad, sm.sA, sm.sB);
+    if (kDwG > 1) {
+        // SPLIT-K (multi-CTA tiling): fan (n_dw·G) (tile,chunk) partials over the
+        // grid so the ~60% idle SMs do work; deterministic ascending-chunk reduce.
+        for (int item = cta; item < n_dw * kDwG; item += nCTA) {
+            const int gt = item / kDwG, kc = item % kDwG;
+            vittc::vittc_dw_run_tile_splitk<SG_TUNED_TILE_N>(spec, gt, kc, kDwG, acts.dh0, dw_part, sm.sA, sm.sB);
+        }
+        bar.sync();   // all (gt,kc) partials complete before the reduce reads them
+        vittc::vittc_dw_reduce_splitk<SG_TUNED_TILE_N>(spec, n_dw, kDwG, dw_part, grad, cta, nCTA);
+    } else {
+        for (int gt = cta; gt < n_dw; gt += nCTA)
+            vittc::vittc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, acts.dh0, grad, sm.sA, sm.sB);
+    }
 #ifdef SG_VIT_PROFILE
     __syncthreads();
     if (threadIdx.x == 0) { unsigned long long _dwb = clock64(); atomicMax(&g_vit_prof_max[3], _dwb - _dwa); }
@@ -471,6 +548,173 @@ fused_vit_megakernel_tc(PersistentContext ctx,
 #endif
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
 
+    // ── P2.5 (GrokAdamW ONLY): GLOBAL grad-norm clip coefficient. Identical to the
+    //    decoder twin (fused_decoder_megakernel.cuh P2.5). Eager grokadamw clips the
+    //    WHOLE grad set to grad_clip via a GLOBAL L2 norm (clip_grad_norms_device_side
+    //    → total_norm = sqrt(Σ_i ‖g_i‖²), clip_coef = grad_clip/(total_norm+1e-6) when
+    //    total_norm>grad_clip, else 1) BEFORE the apply. We replicate it on the REDUCED
+    //    grad with a deterministic ascending reduction (no float atomics): each CTA sums
+    //    a contiguous element-range into a per-CTA partial slot, CTA0 sums the partials
+    //    in ascending CTA order → total_norm → clip_coef, broadcast via a workspace
+    //    slot. The grad buffer is NOT mutated (the return_grad oracle + the eager-side
+    //    clip must both see the unclipped reduced grad); the coefficient is applied
+    //    per-element inside apply_optimizer<GrokAdamW>. Guarded so every other opt's P3
+    //    is byte-identical (no extra barrier/work). Reuses loss_part/loss_out as free
+    //    scratch (the reduced loss is already in *in.loss_out; the dW partials are
+    //    consumed → that whole region after loss_out is also free).
+    if constexpr (Opt == OptId::GrokAdamW) {
+        float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
+        float* coef_bc = loss_out;           // [1] broadcast clip_coef
+        const int64_t total_e = kVitTotalElems;
+        const int64_t base = total_e / nCTA, rem = total_e % nCTA;
+        const int64_t e0 = (int64_t)cta * base + (cta < rem ? cta : rem);
+        const int64_t ecnt = base + (cta < rem ? 1 : 0);
+        float tsum = 0.0f;
+        for (int64_t i = threadIdx.x; i < ecnt; i += blockDim.x) {
+            const float gv = grad[e0 + i];
+            tsum += gv * gv;
+        }
+        // Block reduction via the smem the TC GEMM already owns (sm.red, fp32).
+        float* red = sm.red;
+        red[threadIdx.x] = tsum;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) sq_part[cta] = red[0];
+        bar.sync();   // B2.5a: all per-CTA sum-of-squares partials complete
+        if (cta == 0 && threadIdx.x == 0) {
+            double ss = 0.0;
+            for (int c = 0; c < nCTA; ++c) ss += (double)sq_part[c];
+            const float total_norm = sqrtf((float)ss);
+            float coef = 1.0f;
+            if (st.grad_clip > 0.0f && total_norm > st.grad_clip)
+                coef = st.grad_clip / (total_norm + 1e-6f);
+            *coef_bc = coef;
+        }
+        bar.sync();   // B2.5b: clip_coef broadcast slot ready for all CTAs
+        st.clip_coef = *coef_bc;   // every CTA reads the single global coefficient
+    }
+
+    // ── P2.6 (Prodigy ONLY): STAGED global-d estimate (cross-ALL-tensors reduce).
+    //    Identical to the decoder twin's P2.6. The apply tail (apply_optimizer
+    //    <Prodigy>) reads st.d_factor (the effective LR scale d), which is a single
+    //    cross-tensor reduction (NOT per-element) → an IN-KERNEL phase here, BYTE-
+    //    FAITHFUL to the live eager multi-tensor path (prodigy_sm90.cuh →
+    //    launch_multi_tensor_prodigy_fused_reduce_step, the order prodigy.py executes):
+    //      d_prev  = persisted d_lr  (step 1: d0 cold-start — the zero-init state slot
+    //                is 0 but eager inits _d_lr=d0=1e-6, so seed it here)
+    //      r_ema  <- beta3·r_ema + Σ d_prev²·<g, p0−p>     (decay persisted SCALAR,
+    //      s_ema  <- beta3·s_ema + Σ d_prev²·|g|            then add this step's Σ)
+    //      d       = max(d_prev, d_coef·r_ema/|s_ema|)      (prodigy_update_d; d_coef
+    //                scales ONLY the candidate — persisted r_ema stays UNSCALED)
+    //    phaseA publishes per-CTA (r,s) into opt_reduce slots (owner-computes tree,
+    //    no float atomic, deterministic); a grid barrier; CTA0 owner-sums ascending,
+    //    EMA-decays, updates d, broadcasts. Guarded so every other opt is byte-
+    //    identical (no extra barrier/work). p0 (param_init) is the trajectory anchor.
+    if constexpr (Opt == OptId::Prodigy) {
+        PrecomputeWorkspace pw{};
+        pw.prodigy_partials = opt_reduce;            // [r slots | s slots]
+        pw.prodigy_d        = opt_reduce + 2 * nCTA; // reduced-d broadcast slot
+        const float d_prev = (step == 1) ? st.d0 : st.prodigy_persist[2];
+        st.d_factor = d_prev;   // phaseA reads st.d_factor as d_prev (prodigy.h)
+        // Phase A: each CTA accumulates Σ d_prev²·<g,p0−p> / Σ d_prev²·|g| over its
+        // claimed tensors → per-CTA (r,s) slots. Drains the task queue (the P3
+        // re-drain below needs a queue reset, done at the barrier).
+        prodigy_precompute_reduce_phaseA(ctx, params, st.param_init, grad,
+                                         kVitSizes, kVitOffsets, d_prev, pw);
+        bar.sync_reset(ctx.g_next_task);   // B2.6a: slots published; reset queue for P3
+        // Owner block (CTA0 thread0): EMA decay + accumulate + d_coef + update_d,
+        // byte-matching launch_multi_tensor_prodigy_fused_reduce_step.
+        if (cta == 0 && threadIdx.x == 0) {
+            float r_step = 0.0f, s_step = 0.0f;     // ascending-CTA owner-sum
+            for (int c = 0; c < nCTA; ++c) {
+                r_step += pw.prodigy_partials[c];
+                s_step += pw.prodigy_partials[nCTA + c];
+            }
+            const float r_ema = st.beta3 * st.prodigy_persist[0] + r_step;
+            const float s_ema = st.beta3 * st.prodigy_persist[1] + s_step;
+            const float d_new = algo::prodigy_update_d(d_prev, st.d_coef * r_ema, s_ema);
+            st.prodigy_persist[0] = r_ema;          // persist UNSCALED EMA
+            st.prodigy_persist[1] = s_ema;
+            st.prodigy_persist[2] = d_new;          // persisted d_lr for next step
+            pw.prodigy_d[0]       = d_new;          // broadcast to all CTAs
+        }
+        bar.sync();   // B2.6b: d visible to every CTA before the apply
+        st.d_factor = pw.prodigy_d[0];              // the reduced d the tail reads
+    }
+
+    // ── P2.7 (Muon ONLY): grid-cooperative Newton-Schulz orthogonalization of the
+    //    2D weights (INTEGRATION-OPTSTAGES §3). For EACH 2D matrix (kVitMuon2D) all
+    //    CTAs cooperate: buf=μ·buf+g (buf is the PERSISTENT m-slice — momentum state,
+    //    NOT transient), ‖buf‖_F via per-CTA partials → inv_norm, X=buf·inv_norm,
+    //    then ns_steps × { A=XXᵀ → AX=A·X → AAX=A·AX → orth=a·X+b·AX+c·AAX, swap },
+    //    then the canonical muon_update_step apply (decay·p + neg_lr_scale·orth). The
+    //    1D / non-2D weights (cls_token, biases, LN γ/β) take the AdamW tail in P3.
+    //    The elementwise bodies CALL muon.h (muon_momentum_normalize_step via the
+    //    phaseA buf body, muon_ns_combine_step, muon_update_step); the matmuls are the
+    //    cited new device code (the eager path delegates to torch::mm/cuBLAS). Guarded
+    //    so every other opt is byte-identical (no extra barriers / work).
+    if constexpr (Opt == OptId::Muon) {
+        // Carve the per-matrix NS scratch (sized for the largest 2D weight).
+        PrecomputeWorkspace pw{};
+        pw.muon_X            = muon_base;
+        pw.muon_AX           = pw.muon_X   + kVitMuonMaxNumel;
+        pw.muon_AAX          = pw.muon_AX  + kVitMuonMaxNumel;
+        pw.muon_orth         = pw.muon_AAX + kVitMuonMaxNumel;
+        pw.muon_A            = pw.muon_orth + kVitMuonMaxNumel;
+        pw.muon_nrm_partials = pw.muon_A   + (int64_t)kVitMuonMaxRows * kVitMuonMaxRows;
+        pw.muon_inv_norm     = pw.muon_nrm_partials + nCTA;
+        const float momentum = st.beta1;          // Muon momentum (eager Muon: betas[0])
+        const int   ns_steps = 5;                 // bindings.cpp default
+        for (int mi = 0; mi < vittc::kVitNumMuon2D; ++mi) {
+            const vittc::VitMuon2D M = vittc::kVitMuon2D[mi];
+            const int rows = M.rows, cols = M.cols;
+            const int64_t numel = (int64_t)rows * cols;
+            const int64_t off   = (int64_t)kVitOffsets[M.tidx];
+            // buf = the PERSISTENT momentum slice for this matrix (st.exp_avg+off).
+            pw.muon_buf = st.exp_avg + off;
+            // phaseA: buf=μ·buf+g, publish per-CTA ‖buf‖_F² → reduce → inv_norm → X.
+            muon_momentum_norm_phaseA(grad + off, numel, momentum, pw);
+            bar.sync();
+            muon_norm_reduce_phaseB(ctx, pw);
+            bar.sync();
+            muon_scale_X(numel, pw);
+            bar.sync();
+            // NS iterations. After each combine, orth holds the new iterate; swap so
+            // the next iteration reads it as X. ns_steps swaps → final result is in
+            // muon_X iff ns_steps even else muon_orth (we track the parity below).
+            for (int s = 0; s < ns_steps; ++s) {
+                // A = X Xᵀ  (M=rows,N=rows,K=cols; B transposed).
+                muon_matmul(pw.muon_X, pw.muon_X, pw.muon_A, rows, rows, cols, cols, cols, /*bT=*/true);
+                bar.sync();
+                // AX = A X   (M=rows,N=cols,K=rows).
+                muon_matmul(pw.muon_A, pw.muon_X, pw.muon_AX, rows, cols, rows, rows, cols, /*bT=*/false);
+                bar.sync();
+                // AAX = A (AX) (M=rows,N=cols,K=rows).
+                muon_matmul(pw.muon_A, pw.muon_AX, pw.muon_AAX, rows, cols, rows, rows, cols, /*bT=*/false);
+                bar.sync();
+                muon_ns_combine_phase(numel, pw);   // orth = a·X + b·AX + c·AAX
+                bar.sync();
+                // swap X <-> orth (next iter reads X; final result tracked by parity).
+                float* tmp = pw.muon_X; pw.muon_X = pw.muon_orth; pw.muon_orth = tmp;
+            }
+            // After ns_steps swaps the final orthogonalized matrix is in muon_X (the
+            // last combine wrote muon_orth, then we swapped → muon_X). Apply Muon:
+            //   p = decay_factor·p + neg_lr_scale·orth   (muon.h:63-73)
+            const float scale        = 0.2f * sqrtf((float)(rows > cols ? rows : cols));
+            const float neg_lr_scale = -lr * scale;
+            const float decay_factor = 1.0f - lr * st.wd;
+            float* __restrict__ p = params + off;
+            const float* __restrict__ orth_final = pw.muon_X;   // post-swap result
+            const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
+            for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += gstride)
+                p[i] = decay_factor * p[i] + neg_lr_scale * orth_final[i];
+            bar.sync();   // matrix done; all CTAs synchronized before the next matrix
+        }
+    }
+
     // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
     st.lr = lr;
 #ifdef SG_VIT_PROFILE
@@ -483,11 +727,48 @@ fused_vit_megakernel_tc(PersistentContext ctx,
              t = q.next_block(&task_slot)) {
             const int n = kVitSizes[t];
             const int64_t off = (int64_t)kVitOffsets[t];
-            const FusedOptState ts = vit_rebase_state<Opt>(st, off);
+            // MUON: the 2D matrices were orthogonalized + applied in P2.7; P3 handles
+            //   ONLY the 1D / non-2D weights, which take the AdamW tail (muon.h:75-76,
+            //   the eager Muon auto-split). Skip the 2D ones here (already done).
+            if constexpr (Opt == OptId::Muon) {
+                if (vittc::vit_is_muon_2d(t)) continue;
+            }
+            FusedOptState ts = vit_rebase_state<Opt>(st, off);
+            // (i) PER-TENSOR LAYER-WISE β1 (GrokAdamW only): β1_i = β1·(1-γ)^t,
+            //     t == the tensor's flat named_parameters() layer index (the
+            //     work-steal task id maps 1:1 to kVitOffsets order == the eager
+            //     enumeration order — cls_token is t=0). bc1 must be rebased TOO
+            //     (= 1-β1_i^step) or m_hat=m/bc1 mismatches eager; bc2 stays global.
+            if constexpr (Opt == OptId::GrokAdamW) {
+                const float b1 = st.beta1 * powf(1.0f - st.gamma, (float)t);
+                ts.beta1 = b1;
+                ts.bc1   = 1.0f - powf(b1, (float)step);
+            }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;
-            for (int i = threadIdx.x; i < n; i += blockDim.x)
-                apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+            if constexpr (Opt == OptId::Muon) {
+                // 1D / non-2D weights: the canonical AdamW tail (muon.py:115-125 routes
+                // non-matrix params to a SEPARATE AdamW group with INDEPENDENT
+                // hyperparameters — adamw_lr/adamw_betas — NOT the 2D Muon lr/momentum).
+                // ts.lr/ts.beta1 carry the 2D-group's (lr=0.02, momentum=0.95), so the
+                // 1D tail MUST instead use the aux_* fields (eager adamw_lr/adamw_betas).
+                // weight_decay is SHARED across both eager groups (muon.py:122) → ts.wd
+                // stays. eps is the eager adamw_eps (= ts.eps, mapped by _opt_scalars_from).
+                // bc1/bc2 are device-computed here from aux_beta^step (kept out of the
+                // mirror to shrink the host ABI surface; fp32 powf, tol 2e-3 is ample).
+                // apply_optimizer<Muon> would deref st.orth (NS dir, only valid for 2D),
+                // so route directly to adamw_step with the aux hyperparameters.
+                const float a_bc1 = 1.0f - powf(st.aux_beta1, (float)step);
+                const float a_bc2 = 1.0f - powf(st.aux_beta2, (float)step);
+                for (int i = threadIdx.x; i < n; i += blockDim.x)
+                    algo::adamw_step<float, float>(
+                        p, ts.exp_avg, ts.exp_avg_sq, gg,
+                        st.aux_lr, st.aux_beta1, st.aux_beta2, ts.eps, ts.wd,
+                        a_bc1, a_bc2, (int64_t)i);
+            } else {
+                for (int i = threadIdx.x; i < n; i += blockDim.x)
+                    apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+            }
         }
     }
 #ifdef SG_VIT_PROFILE

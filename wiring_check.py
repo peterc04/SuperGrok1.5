@@ -60,16 +60,51 @@ _BLOCK_REASONS = {
     # optimizer -> short reason (why its L3-TC tail is not wired on the prod path)
     "looksam": ("MODEL-COUPLED: st.sam_dir needs a SAM 2nd backward in the model "
                 "phase (INTEGRATION-OPTSTAGES §6); model-stage-owned, not wired."),
-    "supergrok": ("STAGED+ABI-GAP: SG11 needs per-tensor cosine-gate precompute AND "
-                  "a `sharpness` field absent from FusedOptState (OPTSTAGES §4)."),
-    "supergrok15": ("STAGED+ABI-GAP: SG15 needs the mu precompute + the `sharpness` "
-                    "ABI field absent from FusedOptState (OPTSTAGES §5)."),
-    "supergrok2": ("SKIP/sibling-owned: CSA/HCA/PEER/GRU meta-net + segmented-sort "
-                   "stage (INTEGRATION-NOTES); not a per-element tail."),
-    "prodigy": ("STAGED: cross-all-tensors d-reduction precompute not wired into the "
-                "TC driver (OPTSTAGES §2)."),
-    "muon": ("STAGED: grid-cooperative Newton-Schulz orthogonalization precompute "
-             "not wired into the TC driver; may need a separate launch (OPTSTAGES §3)."),
+    "supergrok": ("MODEL-COUPLED 2nd-pass (OPTSTAGES §4): SG11's `sharpness` is "
+                  "(g_sam−g)² from a SAM SECOND backward at perturbed weights — a "
+                  "FULL second in-kernel model fwd+bwd+dW-assembly (perturb→2nd "
+                  "backward→restore), the SAME model-stage machinery as looksam, a "
+                  "DIFFERENT category from the per-element/precompute tails "
+                  "(prodigy-d, muon-NS) that were in scope. The per-tensor mu/gate "
+                  "meta-MLP precompute sits ON TOP of that 2nd pass. NOTE: the missing "
+                  "`sharpness` FusedOptState field is cheap (append-only, as aux_* "
+                  "proved) but INSUFFICIENT — the second fwd+bwd pipeline is the real "
+                  "blocker. A host-side 2nd backward feeding st.sharpness would be an "
+                  "intermediate launch (violates single-persistent-launch). Probed "
+                  "re-invocable (vittc_forward_tile/vittc_backward_tile are device "
+                  "fns) but the unit of work is the whole P1+P2 pipeline, twice."),
+    "supergrok15": ("MODEL-COUPLED 2nd-pass (OPTSTAGES §5): same blocker as SG11 — "
+                    "SG15's `sharpness` is a SAM SECOND-backward side-channel needing "
+                    "a FULL second in-kernel model fwd+bwd+dW-assembly. SG15 is "
+                    "SIMPLER than SG11 in the tail (gate is a host scalar, no cosine "
+                    "stage) but identical at the blocking layer: the 2nd pass is "
+                    "model-stage machinery, out of the per-element-tail scope. The "
+                    "missing `sharpness` field is cheap but insufficient (the 2nd "
+                    "fwd+bwd is the real cost)."),
+    "supergrok2": ("MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES "
+                   "§7/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a "
+                   "STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> "
+                   "launch), but it CONSUMES pre-computed host inputs it cannot "
+                   "produce in the single vit launch: (i) `sharpness_packed` — the "
+                   "SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-"
+                   "kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` — a "
+                   "per-tensor SEGMENTED-SORT permutation (a separate sort stage), "
+                   "plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-"
+                   "in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into "
+                   "the single persistent launch needs the 2nd-pass pipeline AND an "
+                   "in-kernel segmented sort — model-stage + separate-launch "
+                   "machinery, both out of scope."),
+    "prodigy": ("STAGED global-d, CONVERTED for decoder+vit (wave-2): the cross-all-"
+                "tensors d-reduction is the in-kernel P2.6 phase + the owner-block "
+                "beta3-EMA/d_coef/persist (OPTSTAGES §2). Only mamba×prodigy is still "
+                "blocked (no mamba P2.6 wiring) — decoder/vit fire wgmma."),
+    "muon": ("STAGED grid-cooperative NS, CONVERTED for vit (wave-2): the 11 2D "
+             "weights' Newton-Schulz orthogonalization is the in-kernel P2.7 phase "
+             "(grid-barrier-looped, no separate launch); the 1D weights take the P3 "
+             "AdamW tail with INDEPENDENT aux_lr/aux_betas (the eager non-2D group, "
+             "carried by the append-only FusedScalars aux_* widening). OPTSTAGES §3. "
+             "decoder/mamba×muon are still blocked (no P2.7 wiring there) — vit fires "
+             "wgmma; if vit×muon shows here, the kernel rebuild is stale."),
     "neuralgrok": ("KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in "
                    "opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), "
                    "so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity "
@@ -86,7 +121,9 @@ _BLOCK_REASONS = {
     # thread through FusedScalars); (iii) adaptive-α is a no-op in-context (no
     # losses fed to .step()), so the static α is faithful. So decoder×grokadamw
     # should be OBSERVED as wgmma; if it ever shows here, the kernel rebuild is
-    # stale. (vit×grokadamw remains a separate, not-yet-converted cell.)
+    # stale. vit×grokadamw is ALSO CONVERTED now (wave-2 vit lane — the same 3
+    # mechanisms on the vit TC kernel: P2.5 global-norm clip + P3 per-tensor β1),
+    # so it too should be OBSERVED as wgmma, not listed here.
 }
 # Per-(model) note for any cell that routes to a scalar L3 megakernel rather than
 # wgmma (mamba's measured carve-out — the path EXISTS but scalar wins on wall).

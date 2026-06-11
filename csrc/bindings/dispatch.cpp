@@ -207,7 +207,18 @@ struct FusedScalars {
        // GrokAdamW append-only widening (decoder L3-TC) — keep in lock-step with
        // the real fused::sm90::FusedScalars (opt_components.cuh). Inert defaults
        // (0.0) for every non-GrokAdamW caller; layout stays byte-identical.
-       gamma, grad_clip;
+       gamma, grad_clip,
+       // Prodigy append-only widening (decoder L3-TC, STAGED global-d) — same
+       // lock-step discipline. d0/d_coef/beta3 reach the kernel's P2.6 reduction;
+       // inert/eager defaults (d_coef=1, beta3=0) for every non-Prodigy caller.
+       d0, d_coef, beta3,
+       // Muon append-only widening (ViT L3-TC, STAGED NS) — KEEP IN LOCK-STEP with
+       // the real fused::sm90::FusedScalars (opt_components.cuh): same 3 trailing
+       // fields, same order. The eager Muon's 1D-weight AdamW group has INDEPENDENT
+       // hyperparameters (adamw_lr/adamw_betas, muon.py:115-125); these carry them
+       // to the kernel's Muon P3 1D tail. Defaults = eager Muon adamw_* defaults;
+       // every non-Muon caller leaves them untouched (only OptId::Muon's P3 reads).
+       aux_lr, aux_beta1, aux_beta2;
 };
 } // namespace sm90
 } // namespace fused
@@ -574,8 +585,14 @@ static int wgmma_tail_opt_id(const std::string& optimizer) {
     if (optimizer == "lion")       return 1;   // OptId::Lion
     if (optimizer == "grokfast")   return 2;   // OptId::Grokfast
     if (optimizer == "grokadamw")  return 3;   // OptId::GrokAdamW
+    if (optimizer == "prodigy")    return 5;   // OptId::Prodigy (STAGED global-d,
+                                               // in-kernel P2.6 reduction — still a
+                                               // SINGLE persistent launch)
     if (optimizer == "neuralgrok") return 6;   // OptId::NeuralGrok
-    return -1;                                 // STAGED / model-coupled / SG2
+    if (optimizer == "muon")       return 7;   // OptId::Muon (STAGED grid-cooperative
+                                               // Newton-Schulz — in-kernel P2.7, still a
+                                               // SINGLE persistent launch; vit wired)
+    return -1;                                 // model-coupled / SG2 (no single-launch TC)
 }
 
 } // anonymous namespace
@@ -628,7 +645,16 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // (the inert default for every non-GrokAdamW cell). Flows into FusedScalars
  // below → the kernel's P2.5 global-norm reduction. A stale _ops without this
  // arg trips the caller's TypeError latch (loud degrade, never silent).
- float grad_clip) {
+ float grad_clip,
+ // Prodigy estimator scalars (decoder L3-TC, STAGED global-d). Trailing defaulted
+ // args (same back-compat pattern): eager/inert defaults (d_coef=1, beta3=0) for
+ // every non-Prodigy cell. Flow into FusedScalars → the kernel's P2.6 d-reduction.
+ float d0, float d_coef, float beta3,
+ // Muon 1D-group AdamW hyperparameters (ViT L3-TC, STAGED NS). Trailing defaulted
+ // args (same back-compat pattern): eager Muon adamw_* defaults for every non-Muon
+ // cell. Flow into FusedScalars → the kernel's Muon P3 1D tail (which device-computes
+ // aux_bc1/bc2 = 1-aux_beta^step). The default args live on the helpers.h declaration.
+ float aux_lr, float aux_beta1, float aux_beta2) {
  int arch = detect_arch();
  // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
  // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
@@ -699,11 +725,17 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "fused decoder megakernel: input.numel() (", in_n,
  ") must be B*(kSeq+1) = B*", kDecoderSeq + 1, ".");
  const int B = (int)(in_n / (kDecoderSeq + 1));
- // state = [m|v|extra] (3*total) + 1 loss slot.
- TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ // state = [m|v|extra] (3*total) + 1 loss slot. PRODIGY (STAGED global-d) needs a
+ // LARGER buffer: [m|v|extra/s_track | loss | param_init(total) | r_ema|s_ema|d_lr]
+ // = 4*total + 4 (the TC launcher carves param_init at loss_slot+1, the 3 persisted
+ // estimator scalars after it). The host (fused_train_step) sizes it per-cell.
+ const int64_t min_state = (optimizer == "prodigy") ? (4 * total + 4) : (3 * total + 1);
+ TORCH_CHECK(state.numel() >= min_state &&
  state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
- "fused decoder megakernel: state must be contiguous fp32 with "
- ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ "fused decoder megakernel: state must be contiguous fp32 with >= ", min_state,
+ " elements (", (optimizer == "prodigy")
+ ? "[m|v|s_track|loss|param_init|r_ema|s_ema|d_lr] for Prodigy"
+ : "[m|v|extra]+loss", ").");
  // grad = the REDUCED weight-grad OUTPUT [total]: the kernel writes the
  // deterministically-reduced grad here (P2) and consumes it in the optimizer
  // tail (P3), which does NOT overwrite it — so after the call this buffer holds
@@ -735,7 +767,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // gamma/grad_clip appended (decoder GrokAdamW): inert (0.0) for all other cells.
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
+ d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (owner directive task 1). want_wgmma → the bf16 tensor-core
@@ -850,7 +883,9 @@ void fused_step(const std::string& model, const std::string& optimizer,
 
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
+ d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
+ aux_lr, aux_beta1, aux_beta2};   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
@@ -912,7 +947,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // for them falls through to eager (NOT here). The STAGED/coupled opts never reach
  // here (wgmma_tail_opt_id < 0).
  const int mb_opt_id = wgmma_tail_opt_id(optimizer);
- const bool mb_tc_tail = (mb_opt_id == 0 || mb_opt_id == 1 || mb_opt_id == 2);
+ const bool mb_tc_tail = (mb_opt_id >= 0);  // wave-2: single-launch tails {adamw,lion,grokfast,grokadamw,neuralgrok}; -1 STAGED/coupled excluded
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -970,7 +1005,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
 
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
+ d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (mirrors the decoder/vit). want_wgmma → the bf16 tensor-core
@@ -1084,7 +1120,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // and all race params share `step`.
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
+ d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
 
  // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
  // is set false only if no cell matches (then we fall through to the honest
