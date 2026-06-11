@@ -115,6 +115,13 @@ if _HAS_PALLAS:
                     pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
                     pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
+                # Register the single grid axis as PARALLEL: each tile's
+                # intra-tile scan is independent (the cross-tile stitch below is
+                # an external JAX associative_scan), so Mosaic may pipeline the
+                # tiles across cores. Without this the dim is ARBITRARY-by-
+                # default and the registered TPU tiling is inert.
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=(pltpu.PARALLEL,)),
             )(Ms, bs)
 
             # Cross-tile reduction: sequential scan on tile summaries
@@ -251,6 +258,11 @@ if _HAS_PALLAS:
                 out_specs=[
                     pl.BlockSpec((TILE, top_k, D), lambda i: (i, 0, 0)),
                 ],
+                # Single grid axis over batch blocks; each block's gather is
+                # independent (no cross-block carry), so it is PARALLEL. Makes
+                # the registered batch-tile dim live to Mosaic instead of inert.
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=(pltpu.PARALLEL,)),
             )(flat_weights, expert_indices)
 
             result_shape = (batch_size, top_k) + out_shape_tuple
@@ -442,6 +454,11 @@ if _HAS_PALLAS:
                     pl.BlockSpec((TILE,), lambda i: (i,)),
                     pl.BlockSpec((TILE, gru_hidden), lambda i: (i, 0)),
                 ],
+                # Per-element GRU+PEER over a single tile axis; elements carry no
+                # cross-tile state, so the axis is PARALLEL. Registers the tile
+                # dim with Mosaic (otherwise inert / arbitrary-by-default).
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=(pltpu.PARALLEL,)),
             )(grad, sharpness, fwd_ctx, bwd_ctx, gru_state)
 
             return smart_grad, gru_state_new
@@ -652,6 +669,13 @@ def _make_pallas_scan_kernel(tile_size: int):
                     pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
                     pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
+                # The ``num_tiles`` axis is PARALLEL: each tile runs an
+                # independent intra-tile scan and the cross-tile prefix
+                # correction is applied externally below. This is what threads
+                # the registered MXU tile width (128 / 256) through to Mosaic;
+                # without it the grid dim is inert.
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=(pltpu.PARALLEL,)),
             )(Ms, bs)
         except Exception:
             # Pallas API mismatch — pure JAX fallback
@@ -827,6 +851,13 @@ def vmem_persistent_expert_mlp(
                 out_specs=[
                     pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
                 ],
+                # Batch-block axis is PARALLEL: each tile's expert MLP is
+                # independent. The expert weight tables are whole-array (untiled)
+                # operands shared across blocks; with eviction_policy="none" they
+                # stay VMEM-resident. Registering the dim makes the tiling live to
+                # Mosaic instead of inert.
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=(pltpu.PARALLEL,)),
             )(x, expert_indices, expert_W1, expert_b1, expert_W2, expert_b2)
             return y
         except Exception:
