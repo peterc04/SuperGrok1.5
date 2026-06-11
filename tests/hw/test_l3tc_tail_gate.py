@@ -278,11 +278,28 @@ _CELLS = {
     # not fired yet); the load-bearing check is the MULTI-STEP parity (the d fires by
     # step≥2; _prodigy_multistep_parity --model vit).
     "prodigy/vit": dict(model="vit", opt="prodigy", factory=_prodigy_factory),
+    # prodigy (mamba — wave-2 mamba lane): the SAME STAGED global-d P2.6 phase on the
+    # mamba TC kernel (per-CTA (r,s) owner-computes reduction over kMambaSizes/Offsets →
+    # beta3-EMA → d=max(d_prev,d_coef·r_ema/|s_ema|)). The mamba launcher binds s_track/
+    # param_init/prodigy_persist + routes opt_id=5; the 4*total+4 state sizing is model-
+    # agnostic. Same caveat: single-step is blind to the d-adaptation (step 1 param_init
+    # ==params ⇒ r=0 ⇒ d=d0); the (1b) STATE check validates the kernel's s_track += d·g
+    # against eager's `s` (run_cell_gate's prodigy branch), and A/A/A proves no race.
+    "prodigy/mamba": dict(model="mamba", opt="prodigy", factory=_prodigy_factory),
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz on
     # the 11 2D weights (in-kernel P2.7); 1D weights → AdamW tail. param_tol=2e-3 for
     # the NS 2D path (OPTSTAGES §8); the (1b) STATE check stays 1e-4 (the momentum buf
     # is buf=μ·buf+g, NO NS, so it must match eager exactly — the load-bearing check).
     "muon/vit": dict(model="vit", opt="muon", factory=_muon_factory, param_tol=2e-3),
+    # muon (decoder): CONVERTED (wave-2 decoder lane). The SAME STAGED grid-cooperative
+    # Newton-Schulz P2.7 phase on the decoder TC kernel — 11 2D weights orthogonalized
+    # in-kernel (incl. tok[99,128]/pos[4,128], shapes no vit muon matrix exercised),
+    # 1D weights → AdamW aux tail. param_tol=2e-3 for the NS 2D path (OPTSTAGES §8); the
+    # (1b) STATE check stays TIGHT (1e-4) — the momentum buf=μ·buf+g has NO NS, so it
+    # must match eager exactly (the load-bearing check; the run_cell_gate momentum_buffer
+    # branch reads the eager NS-group momentum for the 2D matrices). pos.weight rows=4 is
+    # the smallest NS matrix in the whole campaign — this gate exercises it against eager.
+    "muon/decoder": dict(model="decoder", opt="muon", factory=_muon_factory, param_tol=2e-3),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,

@@ -89,11 +89,13 @@ DecTcLauncherScratch& dec_tc_launcher_scratch(int dev, int64_t need_floats) {
 //   * neuralgrok        uses m, v, AND a psi-net weight pack the cell supplies in the
 //                       `extra` slice (kPsiPackFloats floats); st.psi_W1/b1/W2 bind
 //                       to those offsets, exactly as opt_components.cuh documents.
-// The STAGED optimizers (prodigy/muon/SG11/SG15) and the model-coupled (looksam) and
-// SG2 are NOT routed here — they need precompute stages / a 2nd backward / a sharpness
-// ABI field that this single-launch path does not carry; dispatch.cpp gates them out
-// (and wiring_check fails them loud with the cited reason). NeuralGrok is wired but
-// its host-trained amplifier is a separate concern (the race fn gates it).
+// The STAGED optimizers prodigy (P2.6 global-d) and muon (P2.7 grid-cooperative NS)
+// ARE routed here: their precompute is an IN-KERNEL phase, so they remain a SINGLE
+// persistent launch (the cases below). The SAM-coupled SG11/SG15/looksam and SG2 are
+// NOT — they need a 2nd in-kernel fwd+bwd / a sharpness ABI field / a segmented sort
+// that this single-launch path does not carry; dispatch.cpp gates them out (and
+// wiring_check fails them loud with the cited reason). NeuralGrok is wired but its
+// host-trained amplifier is a separate concern (the race fn gates it).
 //
 // ncta_cap: forwarded to the TC launcher (0 = one CTA/SM = full saturation, the
 // shipped config). The race always passes 0.
@@ -194,6 +196,18 @@ cudaError_t mega_decoder_real_adamw_tc(
             // not a separate launch. st carries param_init/prodigy_persist/d0/d_coef/
             // beta3; the kernel decays+accumulates the EMA, updates d, applies.
             return launch_fused_decoder_megakernel_tc<OptId::Prodigy>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::Muon:
+            // STAGED grid-cooperative Newton-Schulz (wave-2 decoder lane): the SAME
+            // single persistent launch — the NS orthogonalization of the 11 2D weights
+            // (tok/pos/in_proj/out_proj/ff.0/ff.2/out) is an IN-KERNEL phase (P2.7,
+            // between B2/P2.6 and P3), grid-barrier-looped per matrix, NOT a separate
+            // launch. The per-matrix NS scratch lives in the workspace (dec_tc_muon_floats,
+            // carved after the Prodigy reduce slots). The persistent momentum buffer is
+            // the m-slice (st.exp_avg); the 1D/non-2D weights take the AdamW tail in P3
+            // reading the INDEPENDENT aux_lr/aux_betas (eager Muon adamw_* group). The
+            // vit twin (mega_vit_real_adamw_tc_launcher.cu) proved this routing.
+            return launch_fused_decoder_megakernel_tc<OptId::Muon>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC

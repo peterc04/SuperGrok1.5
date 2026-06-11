@@ -774,8 +774,8 @@ _FUSED_L3_REAL = frozenset({
     # params ⇒ r=0 ⇒ d=d0 (cold-start matches eager _d_lr=d0); the d-adaptation fires
     # at step≥2, so the single-step state-gate is necessary-not-sufficient and the
     # MULTI-STEP parity (kernel tracks eager; a d-frozen control diverges) is the
-    # load-bearing check, exactly as grokadamw's clip. mamba×prodigy stays blocked
-    # (no mamba prodigy P2.6 wiring yet).
+    # load-bearing check, exactly as grokadamw's clip. mamba×prodigy is now CONVERTED
+    # too (wave-2 mamba lane — see the ("mamba3","prodigy") entry below).
     ("transformer_decoder", "prodigy"),
     # prodigy (vit): CONVERTED (wave-2 vit lane). The SAME STAGED global-d P2.6 phase
     # on the vit TC kernel (fused_vit_megakernel_tc): per-CTA (r,s) owner-computes
@@ -785,6 +785,17 @@ _FUSED_L3_REAL = frozenset({
     # sizing + param_init seeding are model-agnostic (keyed on opt_name=="prodigy"), so
     # they apply to vit unchanged. Same MULTI-STEP load-bearing check (d fires step≥2).
     ("vit", "prodigy"),
+    # prodigy (mamba — wave-2 mamba lane): the SAME STAGED global-d P2.6 phase ported
+    # onto the mamba TC kernel (fused_mamba_megakernel_tc) — per-CTA (r,s) owner-computes
+    # reduction over kMambaSizes/kMambaOffsets (n_tasks=kMambaNumTensors=28) → beta3-EMA
+    # decay of the persisted (r_ema,s_ema) → d=max(d_prev,d_coef·r_ema/|s_ema|), all in
+    # ONE persistent wgmma launch. The mamba TC launcher binds s_track/param_init/
+    # prodigy_persist (loss_out+1 / +1+total) + routes opt_id=5; the reduce slots are
+    # carved in mb_tc_workspace_floats (mb_tc_opt_reduce_floats). fused_train_step's
+    # 4*total+4 state sizing + param_init seeding + the d0/d_coef/beta3 scalars are
+    # model-agnostic (keyed on opt_name=="prodigy"), so they apply to mamba unchanged.
+    # Same MULTI-STEP load-bearing check (d fires step≥2; single-step is blind to it).
+    ("mamba3", "prodigy"),
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz.
     # The NS orthogonalization of the 2D weights (kVitMuon2D: 11 matrices) is an
     # IN-KERNEL phase (P2.7, between B2 and P3) — all CTAs cooperate on one matrix at a
@@ -795,6 +806,18 @@ _FUSED_L3_REAL = frozenset({
     # VitTcSmem is static ~7KB, NS buffers are HBM). The vit launcher binds the momentum
     # to st.exp_avg + routes opt_id=7. mamba×muon stays blocked (no mamba P2.7).
     ("vit", "muon"),
+    # muon (decoder — wave-2 decoder lane): the SAME STAGED grid-cooperative Newton-
+    # Schulz P2.7 phase ported onto the decoder TC kernel (fused_decoder_megakernel_tc):
+    # the 11 2D weights (dectc::kDecMuon2D — incl. tok[99,128]/pos[4,128], shapes no vit
+    # muon matrix had) are orthogonalized in-kernel (buf=μ·buf+g with buf the PERSISTENT
+    # m-slice, ‖buf‖→inv_norm→X, 5×NS {A=XXᵀ,AX,AAX,combine}, then the muon.h apply); the
+    # 1D/non-2D weights take the AdamW aux tail in P3 (muon.py auto-split by p.ndim). The
+    # decoder launcher binds the momentum to st.exp_avg + routes opt_id=7 (case OptId::Muon).
+    # The NS scratch is carved in dec_tc_workspace_floats (dec_tc_muon_floats), after the
+    # Prodigy reduce slots — so the 5 already-green decoder cells stay byte-identical.
+    # The aux_lr/aux_betas plumbing + 4*total state sizing are model-agnostic. Still a
+    # SINGLE persistent launch. mamba×muon stays blocked (no mamba P2.7).
+    ("transformer_decoder", "muon"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1234,18 +1257,32 @@ _L3_WGMMA_CELLS = frozenset({
     # dispatch.cpp's wgmma_tail_opt_id("prodigy")=5 routes it onto the TC driver; the
     # decoder launcher (mega_decoder_real_adamw_tc_launcher.cu) binds param_init /
     # prodigy_persist / s_track and dispatches OptId::Prodigy. The d-estimate reduction
-    # byte-matches the eager multi-tensor estimator. mamba×prodigy is NOT here (no
-    # mamba prodigy stage).
+    # byte-matches the eager multi-tensor estimator. mamba×prodigy is now wired too
+    # (see the ("mamba3","prodigy") entry below).
     ("transformer_decoder", "prodigy"),
     # prodigy (vit): CONVERTED (wave-2 vit lane). The SAME STAGED global-d P2.6 phase
     # on the vit TC kernel; the vit launcher binds param_init/prodigy_persist/s_track
     # and dispatches OptId::Prodigy (opt_id=5). Single persistent wgmma launch.
     ("vit", "prodigy"),
+    # prodigy (mamba — wave-2 mamba lane): the SAME STAGED global-d P2.6 phase on the
+    # mamba TC kernel (fused_mamba_megakernel_tc). The mamba TC launcher
+    # (mega_mamba_real_adamw_tc_launcher.cu) binds param_init/prodigy_persist/s_track
+    # and dispatches OptId::Prodigy (opt_id=5, routed by wgmma_tail_opt_id). Single
+    # persistent wgmma launch; gemm_impl_for_cell → "wgmma".
+    ("mamba3", "prodigy"),
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz —
     # in-kernel P2.7 (NS orthogonalization of the 11 2D weights, all CTAs per matrix),
     # 1D weights → AdamW tail in P3. Single persistent wgmma launch (opt_id=7); the vit
     # launcher binds the momentum to the persistent m-slice (st.exp_avg).
     ("vit", "muon"),
+    # muon (decoder — wave-2 decoder lane): the SAME in-kernel P2.7 grid-cooperative NS
+    # ported onto fused_decoder_megakernel_tc (11 2D weights incl. tok[99,128]/pos[4,128]),
+    # 1D weights → AdamW aux tail. dispatch.cpp's wgmma_tail_opt_id("muon")=7 routes it
+    # onto the decoder TC driver, the launcher dispatches case OptId::Muon. WITHOUT this
+    # entry gemm_impl_for_cell returns "scalar" → the scalar adamw-only decoder path →
+    # an Int/Float dtype throw on the token input (the bug this fixes). With it →
+    # "wgmma", the real TC path. mamba×muon stays blocked (no mamba P2.7).
+    ("transformer_decoder", "muon"),
 })
 
 

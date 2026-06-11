@@ -353,13 +353,30 @@ __host__ __device__ __forceinline__ int64_t dec_tc_dw_part_floats() {
 __host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA) {
     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
 }
+// ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. IDENTICAL in
+//    shape to the vit twin (vit_tc_muon_floats): the NS chain runs ONE 2D weight at
+//    a time over all CTAs; the scratch holds X/A/AX/AAX/orth for the LARGEST 2D weight
+//    + the per-CTA Frobenius-norm partials + inv_norm. The momentum buffer (muon_buf)
+//    is NOT here — it PERSISTS across steps as optimizer state, bound to the m slice
+//    (st.exp_avg). Largest decoder 2D weight: ff.0/ff.2 = 512×128 = 65536 numel; largest
+//    rows = 512 ⇒ A = 512×512 (dectc::kDecMuonMaxNumel/kDecMuonMaxRows). Carved
+//    UNCONDITIONALLY (≈ 4·65536 + 512² + nCTA + 1 floats ≈ 2 MB) so the opt-agnostic
+//    launcher (dec_tc_launcher_scratch) fits every OptId; unused by every non-Muon cell
+//    (its P2.7/P3-2D branches are if-constexpr'd out → byte-identical). ──
+__host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA) {
+    // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
+    return (int64_t)4 * dectc::kDecMuonMaxNumel
+         + (int64_t)dectc::kDecMuonMaxRows * dectc::kDecMuonMaxRows
+         + nCTA + 1;
+}
 __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA) {
     return dec_tc_acts_floats(T, B)
          + (int64_t)nCTA * dectc::dec_tile_scratch_total_f32()
          + (int64_t)nCTA * dectc::kLnVecElems
          + nCTA + 1
          + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
-         + dec_tc_opt_reduce_floats(nCTA);    // STAGED-opt (Prodigy) reduce slots
+         + dec_tc_opt_reduce_floats(nCTA)     // STAGED-opt (Prodigy) reduce slots
+         + dec_tc_muon_floats(nCTA);          // STAGED-opt (Muon) NS per-matrix scratch
 }
 
 template <OptId Opt>
@@ -392,6 +409,13 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // STAGED-opt cross-CTA reduce slots (Prodigy d), carved AFTER the dW partials
     // (matches dec_tc_workspace_floats's term order). Unused unless Opt==Prodigy.
     float* opt_reduce = dw_part + dec_tc_dw_part_floats();
+    // Muon NS per-matrix scratch, carved AFTER the Prodigy reduce slots (matches
+    // dec_tc_workspace_floats's term order — carving it LAST keeps every prior
+    // region's offset unchanged, so the 5 already-green cells are byte-identical).
+    // Unused unless Opt==Muon. Layout (mirrors the vit twin):
+    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kDecMuonMaxNumel)
+    //   [muon_A (kDecMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+    float* muon_base = opt_reduce + dec_tc_opt_reduce_floats(nCTA);
 
     dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
     dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -567,6 +591,77 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
         st.d_factor = pw.prodigy_d[0];              // the reduced d the tail reads
     }
 
+    // ── P2.7 (Muon ONLY): grid-cooperative Newton-Schulz orthogonalization of the
+    //    2D weights (INTEGRATION-OPTSTAGES §3). IDENTICAL to the vit twin
+    //    (fused_vit_megakernel.cuh P2.7) — same shared opt_stages_precompute.cuh
+    //    helpers, same barrier sequence — only the per-model 2D table (dectc::
+    //    kDecMuon2D, 11 matrices including tok[99,128]/pos[4,128]) and offset array
+    //    (kDecOffsets) differ. For EACH 2D matrix all CTAs cooperate: buf=μ·buf+g
+    //    (buf is the PERSISTENT m-slice — momentum state, NOT transient), ‖buf‖_F via
+    //    per-CTA partials → inv_norm, X=buf·inv_norm, then ns_steps × { A=XXᵀ → AX=A·X
+    //    → AAX=A·AX → orth=a·X+b·AX+c·AAX, swap }, then the canonical muon_update_step
+    //    apply (decay·p + neg_lr_scale·orth). The 1D / non-2D weights (biases, LN γ/β)
+    //    take the AdamW aux tail in P3. The elementwise bodies CALL muon.h
+    //    (muon_momentum_normalize_step via the phaseA buf body, muon_ns_combine_step,
+    //    muon_update_step); the matmuls are the cited new device code (the eager path
+    //    delegates to torch::mm/cuBLAS). Guarded so every other opt is byte-identical
+    //    (no extra barriers / work).
+    if constexpr (Opt == OptId::Muon) {
+        // Carve the per-matrix NS scratch (sized for the largest 2D weight).
+        PrecomputeWorkspace pw{};
+        pw.muon_X            = muon_base;
+        pw.muon_AX           = pw.muon_X   + dectc::kDecMuonMaxNumel;
+        pw.muon_AAX          = pw.muon_AX  + dectc::kDecMuonMaxNumel;
+        pw.muon_orth         = pw.muon_AAX + dectc::kDecMuonMaxNumel;
+        pw.muon_A            = pw.muon_orth + dectc::kDecMuonMaxNumel;
+        pw.muon_nrm_partials = pw.muon_A   + (int64_t)dectc::kDecMuonMaxRows * dectc::kDecMuonMaxRows;
+        pw.muon_inv_norm     = pw.muon_nrm_partials + nCTA;
+        const float momentum = st.beta1;          // Muon momentum (eager Muon: betas[0])
+        const int   ns_steps = 5;                 // bindings.cpp default
+        for (int mi = 0; mi < dectc::kDecNumMuon2D; ++mi) {
+            const dectc::DecMuon2D M = dectc::kDecMuon2D[mi];
+            const int rows = M.rows, cols = M.cols;
+            const int64_t numel = (int64_t)rows * cols;
+            const int64_t off   = (int64_t)kDecOffsets[M.tidx];
+            // buf = the PERSISTENT momentum slice for this matrix (st.exp_avg+off).
+            pw.muon_buf = st.exp_avg + off;
+            // phaseA: buf=μ·buf+g, publish per-CTA ‖buf‖_F² → reduce → inv_norm → X.
+            muon_momentum_norm_phaseA(grad + off, numel, momentum, pw);
+            bar.sync();
+            muon_norm_reduce_phaseB(ctx, pw);
+            bar.sync();
+            muon_scale_X(numel, pw);
+            bar.sync();
+            // NS iterations. After each combine, orth holds the new iterate; swap so
+            // the next iteration reads it as X. ns_steps swaps → final result is in
+            // muon_X (the last combine wrote muon_orth, then we swapped → muon_X).
+            for (int s = 0; s < ns_steps; ++s) {
+                // A = X Xᵀ  (M=rows,N=rows,K=cols; B transposed).
+                muon_matmul(pw.muon_X, pw.muon_X, pw.muon_A, rows, rows, cols, cols, cols, /*bT=*/true);
+                bar.sync();
+                // AX = A X   (M=rows,N=cols,K=rows).
+                muon_matmul(pw.muon_A, pw.muon_X, pw.muon_AX, rows, cols, rows, rows, cols, /*bT=*/false);
+                bar.sync();
+                // AAX = A (AX) (M=rows,N=cols,K=rows).
+                muon_matmul(pw.muon_A, pw.muon_AX, pw.muon_AAX, rows, cols, rows, rows, cols, /*bT=*/false);
+                bar.sync();
+                muon_ns_combine_phase(numel, pw);   // orth = a·X + b·AX + c·AAX
+                bar.sync();
+                float* tmp = pw.muon_X; pw.muon_X = pw.muon_orth; pw.muon_orth = tmp;
+            }
+            // Apply Muon: p = decay_factor·p + neg_lr_scale·orth  (muon.h:63-73).
+            const float scale        = 0.2f * sqrtf((float)(rows > cols ? rows : cols));
+            const float neg_lr_scale = -lr * scale;
+            const float decay_factor = 1.0f - lr * st.wd;
+            float* __restrict__ p = params + off;
+            const float* __restrict__ orth_final = pw.muon_X;   // post-swap result
+            const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
+            for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += gstride)
+                p[i] = decay_factor * p[i] + neg_lr_scale * orth_final[i];
+            bar.sync();   // matrix done; all CTAs synchronized before the next matrix
+        }
+    }
+
     // ── P3: the REAL optimizer tail over the reduced grad (work-steal the 30
     //    tensors). apply_optimizer<Opt> is the canonical csrc/algorithms math. ──
     st.lr = lr;
@@ -577,6 +672,12 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
              t = q.next_block(&task_slot)) {
             const int n = kDecSizes[t];
             const int64_t off = (int64_t)kDecOffsets[t];
+            // MUON: the 2D matrices were orthogonalized + applied in P2.7; P3 handles
+            //   ONLY the 1D / non-2D weights, which take the AdamW tail (muon.h:75-76,
+            //   the eager Muon auto-split). Skip the 2D ones here (already done).
+            if constexpr (Opt == OptId::Muon) {
+                if (dectc::dec_is_muon_2d(t)) continue;
+            }
             FusedOptState ts = rebase_state<Opt>(st, off);
             // (i) PER-TENSOR LAYER-WISE β1 (GrokAdamW only): β1_i = β1·(1-γ)^t,
             //     t == the tensor's flat named_parameters() layer index (the
@@ -591,8 +692,29 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
             }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;
-            for (int i = threadIdx.x; i < n; i += blockDim.x)
-                apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+            if constexpr (Opt == OptId::Muon) {
+                // 1D / non-2D weights: the canonical AdamW tail (muon.py:99-125 routes
+                // non-matrix params to a SEPARATE AdamW group with INDEPENDENT
+                // hyperparameters — adamw_lr/adamw_betas — NOT the 2D Muon lr/momentum).
+                // ts.lr/ts.beta1 carry the 2D-group's (lr=0.02, momentum=0.95), so the
+                // 1D tail MUST instead use the aux_* fields (eager adamw_lr/adamw_betas).
+                // weight_decay is SHARED across both eager groups (muon.py:122) → ts.wd
+                // stays. eps is the eager adamw_eps (= ts.eps, mapped by _opt_scalars_from).
+                // bc1/bc2 are device-computed from aux_beta^step (kept out of the mirror
+                // to shrink the host ABI; fp32 powf, tol 2e-3 ample). apply_optimizer<Muon>
+                // would deref st.orth (NS dir, only valid for 2D), so route directly to
+                // adamw_step with the aux hyperparameters — IDENTICAL to the vit twin.
+                const float a_bc1 = 1.0f - powf(st.aux_beta1, (float)step);
+                const float a_bc2 = 1.0f - powf(st.aux_beta2, (float)step);
+                for (int i = threadIdx.x; i < n; i += blockDim.x)
+                    algo::adamw_step<float, float>(
+                        p, ts.exp_avg, ts.exp_avg_sq, gg,
+                        st.aux_lr, st.aux_beta1, st.aux_beta2, ts.eps, ts.wd,
+                        a_bc1, a_bc2, (int64_t)i);
+            } else {
+                for (int i = threadIdx.x; i < n; i += blockDim.x)
+                    apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+            }
         }
     }
 }

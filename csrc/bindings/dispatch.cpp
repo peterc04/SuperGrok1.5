@@ -768,7 +768,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
- d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
+ d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
+ aux_lr, aux_beta1, aux_beta2};  // Muon 1D-group AdamW hyperparams (decoder L3-TC
+ // STAGED NS). MUST be passed here — the mirror FusedScalars (line 204) declares
+ // aux_* with NO in-class default, so omitting them aggregate-inits to 0.0 (→ the
+ // 1D AdamW tail would run β1=β2=0: m=g/v=g², the (1b) state FAIL this fixes).
+ // Inert for every non-Muon decoder cell (only OptId::Muon's P3 reads aux_*).
+ // Lock-step with the vit decoder-twin POD below.
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (owner directive task 1). want_wgmma → the bf16 tensor-core

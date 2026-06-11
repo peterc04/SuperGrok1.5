@@ -126,6 +126,47 @@ __device__ __constant__ int kLnVecTensorIdx[kNumLnVec] = {
     26, 27             // norm.w, norm.b
 };
 
+// ── Muon 2D-weight table (the matrices Newton-Schulz orthogonalizes). The eager
+//    Muon auto-splits params by p.ndim: ndim==2 → NS, everything else → AdamW
+//    (muon.py:91-98 _split_by_ndim; muon.h:75-76). For the small decoder the
+//    ndim==2 weights are exactly these 11 (the flat named_parameters() tensor
+//    index + rows[dim0] + cols[dim1], matching the LIVE model's p.shape EXACTLY —
+//    verified against m.named_parameters()). NOTE vs ViT: the decoder's `tok`
+//    (Embedding [99,128]) and `pos` (Embedding [4,128]) ARE 2D, so they take the
+//    NS path (ViT's cls_token is ndim==3 → AdamW). All biases + LayerNorm γ/β
+//    (ndim==1) take the AdamW 1D tail. The kernel's Muon P2.7 loops THIS table
+//    running the grid-cooperative NS per matrix; P3 routes tensor t to the NS
+//    apply iff it is in the table, else the AdamW aux tail. Indices MUST match
+//    decoder_layout / named_parameters() order. ──
+constexpr int kDecNumMuon2D = 11;
+struct DecMuon2D { int tidx; int rows; int cols; };
+__device__ __constant__ DecMuon2D kDecMuon2D[kDecNumMuon2D] = {
+    { 0, dec::kVocab,  dec::kD     },   // tok.weight          [99,128]
+    { 1, dec::kSeq,    dec::kD     },   // pos.weight          [4,128]
+    { 2, 3*dec::kD,    dec::kD     },   // L0 in_proj_weight   [384,128]
+    { 4, dec::kD,      dec::kD     },   // L0 out_proj.weight  [128,128]
+    {10, dec::kDff,    dec::kD     },   // L0 ff.0.weight      [512,128]
+    {12, dec::kD,      dec::kDff   },   // L0 ff.2.weight      [128,512]
+    {14, 3*dec::kD,    dec::kD     },   // L1 in_proj_weight   [384,128]
+    {16, dec::kD,      dec::kD     },   // L1 out_proj.weight  [128,128]
+    {22, dec::kDff,    dec::kD     },   // L1 ff.0.weight      [512,128]
+    {24, dec::kD,      dec::kDff   },   // L1 ff.2.weight      [128,512]
+    {28, dec::kVocab,  dec::kD     },   // out.weight          [99,128]
+};
+// Is tensor index `t` one of the Muon 2D matrices (orthogonalized in P2.7)? P3
+// uses this to route ONLY the 1D / non-2D weights to the AdamW aux tail for Muon.
+__device__ __forceinline__ bool dec_is_muon_2d(int t) {
+    #pragma unroll
+    for (int mi = 0; mi < kDecNumMuon2D; ++mi) if (kDecMuon2D[mi].tidx == t) return true;
+    return false;
+}
+// Largest 2D weight (numel) + largest #rows over the table — sizes the per-matrix
+// NS scratch (the stage runs ONE matrix at a time, reusing the buffers). ff.0
+// [512,128]=65536 is the largest numel; ff.0 rows=512 is the largest #rows (A=XXᵀ
+// is rows×rows). Mirrors vit's kVitMuonMaxNumel/kVitMuonMaxRows.
+constexpr int kDecMuonMaxNumel = dec::kDff * dec::kD;   // 512*128 = 65536 (ff.0/ff.2)
+constexpr int kDecMuonMaxRows  = dec::kDff;             // 512 (ff.0 rows)
+
 // ════════════════════════════════════════════════════════════════════════
 //  HBM bf16 ACTS buffer (Fork B). Carved from the FRONT of the workspace the
 //  host already allocates (float[nCTA*total + nCTA]); Fork B does not use that
