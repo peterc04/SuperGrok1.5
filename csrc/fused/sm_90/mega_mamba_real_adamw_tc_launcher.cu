@@ -134,7 +134,17 @@ cudaError_t mega_mamba_real_adamw_tc(
     st.psi_W1     = extra_slice + kPsiW1Off;   // neuralgrok psi-net pack (when wired)
     st.psi_b1     = extra_slice + kPsiB1Off;
     st.psi_W2     = extra_slice + kPsiW2Off;
-    apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/...)
+    // PRODIGY (STAGED global-d) state bindings (mirror the decoder/vit TC launchers).
+    // The cell extends the state buffer to [m | v | extra/s_track | loss | param_init |
+    // r_ema | s_ema | d_lr] (host sizes it >= 4*total+4; dispatch.fused_train_step). The
+    // `extra` slice doubles as Prodigy's `s` trajectory accumulator (the apply reads
+    // st.s_track, not st.ema — they alias here, harmless: Prodigy has no slow-grad EMA).
+    // loss_out == dispatch's loss_slot (state+3*total), so param_init = loss_out+1 and
+    // the 3 persisted estimator scalars [r_ema | s_ema | d_lr] follow param_init.
+    st.s_track        = extra_slice;            // Prodigy `s` (per-element accumulator)
+    st.param_init     = loss_out + 1;           // state + 3*total + 1
+    st.prodigy_persist = loss_out + 1 + total;  // [r_ema | s_ema | d_lr]
+    apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/... + d0/d_coef/beta3)
     st.lr = lr;
 
     MambaTokenCtx tok;
@@ -170,6 +180,15 @@ cudaError_t mega_mamba_real_adamw_tc(
             // above) + alpha/beta from FusedScalars. Pure elementwise — no precompute,
             // no cross-CTA reduction, so it inherits the deterministic grad reduce.
             return launch_fused_mamba_megakernel_tc<OptId::NeuralGrok>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::Prodigy:
+            // STAGED global-d (wave-2 mamba): the SAME single persistent launch — the
+            // cross-ALL-tensors d-estimate is an IN-KERNEL phase (P2.6, between the grad
+            // reduce B2 and the apply P3), not a separate launch. st carries param_init/
+            // prodigy_persist/d0/d_coef/beta3 (bound above); the mamba TC kernel decays+
+            // accumulates the EMA, updates d, applies. The reduce slots are carved in
+            // mb_tc_workspace_floats (mb_tc_opt_reduce_floats), so this scratch already fits.
+            return launch_fused_mamba_megakernel_tc<OptId::Prodigy>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC

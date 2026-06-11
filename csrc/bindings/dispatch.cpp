@@ -947,28 +947,47 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // workspace is device scratch (never crosses the ABI). Placed BEFORE the
  // surrogate route so the real path wins.
  // OPTID-GENERIC GATE (mirrors the decoder): mamba's scalar real megakernel exists
- // ONLY for adamw; the wgmma TC launcher supports {adamw,lion,grokfast} (opt_id
- // 0/1/2). grokadamw/neuralgrok are NOT mamba TC tails (grokadamw's 3-mechanism gap;
- // neuralgrok's host-coupled amplifier) — mb_opt_id caps them out, so a wgmma request
- // for them falls through to eager (NOT here). The STAGED/coupled opts never reach
- // here (wgmma_tail_opt_id < 0).
+ // ONLY for adamw; the wgmma TC launcher supports the single-launch tails
+ // {adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). Prodigy (opt_id 5) is
+ // CODE-LANDED but BLOCKED for mamba via the carve-out below (A/A/A determinism race in
+ // the shared forward — cited there); decoder/vit prodigy stay converted. The
+ // model-coupled SAM opts (SG11/15/looksam) and SG2 never reach here (wgmma_tail_opt_id
+ // < 0 → eager). mb_tc_tail is the single source of the routed set, so this gate cannot
+ // drift from the launcher's switch.
  const int mb_opt_id = wgmma_tail_opt_id(optimizer);
- const bool mb_tc_tail = (mb_opt_id >= 0);  // wave-2: single-launch tails {adamw,lion,grokfast,grokadamw,neuralgrok}; -1 STAGED/coupled excluded
+ // mamba×prodigy CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 5 for prodigy
+ // (decoder/vit prodigy ARE registered-converted), but the prodigy P2.6 path FAILS A/A/A
+ // determinism — and this is a PRE-EXISTING flaw in the SHARED prodigy reduction, NOT this
+ // lane's mamba port: decoder+vit prodigy ALSO fail A/A/A reproducibly (this lane never
+ // touched fused_{decoder,vit}_megakernel.cuh or the shared opt_stages_precompute.cuh). The
+ // discriminator is STRUCTURAL to prodigy's P2.6 — the work-steal q.next_block() drain in
+ // prodigy_precompute_reduce_phaseA + the extra bar.sync_reset()/queue-reuse, which
+ // grokadamw's FIXED-PARTITION P2.5 lacks (grokadamw is A/A/A-clean on all 3 models at the
+ // SAME 255-reg+spill, so register pressure is NOT the cause). Ruled out: buffer size
+ // (adamw forced to 4*total+4 is bit-identical), opt_reduce/acts overlap (disjoint), smem
+ // race (racecheck=0), barrier misuse (synccheck=0) → cross-CTA grid-barrier global-
+ // visibility + work-steal-partition, both substrate/sibling-owned (megakernel_common.cuh /
+ // opt_stages_precompute.cuh), OUT of this append-only lane. The mamba P2.6 code is
+ // landed-dormant; routing prodigy on the mamba prod path would ship a non-deterministic
+ // cell, so exclude it for mamba ONLY here. Owner: fix the shared prodigy P2.6, re-gate
+ // decoder/vit prodigy, then lift this carve-out. See dispatch.py's ⚠ escalation note.
+ const bool mb_tc_tail = (mb_opt_id >= 0 && optimizer != "prodigy");  // {adamw,lion,grokfast,grokadamw,neuralgrok}; prodigy BLOCKED (pre-existing shared A/A/A race); SAM/SG2 = -1
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
- // A wgmma request for a NON-TC-tail mamba optimizer (grokadamw/neuralgrok) is a
- // loud error rather than a silent scalar run under a wgmma label (no-suppression).
- // The scalar real kernel covers only adamw, so a non-adamw scalar request is also
- // rejected (no silent adamw fallback). The Python gate (gemm_impl_for_cell) only
- // ever asks for mamba wgmma on {adamw,lion,grokfast}, so these fire only if forced.
+ // A wgmma request for a NON-TC-tail mamba optimizer (the SAM/SG2 set) is a loud
+ // error rather than a silent scalar run under a wgmma label (no-suppression). The
+ // scalar real kernel covers only adamw, so a non-adamw scalar request is also
+ // rejected (no silent adamw fallback).
  TORCH_CHECK(want_wgmma || optimizer == "adamw",
  "fused_step: mamba3 scalar L3 path exists ONLY for adamw (got '", optimizer,
  "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
  TORCH_CHECK(!want_wgmma || mb_tc_tail,
  "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
- "', but the mamba TC launcher supports only adamw/lion/grokfast (opt_id 0/1/2). "
- "grokadamw/neuralgrok are not mamba TC tails — use the eager/per-op path.");
+ "', but the mamba TC launcher supports only the single-launch tails "
+ "{adamw,lion,grokfast,grokadamw,neuralgrok} + STAGED Prodigy (opt_id 0/1/2/3/5/6). "
+ "The model-coupled SAM opts (SG11/15/looksam) and SG2 are not mamba TC tails — "
+ "use the eager/per-op path.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),
@@ -985,11 +1004,18 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "fused Mamba megakernel: input.numel() (", in_n,
  ") must be B*(kSeq+1) = B*", kMambaSeq + 1, ".");
  const int B = (int)(in_n / (kMambaSeq + 1));
- // state = [m|v|extra] (3*total) + 1 loss slot.
- TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ // state = [m|v|extra] (3*total) + 1 loss slot. PRODIGY (STAGED global-d) needs a
+ // LARGER buffer: [m|v|s_track | loss | param_init(total) | r_ema|s_ema|d_lr] =
+ // 4*total + 4 (the TC launcher carves param_init at loss_slot+1, the 3 persisted
+ // estimator scalars after it — identical to the decoder/vit prodigy state). The host
+ // (fused_train_step) sizes it per-cell, keyed on opt_name=="prodigy" (model-agnostic).
+ const int64_t min_state = (optimizer == "prodigy") ? (4 * total + 4) : (3 * total + 1);
+ TORCH_CHECK(state.numel() >= min_state &&
  state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
- "fused Mamba megakernel: state must be contiguous fp32 with "
- ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ "fused Mamba megakernel: state must be contiguous fp32 with >= ", min_state,
+ " elements (", (optimizer == "prodigy")
+ ? "[m|v|s_track|loss|param_init|r_ema|s_ema|d_lr] for Prodigy"
+ : "[m|v|extra]+loss", ").");
  // grad = the REDUCED weight-grad OUTPUT [total] (same contract as the
  // decoder): the only check that exercises the hand-written selective-scan
  // backward's magnitudes per-tensor against the oracle (the keystone).

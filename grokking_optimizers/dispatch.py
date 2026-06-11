@@ -785,17 +785,46 @@ _FUSED_L3_REAL = frozenset({
     # sizing + param_init seeding are model-agnostic (keyed on opt_name=="prodigy"), so
     # they apply to vit unchanged. Same MULTI-STEP load-bearing check (d fires step≥2).
     ("vit", "prodigy"),
-    # prodigy (mamba — wave-2 mamba lane): the SAME STAGED global-d P2.6 phase ported
-    # onto the mamba TC kernel (fused_mamba_megakernel_tc) — per-CTA (r,s) owner-computes
-    # reduction over kMambaSizes/kMambaOffsets (n_tasks=kMambaNumTensors=28) → beta3-EMA
-    # decay of the persisted (r_ema,s_ema) → d=max(d_prev,d_coef·r_ema/|s_ema|), all in
-    # ONE persistent wgmma launch. The mamba TC launcher binds s_track/param_init/
-    # prodigy_persist (loss_out+1 / +1+total) + routes opt_id=5; the reduce slots are
-    # carved in mb_tc_workspace_floats (mb_tc_opt_reduce_floats). fused_train_step's
-    # 4*total+4 state sizing + param_init seeding + the d0/d_coef/beta3 scalars are
-    # model-agnostic (keyed on opt_name=="prodigy"), so they apply to mamba unchanged.
-    # Same MULTI-STEP load-bearing check (d fires step≥2; single-step is blind to it).
-    ("mamba3", "prodigy"),
+    # prodigy (mamba): BLOCKED — A/A/A determinism FAILS, and the SAME failure is
+    # PRE-EXISTING on decoder+vit prodigy (see the ⚠ escalation note below). The P2.6
+    # d-reduction kernel + launcher binding ARE LANDED (dormant, if-constexpr'd), but the
+    # production routing is intentionally NOT registered here: the prodigy<Opt> mamba TC
+    # kernel produces NON-DETERMINISTIC loss+grad across A/A/A re-runs from a bit-identical
+    # init (loss 4.7554/4.7555/4.7553; grad maxd ~1e-2 vs the DETERMINISTIC adamw grad on
+    # the SAME input — every one of the 28 grad tensors differs). Root-cause is NOT my
+    # mamba P2.6 port (proven: see the escalation note); it is a PRE-EXISTING flaw in the
+    # SHARED prodigy P2.6 path. Ruled OUT: NOT the 4*total+4 state buffer (adamw forced to
+    # that size is bit-identical), NOT opt_reduce/acts overlap (offset probe: opt_reduce
+    # [132789961,132790226) vs acts [0,55056384) — disjoint), NOT an intra-block smem race
+    # (compute-sanitizer racecheck = 0 hazards) NOR a __syncthreads/barrier misuse
+    # (synccheck = 0 errors). Until the shared prodigy P2.6 is fixed by its owner,
+    # mamba×prodigy stays on the eager/per-op path (no silent non-deterministic production
+    # cell — the no-suppression rule).
+    #
+    # ⚠ ESCALATION (out-of-lane, surfaced LOUD per no-suppression — flag, do NOT silently
+    #   leave broken, do NOT unilaterally revert prior committed work):
+    #   ("transformer_decoder","prodigy") and ("vit","prodigy") are REGISTERED-CONVERTED
+    #   (in _FUSED_L3_REAL + _L3_WGMMA_CELLS above) but ALSO FAIL A/A/A — reproducibly 3/3
+    #   each via test_l3tc_tail_gate (decoder loss 4.7653/4.7643/4.7662; vit nan/nan/nan).
+    #   This is PRE-EXISTING (this lane never touched fused_{decoder,vit}_megakernel.cuh or
+    #   the shared opt_stages_precompute.cuh — git diff confirms; identical source → identical
+    #   SASS → those cells behave exactly as at their commit). The discriminator is STRUCTURAL
+    #   to prodigy's P2.6 and SHARED across all 3 models: the work-steal q.next_block() drain
+    #   in prodigy_precompute_reduce_phaseA + the extra bar.sync_reset()/queue-reuse — which
+    #   grokadamw's FIXED-PARTITION P2.5 (also +barriers, also 255-reg+spill on mamba) does
+    #   NOT have, and grokadamw/{decoder,vit,mamba} are A/A/A-CLEAN. (NB: register pressure is
+    #   NOT the cause — grokadamw matches it and is clean.) The step-1 loss/grad divergence is
+    #   UPSTREAM of the (r,s) reduction (at step 1 d=d0, the reduction is inert), so there are
+    #   likely TWO issues: a step≥2 work-steal-partition non-determinism AND a step-1
+    #   shared-forward/grid-barrier global-visibility race (consistent with racecheck/synccheck
+    #   being clean — those tools do not catch cross-CTA global-memory visibility). Owner action:
+    #   fix the shared prodigy P2.6 (opt_stages_precompute.cuh) / GridBarrier
+    #   (megakernel_common.cuh), then re-gate decoder/vit prodigy and lift the mamba carve-out.
+    #   SCOPE BOUND (checked): the OTHER staged cell that also uses sync_reset+grid-barrier,
+    #   ("vit","muon") (P2.7 NS), is A/A/A-CLEAN 3/3 — so the bug is NARROW to prodigy's
+    #   phaseA WORK-STEAL q.next_block() drain (muon's per-matrix cooperative P2.7 doesn't use
+    #   it), NOT the whole staged class. Implication: muon×mamba is likely NOT blocked by this
+    #   and is a viable next-session port (different, A/A/A-clean reduction pattern).
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz.
     # The NS orthogonalization of the 2D weights (kVitMuon2D: 11 matrices) is an
     # IN-KERNEL phase (P2.7, between B2 and P3) — all CTAs cooperate on one matrix at a
@@ -1264,12 +1293,10 @@ _L3_WGMMA_CELLS = frozenset({
     # on the vit TC kernel; the vit launcher binds param_init/prodigy_persist/s_track
     # and dispatches OptId::Prodigy (opt_id=5). Single persistent wgmma launch.
     ("vit", "prodigy"),
-    # prodigy (mamba — wave-2 mamba lane): the SAME STAGED global-d P2.6 phase on the
-    # mamba TC kernel (fused_mamba_megakernel_tc). The mamba TC launcher
-    # (mega_mamba_real_adamw_tc_launcher.cu) binds param_init/prodigy_persist/s_track
-    # and dispatches OptId::Prodigy (opt_id=5, routed by wgmma_tail_opt_id). Single
-    # persistent wgmma launch; gemm_impl_for_cell → "wgmma".
-    ("mamba3", "prodigy"),
+    # NOTE: mamba×prodigy is NOT here — A/A/A determinism FAILS (scheduling-exposed race
+    # in the shared mamba forward exposed by prodigy's register pressure; see the
+    # _FUSED_L3_REAL block above). The kernel/launcher code is landed-dormant; the cell
+    # stays blocked until the racy component is fixed.
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz —
     # in-kernel P2.7 (NS orthogonalization of the 11 2D weights, all CTAs per matrix),
     # 1D weights → AdamW tail in P3. Single persistent wgmma launch (opt_id=7); the vit

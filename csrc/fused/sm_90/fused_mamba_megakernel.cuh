@@ -54,6 +54,12 @@
 
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/opt_components.cuh"
+// STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction). Pulls in the
+// canonical prodigy.h reduction math + the deterministic per-CTA owner-computes tree;
+// the TC megakernel's Prodigy branch (P2.6) drives prodigy_precompute_reduce_phaseA +
+// an EMA-decay/d-update owner block, BYTE-FAITHFUL to the eager multi-tensor estimator.
+// Header-only, self-contained per COMPONENT_CONTRACT (substrate + algorithm headers).
+#include "csrc/fused/sm_90/opt_stages_precompute.cuh"
 #include "csrc/fused/sm_90/mamba3_layout.cuh"
 #include "csrc/fused/sm_90/model_stage_mamba3.cuh"
 // NOTE: warp_specialize.cuh (warpgroup_reg_alloc/dealloc) is intentionally NOT
@@ -436,10 +442,16 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     // loss slot (matches mb_tc_workspace_floats's term order). G==1 → dw_part unused.
     float* dw_part   = loss_out + 1;
     const int kDwG   = mbtc::kMbDwSplitK;
+    // STAGED-opt (Prodigy P2.6) cross-CTA reduce slots: [r slots | s slots | reduced d]
+    // = 2*nCTA+1, carved AFTER the split-K dW partials (matches mb_tc_workspace_floats's
+    // term order). Unused by every non-Prodigy tail (their P3 never touches it), so this
+    // pointer derivation leaves those cells byte-identical.
+    float* opt_reduce = dw_part + mb_tc_dw_part_floats();
 #if SG_MB_TC_PROFILE
     // 8-byte align the double accumulator: round the float offset up to an even
-    // count so reinterpret_cast<double*> is aligned (past the dW-partial region).
-    float* prof_f = dw_part + mb_tc_dw_part_floats();
+    // count so reinterpret_cast<double*> is aligned (past the opt-reduce region — the
+    // phase-profiler is the LAST workspace term, mirroring mb_tc_workspace_floats).
+    float* prof_f = opt_reduce + mb_tc_opt_reduce_floats(nCTA);
     uintptr_t _pa = reinterpret_cast<uintptr_t>(prof_f);
     if (_pa & 0x7u) prof_f = reinterpret_cast<float*>((_pa + 7u) & ~uintptr_t(7u));
     double* prof = reinterpret_cast<double*>(prof_f);   // [nCTA*SLOTS], host-zeroed
@@ -573,6 +585,74 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         }
         bar.sync();   // B2.5b: clip_coef broadcast slot ready for all CTAs
         st.clip_coef = *coef_bc;   // every CTA reads the single global coefficient
+    }
+
+    // ── P2.6 (PRODIGY ONLY): STAGED cross-ALL-tensors d-estimate. PORT of the
+    //    decoder/vit TC kernels' P2.6 (fused_decoder_megakernel.cuh:514-568) onto the
+    //    mamba constant tables.
+    //    ⚠ LANDED-DORMANT / NOT PRODUCTION-ROUTED: mamba×prodigy is BLOCKED on a
+    //    PRE-EXISTING A/A/A determinism failure SHARED by the decoder/vit prodigy P2.6
+    //    (this port faithfully reproduces them; the failure is NOT in this code). The
+    //    dispatch.cpp mamba carve-out (optimizer!="prodigy") + the Python has_l3_real
+    //    gate keep this branch unreachable from the race until the shared prodigy P2.6
+    //    (opt_stages_precompute.cuh) / GridBarrier (megakernel_common.cuh) is fixed by
+    //    its owner. Kept here (if-constexpr'd, proven byte-identical for every non-Prodigy
+    //    Opt) as the ready starting point for that fix. See dispatch.py's ⚠ escalation.
+    //    The apply tail (apply_optimizer<Prodigy>) reads
+    //    st.d_factor (the effective LR scale d), a GLOBAL reduction over EVERY element
+    //    of EVERY parameter tensor. We compute it here, BYTE-FAITHFUL to the live eager
+    //    multi-tensor path (prodigy_sm90.cuh:465-544, the order prodigy.py →
+    //    _ops.prodigy_fused_step actually executes):
+    //      d_prev  = persisted d_lr  (step 1: d0 cold-start — the zero-init state slot
+    //                would give d_prev=0 ⇒ d=0 ⇒ frozen params; eager inits _d_lr=d0,
+    //                so seed it here, the grokfast-style step-1 fix)
+    //      r_ema  <- beta3·r_ema + Σ d_prev²·<g, p0−p>     (decay persisted SCALAR,
+    //      s_ema  <- beta3·s_ema + Σ d_prev²·|g|            then add this step's Σ)
+    //      d       = max(d_prev, d_coef·r_ema/|s_ema|)      (prodigy_update_d; d_coef
+    //                scales ONLY the candidate — persisted r_ema stays UNSCALED)
+    //    DETERMINISM (COMPONENT_CONTRACT): NO float atomic. Each CTA publishes its
+    //    (r,s) into per-CTA slots (opt_reduce) → grid barrier → CTA0 owner-sums in
+    //    ascending index order → writes d back to the persisted slot + a broadcast
+    //    slot. The decay is on the persisted SCALARS (not the per-CTA partials): the
+    //    work-steal queue reassigns tensors to CTAs across steps, so a per-CTA EMA is
+    //    undefined — the live form is a scalar EMA (prodigy_sm90.cuh:488). Guarded so
+    //    every other opt's P3 is byte-identical (no extra barrier/work).
+    if constexpr (Opt == OptId::Prodigy) {
+        PrecomputeWorkspace pw{};
+        pw.prodigy_partials = opt_reduce;            // [r slots | s slots]
+        pw.prodigy_d        = opt_reduce + 2 * nCTA; // reduced-d broadcast slot
+        // d_prev: persisted d_lr (slot 2 of prodigy_persist), or d0 at step 1.
+        const float d_prev = (step == 1) ? st.d0 : st.prodigy_persist[2];
+        st.d_factor = d_prev;   // phaseA reads st.d_factor as d_prev (prodigy.h)
+        // Phase A: each CTA accumulates Σ d_prev²·<g,p0−p> / Σ d_prev²·|g| over its
+        // claimed tensors → per-CTA (r,s) slots. Drains the task queue (the P3
+        // re-drain below needs a queue reset, done at the barrier). Reads the mamba
+        // __constant__ layout tables (kMambaSizes/kMambaOffsets), n_tasks=kMambaNumTensors.
+        prodigy_precompute_reduce_phaseA(ctx, params, st.param_init, grad,
+                                         kMambaSizes, kMambaOffsets, d_prev, pw);
+        bar.sync_reset(ctx.g_next_task);   // B2.6a: slots published; reset queue for P3
+        // Owner block (CTA0 thread0): EMA decay + accumulate + d_coef + update_d,
+        // byte-matching launch_multi_tensor_prodigy_fused_reduce_step.
+        if (cta == 0 && threadIdx.x == 0) {
+            float r_step = 0.0f, s_step = 0.0f;     // ascending-CTA owner-sum
+            for (int c = 0; c < nCTA; ++c) {
+                r_step += pw.prodigy_partials[c];
+                s_step += pw.prodigy_partials[nCTA + c];
+            }
+            // Decay persisted scalars by beta3, then add this step's reduction.
+            const float r_ema = st.beta3 * st.prodigy_persist[0] + r_step;
+            const float s_ema = st.beta3 * st.prodigy_persist[1] + s_step;
+            // d = max(d_prev, d_coef·r_ema/|s_ema|). prodigy_update_d does
+            // max(d_prev, r/|s|) verbatim, so fold d_coef into the numerator copy
+            // (persisted r_ema stays UNSCALED — returned/persisted, eager parity).
+            const float d_new = algo::prodigy_update_d(d_prev, st.d_coef * r_ema, s_ema);
+            st.prodigy_persist[0] = r_ema;          // persist UNSCALED EMA
+            st.prodigy_persist[1] = s_ema;
+            st.prodigy_persist[2] = d_new;          // persisted d_lr for next step
+            pw.prodigy_d[0]       = d_new;          // broadcast to all CTAs
+        }
+        bar.sync();   // B2.6b: d visible to every CTA before the apply
+        st.d_factor = pw.prodigy_d[0];              // the reduced d the tail reads
     }
 
     // ── P3: the REAL optimizer tail over the reduced grad (work-steal 28). ──
