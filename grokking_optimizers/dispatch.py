@@ -785,46 +785,43 @@ _FUSED_L3_REAL = frozenset({
     # sizing + param_init seeding are model-agnostic (keyed on opt_name=="prodigy"), so
     # they apply to vit unchanged. Same MULTI-STEP load-bearing check (d fires step≥2).
     ("vit", "prodigy"),
-    # prodigy (mamba): BLOCKED — A/A/A determinism FAILS, and the SAME failure is
-    # PRE-EXISTING on decoder+vit prodigy (see the ⚠ escalation note below). The P2.6
-    # d-reduction kernel + launcher binding ARE LANDED (dormant, if-constexpr'd), but the
-    # production routing is intentionally NOT registered here: the prodigy<Opt> mamba TC
-    # kernel produces NON-DETERMINISTIC loss+grad across A/A/A re-runs from a bit-identical
-    # init (loss 4.7554/4.7555/4.7553; grad maxd ~1e-2 vs the DETERMINISTIC adamw grad on
-    # the SAME input — every one of the 28 grad tensors differs). Root-cause is NOT my
-    # mamba P2.6 port (proven: see the escalation note); it is a PRE-EXISTING flaw in the
-    # SHARED prodigy P2.6 path. Ruled OUT: NOT the 4*total+4 state buffer (adamw forced to
-    # that size is bit-identical), NOT opt_reduce/acts overlap (offset probe: opt_reduce
-    # [132789961,132790226) vs acts [0,55056384) — disjoint), NOT an intra-block smem race
-    # (compute-sanitizer racecheck = 0 hazards) NOR a __syncthreads/barrier misuse
-    # (synccheck = 0 errors). Until the shared prodigy P2.6 is fixed by its owner,
-    # mamba×prodigy stays on the eager/per-op path (no silent non-deterministic production
-    # cell — the no-suppression rule).
+    # prodigy (mamba): BLOCKED — A/A/A determinism FAILS on the mamba TC kernel. This is a
+    # SEPARATE defect from the decoder/vit prodigy P2.6 nondeterminism that is now RESOLVED
+    # (see the ✓ note below); do NOT conflate them. The P2.6 d-reduction kernel + launcher
+    # binding ARE LANDED (dormant, if-constexpr'd), but the production routing is intentionally
+    # NOT registered here: the prodigy<Opt> mamba TC kernel produces NON-DETERMINISTIC
+    # loss+grad across A/A/A re-runs from a bit-identical init (loss 4.7554/4.7555/4.7553;
+    # grad maxd ~1e-2 vs the DETERMINISTIC adamw grad on the SAME input — every one of the 28
+    # grad tensors differs). Note the SYMPTOM (~1e-2 grad drift) is NOT the decoder/vit class
+    # (which the fixed-partition P2.6 below resolved) — the mamba block is in the shared mamba
+    # scan/forward, not the prodigy reduction. Ruled OUT for mamba: NOT the 4*total+4 state
+    # buffer (adamw forced to that size is bit-identical), NOT opt_reduce/acts overlap (offset
+    # probe: opt_reduce [132789961,132790226) vs acts [0,55056384) — disjoint), NOT an intra-
+    # block smem race (compute-sanitizer racecheck = 0 hazards) NOR a __syncthreads/barrier
+    # misuse (synccheck = 0 errors). Until the mamba forward is fixed, mamba×prodigy stays on
+    # the eager/per-op path (no silent non-deterministic production cell — the no-suppression
+    # rule).
     #
-    # ⚠ ESCALATION (out-of-lane, surfaced LOUD per no-suppression — flag, do NOT silently
-    #   leave broken, do NOT unilaterally revert prior committed work):
+    # ✓ RESOLVED — decoder+vit prodigy A/A/A (was the ⚠ escalation; now FIXED):
     #   ("transformer_decoder","prodigy") and ("vit","prodigy") are REGISTERED-CONVERTED
-    #   (in _FUSED_L3_REAL + _L3_WGMMA_CELLS above) but ALSO FAIL A/A/A — reproducibly 3/3
-    #   each via test_l3tc_tail_gate (decoder loss 4.7653/4.7643/4.7662; vit nan/nan/nan).
-    #   This is PRE-EXISTING (this lane never touched fused_{decoder,vit}_megakernel.cuh or
-    #   the shared opt_stages_precompute.cuh — git diff confirms; identical source → identical
-    #   SASS → those cells behave exactly as at their commit). The discriminator is STRUCTURAL
-    #   to prodigy's P2.6 and SHARED across all 3 models: the work-steal q.next_block() drain
-    #   in prodigy_precompute_reduce_phaseA + the extra bar.sync_reset()/queue-reuse — which
-    #   grokadamw's FIXED-PARTITION P2.5 (also +barriers, also 255-reg+spill on mamba) does
-    #   NOT have, and grokadamw/{decoder,vit,mamba} are A/A/A-CLEAN. (NB: register pressure is
-    #   NOT the cause — grokadamw matches it and is clean.) The step-1 loss/grad divergence is
-    #   UPSTREAM of the (r,s) reduction (at step 1 d=d0, the reduction is inert), so there are
-    #   likely TWO issues: a step≥2 work-steal-partition non-determinism AND a step-1
-    #   shared-forward/grid-barrier global-visibility race (consistent with racecheck/synccheck
-    #   being clean — those tools do not catch cross-CTA global-memory visibility). Owner action:
-    #   fix the shared prodigy P2.6 (opt_stages_precompute.cuh) / GridBarrier
-    #   (megakernel_common.cuh), then re-gate decoder/vit prodigy and lift the mamba carve-out.
-    #   SCOPE BOUND (checked): the OTHER staged cell that also uses sync_reset+grid-barrier,
-    #   ("vit","muon") (P2.7 NS), is A/A/A-CLEAN 3/3 — so the bug is NARROW to prodigy's
-    #   phaseA WORK-STEAL q.next_block() drain (muon's per-matrix cooperative P2.7 doesn't use
-    #   it), NOT the whole staged class. Implication: muon×mamba is likely NOT blocked by this
-    #   and is a viable next-session port (different, A/A/A-clean reduction pattern).
+    #   (in _FUSED_L3_REAL + _L3_WGMMA_CELLS above) and now PASS A/A/A bit-exact via
+    #   test_l3tc_tail_gate — step 1 (loss 4.775414 ×3, params rel 8.8e-10) AND step>=40 with
+    #   d adapted off d0 (params bit-identical maxd=0, d_lr 4.834174e-04 ×3); multistep parity
+    #   tracks eager to <1e-4. FIX: the megakernel prodigy P2.6 (fused_{decoder,vit}_
+    #   megakernel.cuh) was rewritten from the work-steal q.next_block() drain + extra
+    #   bar.sync_reset() to a FIXED-PARTITION reduce — each CTA owns a fixed contiguous element
+    #   range of the flat [0,total) arrays (params/param_init/grad are parallel flat blobs, so a
+    #   contiguous flat-range Σ == the cross-all-tensors Σ), published to per-CTA (r,s) slots →
+    #   ONE plain grid barrier → CTA0 ascending owner-sum → EMA/update_d → broadcast. This is the
+    #   IDENTICAL deterministic shape as the A/A/A-clean GrokAdamW P2.5 grad-norm reduce; the
+    #   per-element contribution still CALLS canonical prodigy_partials_step (prodigy.h, single
+    #   source). The work-steal drain made each CTA's claimed-tensor SUBSET timing-dependent, so
+    #   its per-CTA partial regrouped the same values differently → an fp32-order-dependent d at
+    #   step>=2 (a COMPONENT_CONTRACT deterministic-reduction violation). ("vit","muon") (P2.7
+    #   NS) was always A/A/A-CLEAN (per-matrix cooperative, no work-steal drain). NOTE: the
+    #   opt_stages_precompute.cuh prodigy_precompute_reduce_phaseA/B helpers (the old work-steal
+    #   form) are now UNUSED by decoder/vit (kept for reference / the dormant mamba path).
+    #   mamba×prodigy remains the only blocked prodigy cell, on its OWN mamba-forward symptom.
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz.
     # The NS orthogonalization of the 2D weights (kVitMuon2D: 11 matrices) is an
     # IN-KERNEL phase (P2.7, between B2 and P3) — all CTAs cooperate on one matrix at a

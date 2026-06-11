@@ -949,29 +949,29 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // OPTID-GENERIC GATE (mirrors the decoder): mamba's scalar real megakernel exists
  // ONLY for adamw; the wgmma TC launcher supports the single-launch tails
  // {adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). Prodigy (opt_id 5) is
- // CODE-LANDED but BLOCKED for mamba via the carve-out below (A/A/A determinism race in
- // the shared forward — cited there); decoder/vit prodigy stay converted. The
+ // CONVERTED + A/A/A-clean for decoder+vit, and CODE-LANDED but BLOCKED for mamba via the
+ // carve-out below (a SEPARATE mamba scan/forward determinism issue — cited there). The
  // model-coupled SAM opts (SG11/15/looksam) and SG2 never reach here (wgmma_tail_opt_id
  // < 0 → eager). mb_tc_tail is the single source of the routed set, so this gate cannot
  // drift from the launcher's switch.
  const int mb_opt_id = wgmma_tail_opt_id(optimizer);
  // mamba×prodigy CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 5 for prodigy
- // (decoder/vit prodigy ARE registered-converted), but the prodigy P2.6 path FAILS A/A/A
- // determinism — and this is a PRE-EXISTING flaw in the SHARED prodigy reduction, NOT this
- // lane's mamba port: decoder+vit prodigy ALSO fail A/A/A reproducibly (this lane never
- // touched fused_{decoder,vit}_megakernel.cuh or the shared opt_stages_precompute.cuh). The
- // discriminator is STRUCTURAL to prodigy's P2.6 — the work-steal q.next_block() drain in
- // prodigy_precompute_reduce_phaseA + the extra bar.sync_reset()/queue-reuse, which
- // grokadamw's FIXED-PARTITION P2.5 lacks (grokadamw is A/A/A-clean on all 3 models at the
- // SAME 255-reg+spill, so register pressure is NOT the cause). Ruled out: buffer size
- // (adamw forced to 4*total+4 is bit-identical), opt_reduce/acts overlap (disjoint), smem
- // race (racecheck=0), barrier misuse (synccheck=0) → cross-CTA grid-barrier global-
- // visibility + work-steal-partition, both substrate/sibling-owned (megakernel_common.cuh /
- // opt_stages_precompute.cuh), OUT of this append-only lane. The mamba P2.6 code is
- // landed-dormant; routing prodigy on the mamba prod path would ship a non-deterministic
- // cell, so exclude it for mamba ONLY here. Owner: fix the shared prodigy P2.6, re-gate
- // decoder/vit prodigy, then lift this carve-out. See dispatch.py's ⚠ escalation note.
- const bool mb_tc_tail = (mb_opt_id >= 0 && optimizer != "prodigy");  // {adamw,lion,grokfast,grokadamw,neuralgrok}; prodigy BLOCKED (pre-existing shared A/A/A race); SAM/SG2 = -1
+ // (decoder/vit prodigy ARE registered-converted AND A/A/A-clean — they PASS test_l3tc_
+ // tail_gate bit-exact, incl. step>=40 with d adapted off d0). The prior claim that the
+ // SHARED prodigy P2.6 reduction was racy across all 3 models is RETIRED: decoder/vit
+ // prodigy now use a FIXED-PARTITION P2.6 reduce (each CTA owns a fixed contiguous element
+ // range of the flat [0,total) arrays → deterministic owner-sum, the SAME shape as the
+ // A/A/A-clean GrokAdamW P2.5 grad-norm reduce) instead of the work-steal q.next_block()
+ // drain + extra bar.sync_reset() the old form used; the per-element math still CALLS
+ // canonical prodigy_partials_step (prodigy.h, single source). mamba×prodigy stays blocked
+ // on its OWN distinct symptom — a ~1e-2 grad drift across bit-identical re-runs (NOT the
+ // gate-visible decoder/vit class, which is now fixed) in the shared mamba scan/forward.
+ // Ruled OUT for mamba: buffer size (adamw forced to 4*total+4 is bit-identical),
+ // opt_reduce/acts overlap (disjoint), smem race (racecheck=0), barrier misuse
+ // (synccheck=0). Routing prodigy on the mamba prod path would ship a non-deterministic
+ // cell, so exclude it for mamba ONLY here. Owner: fix the mamba forward, then lift this
+ // carve-out. See dispatch.py's note.
+ const bool mb_tc_tail = (mb_opt_id >= 0 && optimizer != "prodigy");  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy BLOCKED (separate mamba-forward A/A/A issue); SAM/SG2 = -1
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {

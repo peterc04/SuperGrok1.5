@@ -51,8 +51,9 @@
 #include "csrc/fused/sm_90/opt_components.cuh"
 // STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction). Pulls in the
 // canonical prodigy.h reduction math + the deterministic block reductions; the vit
-// TC megakernel's Prodigy branch drives prodigy_precompute_reduce_phaseA + an EMA
-// owner-update between B2 and P3 (the ViT twin of the decoder's P2.6 block).
+// TC megakernel's Prodigy branch runs an INLINE FIXED-PARTITION (r,s) reduce + an EMA
+// owner-update between B2 and P3 (the ViT twin of the decoder's P2.6 block; the
+// work-steal phaseA/B helpers in opt_stages_precompute.cuh are the older form).
 #include "csrc/fused/sm_90/opt_stages_precompute.cuh"
 #include "csrc/fused/sm_90/vit_layout.cuh"
 #include "csrc/fused/sm_90/model_stage_vit.cuh"
@@ -615,16 +616,19 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //    identical (no extra barrier/work). p0 (param_init) is the trajectory anchor.
     // DETERMINISM — FIXED-PARTITION reduction (mirrors the A/A/A-CLEAN GrokAdamW
     // P2.5 above + the decoder twin's P2.6), NOT the work-steal task-queue drain.
-    // ROOT-CAUSE FIX (the A/A/A non-determinism leg): the work-steal phaseA drained
-    // the global TaskQueue (atomicAdd(g_next_task)) in timing-dependent claim order,
-    // so each CTA's (r,s) slot was a non-reproducible subset-sum → loss/grad/params
-    // differed across bit-identical re-runs (grad-eq=False) even after the OOB-NaN
-    // fix in model_stage_*_tc.cuh. A FIXED contiguous element range per CTA over the
+    // WHY THIS SHAPE (the A/A/A determinism leg): the work-steal phaseA drained the
+    // global TaskQueue (atomicAdd(g_next_task)) in timing-dependent claim order, so
+    // each CTA's (r,s) slot could be a different tensor subset run-to-run; with non-
+    // associative fp32 add the partials then regroup differently and the owner's d can
+    // differ at ULP level from step>=2 — a COMPONENT_CONTRACT deterministic-reduction
+    // violation (not guaranteed reproducible BY CONSTRUCTION, even where empirically
+    // bit-exact on a given GPU). A FIXED contiguous element range per CTA over the
     // FLAT [0,kVitTotalElems) arrays (params/param_init/grad are parallel flat blobs
     // → flat Σ == cross-tensor Σ) with a plain sync() is the IDENTICAL shape as the
-    // A/A/A-CLEAN GrokAdamW P2.5. Per-element math still CALLS canonical
-    // prodigy_partials_step (prodigy.h, single-source). g_next_task is UNTOUCHED (B2
-    // reset it), so P3's drain is unchanged — no sync_reset in P2.6.
+    // A/A/A-CLEAN GrokAdamW P2.5 — deterministic by construction. Per-element math
+    // still CALLS canonical prodigy_partials_step (prodigy.h, single-source).
+    // g_next_task is UNTOUCHED (B2 reset it), so P3's drain is unchanged — no
+    // sync_reset in P2.6.
     if constexpr (Opt == OptId::Prodigy) {
         float* r_part = opt_reduce;                  // [nCTA] per-CTA Σ d²·<g,p0−p>
         float* s_part = opt_reduce + nCTA;           // [nCTA] per-CTA Σ d²·|g|

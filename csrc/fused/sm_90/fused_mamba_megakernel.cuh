@@ -56,8 +56,11 @@
 #include "csrc/fused/sm_90/opt_components.cuh"
 // STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction). Pulls in the
 // canonical prodigy.h reduction math + the deterministic per-CTA owner-computes tree;
-// the TC megakernel's Prodigy branch (P2.6) drives prodigy_precompute_reduce_phaseA +
-// an EMA-decay/d-update owner block, BYTE-FAITHFUL to the eager multi-tensor estimator.
+// the TC megakernel's Prodigy branch (P2.6) runs an INLINE FIXED-PARTITION (r,s) reduce
+// + an EMA-decay/d-update owner block, BYTE-FAITHFUL to the eager multi-tensor estimator
+// (the work-steal prodigy_precompute_reduce_phaseA/B helpers in opt_stages_precompute.cuh
+// are the older form). NB: mamba×prodigy is still BLOCKED on a SEPARATE mamba scan/forward
+// determinism issue (see dispatch.cpp's carve-out), so this branch is landed-dormant.
 // Header-only, self-contained per COMPONENT_CONTRACT (substrate + algorithm headers).
 #include "csrc/fused/sm_90/opt_stages_precompute.cuh"
 #include "csrc/fused/sm_90/mamba3_layout.cuh"
@@ -619,17 +622,20 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     //    every other opt's P3 is byte-identical (no extra barrier/work).
     // DETERMINISM — FIXED-PARTITION reduction (mirrors the A/A/A-CLEAN GrokAdamW
     // P2.5 + the decoder/vit twins' P2.6), NOT the work-steal task-queue drain.
-    // ROOT-CAUSE FIX (the A/A/A non-determinism leg): the work-steal phaseA drained
-    // the global TaskQueue (atomicAdd(g_next_task)) in timing-dependent claim order,
-    // so each CTA's (r,s) slot was a non-reproducible subset-sum → loss/grad/params
-    // differed across bit-identical re-runs even after the OOB-NaN fix in
-    // model_stage_*_tc.cuh. A FIXED contiguous element range per CTA over the FLAT
-    // [0,kMambaTotalElems) arrays (params/param_init/grad are parallel flat blobs →
-    // flat Σ == cross-tensor Σ) with a plain sync() is the IDENTICAL shape as the
-    // A/A/A-CLEAN GrokAdamW P2.5. Per-element math still CALLS canonical
-    // prodigy_partials_step (prodigy.h, single-source). g_next_task is UNTOUCHED (B2
-    // reset it), so P3's drain is unchanged — no sync_reset in P2.6. (mamba×prodigy
-    // is dispatch-gated to eager today; this keeps the landed-dormant P2.6 correct.)
+    // WHY THIS SHAPE (the A/A/A determinism leg): the work-steal phaseA drained the
+    // global TaskQueue (atomicAdd(g_next_task)) in timing-dependent claim order, so
+    // each CTA's (r,s) slot could be a different tensor subset run-to-run; with non-
+    // associative fp32 add the partials regroup differently and the owner's d can
+    // differ at ULP level from step>=2 — a COMPONENT_CONTRACT deterministic-reduction
+    // violation (not reproducible BY CONSTRUCTION). A FIXED contiguous element range
+    // per CTA over the FLAT [0,kMambaTotalElems) arrays (params/param_init/grad are
+    // parallel flat blobs → flat Σ == cross-tensor Σ) with a plain sync() is the
+    // IDENTICAL shape as the A/A/A-CLEAN GrokAdamW P2.5 — deterministic by
+    // construction. Per-element math still CALLS canonical prodigy_partials_step
+    // (prodigy.h, single-source). g_next_task is UNTOUCHED (B2 reset it), so P3's
+    // drain is unchanged — no sync_reset in P2.6. (mamba×prodigy is dispatch-gated to
+    // eager today on a SEPARATE mamba scan/forward determinism issue; this keeps the
+    // landed-dormant P2.6 correct + deterministic.)
     if constexpr (Opt == OptId::Prodigy) {
         float* r_part = opt_reduce;                  // [nCTA] per-CTA Σ d²·<g,p0−p>
         float* s_part = opt_reduce + nCTA;           // [nCTA] per-CTA Σ d²·|g|

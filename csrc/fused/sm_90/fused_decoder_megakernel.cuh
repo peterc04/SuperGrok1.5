@@ -100,9 +100,11 @@
 #include "csrc/fused/sm_90/model_stage_decoder_tc.cuh"
 // STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction, …). Pulls in
 // the canonical prodigy.h reduction math + the deterministic block reductions; the
-// TC megakernel's Prodigy branch drives prodigy_precompute_reduce_phaseA + an EMA
-// d-update owner block between B2 and P3. Included only under the wgmma token (the
-// scalar default path has no STAGED tail).
+// TC megakernel's Prodigy branch runs an INLINE FIXED-PARTITION (r,s) reduce + an EMA
+// d-update owner block between B2 and P3 (see the P2.6 block; the work-steal
+// prodigy_precompute_reduce_phaseA/B helpers in opt_stages_precompute.cuh are the
+// older form, retained for the dormant mamba path). Included only under the wgmma
+// token (the scalar default path has no STAGED tail).
 #include "csrc/fused/sm_90/opt_stages_precompute.cuh"
 #endif
 
@@ -549,23 +551,25 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //                scales ONLY the candidate — persisted r_ema stays UNSCALED)
     //
     //    DETERMINISM — FIXED-PARTITION reduction (mirrors the A/A/A-CLEAN GrokAdamW
-    //    P2.5 grad-norm reduce above), NOT the work-steal task-queue drain. ROOT-
-    //    CAUSE FIX: the previous form drained the global TaskQueue (q.next_block →
-    //    atomicAdd(g_next_task)) inside phaseA and then reset that SAME counter in a
+    //    P2.5 grad-norm reduce above), NOT the work-steal task-queue drain. WHY THIS
+    //    SHAPE: the previous form drained the global TaskQueue (q.next_block →
+    //    atomicAdd(g_next_task)) inside phaseA and reset that SAME counter in a
     //    sync_RESET barrier (B2.6a). The work-steal claim order is timing-dependent,
-    //    so each CTA's (r,s) slot held a DIFFERENT, non-reproducible subset-sum each
-    //    run; folding the counter reset into the barrier on top of that exposed a
-    //    grid-barrier visibility window that made the WHOLE persistent step non-
-    //    deterministic (P1/P2 loss+grad differed across bit-identical re-runs, with
-    //    NaN in the tail) — A/A/A FAIL. GrokAdamW's P2.5 reduces a FIXED contiguous
+    //    so each CTA's (r,s) slot holds a potentially DIFFERENT tensor subset run-to-
+    //    run; because fp32 add is non-associative, the per-CTA partials then regroup
+    //    the same values differently and the owner's d can differ at ULP level from
+    //    step>=2 (a COMPONENT_CONTRACT deterministic-reduction violation — even where
+    //    it happens to be empirically bit-exact on a given GPU/workload, it is not
+    //    deterministic BY CONSTRUCTION). GrokAdamW's P2.5 reduces a FIXED contiguous
     //    element range per CTA with a plain sync() and is A/A/A-CLEAN; prodigy now
-    //    uses the IDENTICAL shape. Each CTA owns [e0,e0+ecnt) of the FLAT [0,total)
-    //    arrays — params/param_init/grad are parallel flat blobs, so a contiguous
-    //    flat range sum == the cross-all-TENSORS sum (tensor boundaries are
-    //    irrelevant to a global Σ). The per-element contribution still CALLS the
-    //    canonical prodigy_partials_step (prodigy.h:28-53, single-source). NO float
-    //    atomic; per-CTA (r,s) slot publish → ONE plain grid barrier → CTA0 owner-
-    //    sums ascending → EMA-decay/update_d → broadcast → ONE plain grid barrier.
+    //    uses the IDENTICAL shape — deterministic by construction, independent of CTA
+    //    timing. Each CTA owns [e0,e0+ecnt) of the FLAT [0,total) arrays —
+    //    params/param_init/grad are parallel flat blobs, so a contiguous flat range
+    //    sum == the cross-all-TENSORS sum (tensor boundaries are irrelevant to a
+    //    global Σ). The per-element contribution still CALLS the canonical
+    //    prodigy_partials_step (prodigy.h:28-53, single-source). NO float atomic;
+    //    per-CTA (r,s) slot publish → ONE plain grid barrier → CTA0 owner-sums
+    //    ascending → EMA-decay/update_d → broadcast → ONE plain grid barrier.
     //    g_next_task is UNTOUCHED here (B2 already reset it to 0), so P3's queue
     //    drain runs unchanged — no sync_reset needed in P2.6.
     //    Guarded so every other opt's P3 is byte-identical (no extra barrier/work).
