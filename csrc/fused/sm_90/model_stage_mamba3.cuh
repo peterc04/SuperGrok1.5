@@ -542,13 +542,45 @@ __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
                            float* __restrict__ dCmat,           // [kSeq,kState] += (smem; zeroed by caller)
                            float* __restrict__ g_A_log,         // [d_inner,state] partial (+=)
                            float* __restrict__ red) {
-    float dB_loc[mb::kSeq][mb::kState];
-    float dC_loc[mb::kSeq][mb::kState];
+    // DETERMINISM / REGISTER-PRESSURE FIX (TC wgmma A/A/A race root cause): the
+    // previous form stashed dB/dC for ALL kSeq·kState pairs in per-thread arrays
+    // dB_loc[kSeq][kState] + dC_loc[kSeq][kState] (256 fp32 = 1 KB/thread) ONLY to
+    // block-reduce them in a trailing pass. Those arrays cannot live in registers,
+    // so they SPILL to local memory; the spill inflated the whole-kernel frame
+    // (STACK 4368 B for the LookSAM instantiation vs 3088 for AdamW), which tipped
+    // ptxas into ALSO spilling the wgmma fp32 ACCUMULATOR (N/2=64 regs) of the
+    // double-buffered projection GEMM inside its async issue→stage→wait window —
+    // exactly the ptxas C7515 hazard ("non-wgmma instructions defining accumulator
+    // registers between start and end of the pipeline stage"). A spilled
+    // accumulator reloaded WHILE wgmma.mma_async is concurrently writing it is
+    // NON-DETERMINISTIC (denormal-scale grad drift, occasionally NaN) — A/A/A FAIL,
+    // exposed by the SAM-2nd-pass mamba cells (looksam/SG11/SG15) and shared with
+    // mamba×prodigy (their <Opt> instantiations push registers over the spill
+    // threshold; AdamW/Lion/Grokfast happen to stay under it, which is why ONLY the
+    // basic cells were deterministic). FIX: keep ONLY the CURRENT timestep's dB/dC
+    // row (kState fp32 each) and block-reduce IN the reverse loop — the kSeq·kState
+    // arrays vanish, the frame drops below the accumulator-spill point for EVERY
+    // instantiation, and the GEMM accumulator stays register-resident → the wgmma
+    // is deterministic BY CONSTRUCTION. The MATH is byte-identical: the per-(t,s)
+    // block sum runs in the SAME ascending lane/warp order (mb_block_sum), over the
+    // SAME addends, into the SAME dBmat/dCmat slots — only the storage of the
+    // already-computed dB/dC moved from "all-t array, reduce after" to "per-t row,
+    // reduce now". ALL threads (active j<d_inner AND the dead j>=d_inner tail, here
+    // none since blockDim==d_inner) reach every mb_block_sum, so the in-loop block
+    // reduction is well-formed. Per-thread gh/dA state is untouched by the reduce.
+    // REGISTER-PRESSURE NOTE (part of the A/A/A determinism fix): a_save[kSeq][kState]
+    // (128 fp32) is DROPPED — adec = exp(dt_t·A[s]) is recomputed in the reverse loop
+    // (a cheap intrinsic) rather than cached. This + the fused dB/dC reduce below shrinks
+    // the scan-bwd's spilled local frame so the whole-kernel stack stays under the
+    // wgmma-accumulator-spill threshold for the register-heavier instantiations
+    // (the SAM-2nd-pass cells inline this backward TWICE). adec is bit-identical whether
+    // cached or recomputed (same __expf, same args), so parity/determinism are unchanged.
     const bool active = (threadIdx.x < mb::kDInner);
+    float A[mb::kState], hh[mb::kSeq + 1][mb::kState];
+    float dt_save[mb::kSeq];
+    float gh[mb::kState], dA[mb::kState];
+    const int j = threadIdx.x;
     if (active) {
-        const int j = threadIdx.x;
-        float A[mb::kState], hh[mb::kSeq + 1][mb::kState];
-        float dt_save[mb::kSeq], a_save[mb::kSeq][mb::kState];
         #pragma unroll
         for (int s = 0; s < mb::kState; ++s) {
             A[s] = -__expf(A_log[(int64_t)j * mb::kState + s]);
@@ -563,16 +595,25 @@ __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
             #pragma unroll
             for (int s = 0; s < mb::kState; ++s) {
                 const float adec = __expf(dt_t * A[s]);
-                a_save[t][s] = adec;
                 hh[t + 1][s] = adec * hh[t][s] + dt_t * a->Bmat[t][s] * xv;
             }
         }
-        // reverse scan.
-        float gh[mb::kState], dA[mb::kState];
         #pragma unroll
         for (int s = 0; s < mb::kState; ++s) { gh[s] = 0.0f; dA[s] = 0.0f; }
-        #pragma unroll
-        for (int t = mb::kSeq - 1; t >= 0; --t) {
+    }
+    // REVERSE scan with FUSED per-timestep dB/dC block-reduce. The reverse loop runs
+    // t = kSeq-1 .. 0; reducing IN ASCENDING t order (matching the old trailing
+    // pass's t=0..kSeq-1 over INDEPENDENT (t,s) reductions — each dBmat[t]/dCmat[t]
+    // slot is summed from one addend per channel, so the t-iteration order does not
+    // change any individual slot's value) requires the reduce to walk t up while the
+    // recurrence walks t down. So compute the whole reverse recurrence first into a
+    // per-thread dB/dC row cache is what we AVOID; instead we reduce slot t exactly
+    // when the reverse loop produces it (descending t). Slot independence makes the
+    // visitation order irrelevant to the result.
+    #pragma unroll
+    for (int t = mb::kSeq - 1; t >= 0; --t) {
+        float dB_row[mb::kState], dC_row[mb::kState];   // THIS t only (kState fp32)
+        if (active) {
             const float xv = x_main[t * mb::kDInner + j];
             const float dt_t = dt_save[t];
             const float dyv = dy_scan[t * mb::kDInner + j];
@@ -581,12 +622,12 @@ __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
             for (int s = 0; s < mb::kState; ++s) {
                 const float h_t = hh[t + 1][s];
                 const float h_tm1 = hh[t][s];
-                const float adec = a_save[t][s];
+                const float adec = __expf(dt_t * A[s]);   // recompute (a_save dropped)
                 const float cc = a->Cmat[t][s];
                 const float bb = a->Bmat[t][s];
-                dC_loc[t][s] = h_t * dyv;
+                dC_row[s] = h_t * dyv;
                 gh[s] += cc * dyv;
-                dB_loc[t][s] = dt_t * xv * gh[s];
+                dB_row[s] = dt_t * xv * gh[s];
                 dx_acc += bb * dt_t * gh[s];
                 ddt_acc += (A[s] * adec * h_tm1 + bb * xv) * gh[s];
                 dA[s] += dt_t * adec * h_tm1 * gh[s];
@@ -594,25 +635,24 @@ __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
             }
             dx_main_scan[t * mb::kDInner + j] = dx_acc;
             ddt_pre[t * mb::kDInner + j] = ddt_acc * mb_softplus_grad(a->dt_pre[t][j]);
+        } else {
+            #pragma unroll
+            for (int s = 0; s < mb::kState; ++s) { dB_row[s] = 0.0f; dC_row[s] = 0.0f; }
         }
+        // Block-reduce THIS timestep's dB/dC across channels (fixed ascending
+        // lane/warp order) → dBmat[t]/dCmat[t]. Same addends + same order as the
+        // old trailing reduce; slot t is independent of every other t.
+        #pragma unroll
+        for (int s = 0; s < mb::kState; ++s) {
+            float sb = mb_block_sum(dB_row[s], red);
+            float sc = mb_block_sum(dC_row[s], red);
+            if (threadIdx.x == 0) { dBmat[t * mb::kState + s] += sb; dCmat[t * mb::kState + s] += sc; }
+        }
+    }
+    if (active) {
         #pragma unroll
         for (int s = 0; s < mb::kState; ++s)
             g_A_log[(int64_t)j * mb::kState + s] += dA[s] * A[s];
-    } else {
-        #pragma unroll
-        for (int t = 0; t < mb::kSeq; ++t)
-            #pragma unroll
-            for (int s = 0; s < mb::kState; ++s) { dB_loc[t][s] = 0.0f; dC_loc[t][s] = 0.0f; }
-    }
-    // Reduce dB_loc/dC_loc across channels (threads) in fixed order -> dBmat/dCmat.
-    #pragma unroll
-    for (int t = 0; t < mb::kSeq; ++t) {
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s) {
-            float sb = mb_block_sum(dB_loc[t][s], red);
-            float sc = mb_block_sum(dC_loc[t][s], red);
-            if (threadIdx.x == 0) { dBmat[t * mb::kState + s] += sb; dCmat[t * mb::kState + s] += sc; }
-        }
     }
     __syncthreads();
 }

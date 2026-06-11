@@ -589,7 +589,10 @@ __device__ __forceinline__ MbPartial mb_partial_bind(float* base) {
 //  (in_proj + residual), x_main/dt_raw fp32 into scan/conv/gate with ONLY the
 //  bf16 copy consumed by x_proj/dt_proj rounded; LN/scan/conv/gate/head fp32.
 // ════════════════════════════════════════════════════════════════════════
-__device__ float mbtc_forward_tile(
+// __noinline__ (mirrors mbtc_backward_tile): one shared out-of-line frame for the
+// 2nd-pass cells that call the forward twice, bounding the megakernel's register
+// footprint so the wgmma accumulator stays register-resident (A/A/A determinism).
+__device__ __noinline__ float mbtc_forward_tile(
         const MambaWeights& w, int g0, int nrows, const MbActs& acts,
         const MbTileScratch& sc, const int* __restrict__ tok_ids,
         const int* __restrict__ tgt_ids,
@@ -786,7 +789,20 @@ __device__ float mbtc_forward_tile(
 //  smem: `dBmat_s`/`dCmat_s` [kSeq*kState] each (the scan-bwd cross-channel reduce
 //  target, zeroed + consumed PER SAMPLE). `red` the reduction slot.
 // ════════════════════════════════════════════════════════════════════════
-__device__ void mbtc_backward_tile(
+// __noinline__ (A/A/A DETERMINISM, register-pressure bound): the megakernel calls
+// this heavy backward from P1 AND — for the SAM-2nd-pass cells (looksam/SG) — a
+// SECOND time inside the P2.4 SAM block. Inlining both copies into the megakernel
+// pushes the per-thread frame past the wgmma-accumulator-spill threshold (the
+// LookSAM instantiation hit STACK 3024 / spilled the 64-reg wgmma accumulator of
+// the projection GEMMs in the double-buffer window → non-deterministic denormal/NaN
+// grad drift; the basic single-pass cells stayed under it). Forcing ONE shared
+// out-of-line frame keeps the megakernel's own register footprint small for EVERY
+// instantiation, so the GEMM accumulator stays register-resident and the wgmma is
+// deterministic BY CONSTRUCTION — independent of which optimizer's tail is compiled
+// in. The math is unchanged (same code, just not inlined). Warpgroup-uniform call:
+// the whole CTA enters/exits together, so the wgmma fence/commit/wait choreography
+// inside is well-formed across the call boundary.
+__device__ __noinline__ void mbtc_backward_tile(
         const MambaWeights& w, int g0, int nrows, int B, const MbActs& acts,
         const MbTileScratch& sc, const MbPartial& part,
         const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,

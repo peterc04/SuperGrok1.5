@@ -338,10 +338,20 @@ _CELLS = {
     # not fired yet); the load-bearing check is the MULTI-STEP parity (the d fires by
     # step≥2; _prodigy_multistep_parity --model vit).
     "prodigy/vit": dict(model="vit", opt="prodigy", factory=_prodigy_factory),
-    # NOTE: prodigy/mamba is NOT registered — it FAILS A/A/A (scheduling-exposed race in
-    # the shared mamba forward, exposed by prodigy's register pressure; loss+grad differ
-    # across bit-identical re-runs, grad maxd ~1e-2). The P2.6 kernel/launcher code is
-    # landed-dormant; the cell stays blocked until the racy mamba component is fixed.
+    # prodigy (mamba): CONVERTED — the A/A/A race is FIXED. The non-determinism was a
+    # register-pressure-induced wgmma-accumulator spill in the mamba TC backward: the
+    # selective-scan backward (mb_scan_bwd) cached a large per-thread frame
+    # (dB_loc/dC_loc[kSeq][kState] + a_save[kSeq][kState]) that, combined with prodigy's
+    # P2.6 d-reduce state, pushed the kernel past the spill threshold and spilled the 64-
+    # reg projection-GEMM accumulator in the double-buffer window (the ptxas C7515 hazard)
+    # → denormal/NaN grad drift across bit-identical re-runs. FIX (model_stage_mamba3.cuh +
+    # model_stage_mamba_tc.cuh): fused per-timestep dB/dC block-reduce (drops the
+    # [kSeq][kState] arrays), dropped a_save (recompute adec=exp(dt·A) in the reverse
+    # loop, bit-identical), and __noinline__ on mbtc_forward_tile/mbtc_backward_tile so the
+    # heavy model frame lives out-of-line → the megakernel's own frame stays small and the
+    # GEMM accumulator is register-resident for EVERY instantiation. prodigy/mamba now PASSES
+    # A/A/A bit-exact on the production path (loss/grad/param maxd=0 ×4).
+    "prodigy/mamba": dict(model="mamba", opt="prodigy", factory=_prodigy_factory),
     # muon (vit): CONVERTED (wave-2 vit lane). STAGED grid-cooperative Newton-Schulz on
     # the 11 2D weights (in-kernel P2.7); 1D weights → AdamW tail. param_tol=2e-3 for
     # the NS 2D path (OPTSTAGES §8); the (1b) STATE check stays 1e-4 (the momentum buf
@@ -436,16 +446,26 @@ _CELLS = {
     "supergrok15/vit": dict(model="vit", opt="supergrok15",
                             factory=_supergrok15_factory,
                             sharpness_tol=2e-2, mu_tol=3e-3),
-    # NOTE: looksam/mamba is NOT registered — it FAILS A/A/A (the SAME latent shared mamba
-    # scan/forward race that blocks prodigy/mamba). The in-kernel P2.4 SAM 2nd backward IS
-    # code-landed (fused_mamba_megakernel.cuh + the mamba launcher case OptId::LookSAM) and the
-    # mamba bf16-faithful sam_dir oracle branch (gate (A), above) is wired for the probe, but
-    # the LookSAM mamba INSTANTIATION's grad is non-deterministic across bit-identical re-runs
-    # (loss ~5e-5 spread, grad maxΔ~1e-3, intermittent NaN) — MEASURED even on a SAM-OFF step
-    # (no 2nd backward), so it is the shared forward, NOT the SAM code (the sam_dir reductions
-    # are fixed-ownership mirrors of the A/A/A-clean P1+P2). dispatch.cpp gates it to eager
-    # (mb_looksam carve-out, env SG_MAMBA_LOOKSAM_PROBE to observe). Stays blocked until the
-    # racy mamba forward is fixed. decoder/vit looksam ARE registered-converted (A/A/A-clean).
+    # looksam (mamba): CONVERTED — the A/A/A race is FIXED (same root cause + fix as
+    # prodigy/mamba above: a register-pressure wgmma-accumulator spill in the mamba TC
+    # backward, exposed harder here because the SAM block inlines the heavy fwd+bwd a SECOND
+    # time, doubling the frame). The __noinline__ on mbtc_forward_tile/mbtc_backward_tile +
+    # the scan-bwd footprint reduction keep the megakernel frame small even with the SAM
+    # block + 2nd-pass inline → the GEMM accumulator stays register-resident. The in-kernel
+    # P2.4 SAM 2nd backward (fused_mamba_megakernel.cuh + mamba launcher case OptId::LookSAM)
+    # now PASSES A/A/A bit-exact on the production path (loss/grad/param maxd=0 ×4), on BOTH
+    # a SAM step (sam_dir = g_sam−g recomputed bit-stable) and a SAM-off step. decoder/vit
+    # looksam were already A/A/A-clean; mamba now joins them.
+    "looksam/mamba": dict(model="mamba", opt="looksam", factory=_looksam_factory,
+                          sam_dir_tol=2e-2),
+    # NOTE: supergrok11/mamba and supergrok15/mamba remain UNregistered — they are code-ABSENT
+    # in the mamba TC kernel/launcher (the mamba megakernel SAM block + mega_mamba_real_adamw_
+    # tc_launcher.cu switch carry only OptId::LookSAM, no SG sharpness/meta-net case). The A/A/A
+    # determinism root cause is now fixed (the LookSAM mamba instantiation proves the SAM 2nd-
+    # pass path is deterministic), so the remaining work to un-dormant them is to ADD the SG
+    # sharpness=(g_sam−g)² + per-tensor meta-net mu path to the mamba kernel/launcher (the
+    # decoder/vit twins exist) — a feature port, not a determinism fix. SG11/SG15 keep the
+    # won't-grok caveat regardless. Tracked separately.
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,

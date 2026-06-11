@@ -1008,76 +1008,47 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // workspace is device scratch (never crosses the ABI). Placed BEFORE the
  // surrogate route so the real path wins.
  // OPTID-GENERIC GATE (mirrors the decoder): mamba's scalar real megakernel exists
- // ONLY for adamw; the wgmma TC launcher supports the single-launch tails
- // {adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). TWO tails are CODE-LANDED
- // (the launcher has their case + the kernel their if-constexpr'd phase) but BLOCKED for
- // mamba via the carve-outs below, on the SAME latent shared mamba scan/forward determinism
- // race: Prodigy (opt_id 5, in-kernel P2.6 d-estimate — CONVERTED + A/A/A-clean for decoder/
- // vit) and MODEL-COUPLED LookSAM (opt_id 4, in-kernel P2.4 SAM 2nd backward — CONVERTED +
- // A/A/A-clean for decoder/vit). Both mamba instantiations FAIL A/A/A (non-deterministic
- // grad, intermittent NaN — for LookSAM, measured EVEN on a SAM-OFF step, so it is the shared
- // forward, not the SAM code); their register/occupancy profile exposes the race that the
- // simple tails (bit-identical on the SAME forward) do not. The remaining SAM opts (SG11/15)
- // and SG2 never reach here (wgmma_tail_opt_id < 0 → eager). mb_tc_tail is the single source
- // of the routed set, so this gate cannot drift from the launcher's switch.
+ // ONLY for adamw; the wgmma TC launcher production-routes the single-launch tails
+ // {adamw,lion,grokfast,grokadamw,neuralgrok,muon} (opt_id 0/1/2/3/6/7) PLUS the now-
+ // A/A/A-FIXED Prodigy (opt_id 5, in-kernel P2.6 d-estimate) and MODEL-COUPLED LookSAM
+ // (opt_id 4, in-kernel P2.4 SAM 2nd backward). mb_tc_tail is the single source of the
+ // routed set, so this gate cannot drift from the launcher's switch.
  const int mb_opt_id = wgmma_tail_opt_id(optimizer);
- // mamba×prodigy CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 5 for prodigy
- // (decoder/vit prodigy ARE registered-converted AND A/A/A-clean — they PASS test_l3tc_
- // tail_gate bit-exact, incl. step>=40 with d adapted off d0). The prior claim that the
- // SHARED prodigy P2.6 reduction was racy across all 3 models is RETIRED: decoder/vit
- // prodigy now use a FIXED-PARTITION P2.6 reduce (each CTA owns a fixed contiguous element
- // range of the flat [0,total) arrays → deterministic owner-sum, the SAME shape as the
- // A/A/A-clean GrokAdamW P2.5 grad-norm reduce) instead of the work-steal q.next_block()
- // drain + extra bar.sync_reset() the old form used; the per-element math still CALLS
- // canonical prodigy_partials_step (prodigy.h, single source). mamba×prodigy stays blocked
- // on its OWN distinct symptom — a ~1e-2 grad drift across bit-identical re-runs (NOT the
- // gate-visible decoder/vit class, which is now fixed) in the shared mamba scan/forward.
- // Ruled OUT for mamba: buffer size (adamw forced to 4*total+4 is bit-identical),
- // opt_reduce/acts overlap (disjoint), smem race (racecheck=0), barrier misuse
- // (synccheck=0). Routing prodigy on the mamba prod path would ship a non-deterministic
- // cell, so exclude it for mamba ONLY here. Owner: fix the mamba forward, then lift this
- // carve-out. See dispatch.py's note.
- // DIAGNOSTIC OVERRIDE (env SG_MAMBA_PRODIGY_PROBE=1): TEMPORARILY lift the
- // prodigy carve-out so the A/A/A determinism of the landed-dormant mamba prodigy
- // tail can be OBSERVED on a real build (the fix-or-cite empirical step). OFF by
- // default → production behavior is byte-identical to before. Never commit with
- // this path routed unless the cell is proven A/A/A-clean (no-suppression).
- static const bool mb_prodigy_probe =
-     (std::getenv("SG_MAMBA_PRODIGY_PROBE") != nullptr);
- // mamba×looksam CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 4 for looksam, and
- // the in-kernel P2.4 SAM 2nd backward IS code-landed in fused_mamba_megakernel_tc<LookSAM>
- // (the launcher routes case OptId::LookSAM; the FusedScalars POD carries rho/looksam_sam).
- // But the LookSAM mamba INSTANTIATION FAILS test_l3tc_tail_gate A/A/A: its grad is NON-
- // DETERMINISTIC across bit-identical re-runs (loss varies ~5e-5, grad maxΔ~1e-3, intermittent
- // NaN). MEASURED: the non-determinism appears EVEN on a SAM-OFF step (no 2nd backward), so it
- // is NOT the SAM phase code (the sam_dir reductions are fixed-ownership mirrors of the A/A/A-
- // clean P1+P2) — it is the SAME latent shared mamba scan/forward race that blocks mamba×
- // prodigy, exposed here by the LookSAM instantiation's register/occupancy profile (the if-
- // constexpr'd P2.4 shifts ptxas allocation; mamba×{adamw,lion,grokfast} on the SAME forward
- // stay bit-identical). Routing it would ship a non-deterministic cell, so exclude it for
- // mamba ONLY here (decoder/vit looksam ARE A/A/A-clean + registered-converted). Owner: fix
- // the mamba forward (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh), then lift
- // BOTH this and the prodigy carve-out. DIAGNOSTIC OVERRIDE (env SG_MAMBA_LOOKSAM_PROBE=1):
- // TEMPORARILY route the landed-dormant tail so its A/A/A can be OBSERVED on a real build (the
- // fix-or-cite empirical step). OFF by default → production is byte-identical. Never commit
- // with this routed unless the cell is proven A/A/A-clean.
- static const bool mb_looksam_probe =
-     (std::getenv("SG_MAMBA_LOOKSAM_PROBE") != nullptr);
- // SuperGrok11/15 CARVE-OUT (no-suppression): wgmma_tail_opt_id now returns 8/9 for
- // them (decoder/vit SG11/15 ARE registered-converted + A/A/A-clean via the in-kernel
- // SAM 2nd backward + per-tensor mu precompute). But the mamba SG11/15 path is BLOCKED
- // on the SAME shared mamba scan/forward A/A/A determinism race that blocks mamba×
- // prodigy/looksam (the SG SAM 2nd backward re-runs the mamba forward TWICE + register
- // pressure → exposes the latent race). The mamba megakernel deliberately does NOT carry
- // the SG SAM/mu phases (decoder/vit only) and the mamba launcher has NO SG case, so this
- // is a code-absent block (stricter than looksam's code-landed-dormant) — SG mamba is
- // simply not a mamba TC tail. Exclude it here so a forced wgmma request fails LOUD with
- // the cited reason rather than hitting the launcher's cudaErrorInvalidValue. Lift once
- // the mamba forward is fixed (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh).
+ // mamba×prodigy + mamba×looksam: the A/A/A determinism race that previously BLOCKED these
+ // (non-deterministic grad, intermittent NaN, ~1e-3 loss/grad drift across bit-identical
+ // re-runs on the production path) is FIXED and the carve-out is LIFTED. ROOT CAUSE: a
+ // register-pressure-induced wgmma-accumulator spill in the mamba TC backward — the
+ // selective-scan backward (mb_scan_bwd, model_stage_mamba3.cuh) cached a large per-thread
+ // frame (dB_loc/dC_loc[kSeq][kState] + a_save[kSeq][kState], ~2 KB/thread) that spilled to
+ // local memory; combined with the EXTRA register pressure of prodigy's P2.6 state OR
+ // LookSAM's P2.4 SAM block (which inlines the heavy fwd+bwd a SECOND time), the whole-kernel
+ // frame crossed the spill threshold and ptxas ALSO spilled the 64-register projection-GEMM
+ // accumulator inside the wgmma double-buffer issue→stage→wait window (the ptxas C7515
+ // hazard: "non-wgmma instructions defining accumulator registers between start and end of
+ // the pipeline stage"). A spilled fp32 accumulator reloaded while wgmma.mma_async is
+ // concurrently writing it is NON-DETERMINISTIC → denormal/NaN grad drift. The basic single-
+ // pass tails (adamw/lion/grokfast/grokadamw/neuralgrok) + muon (single fwd + NS precompute)
+ // stayed UNDER the threshold, which is why ONLY they were deterministic. FIX (no suppression
+ // — toward canonical, deterministic by construction): (1) fused per-timestep dB/dC block-
+ // reduce in mb_scan_bwd (drops the [kSeq][kState] arrays — same addends, same ascending
+ // order); (2) dropped a_save (recompute adec=exp(dt·A) in the reverse loop, bit-identical);
+ // (3) __noinline__ on mbtc_forward_tile/mbtc_backward_tile (model_stage_mamba_tc.cuh) so the
+ // heavy model frame lives in ONE out-of-line frame instead of being inlined (TWICE for the
+ // SAM cells) into the megakernel — the megakernel's own frame stays small and the GEMM
+ // accumulator is register-resident for EVERY instantiation. mamba×prodigy AND mamba×looksam
+ // now PASS test_l3tc_tail_gate A/A/A bit-exact on the production fused_train_step path
+ // (loss/grad/param maxd=0 ×4; looksam on a SAM step AND a SAM-off step). SG_MAMBA_PRODIGY_
+ // PROBE / SG_MAMBA_LOOKSAM_PROBE diagnostic overrides are retired (the cells route in
+ // production now). The 6 basic mamba cells stay byte-identical (the scan math is unchanged;
+ // __noinline__ does not alter results — re-gated green).
+ // SuperGrok11/15 stay BLOCKED — but on a DIFFERENT reason than the (now-fixed) race: they
+ // are CODE-ABSENT in the mamba TC kernel/launcher (the mamba megakernel SAM block + the
+ // launcher switch carry only OptId::LookSAM; there is NO SG sharpness=(g_sam−g)²/meta-net mu
+ // case). Un-dormanting them is a FEATURE PORT (the decoder/vit twins exist), not a
+ // determinism fix; the now-deterministic LookSAM mamba instantiation proves the SAM 2nd-pass
+ // path is race-free. So a forced wgmma request for SG11/15 mamba still fails LOUD here.
  const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
- const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg &&
-                          (optimizer != "prodigy" || mb_prodigy_probe) &&
-                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon}; mamba prodigy+looksam+SG11/15 BLOCKED (shared mamba-forward A/A/A race); SG2 = -1. MUON is a SINGLE forward + NS precompute (opt_id 7, P2.7) — NOT a 2nd forward, so it does NOT hit that race (A/A/A bit-exact via test_l3tc_tail_gate); routed unconditionally.
+ const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg);  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam}; mamba SG11/15 = code-absent block; SG2 = -1.
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1090,13 +1061,12 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
  TORCH_CHECK(!want_wgmma || mb_tc_tail,
  "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
- "', but the mamba TC launcher production-routes only the single-launch tails "
- "{adamw,lion,grokfast,grokadamw,neuralgrok,muon} (opt_id 0/1/2/3/6/7). STAGED Muon (opt_id 7, "
- "in-kernel P2.7 grid-cooperative Newton-Schulz) is a SINGLE forward + NS precompute — NOT a "
- "2nd forward — so it does NOT hit the shared mamba-forward A/A/A race (A/A/A bit-exact). STAGED "
- "Prodigy (opt_id 5) and MODEL-COUPLED LookSAM (opt_id 4) are CODE-LANDED but BLOCKED on that race "
- "(set SG_MAMBA_PRODIGY_PROBE / SG_MAMBA_LOOKSAM_PROBE to observe). "
- "The remaining SAM opts (SG11/15) and SG2 are not mamba TC tails — use the eager/per-op path.");
+ "', but the mamba TC launcher production-routes the tails "
+ "{adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam} (opt_id 0/1/2/3/6/7/5/4). "
+ "Prodigy (P2.6 d-estimate) + LookSAM (P2.4 SAM 2nd backward) are now A/A/A bit-exact "
+ "(the register-pressure wgmma-accumulator-spill race is fixed). SuperGrok11/15 are CODE-ABSENT "
+ "in the mamba kernel/launcher (no SG sharpness/meta-net case — a feature port, not this fix) "
+ "and SG2 is eager-only — use the eager/per-op path for those.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),

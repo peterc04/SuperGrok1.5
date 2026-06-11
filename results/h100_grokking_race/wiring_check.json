@@ -1,9 +1,9 @@
 {
   "summary": {
     "total_cells": 33,
-    "converted_l3_tc": 26,
-    "blocked": 7,
-    "fraction_l3_tc": 0.7879,
+    "converted_l3_tc": 28,
+    "blocked": 5,
+    "fraction_l3_tc": 0.8485,
     "converted_cells": [
       "adamw/decoder",
       "neuralgrok/decoder",
@@ -30,16 +30,16 @@
       "grokadamw/mamba",
       "grokfast/mamba",
       "muon/mamba",
-      "lion/mamba"
+      "lion/mamba",
+      "looksam/mamba",
+      "prodigy/mamba"
     ],
     "blocked_cells": [
       "supergrok2/decoder",
       "supergrok2/vit",
       "supergrok/mamba",
       "supergrok15/mamba",
-      "supergrok2/mamba",
-      "looksam/mamba",
-      "prodigy/mamba"
+      "supergrok2/mamba"
     ]
   },
   "rows": [
@@ -470,26 +470,30 @@
     {
       "model": "mamba",
       "optimizer": "looksam",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "BLOCKED: mamba\u00d7looksam in-kernel phase is code-landed (launcher case + if-constexpr'd kernel phase, byte-identical for the routed tails) but FAILS A/A/A on the shared mamba scan/forward race (same class as mamba\u00d7prodigy; for looksam, measured even on a SAM-OFF step \u2192 not the SAM code). Gated to eager via the dispatch.cpp carve-out. decoder/vit looksam ARE L3-TC-converted (A/A/A-clean)."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",
       "optimizer": "prodigy",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "BLOCKED: mamba\u00d7prodigy in-kernel phase is code-landed (launcher case + if-constexpr'd kernel phase, byte-identical for the routed tails) but FAILS A/A/A on the shared mamba scan/forward race (same class as mamba\u00d7prodigy; for looksam, measured even on a SAM-OFF step \u2192 not the SAM code). Gated to eager via the dispatch.cpp carve-out. decoder/vit prodigy ARE L3-TC-converted (A/A/A-clean)."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     }
   ]
 }

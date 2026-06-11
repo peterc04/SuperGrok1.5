@@ -862,6 +862,19 @@ _FUSED_L3_REAL = frozenset({
     # forward), so it does NOT hit that race — VERIFIED A/A/A bit-exact by test_l3tc_tail_gate
     # (muon/mamba). Still a SINGLE persistent launch.
     ("mamba3", "muon"),
+    # prodigy (mamba): CONVERTED — the A/A/A race is FIXED (register-pressure wgmma-accumulator
+    # spill in the mamba TC backward; see the test_l3tc_tail_gate "prodigy/mamba" note + the
+    # fused-dB/dC-reduce + a_save-drop + __noinline__ fix in model_stage_mamba{3,_tc}.cuh).
+    # prodigy/mamba now PASSES A/A/A bit-exact on the production fused_train_step path
+    # (loss/grad/param maxd=0 ×4). The dispatch.cpp mamba×prodigy carve-out is lifted.
+    ("mamba3", "prodigy"),
+    # looksam (mamba): CONVERTED — same root cause + fix (the SAM block inlines the heavy
+    # fwd+bwd a SECOND time; __noinline__ + the scan-bwd footprint cut keep the megakernel
+    # frame under the spill threshold). looksam/mamba now PASSES A/A/A bit-exact on the
+    # production path (SAM step AND SAM-off step; loss/grad/param maxd=0 ×4). The dispatch.cpp
+    # mb_looksam carve-out is lifted. (supergrok11/15 mamba stay dormant — code-ABSENT SG path
+    # in the mamba kernel/launcher, a feature port, not this determinism fix.)
+    ("mamba3", "looksam"),
     # looksam (decoder — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
     # (st.sam_dir = g_sam − g, INTEGRATION-OPTSTAGES §6) is now an IN-KERNEL phase (P2.4,
     # between B2 and P2.5/P3) on the decoder TC kernel (fused_decoder_megakernel.cuh):
@@ -1507,6 +1520,12 @@ _L3_WGMMA_CELLS = frozenset({
     # the shared mamba-forward A/A/A race that blocks looksam/prodigy/SG mamba — VERIFIED
     # A/A/A bit-exact by test_l3tc_tail_gate (muon/mamba). Single persistent wgmma launch.
     ("mamba3", "muon"),
+    # prodigy/mamba + looksam/mamba: CONVERTED (A/A/A race fixed — see _FUSED_L3_REAL notes
+    # above + test_l3tc_tail_gate). gemm_impl_for_cell must return "wgmma" for them so the real
+    # mamba TC tail (prodigy P2.6 / looksam P2.4 SAM 2nd backward) routes instead of the scalar
+    # adamw-only path. Both PASS A/A/A bit-exact on the production path.
+    ("mamba3", "prodigy"),
+    ("mamba3", "looksam"),
     # looksam (decoder — SAM-tier lane): CONVERTED. The SAM 2nd backward is the in-kernel
     # P2.4 phase (perturb→2nd fwd+bwd→sam_dir=g_sam−g) on the decoder TC kernel; opt_id=4
     # routes it onto the TC driver (dispatch.cpp wgmma_tail_opt_id("looksam")=4 → case
