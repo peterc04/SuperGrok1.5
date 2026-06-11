@@ -272,32 +272,256 @@ def _hw_available():
 
 
 _HW, _torch, _ops = _hw_available()
-hw = pytest.mark.skipif(
+# Two-part gating, matching the rest of tests/hw (e.g. test_mamba_megakernel.py):
+#   @pytest.mark.hw      — the REAL registered marker (tests/conftest.py). Makes
+#                          `pytest -m hw` COLLECT these (the gate's command) and
+#                          `pytest -m "not hw"` (CPU CI) skip them. A bare
+#                          skipif-mark named `hw` would NOT be selected by
+#                          `-m hw` (its marker name is `skipif`), so the gate
+#                          would silently not run the parity — hence the marker.
+#   @_skip_no_hw         — skipif guard: skip cleanly when CUDA / the binding is
+#                          absent (so collection under -m hw never errors).
+_skip_no_hw = pytest.mark.skipif(
     not _HW,
     reason="needs sm_90 CUDA + the sg2_meta_optimizer_tail binding (integrator-wired)")
 
 
-@hw
+# ── (B) shared harness: build a real CSAHCAMetaNet, extract its weight bundle
+#    in BOTH the megakernel `meta`-dict order and the per-op `supergrok2_batched_
+#    step` arg order, and drive BOTH paths from identical init on cloned buffers.
+#    Driving the OPS directly (not opt.step()) keeps the scalar vectors identical
+#    across paths — no ramp/gate scheduling can desync them.
+def _build_net_and_bundle():
+    torch = _torch
+    from grokking_optimizers.optimizers.supergrok2 import CSAHCAMetaNet, SuperGrok2
+    net = CSAHCAMetaNet(
+        d_model=8, num_peer_heads=4, peer_topk=4, num_experts=144,
+        expert_hidden=16, gru_hidden=4, n_heads=2, csa_compress=4,
+        csa_window=8, csa_topk=16, hca_compress=128, indexer_rank=4,
+        rescale=0.1, grad_checkpoint=False).float().cuda().eval()
+    # A SuperGrok2 optimizer wrapping THIS net — sg2_step_megakernel is a method
+    # on the optimizer (it reads self.meta_net.{gru_hidden,num_experts}). Wraps a
+    # throwaway param; we only call its sg2_step_megakernel(...) helper directly.
+    _dummy = torch.zeros(1, device='cuda', requires_grad=True)
+    opt = SuperGrok2([_dummy], meta_net=net, d_model=8, num_peer_heads=4,
+                     peer_topk=4, num_experts=144, expert_hidden=16,
+                     gru_hidden=4, n_heads=2, csa_compress=4, csa_window=8,
+                     csa_topk=16, hca_compress=128, indexer_rank=4)
+    opt.meta_net = net  # ensure the wrapped net is the one we extracted weights from
+    w = net.get_weights(None)   # fp32 bundle (get_weights keys: gru_W_z, peer_queries lists, ...)
+    peer_Ws = torch.stack([q.float().contiguous() for q in w['peer_queries']])
+    pkA = torch.stack([k.float().contiguous() for k in w['product_keys_A']])
+    pkB = torch.stack([k.float().contiguous() for k in w['product_keys_B']])
+    ne = net.num_experts
+    # `meta` dict the megakernel driver (sg2_step_megakernel) consumes — note the
+    # ABI uses gru_Wz/gru_bz (no underscore) vs get_weights' gru_W_z/gru_b_z.
+    meta = dict(
+        input_proj_W=w['input_proj_W'], input_proj_b=w['input_proj_b'],
+        csa_q_W=w['csa_q_W'], csa_k_W=w['csa_k_W'], csa_v_W=w['csa_v_W'],
+        csa_out_W=w['csa_out_W'], csa_compress_w=w['csa_compress_w'],
+        csa_idx_DQ=w['csa_idx_DQ'], csa_idx_K=w['csa_idx_K'],
+        hca_q_W=w['hca_q_W'], hca_k_W=w['hca_k_W'], hca_v_W=w['hca_v_W'],
+        hca_out_W=w['hca_out_W'],
+        gru_Wz=w['gru_W_z'], gru_bz=w['gru_b_z'],
+        gru_Wr=w['gru_W_r'], gru_br=w['gru_b_r'],
+        gru_Wh=w['gru_W_h'], gru_bh=w['gru_b_h'],
+        peer_query_Ws=peer_Ws, prod_keys_A=pkA, prod_keys_B=pkB,
+        expert_W1=w['expert_W1'].reshape(ne, -1), expert_b1=w['expert_b1'],
+        expert_W2=w['expert_W2'].reshape(ne, -1), expert_b2=w['expert_b2'].reshape(-1))
+    return net, opt, w, peer_Ws, pkA, pkB, meta
+
+
+def _make_states(shapes, GH, seed):
+    torch = _torch
+    rng = _torch.Generator(device='cuda'); rng.manual_seed(seed)
+    def lst(fn):
+        return [fn(m) for m in shapes]
+    return dict(
+        exp_avg=lst(lambda m: torch.randn(m, device='cuda', generator=rng) * 0.1),
+        exp_avg_sq=lst(lambda m: (torch.randn(m, device='cuda', generator=rng) * 0.1).abs() + 0.01),
+        mu=lst(lambda m: torch.randn(m, device='cuda', generator=rng) * 0.1),
+        slow=lst(lambda m: torch.randn(m, device='cuda', generator=rng) * 0.1),
+        gru_state=lst(lambda m: torch.randn(m, GH, device='cuda', generator=rng) * 0.1))
+
+
+def _per_op_oracle(net, w, peer_Ws, pkA, pkB, params, grads, sharps, st,
+                   scal, GH):
+    """Run ONE step of the parity-validated per-op csa_hca_step_one over the
+    SAME inputs/weights/state (mutates params + st in place)."""
+    torch = _torch
+    ops = _ops
+    P = len(params)
+    alpha_mus = [float(scal['alpha'][i]) for i in range(P)]
+    lamb_effs = [float(scal['lamb_eff'][i]) for i in range(P)]
+    beta1s = [float(scal['beta1'][i]) for i in range(P)]
+    bc1s = [float(scal['bc1'][i]) for i in range(P)]
+    bc2s = [float(scal['bc2'][i]) for i in range(P)]
+    ne = net.num_experts
+    ops.supergrok2_batched_step(
+        params, grads, sharps,
+        st['exp_avg'], st['exp_avg_sq'], st['mu'], st['slow'],
+        [g.reshape(-1, GH) for g in st['gru_state']],
+        w['input_proj_W'], w['input_proj_b'],
+        w['csa_q_W'], w['csa_k_W'], w['csa_v_W'], w['csa_compress_w'],
+        w['csa_idx_DQ'], w['csa_idx_UQ'], w['csa_idx_K'], w['csa_out_W'],
+        w['hca_q_W'], w['hca_k_W'], w['hca_v_W'], w['hca_out_W'],
+        w['gru_W_z'], w['gru_b_z'], w['gru_W_r'], w['gru_b_r'],
+        w['gru_W_h'], w['gru_b_h'],
+        peer_Ws, pkA, pkB,
+        w['expert_W1'].reshape(ne, -1), w['expert_b1'],
+        w['expert_W2'].reshape(ne, -1), w['expert_b2'].reshape(-1),
+        alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
+        float(scal['rescale']), float(scal['beta2']), float(scal['lr']),
+        float(scal['wd']), float(scal['eps']),
+        net.d_model, net.gru_hidden, net.n_heads, net.pk_dim,
+        net.expert_hidden, net.num_experts,
+        net.csa_compress, net.csa_window, net.csa_topk, net.hca_compress,
+        net.indexer_rank, net.expert_counts, net.peer_topk)
+
+
+def _scalars(P, seed=0):
+    # Per-tensor scalars mirroring the per-op layer-scaled betas/alphas. gru_decay
+    # == beta1 (csa_hca_step_one: `gru_decay = beta1s[i]`). bc1/bc2 = 1-beta^t at
+    # a fixed t so the single-step compare exercises bias correction.
+    rng = np.random.default_rng(500 + seed)
+    beta1 = (0.88 + 0.04 * rng.random(P)).tolist()
+    alpha = (0.95 + 0.03 * rng.random(P)).tolist()
+    beta2 = 0.999
+    t = 5
+    bc1 = [1.0 - b ** t for b in beta1]
+    bc2 = [1.0 - beta2 ** t] * P
+    return dict(alpha=alpha, gru_decay=list(beta1), lamb_eff=[2.0] * P,
+                beta1=list(beta1), bc1=bc1, bc2=bc2,
+                rescale=0.1, beta2=beta2, lr=1e-3, wd=0.01, eps=1e-8)
+
+
+@pytest.mark.hw
+@_skip_no_hw
 def test_megakernel_single_step_vs_per_op():
     """(B1) Single SG2 step: persistent megakernel vs the parity-validated
-    csa_hca_step_one. Same inputs/weights/state → smart_grad-equivalent params +
-    moments within 1e-5. The per-op path is the ORACLE (already 13/0 parity)."""
-    pytest.skip(
-        "Spec ready; the integrator wires ops.sg2_meta_optimizer_tail per "
-        "INTEGRATION-NOTES.md, then this body drives both paths and asserts "
-        "max|Δparam|, max|Δexp_avg|, max|Δexp_avg_sq|, max|Δmu|, max|Δslow|, "
-        "max|Δgru_state| < 1e-5. See INTEGRATION-NOTES.md §'GPU test wiring'.")
+    csa_hca_step_one. Same inputs/weights/state → params + moments within 1e-5.
+    The per-op path is the ORACLE (already 13/0 parity)."""
+    torch = _torch
+    torch.manual_seed(123)
+    net, opt, w, peer_Ws, pkA, pkB, meta = _build_net_and_bundle()
+    GH = net.gru_hidden
+
+    # A few random param tensors of assorted sizes. CONTINUOUS randn grads →
+    # P(|grad| tie)=0, so the megakernel's driver-perm and the oracle's internal
+    # unstable torch.sort coincide (no tie-break ambiguity — the documented #1
+    # spurious-failure risk). N=333 forces the low-rank CSA indexer to select
+    # 16-of-84 compressed entries (the path the eager-net anchor could not cover
+    # for N<=64). TWO seeds: insurance against a seed-lucky CSA-indexer / PEER
+    # top-k tie-order (a documented parity hotspot for tied scores).
+    sizes = [5, 17, 64, 200, 1, 333]
+    P = len(sizes)
+    worst_all = 0.0
+    for trial, gseed in enumerate((77, 4242)):
+        g0 = torch.Generator(device='cuda'); g0.manual_seed(gseed)
+        params0 = [torch.randn(m, device='cuda', generator=g0) * 0.5 for m in sizes]
+        grads = [torch.randn(m, device='cuda', generator=g0) * 0.5 for m in sizes]
+        sharps = [torch.randn(m, device='cuda', generator=g0) * 0.3 for m in sizes]
+        st0 = _make_states(sizes, GH, seed=11 + trial)
+        scal = _scalars(P, seed=trial)
+
+        # ORACLE copy.
+        p_o = [p.clone() for p in params0]
+        st_o = {k: [t.clone() for t in v] for k, v in st0.items()}
+        _per_op_oracle(net, w, peer_Ws, pkA, pkB, p_o,
+                       [g.clone() for g in grads], [s.clone() for s in sharps],
+                       st_o, scal, GH)
+
+        # MEGAKERNEL copy (driver mutates in place).
+        p_m = [p.clone() for p in params0]
+        st_m = {k: [t.clone() for t in v] for k, v in st0.items()}
+        opt.sg2_step_megakernel(
+            p_m, [g.clone() for g in grads], [s.clone() for s in sharps],
+            st_m, meta, scal)
+
+        torch.cuda.synchronize()
+        diffs = {}
+        diffs['param'] = max(float((a - b).abs().max()) for a, b in zip(p_m, p_o))
+        for k in ('exp_avg', 'exp_avg_sq', 'mu', 'slow', 'gru_state'):
+            diffs[k] = max(float((a - b).abs().max())
+                           for a, b in zip(st_m[k], st_o[k]))
+        worst = max(diffs.values())
+        worst_all = max(worst_all, worst)
+        print(f"\n[B1] megakernel vs per-op (single step, seed={gseed}):")
+        for k, v in diffs.items():
+            print(f"      max|Δ{k}| = {v:.3e}")
+        print(f"      WORST    = {worst:.3e}  (tol 1e-5)")
+        assert worst < 1e-5, (
+            f"B1 megakernel vs per-op diverged (seed={gseed}): "
+            + ", ".join(f"{k}={v:.2e}" for k, v in diffs.items()))
+    print(f"[B1] WORST across seeds = {worst_all:.3e}  (tol 1e-5)")
 
 
-@hw
+@pytest.mark.hw
+@_skip_no_hw
 def test_megakernel_trajectory_vs_per_op():
     """(B2) 200-step trajectory: a fixed random-grad sequence through both paths;
     per-step mean|param| proxy + final params within 1e-5 (bias-correction / EMA
     drift over a trajectory)."""
-    pytest.skip(
-        "Spec ready; integrator wires the binding then loops 200 steps feeding "
-        "an identical grad sequence to both paths, asserting the mean|param| "
-        "trajectory and final |Δparam| stay < 1e-5.")
+    torch = _torch
+    torch.manual_seed(321)
+    net, opt, w, peer_Ws, pkA, pkB, meta = _build_net_and_bundle()
+    GH = net.gru_hidden
+
+    sizes = [17, 64, 200]
+    P = len(sizes)
+    g0 = torch.Generator(device='cuda'); g0.manual_seed(909)
+    params0 = [torch.randn(m, device='cuda', generator=g0) * 0.5 for m in sizes]
+    sharps = [torch.randn(m, device='cuda', generator=g0) * 0.3 for m in sizes]
+    st0 = _make_states(sizes, GH, seed=22)
+    scal = _scalars(P, seed=1)
+
+    p_o = [p.clone() for p in params0]
+    st_o = {k: [t.clone() for t in v] for k, v in st0.items()}
+    p_m = [p.clone() for p in params0]
+    st_m = {k: [t.clone() for t in v] for k, v in st0.items()}
+
+    # FIXED random-grad sequence (continuous → no |grad| ties).
+    gseq = torch.Generator(device='cuda'); gseq.manual_seed(4242)
+    beta1_pt = list(scal['beta1'])          # per-tensor Adam beta1 (layer-scaled)
+    beta2_sh = float(scal['beta2'])
+    worst = 0.0
+    worst_meanproxy = 0.0
+    for step in range(200):
+        # Advance the bias-correction terms each step (t = step+1) so the
+        # trajectory genuinely exercises bias correction (1-beta^t evolving),
+        # not a frozen t. BOTH paths get the identical per-step scalars, so
+        # parity is preserved while the EMA/bias-correction drift is tested.
+        t = step + 1
+        scal['bc1'] = [1.0 - b ** t for b in beta1_pt]
+        scal['bc2'] = [1.0 - beta2_sh ** t] * P
+        grads = [torch.randn(m, device='cuda', generator=gseq) * 0.5 for m in sizes]
+        _per_op_oracle(net, w, peer_Ws, pkA, pkB, p_o,
+                       [g.clone() for g in grads], [s.clone() for s in sharps],
+                       st_o, scal, GH)
+        opt.sg2_step_megakernel(
+            p_m, [g.clone() for g in grads], [s.clone() for s in sharps],
+            st_m, meta, scal)
+        torch.cuda.synchronize()
+        d = max(float((a - b).abs().max()) for a, b in zip(p_m, p_o))
+        worst = max(worst, d)
+        # mean|param| proxy divergence (per-step trajectory health).
+        mp = max(abs(float(a.abs().mean()) - float(b.abs().mean()))
+                 for a, b in zip(p_m, p_o))
+        worst_meanproxy = max(worst_meanproxy, mp)
+
+    final_param = max(float((a - b).abs().max()) for a, b in zip(p_m, p_o))
+    final_state = {k: max(float((a - b).abs().max())
+                          for a, b in zip(st_m[k], st_o[k]))
+                   for k in ('exp_avg', 'exp_avg_sq', 'mu', 'slow', 'gru_state')}
+    print("\n[B2] megakernel vs per-op (200-step trajectory):")
+    print(f"      worst per-step max|Δparam|   = {worst:.3e}")
+    print(f"      worst per-step Δmean|param|  = {worst_meanproxy:.3e}")
+    print(f"      final     max|Δparam|        = {final_param:.3e}")
+    for k, v in final_state.items():
+        print(f"      final     max|Δ{k}| = {v:.3e}")
+    print(f"      (tol 1e-5)")
+    assert worst < 1e-5, f"B2 trajectory max|Δparam| drift {worst:.2e}"
+    assert worst_meanproxy < 1e-5, f"B2 mean|param| proxy drift {worst_meanproxy:.2e}"
 
 
 # ── standalone runner (part A only; no GPU) ───────────────────────────────

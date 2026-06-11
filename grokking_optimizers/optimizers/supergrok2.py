@@ -2333,6 +2333,145 @@ class SuperGrok2(Optimizer):
 
         self._step_counter += 1
 
+    @torch.no_grad()
+    def sg2_step_megakernel(self, params, grads, sharpness_list, states, meta,
+                            scalars):
+        """ONE persistent-kernel SG2 optimizer step over ALL param tensors.
+
+        The launch-elimination driver for csrc/fused/sm_90/
+        opt_stage_supergrok2.cuh (INTEGRATION-NOTES.md §2): replaces the per-op
+        ``supergrok2_batched_step``'s ~15-20 launches/tensor with ONE batched
+        argsort prep + ONE persistent megakernel (CSA/HCA/GRU/PEER/apply for all
+        tensors via the task queue). Mutates ``params`` and the carried state in
+        ``states`` IN PLACE; returns None.
+
+        Args (all explicit — no optimizer-internal scheduling is read, so the
+        scalars cannot desync from a caller that also drives the oracle):
+          params:        list[Tensor]  param tensors (mutated in place)
+          grads:         list[Tensor]  reduced gradients (same order)
+          sharpness_list:list[Tensor]  per-element sharpness (same order)
+          states:        dict of lists-per-tensor with keys
+                         'exp_avg','exp_avg_sq','mu','slow','gru_state'
+                         (gru_state[t] is [n_t, gru_hidden]); all mutated in place
+          meta:          dict — the meta weight bundle (any dtype; upcast to fp32
+                         here once). Keys: input_proj_W/b, csa_{q,k,v,out}_W,
+                         csa_compress_w, csa_idx_{DQ,K}, hca_{q,k,v,out}_W,
+                         gru_{Wz,bz,Wr,br,Wh,bh}, peer_query_Ws,
+                         prod_keys_A/B, expert_{W1,b1,W2,b2}.
+          scalars:       dict — per-tensor arrays 'alpha','gru_decay','lamb_eff',
+                         'beta1','bc1','bc2' (length P) + shared floats 'rescale',
+                         'beta2','lr','wd','eps'.
+        """
+        if not params:
+            return
+        dev = params[0].device
+        GH = self.meta_net.gru_hidden
+
+        # 1) PACK all tensors back-to-back (one contiguous fp32 buffer each). The
+        #    kernel addresses tensor t at row_off[t] .. row_off[t]+n[t].
+        P = len(params)
+        n = torch.tensor([p.numel() for p in params], dtype=torch.int32,
+                         device=dev)
+        row_off = torch.zeros(P, dtype=torch.int64, device=dev)
+        row_off[1:] = torch.cumsum(n.to(torch.int64), 0)[:-1]
+        total = int(n.sum())
+        row_off_cpu = row_off.cpu().tolist()
+        n_cpu = n.cpu().tolist()
+
+        def pack(lst, width=1):
+            out = torch.empty(total * width, dtype=torch.float32, device=dev)
+            for t, x in enumerate(lst):
+                o = row_off_cpu[t] * width
+                out[o:o + x.numel()] = x.reshape(-1).float()
+            return out
+
+        params_packed = pack([p.data for p in params])
+        grads_packed = pack(grads)
+        sharp_packed = pack(sharpness_list)
+        exp_avg_packed = pack(states['exp_avg'])
+        exp_avg_sq_packed = pack(states['exp_avg_sq'])
+        mu_packed = pack(states['mu'])
+        slow_packed = pack(states['slow'])
+        gru_state_packed = pack(states['gru_state'], width=GH)  # [total*GH] row-major
+
+        # 2) THE ONE EXPLICIT PRE-KERNEL SORT (honesty rail #5). Per tensor,
+        #    argsort |grad| ASCENDING reproducing csa_hca_step_one's
+        #    `sort_keys.sort(0, descending=false)` (plain torch.sort, NOT stable
+        #    on CUDA). perm/unsort are PACKED with indices LOCAL to each tensor.
+        perm_packed = torch.empty(total, dtype=torch.int32, device=dev)
+        unsort_packed = torch.empty(total, dtype=torch.int32, device=dev)
+        for t, gt in enumerate(grads):
+            o, m = row_off_cpu[t], n_cpu[t]
+            _, perm = gt.reshape(-1).abs().sort(dim=0, descending=False)  # [m]
+            unsort = perm.argsort()                                       # inverse perm
+            perm_packed[o:o + m] = perm.to(torch.int32)
+            unsort_packed[o:o + m] = unsort.to(torch.int32)
+
+        # 3) Per-CTA workspace. ws_stride = the AUTHORITATIVE C++ binding (so the
+        #    host stride can never drift from the kernel carve). n_ctas == #SMs.
+        Nmax = int(n.max())
+        ws_stride = int(_ops.sg2_ws_stride(Nmax))
+        n_ctas = torch.cuda.get_device_properties(dev).multi_processor_count
+        workspace = torch.empty(n_ctas * ws_stride, dtype=torch.float32,
+                                device=dev)
+
+        # 4) Persistent-context scratch (zero-init; the launcher re-zeros each call).
+        g_next_task = torch.zeros(1, dtype=torch.int32, device=dev)
+        g_arrived = torch.zeros(1, dtype=torch.int32, device=dev)
+        g_generation = torch.zeros(1, dtype=torch.int32, device=dev)
+
+        # 5) Meta bundle as fp32 (upcast ONCE here — the kernel is fp32-compute).
+        def f32(x):
+            x = x if x.dtype == torch.float32 else x.float()
+            return x.contiguous()
+        ne = self.meta_net.num_experts
+
+        # 6) Per-tensor scalar arrays (length P).
+        def sc_arr(key):
+            return torch.as_tensor(scalars[key], dtype=torch.float32,
+                                   device=dev).contiguous()
+        alpha = sc_arr('alpha')
+        gru_decay = sc_arr('gru_decay')
+        lamb_eff = sc_arr('lamb_eff')
+        beta1 = sc_arr('beta1')
+        bc1 = sc_arr('bc1')
+        bc2 = sc_arr('bc2')
+
+        _ops.sg2_meta_optimizer_tail(
+            params_packed, grads_packed, sharp_packed,
+            exp_avg_packed, exp_avg_sq_packed, mu_packed, slow_packed,
+            gru_state_packed, perm_packed, unsort_packed, n, row_off,
+            workspace, ws_stride,
+            f32(meta['input_proj_W']), f32(meta['input_proj_b']),
+            f32(meta['csa_q_W']), f32(meta['csa_k_W']), f32(meta['csa_v_W']),
+            f32(meta['csa_out_W']),
+            f32(meta['csa_compress_w']), f32(meta['csa_idx_DQ']),
+            f32(meta['csa_idx_K']),
+            f32(meta['hca_q_W']), f32(meta['hca_k_W']), f32(meta['hca_v_W']),
+            f32(meta['hca_out_W']),
+            f32(meta['gru_Wz']), f32(meta['gru_bz']), f32(meta['gru_Wr']),
+            f32(meta['gru_br']), f32(meta['gru_Wh']), f32(meta['gru_bh']),
+            f32(meta['peer_query_Ws']), f32(meta['prod_keys_A']),
+            f32(meta['prod_keys_B']),
+            f32(meta['expert_W1']).reshape(ne, -1), f32(meta['expert_b1']),
+            f32(meta['expert_W2']).reshape(ne, -1),
+            f32(meta['expert_b2']).reshape(-1),
+            alpha, gru_decay, lamb_eff, beta1, bc1, bc2,
+            float(scalars['rescale']), float(scalars['beta2']),
+            float(scalars['lr']), float(scalars['wd']), float(scalars['eps']),
+            g_next_task, g_arrived, g_generation)
+
+        # 7) UNPACK results back into the per-tensor buffers (params + state).
+        for t, p in enumerate(params):
+            o, m = row_off_cpu[t], n_cpu[t]
+            p.data.copy_(params_packed[o:o + m].reshape(p.shape))
+            states['exp_avg'][t].copy_(exp_avg_packed[o:o + m].reshape(-1))
+            states['exp_avg_sq'][t].copy_(exp_avg_sq_packed[o:o + m].reshape(-1))
+            states['mu'][t].copy_(mu_packed[o:o + m].reshape(-1))
+            states['slow'][t].copy_(slow_packed[o:o + m].reshape(-1))
+            states['gru_state'][t].copy_(
+                gru_state_packed[o * GH:(o + m) * GH].reshape(m, GH))
+
     def _single_param_step(self, param, group, state):
         """Per-parameter step used by `use_grad_hooks=True`.
 

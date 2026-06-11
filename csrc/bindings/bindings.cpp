@@ -1862,8 +1862,40 @@ namespace sg {
 
  DECLARE_SG2(sm90)
 
-DECLARE_SG2(gfx942) 
+DECLARE_SG2(gfx942)
 #undef DECLARE_SG2
+
+// ---------------------------------------------------------------------
+// SuperGrok2 FULL meta-net as ONE persistent megakernel (INTEGRATION-NOTES.md
+// §1). The §1b host wrapper body + the ws-stride accessor are DEFINED in the
+// .cu TU csrc/fused/sm_90/sg2_meta_tail.cu (nvcc-compiled, so the kernel
+// `<<<...>>>` launch + the device-templated launcher are legal). bindings.cpp
+// (host-only .cpp) cannot #include opt_stage_supergrok2.cuh — host gcc cannot
+// parse the launch syntax — so it only extern-declares + PYBIND-registers them.
+// This is a NEW op (sm_90 persistent path); it does NOT alter the existing
+// supergrok2_batched_step path, which stays the parity oracle.
+// ---------------------------------------------------------------------
+void sg2_meta_optimizer_tail(
+    torch::Tensor params_packed, torch::Tensor grads_packed, torch::Tensor sharpness_packed,
+    torch::Tensor exp_avg_packed, torch::Tensor exp_avg_sq_packed,
+    torch::Tensor mu_packed, torch::Tensor slow_packed,
+    torch::Tensor gru_state_packed, torch::Tensor perm_packed, torch::Tensor unsort_packed,
+    torch::Tensor n_per_tensor, torch::Tensor row_off,
+    torch::Tensor workspace, int64_t ws_stride,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, torch::Tensor csa_out_W,
+    torch::Tensor csa_compress_w, torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_K,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, torch::Tensor hca_out_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz, torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1, torch::Tensor expert_W2, torch::Tensor expert_b2,
+    torch::Tensor alpha, torch::Tensor gru_decay, torch::Tensor lamb_eff,
+    torch::Tensor beta1, torch::Tensor bc1, torch::Tensor bc2,
+    double rescale, double beta2, double lr, double wd, double eps,
+    torch::Tensor g_next_task, torch::Tensor g_arrived, torch::Tensor g_generation);
+
+int64_t sg2_ws_stride(int64_t Nmax);
 
 // ---------------------------------------------------------------------
 // Public entry points: thin SG_DISPATCH wrappers around the launchers.
@@ -3441,7 +3473,13 @@ PYBIND11_MODULE(_ops, m) {
  // GEMM-engine selector for the L3-REAL path (task 1). Default "scalar" keeps
  // the old call shape valid (back-compat); the Python wrapper passes "wgmma"
  // for decoder/vit at bf16 to take the tensor-core launchers.
- py::arg("gemm_impl") = "scalar");
+ py::arg("gemm_impl") = "scalar",
+ // GrokAdamW GLOBAL grad-norm clip threshold (decoder L3-TC, mechanism (ii)).
+ // Trailing defaulted arg → back-compat preserved (a stale _ops without it
+ // trips the caller's one-shot TypeError latch, loud degrade). ≤0 ⇒ no clip
+ // (inert for every non-GrokAdamW cell); the decoder GrokAdamW cell passes the
+ // optimizer's grad_clip (=1.0) so the kernel's P2.5 global-norm clip fires.
+ py::arg("grad_clip") = 0.0f);
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);
@@ -3533,6 +3571,42 @@ PYBIND11_MODULE(_ops, m) {
  "SuperGrok2: batched CSA/HCA step for all params at once");
  m.def("supergrok2_mamba_peer_batched_step", &sg::supergrok2_batched_step,
  "Alias of supergrok2_batched_step (back-compat)");
+ m.def("sg2_meta_optimizer_tail", &sg::sg2_meta_optimizer_tail,
+ "SuperGrok2 full meta-net as ONE persistent megakernel (launch-elimination "
+ "of csa_hca_step_one). Consumes the per-tensor PACKED flat buffers + the "
+ "pre-computed |grad|-ascending sort perms; runs CSA/HCA/GRU/PEER/apply "
+ "in-kernel.",
+ py::arg("params_packed"),
+ py::arg("grads_packed"),
+ py::arg("sharpness_packed"),
+ py::arg("exp_avg_packed"),
+ py::arg("exp_avg_sq_packed"),
+ py::arg("mu_packed"),
+ py::arg("slow_packed"),
+ py::arg("gru_state_packed"),
+ py::arg("perm_packed"),
+ py::arg("unsort_packed"),
+ py::arg("n_per_tensor"),
+ py::arg("row_off"),
+ py::arg("workspace"),
+ py::arg("ws_stride"),
+ py::arg("input_proj_W"), py::arg("input_proj_b"),
+ py::arg("csa_q_W"), py::arg("csa_k_W"), py::arg("csa_v_W"), py::arg("csa_out_W"),
+ py::arg("csa_compress_w"), py::arg("csa_idx_DQ"), py::arg("csa_idx_K"),
+ py::arg("hca_q_W"), py::arg("hca_k_W"), py::arg("hca_v_W"), py::arg("hca_out_W"),
+ py::arg("gru_Wz"), py::arg("gru_bz"), py::arg("gru_Wr"), py::arg("gru_br"),
+ py::arg("gru_Wh"), py::arg("gru_bh"),
+ py::arg("peer_query_Ws"), py::arg("prod_keys_A"), py::arg("prod_keys_B"),
+ py::arg("expert_W1"), py::arg("expert_b1"), py::arg("expert_W2"), py::arg("expert_b2"),
+ py::arg("alpha"), py::arg("gru_decay"), py::arg("lamb_eff"),
+ py::arg("beta1"), py::arg("bc1"), py::arg("bc2"),
+ py::arg("rescale"), py::arg("beta2"), py::arg("lr"), py::arg("wd"), py::arg("eps"),
+ py::arg("g_next_task"), py::arg("g_arrived"), py::arg("g_generation"));
+ m.def("sg2_ws_stride", &sg::sg2_ws_stride,
+ "Authoritative floats-per-CTA workspace stride for the SG2 megakernel "
+ "(== sg2_ws_stride<SG2Dims<>>(Nmax)); the Python driver calls this so the "
+ "host allocation can never drift from the kernel's workspace carve.",
+ py::arg("Nmax"));
  m.def("supergrok2_bilevel_fwd_save", &sg::supergrok2_bilevel_fwd_save,
  "SuperGrok2 bilevel: CSA/HCA forward with adjoint state saving");
  m.def("supergrok2_bilevel_fwd_save_batched", &sg::supergrok2_bilevel_fwd_save_batched,
