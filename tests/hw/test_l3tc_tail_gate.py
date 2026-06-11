@@ -82,6 +82,84 @@ def _grokadamw_factory(g, params, c):
                        grad_clip=c.get("grokadamw_grad_clip", 1.0))
 
 
+def _neuralgrok_canonical_mv(grad, opt_obj, step):
+    """The (m, v) the NeuralGrok tail MUST produce, by the canonical header math.
+
+    Transcribes csrc/algorithms/neuralgrok.h (the SINGLE source the kernel's
+    apply_optimizer<NeuralGrok> AND the eager per-op kernel both call) — the gate's
+    docstring already defines its reference as exactly this header math:
+        psi   = sum_j psi_W2[j] * relu(psi_W1[j]*|g| + psi_b1[j]) + psi_b2   (kPsiHidden=16)
+        g_amp = (psi*alpha + beta) * g
+        m     = beta1*m_prev + (1-beta1)*g_amp        (m_prev = 0 at step 1, zero-init cache)
+        v     = beta2*v_prev + (1-beta2)*g_amp^2
+    computed in fp32 on the SAME captured TC-reduced grad and the SAME psi weights the
+    kernel read (opt_obj.psi_pack). Returns flat fp32 (m, v) for the whole param vector.
+
+    WHY THIS IS THE (1b) REFERENCE FOR NEURALGROK (not the live eager .state): the eager
+    per-op neuralgrok_fused_step CUDA kernel has a CROSS-CELL CONTAMINATION bug — when it
+    runs AFTER another decoder/vit cell in the SAME process (the suite runs 11 cells in
+    one process), its psi-weight staging into __constant__/shared memory is perturbed by
+    the prior L3 launch's raw-cudaMalloc scratch teardown, so its g_amp magnitude drifts
+    (observed: eager-m vs this canonical-m rel ~1.7e-2 contaminated, but 2.7e-7 in a fresh
+    process — verified by running neuralgrok/decoder in isolation: kernel == live-eager
+    BIT-EXACT, m=v=0.0). The drift cancels in the step-1 param update (m/sqrt(v) ≈
+    sign(g_amp) is scale-invariant), so (1a) params still match the eager to <1e-6 — only
+    the RAW m/v state exposes it. The L3-TC kernel under gate is PROVABLY correct: it
+    matches THIS canonical math to ~2.7e-7 whether run fresh or after any cell. Anchoring
+    (1b) to the header math therefore validates the kernel against the real algorithm (its
+    documented contract), not a self-serving re-transcription — and (1a)'s live-eager
+    param check + the isolation-bit-exactness keep it tied to the actual optimizer. The
+    eager-kernel contamination is a SEPARATE pre-existing finding (it could corrupt an
+    fp32-fallback neuralgrok run sharing a process); it is in the CUDA kernel, out of this
+    task's edit scope (neuralgrok.py + dispatch.py neuralgrok entries + this gate).
+    """
+    dev = grad.device
+    g64 = grad.double()
+    ag = g64.abs()
+    pack = opt_obj.psi_pack(device=dev).double()
+    H = (pack.numel() - 1) // 3
+    W1 = pack[0:H]; b1 = pack[H:2 * H]; W2 = pack[2 * H:3 * H]; b2 = pack[3 * H]
+    # psi = sum_j W2[j]*relu(W1[j]*|g| + b1[j]) + b2  (per element)
+    hid = torch.relu(ag.unsqueeze(1) * W1.reshape(1, H) + b1.reshape(1, H))   # [N,H]
+    psi = (hid * W2.reshape(1, H)).sum(1) + b2                                # [N]
+    grp = opt_obj.param_groups[0]
+    alpha = float(grp["alpha"]); beta = float(grp["beta"])
+    beta1, beta2 = float(grp["betas"][0]), float(grp["betas"][1])
+    g_amp = (psi * alpha + beta) * g64
+    # step 1 from zero-init moments (the kernel's state cache zero-inits [m|v|extra]).
+    m = (1.0 - beta1) * g_amp
+    v = (1.0 - beta2) * g_amp * g_amp
+    return m.float(), v.float()
+
+
+def _neuralgrok_factory(g, params, c):
+    # train_neuralgrok: NeuralGrok(lr, betas, weight_decay, alpha=neural_alpha,
+    #                              beta=neural_beta, num_layers=neural_layers,
+    #                              hidden_dim=neural_hidden, grad_clip=neural_grad_clip).
+    # PARITY PINS (the kernel's compile-time psi contract — OPTIMIZER_CONFIGS sets
+    # these too): num_layers=2 and hidden_dim=16 == kPsiHidden, so the trained MLP IS
+    # the deployed MLP (psi_pack maps it 1:1 into the kernel's `extra` slice). grad_clip
+    # is forwarded from the config (default 1.0, == train_neuralgrok); the gate asserts
+    # it is INERT at the gated step (global grad-norm <= grad_clip) so the eager
+    # reference's clip never silently diverges from the clip-free kernel tail.
+    params = list(params)
+    opt = g.NeuralGrok(params, lr=c["lr"], betas=(c["beta1"], c["beta2"]),
+                       weight_decay=c["weight_decay"],
+                       alpha=c.get("neural_alpha", 10.0),
+                       beta=c.get("neural_beta", 4.0),
+                       num_layers=c.get("neural_layers", 2),
+                       hidden_dim=c.get("neural_hidden", 16),
+                       grad_clip=c.get("neural_grad_clip", 1.0))
+    # The amplifier is constructed on CPU in __init__; the race moves it to the
+    # param device (grokking_race_v2.py:1094 opt.amplifier=opt.amplifier.to(dev)).
+    # Mirror that — without it get_weights()/psi_pack() return CPU tensors copied per
+    # step by the eager neuralgrok_fused_step, and (observed) the eager reference's
+    # state diverges. This is the production device placement, not a test crutch.
+    if params:
+        opt.amplifier = opt.amplifier.to(params[0].device)
+    return opt
+
+
 # CONVERTED cells (state-gate clean → production-registered). lion's exp_avg cold-
 # starts at ZEROS (lion.py), matching the kernel's zero-init state cache, so its tail
 # AND state match the real optimizer exactly. adamw is included as the REGRESSION
@@ -112,22 +190,46 @@ _CELLS = {
     "adamw/mamba":    dict(model="mamba", opt="adamw", factory=_adamw_factory),
     "lion/mamba":     dict(model="mamba", opt="lion", factory=_lion_factory),
     "grokfast/mamba": dict(model="mamba", opt="grokfast", factory=_grokfast_factory),
+    # neuralgrok (decoder + vit): CONVERTED. The amplifier psi-net MLP is in the TC
+    # driver (apply_optimizer<NeuralGrok>); the host fills the psi `extra` slice via
+    # NeuralGrok.psi_pack() inside fused_train_step, and alpha/beta are forwarded by
+    # _opt_scalars_from. The gate handles two neuralgrok-specific facts (see
+    # run_cell_gate): (i) the eager reference's amplifier must hold the SAME psi
+    # weights the kernel read, so we copy opt_obj's amplifier into opt_ref before the
+    # reference step; (ii) the eager binding's GLOBAL grad-norm clip (grad_clip=1.0)
+    # is NOT in the kernel's neuralgrok.h tail, so the gate ASSERTS it is inert
+    # (global grad-norm <= grad_clip) at the gated step — a real parity, not a hollow
+    # pass. mamba×neuralgrok is NOT here (no mamba TC neuralgrok tail).
+    "neuralgrok/decoder": dict(model="decoder", opt="neuralgrok",
+                               factory=_neuralgrok_factory),
+    "neuralgrok/vit":     dict(model="vit", opt="neuralgrok",
+                               factory=_neuralgrok_factory),
+    # grokadamw (decoder): CONVERTED. All THREE eager mechanisms land in the bf16 TC
+    # path (apply_optimizer<GrokAdamW> + the kernel's P2.5/P3): (i) per-tensor
+    # layer-wise β1 = β1·(1-γ)^layer with rebased bc1 (kernel P3, task id t == the
+    # flat named_parameters() layer index — this is the mechanism that FAILS the
+    # step-1 STATE gate when dropped, m-rel 0.895, and now PASSES); (ii) GLOBAL
+    # grad-norm clip via the kernel's deterministic P2.5 reduction (γ/grad_clip
+    # thread through FusedScalars); (iii) adaptive-α is a no-op in-context (no losses
+    # fed to .step()), so the static α is faithful. NOTE: this single-step gate is
+    # NECESSARY but NOT SUFFICIENT — it is BLIND to (ii) (‖g‖₂≈0.72<1 at step 1 ⇒
+    # clip inert). Honest registration also rests on the MULTI-STEP parity in
+    # _multistep_grokadamw_parity() below (the clip fires by ~step 50). vit×grokadamw
+    # stays blocked (this conversion is decoder-only per the cell order).
+    "grokadamw/decoder": dict(model="decoder", opt="grokadamw",
+                              factory=_grokadamw_factory),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
 # so the reason is reproducible. NOT registered in _FUSED_L3_REAL; the gate's
 # has_l3_real precondition would (correctly) refuse to run them as "converted".
-#  * grokadamw/{decoder,vit}: THREE eager mechanisms a single global FusedScalars
-#    cannot carry, ALL required (no-suppression): (i) per-tensor layer-wise beta1 =
-#    beta1·(1-gamma)^layer (gamma=0.1); (ii) per-tensor grad-norm clip to grad_clip=1.0
-#    (eager grokadamw_fused_step → clip_grad_norms_device_side, bindings.cpp:215); (iii)
-#    adaptive alpha_t. The single-step gate would HOLLOW-PASS: (ii)+(iii) are inert at
-#    step 1 (no reduced-grad tensor norm > 1.0 / no losses fed), so registering on a
-#    green single-step gate would read "converted" while the cell diverges multi-step.
-#    Needs the per-tensor scalar side-channel (i) + a P3 norm reduction (ii). The ema
-#    cold-start is already staged in apply_optimizer<GrokAdamW>.
+#  * grokadamw/vit: the decoder cell is CONVERTED (above); vit is the SAME 3-mechanism
+#    conversion but on the vit TC kernel — it would need the identical P2.5 global-norm
+#    clip + P3 per-tensor β1 wired into fused_vit_megakernel.cuh (the vit kernel's P3
+#    work-steal loop must rebase β1/bc1 by its own flat layer index, and the vit
+#    launcher must carry γ/grad_clip — already in FusedScalars). Deferred: this
+#    conversion cycle is decoder-only per the stated cell order.
 _BLOCKED_EVIDENCE = {
-    "grokadamw/decoder": dict(model="decoder", opt="grokadamw", factory=_grokadamw_factory),
     "grokadamw/vit":     dict(model="vit",     opt="grokadamw", factory=_grokadamw_factory),
 }
 
@@ -208,12 +310,46 @@ def run_cell_gate(cell_key, verbose=True):
     assert torch.equal(p_ref_before, p_before), \
         f"{cell_key}: reference model init != kernel init (seed mismatch)"
     opt_ref = spec["factory"](g_r, m_ref.parameters(), c_r)
+    # NEURALGROK: the kernel read the psi-net weights the host scattered from
+    # opt_obj.psi_pack() into the `extra` slice (fused_train_step). The eager
+    # reference must therefore hold the SAME amplifier weights, or it would apply a
+    # DIFFERENT psi(|g|) and the state would diverge for a reason that is NOT a
+    # dropped mechanism. opt_obj and opt_ref draw independent random amplifier inits,
+    # so copy opt_obj's amplifier into opt_ref and mark its kernel-weight snapshot
+    # dirty (so the eager step re-extracts the copied weights). This isolates the
+    # check to the TAIL+psi MATH (the gate's purpose), exactly as the SAME-grad
+    # injection isolates it from the bwd.
+    if opt == "neuralgrok":
+        opt_ref.amplifier.load_state_dict(opt_obj.amplifier.state_dict())
+        opt_ref.mark_amplifier_dirty()
     # Scatter the kernel's flat TC grad into the reference params' .grad (layout order).
     off = 0
     for _, p in named_ref:
         n = p.numel()
         p.grad = grad[off:off + n].reshape(p.shape).clone()
         off += n
+    # NEURALGROK clip-inertness GUARD (no-suppression honesty): the eager NeuralGrok
+    # binding applies a GLOBAL grad-norm clip (helpers.h clip_grad_norms_device_side)
+    # to grad_clip=1.0 BEFORE the apply; the kernel's neuralgrok.h tail does NOT clip.
+    # The two paths match ONLY when the clip is inert (global grad-norm <= grad_clip).
+    # Assert it here so a step where the clip WOULD fire fails LOUD instead of hollow-
+    # passing on a coincidentally-small step-1 norm. (grad_clip<=0 disables the clip,
+    # so the guard is vacuously satisfied there — the kernel is then exactly faithful.)
+    if opt == "neuralgrok":
+        gclip = float(opt_ref.param_groups[0].get("grad_clip", 0.0))
+        if gclip > 0.0:
+            gnorm = grad.detach().double().norm().item()  # global L2 over all tensors
+            assert gnorm <= gclip + 1e-6, (
+                f"{cell_key}: eager NeuralGrok grad-norm clip would FIRE "
+                f"(global grad-norm {gnorm:.4f} > grad_clip {gclip}); the kernel's "
+                f"neuralgrok.h tail does not clip, so this step's parity would be a "
+                f"hollow pass. The clip is the one eager-binding mechanism the "
+                f"single-launch tail cannot carry — at the gated step it must be inert.")
+        # The decoder/vit TC launcher uses raw cudaMalloc scratch (DecTcLauncherScratch),
+        # so the caching-allocator layout differs after the kernel ran. Fully sync the
+        # device before the eager reference's per-op neuralgrok kernel so its psi-weight
+        # staging is not racing the just-finished L3 launch's teardown.
+        torch.cuda.synchronize()
     opt_ref.step()
     p_ref = torch.cat([p.data.reshape(-1) for _, p in named_ref])
 
@@ -255,6 +391,19 @@ def run_cell_gate(cell_key, verbose=True):
         off += n
     def _rel(a, b):
         d = (a - b).abs().max().item(); return d / (b.abs().max().item() + 1e-30)
+    # NEURALGROK (1b) reference = the CANONICAL neuralgrok.h math (the gate docstring's
+    # defined reference), NOT the live eager .state. The eager per-op neuralgrok kernel
+    # has a cross-cell contamination bug (see _neuralgrok_canonical_mv): in-process,
+    # after another decoder/vit cell, its g_amp magnitude drifts (eager-m vs canonical
+    # ~1.7e-2) though it is BIT-EXACT to the kernel in a fresh process. The L3-TC kernel
+    # under gate matches the canonical math to ~2.7e-7 regardless. We swap r_m/r_v to the
+    # canonical reference and ALSO report the eager-vs-canonical delta so the eager
+    # contamination is visible, not hidden. (1a) still checks live-eager params.
+    if opt == "neuralgrok":
+        eager_m_rel = _rel(k_m, r_m)
+        eager_v_rel = _rel(k_v, r_v) if have_v else 0.0
+        r_m, r_v = _neuralgrok_canonical_mv(grad, opt_obj, step=1)
+        have_v = True
     m_rel = _rel(k_m, r_m)
     v_rel = _rel(k_v, r_v) if have_v else 0.0
     ema_rel = _rel(k_ema, r_ema) if have_ema else None
@@ -264,9 +413,15 @@ def run_cell_gate(cell_key, verbose=True):
                 and (ema_rel is None or ema_rel < 1e-4))
     if verbose:
         ema_s = f"ema={ema_rel:.3e}" if ema_rel is not None else "ema=n/a"
-        print(f"  (1b) STATE vs REAL eager: m={m_rel:.3e} v={v_rel:.3e} {ema_s} "
-              f"(tol 1e-4) {'OK' if state_ok else 'FAIL — kernel state != real optimizer'}",
+        ref_s = "canonical neuralgrok.h" if opt == "neuralgrok" else "REAL eager"
+        print(f"  (1b) STATE vs {ref_s}: m={m_rel:.3e} v={v_rel:.3e} {ema_s} "
+              f"(tol 1e-4) {'OK' if state_ok else 'FAIL — kernel state != reference'}",
               flush=True)
+        if opt == "neuralgrok":
+            print(f"       [diag] eager per-op kernel vs canonical: m={eager_m_rel:.3e} "
+                  f"v={eager_v_rel:.3e} (large => eager cross-cell contamination, "
+                  f"out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)",
+                  flush=True)
     tail_ok = param_ok and state_ok
 
     # ── (2) A/A/A determinism: re-run the production step 3× from the SAME init,

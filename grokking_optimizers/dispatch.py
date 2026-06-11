@@ -689,28 +689,50 @@ _FUSED_L3_REAL = frozenset({
     # are NOT mamba TC tails (grokadamw's 3-mechanism gap; neuralgrok host-coupled).
     ("mamba3", "lion"),
     ("mamba3", "grokfast"),
-    # NOTE — BLOCKED (state-gate evidence), deliberately NOT registered:
-    #  * grokadamw: THREE eager mechanisms the single global FusedScalars/state cache
-    #    cannot carry, ALL required for a faithful conversion (no-suppression):
-    #      (i)  per-tensor layer-wise beta1 = beta1·(1-gamma)^layer (gamma=0.1) —
-    #           rebase_state rebases POINTERS, not scalars; needs an offsets-indexed
-    #           per-tensor scalar side-channel next to FusedScalars (ABI-gap pattern).
-    #           This is a HARD state-gate fail AT STEP 1 (not a hollow-pass): the kernel
-    #           uses one global beta1 while eager uses beta1·(1-gamma)^layer, so the
-    #           m-state diverges for every layer>=1 (m=beta1·m_prev+(1-beta1)·g_amp
-    #           differs) — OBSERVED m-rel = 0.895 at step 1 (deepest layer: beta1_i→0 so
-    #           eager m≈g_amp while the kernel's global-beta1 m=0.1·g_amp; reproduce by
-    #           temp-registering grokadamw/decoder and running the tail gate).
-    #      (ii) per-tensor grad-NORM clip to grad_clip=1.0 (the eager grokadamw_fused_step
-    #           calls clip_grad_norms_device_side BEFORE apply, bindings.cpp:215) — needs
-    #           a P3 per-tensor norm reduction; the kernel's grokadamw_step has no clip.
-    #           ADDITIONAL multi-step divergence: measured inert at step 1 (max grad-norm
-    #           0.72<1.0) but FIRES by step 50 (param rel 2e-4) as grads grow.
-    #      (iii) adaptive alpha_t = alpha·exp(-kappa·signal) from the train/val gap —
-    #           also multi-step (no losses fed at step 1).
-    #    The ema cold-start is staged in apply_optimizer<GrokAdamW>; the remaining gap is
-    #    exactly (i)+(ii)+(iii). (i) alone fails the step-1 state gate, so the cell cannot
-    #    be registered on any single-step pass.
+    # neuralgrok (decoder + vit): CONVERTED. The amplifier psi-net MLP is already
+    # in the TC driver (apply_optimizer<NeuralGrok>, opt_components.cuh:238-251),
+    # and the decoder/vit TC launchers bind st.psi_W1/b1/W2 from the `extra` state
+    # slice. The missing seam was HOST-SIDE: (1) the psi-net pack must be written
+    # into extra[0..3H+1] (fused_train_step now scatters NeuralGrok.psi_pack() in
+    # every step), and (2) the amplifier is trained host-side on a cadence
+    # (NeuralGrok.maybe_train_amplifier; the kernel cannot run the lookahead
+    # autograd). alpha+beta are forwarded by _opt_scalars_from so the kernel's
+    # (psi*alpha+beta)*g uses the live neural_alpha/neural_beta. State-gate clean:
+    # the kernel and the real eager NeuralGrok consume the SAME TC-reduced grad and
+    # the SAME psi weights, so m/v match to fp32 reorder tol (no per-element `extra`
+    # ema for neuralgrok — extra carries the psi PACK, which the kernel does not
+    # write, so it survives the step). neuralgrok's grad_clip is a GLOBAL grad-norm
+    # clip in the eager BINDING (helpers.h clip_grad_norms_device_side), NOT in the
+    # neuralgrok.h algorithm the kernel implements; the L3-TC gate asserts the clip
+    # is INERT (global grad-norm <= grad_clip) at the gated step so the parity is
+    # real, not a hollow pass. mamba×neuralgrok stays OUT (no mamba TC neuralgrok
+    # tail — the mamba launcher's opt_id switch does not include NeuralGrok).
+    ("transformer_decoder", "neuralgrok"),
+    ("vit", "neuralgrok"),
+    # grokadamw (decoder): CONVERTED. The THREE eager mechanisms ALL land now (the
+    # ema cold-start was already staged in apply_optimizer<GrokAdamW>); the cell is
+    # no longer a hollow pass:
+    #   (i)  PER-TENSOR LAYER-WISE β1 = β1·(1-γ)^layer (γ via FusedScalars.gamma).
+    #        Applied in the kernel's P3 work-steal loop where the task id t == the
+    #        flat named_parameters() layer index (kDecOffsets order == eager
+    #        enumeration), with bc1 ALSO rebased (1-β1_i^step) so m_hat=m/bc1 matches
+    #        eager (β1-only re-fails 1a ~9.6× on the deep layer). bc2 stays global.
+    #        This is the mechanism that failed the STEP-1 state gate (m-rel 0.895);
+    #        it now passes.
+    #   (ii) GLOBAL grad-norm clip to grad_clip (FusedScalars.grad_clip). The eager
+    #        clip_grad_norms_device_side (helpers.h) is a GLOBAL norm over ALL
+    #        tensors, one clip_coef = grad_clip/(‖g‖₂+1e-6) when ‖g‖₂>grad_clip. The
+    #        kernel computes it ON-DEVICE in a P2.5 deterministic ascending-CTA
+    #        reduction over the reduced grad → clip_coef, applied per-element in the
+    #        tail. grad_out is NOT mutated (the return_grad oracle + the eager-side
+    #        clip both see the unclipped grad). Inert at step 1 (‖g‖₂≈0.72<1) but
+    #        FIRES by ~step 50 — so the single-step gate is BLIND to it; honest
+    #        registration rests on a MULTI-STEP parity (kernel-with-clip tracks eager
+    #        to fp32-reorder tol; kernel-without-clip reproduces the ~2e-4 divergence).
+    #   (iii) adaptive α = α·exp(-κ·signal): a genuine NO-OP in-context. No race/gate
+    #        path feeds (train_loss, val_loss) to GrokAdamW.step(), so eager α stays
+    #        at α_init = the kernel's static α for ALL steps. Faithful, not dropped.
+    ("transformer_decoder", "grokadamw"),
 })
 
 _FUSED_REGISTRY = {}
@@ -884,9 +906,42 @@ def _opt_scalars_from(optimizer, step):
     if "grokfast_alpha" in g:
         out["alpha"] = float(g["grokfast_alpha"])
         out["lamb"] = float(g.get("grokfast_lamb", 2.0))
-    elif "alpha" in g and "lamb" in g:   # grokadamw (also lion has no alpha key)
+    elif "alpha" in g and "beta" in g and "lamb" not in g:
+        # neuralgrok: the in-kernel apply_optimizer<NeuralGrok> computes
+        # g_amp = (psi*alpha + beta)*g (opt_components.cuh:250 / neuralgrok.h:70),
+        # reading st.alpha AND st.beta. NeuralGrok's param_groups carry `alpha`
+        # (amplification scale) and `beta` (affine psi term) but NO `lamb`, which
+        # distinguishes it from grokadamw below. Forward BOTH so the kernel uses the
+        # live configured values (neural_alpha=10.0, neural_beta=4.0) instead of the
+        # FusedScalars defaults (0.98/0.0). `beta` lands in scalars["beta"], which
+        # fused_step maps to the FusedScalars.beta field the apply reads.
         out["alpha"] = float(g["alpha"])
+        out["beta"] = float(g["beta"])
+    elif "alpha" in g and "lamb" in g:   # grokadamw (also lion has no alpha key)
         out["lamb"] = float(g["lamb"])
+        # GrokAdamW decoder L3-TC — ALL THREE mechanisms thread here:
+        #  (iii) ADAPTIVE α = α_init·exp(-κ·signal). The L3 path REPLACES the eager
+        #        opt.step() (where α adaptation lives), so we must pass the LIVE α_t
+        #        here or the adaptation is dropped on the fused path (suppression in
+        #        the race, which feeds train/val losses on a cadence). When the
+        #        optimizer exposes _alpha_for_group (a GrokAdamW), use it: it returns
+        #        α_init until a (train_loss,val_loss) signal has been set (so the
+        #        single-step gate + early steps are unchanged) and α_init·exp(-κ·
+        #        signal) once the race/parity sets opt._grok_signal/_signal_active
+        #        BEFORE the step. Falls back to the static group α otherwise.
+        if hasattr(optimizer, "_alpha_for_group"):
+            out["alpha"] = float(optimizer._alpha_for_group(g))
+        else:
+            out["alpha"] = float(g["alpha"])
+        #  (i) layer-wise β1 = β1·(1-γ)^layer (kernel P3, per-tensor) and (ii) the
+        #      GLOBAL grad-norm clip to grad_clip (kernel P2.5). Both are grokadamw-
+        #      only param_group keys; every other optimizer lacks them, so they
+        #      default to the inert FusedScalars value (0.0 ⇒ single global β1 / no
+        #      clip). They make the cell a faithful conversion, not a hollow pass.
+        if "gamma" in g:
+            out["gamma"] = float(g["gamma"])
+        if "grad_clip" in g:
+            out["grad_clip"] = float(g["grad_clip"])
     return out
 
 
@@ -1034,6 +1089,24 @@ _L3_WGMMA_CELLS = frozenset({
     # representable in the single global FusedScalars; see the _FUSED_L3_REAL note.
     ("transformer_decoder", "grokfast"),
     ("vit", "grokfast"),
+    # neuralgrok (decoder + vit): the bf16 TC launcher dispatches opt_id=6
+    # (OptId::NeuralGrok) → apply_optimizer<NeuralGrok> over the TC-reduced grad,
+    # binding the psi-net from the `extra` slice the host fills via psi_pack(). The
+    # fwd+bwd is the SAME validated wgmma decoder/vit kernel; only the per-element
+    # tail differs. mamba×neuralgrok is NOT here (no mamba TC neuralgrok tail).
+    ("transformer_decoder", "neuralgrok"),
+    ("vit", "neuralgrok"),
+    # grokadamw (decoder): CONVERTED. All THREE eager mechanisms now land in the
+    # bf16 TC path (opt_id=3 → apply_optimizer<GrokAdamW>): (i) per-tensor
+    # layer-wise β1=β1·(1-γ)^layer + rebased bc1 (kernel P3, t==flat layer index);
+    # (ii) GLOBAL grad-norm clip to grad_clip (kernel P2.5 deterministic global-norm
+    # reduction → clip_coef, applied to g in the tail, grad_out NOT mutated);
+    # (iii) adaptive-α is a no-op in-context (no train/val losses fed to .step()),
+    # so the static α is faithful. γ/grad_clip thread via FusedScalars (gamma,
+    # grad_clip appended). Validated: single-step state-gate + a MULTI-STEP parity
+    # (the clip fires by ~step 50; kernel tracks eager to fp32-reorder tol). vit is
+    # NOT here yet (this conversion is decoder-only per the cell order).
+    ("transformer_decoder", "grokadamw"),
 })
 
 
@@ -1262,6 +1335,33 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         raise RuntimeError(
             f"fused_train_step: unknown input kind {spec['kind']!r} for {model_c}")
 
+    # neuralgrok SEAM: scatter the FRESH amplifier psi-net pack into the HEAD of the
+    # `extra` state slice (state[2*total : 2*total + 3H+1]) before the kernel runs.
+    # The TC launcher binds st.psi_W1/b1/W2 from extra[0/H/2H] (kPsiW1Off/...), so
+    # the kernel reads the host-owned amplifier weights from here; the kernel's
+    # apply_optimizer<NeuralGrok> reads but NEVER writes `extra` for neuralgrok (it
+    # writes only m/v), so the pack we lay down is exactly what the device evaluates.
+    # We re-lay it EVERY step (cheap, 49 floats) so a host-trained amplifier
+    # (maybe_train_amplifier) is picked up on the very next launch — the snapshot
+    # refresh the megakernel path needs (it cannot call mark_amplifier_dirty back
+    # into the kernel). psi_pack() asserts hidden_dim==16 (the kernel's compile-time
+    # psi width) so a mismatched MLP fails LOUD instead of mis-binding the extra
+    # slice. Guard on the method so a non-NeuralGrok optimizer (the parity-test
+    # stand-ins) never trips it.
+    if opt_name == "neuralgrok":
+        if not hasattr(optimizer, "psi_pack"):
+            raise RuntimeError(
+                "fused_train_step: neuralgrok L3 cell requires an optimizer exposing "
+                "psi_pack() to fill the kernel's psi `extra` slice; got "
+                f"{type(optimizer).__name__}. Pass a NeuralGrok instance.")
+        pack = optimizer.psi_pack(device=device)
+        npk = pack.numel()
+        if 2 * total + npk > state.numel() - 1:   # -1: the trailing loss slot
+            raise RuntimeError(
+                f"fused_train_step: psi pack ({npk} floats) does not fit the extra "
+                f"slice (state has {state.numel()}, needs >= {2 * total + npk + 1}).")
+        state[2 * total:2 * total + npk].copy_(pack)
+
     scalars = _opt_scalars_from(optimizer, step)
     # opt_only=False selects the L3-REAL decoder path in dispatch.cpp (which reads
     # tokens/targets from `input` and runs the real fwd+bwd+adamw). The 33 surrogate
@@ -1278,6 +1378,20 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         _extra_scalars["alpha"] = scalars["alpha"]
     if "lamb" in scalars:
         _extra_scalars["lamb"] = scalars["lamb"]
+    # neuralgrok's affine psi term: the kernel reads st.beta in (psi*alpha+beta)*g.
+    # _opt_scalars_from sets scalars["beta"] only for neuralgrok; omitting it would
+    # leave the FusedScalars.beta default (0.0) and drop the +beta amplification.
+    if "beta" in scalars:
+        _extra_scalars["beta"] = scalars["beta"]
+    # grokadamw decoder L3-TC mechanisms (i)+(ii): the kernel reads st.gamma
+    # (layer-wise β1 = β1·(1-γ)^layer, P3) and st.grad_clip (GLOBAL grad-norm clip,
+    # P2.5). _opt_scalars_from sets these only for grokadamw; omitting them leaves
+    # the inert FusedScalars defaults (0.0 ⇒ single global β1 / no clip), which is
+    # the hollow-pass the gate names. Forward them so the real mechanisms execute.
+    if "gamma" in scalars:
+        _extra_scalars["gamma"] = scalars["gamma"]
+    if "grad_clip" in scalars:
+        _extra_scalars["grad_clip"] = scalars["grad_clip"]
     ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],

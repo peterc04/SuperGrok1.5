@@ -23,6 +23,15 @@ from grokking_optimizers.optimizers.adamw import _validate_grad
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
+# The L3-TC megakernel evaluates the psi-net at a COMPILE-TIME hidden width
+# (csrc/fused/sm_90/opt_components.cuh: static constexpr int kPsiHidden = 16, and
+# the eager per-op full_step is instantiated <16> too). The amplifier MUST use this
+# width for the L3 path so the trained net == the deployed net (no A3-class
+# train/deploy split). OPTIMIZER_CONFIGS["neuralgrok"] pins neural_hidden=16 to
+# match. Mirror it here as the single Python-side source of truth (psi_pack asserts
+# against it); keep byte-identical to the kernel constant.
+KERNEL_PSI_HIDDEN = 16
+
 
 # Activation/gradient checkpointing helper (mirrors grokking_race_v2.py).
 # Only checkpoints when training AND grad is being tracked — under
@@ -109,6 +118,59 @@ class _Amplifier(nn.Module):
         b_last = last_linear.bias.detach().float().contiguous()
 
         return W1, b1, W_last, b_last
+
+    def psi_pack(self, device=None) -> Tensor:
+        """The psi-net weights flattened into the L3-TC kernel's `extra`-slice layout.
+
+        The L3-TC megakernel (mega_{decoder,vit}_real_adamw_tc_launcher.cu) does NOT
+        take the amplifier weights as a separate ABI arg — it binds st.psi_W1/b1/W2
+        from the HEAD of the per-tensor `extra` state slice, in the EXACT packing
+        csrc/fused/sm_90/opt_components.cuh (#5) documents:
+
+            extra[0          .. H)        = psi_W1  [H]
+            extra[H          .. 2H)       = psi_b1  [H]
+            extra[2H         .. 3H)       = psi_W2  [H]
+            extra[3H]                     = psi_b2  (scalar; read on-device as W2[H])
+
+        with H == kPsiHidden == 16 (the kernel's COMPILE-TIME psi width). This method
+        returns that contiguous ``[3*H + 1]`` fp32 vector so the host (dispatch.
+        fused_train_step) can scatter the FRESH amplifier weights into the L3 state
+        cache's extra slice every step — the seam that makes the kernel read the
+        host-trained amplifier instead of a null/stale pointer.
+
+        The vector is exactly the same psi math the kernel evaluates: with H==16 and
+        num_layers==2, ``_Amplifier.net`` is ``Linear(1,H) -> ReLU -> Linear(H,1)``,
+        so get_weights' (W1[H,1], b1[H], W_last[1,H], b_last[1]) flatten to
+        (psi_W1[H], psi_b1[H], psi_W2[H], psi_b2) — the per-hidden weights
+        neuralgrok_psi_forward<H> reads positionally.
+
+        Raises if hidden_dim != KERNEL_PSI_HIDDEN: the kernel's psi width is fixed at
+        compile time, so a mismatched amplifier would train/deploy DIFFERENT functions
+        (the A3-class train/deploy split). Loud, not silent.
+        """
+        if self.hidden_dim != KERNEL_PSI_HIDDEN:
+            raise ValueError(
+                f"NeuralGrok.psi_pack: amplifier hidden_dim={self.hidden_dim} but the "
+                f"L3-TC kernel's psi width is fixed at kPsiHidden={KERNEL_PSI_HIDDEN} "
+                f"(compile-time). Build the optimizer with hidden_dim="
+                f"{KERNEL_PSI_HIDDEN} for the L3 path (OPTIMIZER_CONFIGS pins "
+                f"neural_hidden=16), or the kernel reads a different-width MLP than "
+                f"the one trained.")
+        if len(self.net) != 3:
+            raise ValueError(
+                "NeuralGrok.psi_pack: the kernel evaluates a 2-layer MLP "
+                "(Linear-ReLU-Linear); amplifier has num_layers != 2 so the pack "
+                "would not match the deployed psi function. Set num_layers=2.")
+        W1, b1, W_last, b_last = self.get_weights()
+        H = self.hidden_dim
+        pack = torch.empty(3 * H + 1, dtype=torch.float32)
+        pack[0:H].copy_(W1.reshape(-1))          # psi_W1[H]  (Linear(1,H).weight)
+        pack[H:2 * H].copy_(b1.reshape(-1))      # psi_b1[H]
+        pack[2 * H:3 * H].copy_(W_last.reshape(-1))  # psi_W2[H]  (Linear(H,1).weight)
+        pack[3 * H:3 * H + 1].copy_(b_last.reshape(-1))  # psi_b2 (scalar, read on-device)
+        if device is not None:
+            pack = pack.to(device)
+        return pack
 
 
 class NeuralGrok(Optimizer):
@@ -331,6 +393,17 @@ class NeuralGrok(Optimizer):
         """Return the gradient amplifier module."""
         return self.amplifier
 
+    def psi_pack(self, device=None) -> Tensor:
+        """The amplifier psi-net weights in the L3-TC kernel's `extra`-slice layout.
+
+        Thin delegate to :meth:`_Amplifier.psi_pack` (the amplifier owns the weights).
+        dispatch.fused_train_step calls this on the live NeuralGrok every step to
+        scatter the FRESH (possibly just host-trained) psi weights into the L3 state
+        cache's extra slice, so the megakernel evaluates the host-owned amplifier.
+        Returns a contiguous ``[3*kPsiHidden + 1]`` fp32 vector [W1|b1|W2|b2].
+        """
+        return self.amplifier.psi_pack(device=device)
+
     def train_amplifier_step(self, model, val_x, val_y, criterion,
                              amplifier_optimizer=None):
         """Train the gradient amplifier via a one-step lookahead objective.
@@ -519,6 +592,43 @@ class NeuralGrok(Optimizer):
             p.grad = saved_grads.get(name)
 
         return amp_loss.item()
+
+    def maybe_train_amplifier(self, model, val_x, val_y, criterion, step,
+                              every=1, amplifier_optimizer=None):
+        """Host-side amplifier-train CADENCE for the L3-TC path (eager, every k steps).
+
+        The L3-TC megakernel runs the model fwd+bwd+amplified-AdamW in ONE persistent
+        kernel and CANNOT call back into Python autograd to train the amplifier (the
+        amplifier's lookahead objective needs functional_call + a second graph). So the
+        amplifier is trained HOST-SIDE on a cadence, EAGERLY, here: every ``every``
+        steps this runs one ``train_amplifier_step`` (which itself snapshots/restores
+        p.grad and marks the snapshot dirty). The caller then re-extracts the fresh
+        psi_pack() into the kernel's `extra` state slice (dispatch.fused_train_step does
+        this every step, so the just-trained weights are picked up on the very next
+        kernel launch).
+
+        CADENCE PARITY: train_neuralgrok trains the amplifier EVERY step (every==1 — the
+        default here reproduces that). A larger ``every`` is the host-cost amortization
+        the directive allows ("every k steps"); the math each time it fires is byte-
+        identical to train_amplifier_step (== the deployed psi function at num_layers=2,
+        hidden=16).
+
+        REQUIRES the caller to have run model backward already (so p.grad is populated
+        for the lookahead's detached-grad snapshot) — on the L3-TC path the kernel does
+        NOT leave eager grads, so the caller runs a SEPARATE eager fwd+bwd on the train
+        batch to seed p.grad before calling this (the host-side amplifier train is a
+        side computation, distinct from the kernel's in-fused grad). Returns the scalar
+        val loss when it fired this step, else None.
+
+        Args mirror train_amplifier_step; ``step`` is the 1-based global step and
+        ``every`` the cadence. ``amplifier_optimizer`` optional (else the internal Adam).
+        """
+        if every < 1:
+            raise ValueError(f"maybe_train_amplifier: every must be >= 1 (got {every})")
+        if step % every != 0:
+            return None
+        return self.train_amplifier_step(model, val_x, val_y, criterion,
+                                         amplifier_optimizer=amplifier_optimizer)
 
     def _single_param_step(self, param, group, state):
         """Per-parameter step used by the `use_grad_hooks=True` path."""
