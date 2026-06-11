@@ -984,7 +984,18 @@ _FUSED_L3_REAL = frozenset({
     # non-deterministic production cell).
     ("mamba3", "supergrok11"),
     ("mamba3", "supergrok15"),
-    # __SG2_MAMBA_FUSED_L3_REAL__
+    # supergrok2 (mamba — the LAST/hardest cell): the FULL CSA/HCA/PEER/GRU meta-net + the
+    # in-kernel segmented sort (STAGE -1) + the SAM 2nd backward, PORTED onto the mamba
+    # megakernel (P3-SG2) + the DEDICATED mega_mamba_sg2_tc launcher entry (the meta-net weight
+    # bundle + per-tensor scalar ARRAYS ride ops.sg2_fused_step, NOT the generic fused_step).
+    # The SAM double-forward + segmented sort re-exercise the shared mamba forward (the
+    # .sg2_spec.md-flagged risk), but the now-fixed race (0b57f7e) COVERS it: the tail gate
+    # confirms A/A/A bit-determinism (loss 4.754265 ×3; grad/param/sharp/gru-eq all True) +
+    # single-step parity vs the per-op oracle (WORST 3.1e-7 < 1e-5). HONEST CAVEAT: SG2 mamba
+    # won't GROK (the CSA idx_UQ fidelity gap, same as decoder/vit — out of scope; the gate's
+    # N>64 CSA fidelity probe REPORTS it). The DEDICATED entry path is reached because
+    # has_l3_real is True; the _L3_WGMMA_CELLS membership below is the production gate.
+    ("mamba3", "supergrok2"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1648,7 +1659,15 @@ _L3_WGMMA_CELLS = frozenset({
     # see the dormant carve below). They reach L3-TC but WON'T GROK (meta-net untrained).
     ("mamba3", "supergrok11"),
     ("mamba3", "supergrok15"),
-    # __SG2_MAMBA_L3_WGMMA__
+    # supergrok2 (mamba — the LAST/hardest cell): CONVERTED via the DEDICATED
+    # ops.sg2_fused_step → mega_mamba_sg2_tc entry (the FULL CSA/HCA/PEER/GRU meta-net AS the
+    # optimizer phase: P3-SG2 in-kernel SEGMENTED SORT (STAGE -1) + SAM 2nd backward + the
+    # sg2_meta_stages CSA/HCA/GRU/PEER pipeline, ported onto the mamba megakernel + launcher).
+    # The SAM double-forward + segmented sort re-exercise the shared mamba forward; the now-
+    # fixed race (0b57f7e) COVERS it — the tail gate confirms A/A/A bit-determinism. Won't GROK
+    # (CSA idx_UQ fidelity gap, out of scope). If A/A/A ever re-trips, REMOVE this membership
+    # (the kernel/launcher stay landed) — but it is A/A/A-clean as shipped.
+    ("mamba3", "supergrok2"),
 })
 
 

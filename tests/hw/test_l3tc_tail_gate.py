@@ -493,7 +493,7 @@ _CELLS = {
     # Won't GROK (CSA idx_UQ fidelity gap, out of scope).
     "supergrok2/decoder": dict(model="decoder", opt="supergrok2", factory=None),
     "supergrok2/vit": dict(model="vit", opt="supergrok2", factory=None),
-    # __SG2_MAMBA_TEST_CELL__
+    "supergrok2/mamba": dict(model="mamba", opt="supergrok2", factory=None),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
