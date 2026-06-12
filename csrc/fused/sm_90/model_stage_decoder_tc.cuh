@@ -1324,51 +1324,204 @@ __device__ __forceinline__ void dectc_dw_reduce_splitk(
     }
 }
 
-// Biases db = Σ_K dY  (per output row). Work-stealing over the 9 weights' rows is
-// overkill; instead each CTA strides ALL bias outputs (cheap: ≤ 3d=384 rows × 9).
-// Single owner per output element (thread strides global bias-row index) → no atomics.
+// Biases db = Σ_K dY  (column-sum of dY[K,Nout] → [Nout], per output row).
+//
+// WAS: each CTA strided ALL bias outputs and ran the full Σ_K reduction — i.e. the
+// ENTIRE column-sum was recomputed redundantly on ALL ~132 CTAs (the comment called
+// it "cheap" — true only when Nout≤3d=384 at the d=128 production width; at the
+// d=1024 roofline width Nout reaches 4d=4096 and K=T=65536, so the 132× redundant
+// reduction was the DOMINANT grad_asm cost — ~500 ms, eclipsing even the embedding
+// scan this task set out to fix; the per-phase profiler (ga.biases sub-timer) made
+// it visible). HBM traffic was 132 × Σ_s K_s·Nout_s·2 B ≈ 70 GB.
+//
+// NOW: SINGLE OWNER per output element across the WHOLE grid. Flatten the 9 specs'
+// outputs into one global index space [0, ΣNout) and grid-stride it over all CTAs
+// × threads, so each bias output is reduced EXACTLY ONCE and the work is spread
+// across the full grid. Traffic collapses to Σ_s K_s·Nout_s·2 B (one pass, ≈ 130×
+// less at d=1024). Reads stay COALESCED (consecutive threads → consecutive o on the
+// same k → consecutive dY addresses). DETERMINISM: one owner per output + the SAME
+// ascending-k fp32 accumulation → bit-identical to the old per-output sum, no atomics.
+//
+// PORTABLE: the "single-owner grid-stride column-sum" is the general fix for any
+// bias/reduction-to-a-vector that a megakernel was recomputing per-CTA; vit/mamba
+// bias grads (same db = Σ_K dY shape) reuse this verbatim.
 __device__ __forceinline__ void dectc_dw_biases(
-        const DecDwSpec spec[9], float* __restrict__ grad) {
-    for (int s = 0; s < 9; ++s) {
+        const DecDwSpec spec[9], float* __restrict__ grad, int cta, int nCTA) {
+    // exclusive prefix of Nout across the 9 specs → total bias-output count.
+    int pre[10];
+    pre[0] = 0;
+    #pragma unroll
+    for (int s = 0; s < 9; ++s) pre[s + 1] = pre[s] + spec[s].Nout;
+    const int total = pre[9];
+    const int stride = nCTA * blockDim.x;
+    for (int go = cta * blockDim.x + threadIdx.x; go < total; go += stride) {
+        // decode global output index → (spec s, local row o). 9 specs → linear scan.
+        int s = 0;
+        #pragma unroll
+        for (int t = 0; t < 9; ++t) if (go >= pre[t + 1]) s = t + 1;
         const DecDwSpec& sp = spec[s];
-        for (int o = threadIdx.x; o < sp.Nout; o += blockDim.x) {
-            float accv = 0.0f;
-            for (int k = 0; k < sp.K; ++k) accv += __bfloat162float(sp.dY_bias[(int64_t)k * sp.Nout + o]);
-            grad[sp.bias_off + o] = accv;
-        }
+        const int o = go - pre[s];
+        float accv = 0.0f;
+        for (int k = 0; k < sp.K; ++k) accv += __bfloat162float(sp.dY_bias[(int64_t)k * sp.Nout + o]);
+        grad[sp.bias_off + o] = accv;
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-//  P2 — EMBEDDING owner-scan (tok/pos). dh0 [T,d] (bf16) holds grad wrt h0.
-//    tok grad: row r (token id) of tok.weight → owner CTA (r % nCTA); the owner
-//    scans ALL T tokens in ascending t, accumulating dh0[t,:] for tokens whose
-//    id == r. pos grad: row p → owner; sums dh0[t,:] over t with (t%S)==p.
-//    Fixed t-order + single owner per row → deterministic, atomic-free.
-//    `tok_ids` is HBM int32 [T]. Writes grad[tok_off..], grad[pos_off..].
+//  P2 — EMBEDDING grad (tok/pos). dh0 [T,d] (bf16) holds grad wrt h0.
+//
+//  WAS (the owner-LINEAR-SCAN, task #13 H2 target): each of V owner-CTAs scanned
+//  ALL T tokens (`if tok_ids[t]==r` per token), re-reading the WHOLE dh0 stream V
+//  times — O(V·d·T) work + V passes over 134 MB of dh0, where O(d·T) (ONE pass)
+//  suffices. V=99<132 left 33 CTAs idle; threads beyond d idled per owner; pos
+//  used only S=4 owner-CTAs scanning all T with a t%S branch.
+//
+//  NOW (H2 — counting-sort token lists + flat-element grid-stride):
+//    BUILD (dectc_embed_build_lists, once, cta 0, in the P1 window so it overlaps
+//    fwd/bwd and adds NO barrier — B1 already fences it before P2 consumes):
+//    a deterministic integer counting sort over tok_ids → row_start[V+1] (CSR
+//    offsets) + perm[T] (token positions bucketed by vocab row, ASCENDING t
+//    within each row, because the scatter visits t ascending and appends).
+//    CONSUME (dectc_embed_owner_scan): a flat grid-stride over ALL V·d output
+//    elements. Element (r,j) walks ONLY row r's own tokens perm[row_start[r] ..
+//    row_start[r+1]) in ascending-t order, reading dh0[perm[i]·d + j]. Total
+//    work collapses to O(d·T) (each dh0 value read once in aggregate); reads are
+//    COALESCED (consecutive threads = consecutive j on the same token row); ALL
+//    132 CTAs + full blockDim are busy (V·d=101376 elems ≫ 132·256). pos is the
+//    same flat grid-stride but needs NO list: tokens with (t%S)==p are exactly
+//    t = p, p+S, …, p+(B-1)·S (T=B·S), a closed-form ascending walk of length B.
+//
+//  DETERMINISM: per row the accumulation order over its tokens is the SAME fixed
+//  ascending-t order as the old scan (perm is built ascending; pos walk is
+//  ascending) → bitwise-identical fp32 accumulation, no float atomics, no timing-
+//  dependent order. The build is integer-exact (histogram counts + prefix +
+//  serial ascending scatter), so row_start/perm are bit-identical every rerun.
+//
+//  PORTABLE: this CSR-bucket + flat-element grid-stride is the general pattern for
+//  any "gather grad into a small set of embedding/lookup rows" — vit patch-proj /
+//  pos-embed rows and mamba's embedding will reuse dectc_embed_build_lists +
+//  this consume verbatim (only the row count V and the membership map differ; a
+//  structural map like pos needs no list at all).
 // ════════════════════════════════════════════════════════════════════════
+
+// Scratch float count for the embedding token lists (host carves it from the
+// workspace tail). row_start[V+1] + perm[T], stored as int32 (1 float slot each).
+__host__ __device__ __forceinline__ int64_t dec_embed_lists_floats(int T) {
+    return (int64_t)(dec::kVocab + 1) + (int64_t)T;
+}
+
+// BUILD the per-vocab-row token lists (counting sort). Single CTA (caller guards
+// cta==0); runs in the P1 window so it overlaps fwd/bwd and the existing B1
+// barrier fences it before the P2 consume — NO new barrier. `row_start` is
+// [V+1] int32 (CSR offsets), `perm` is [T] int32 (token positions, ascending t
+// within each vocab-row bucket). All integer ops → bit-exact + deterministic.
+//
+// COST: O(T), PARALLEL over kW worker lanes (HBM-latency hidden) so the build is a
+// few hundred µs — far below the consume saving it enables. DETERMINISM via a fixed
+// STRUCTURAL decomposition: worker w owns the CONTIGUOUS t-chunk [w·C,(w+1)·C); it
+// histograms then scatters its chunk in ascending t into a per-(worker,row) slice
+// of perm whose base sits AFTER all lower-w workers' slices for the same row. Lower
+// w ⇒ lower t, and within a worker ascending t ⇒ each row's perm bucket is GLOBALLY
+// ascending t — the SAME order the old single-cursor scatter (and the old owner-scan
+// accumulation) produced, so bit-identical. All integer ops; no atomics on the hot
+// path. tok_ids is HBM int32 [T]. row_start is [V+1] (CSR offsets); perm is [T].
+__device__ __forceinline__ void dectc_embed_build_lists(
+        const int* __restrict__ tok_ids, int T,
+        int* __restrict__ row_start, int* __restrict__ perm) {
+    constexpr int kW = 64;                         // worker lanes (latency hiding)
+    __shared__ int wcnt[kW * dec::kVocab];         // per-(worker,row) count, then base cursor
+    // floor-balanced contiguous t-chunk per worker w: [c0(w), c0(w+1)).
+    auto c0 = [&] (int w) -> int { return (int)(((int64_t)w * T) / kW); };
+    // 1) zero the per-worker histograms (all threads).
+    for (int i = threadIdx.x; i < kW * dec::kVocab; i += blockDim.x) wcnt[i] = 0;
+    __syncthreads();
+    // 2) each of the first kW threads histograms its contiguous t-chunk into its own
+    //    row of wcnt (no atomics — private per worker).
+    if (threadIdx.x < kW) {
+        const int w = threadIdx.x, e0 = c0(w), e1 = c0(w + 1);
+        int* my = wcnt + (int64_t)w * dec::kVocab;
+        for (int t = e0; t < e1; ++t) {
+            const int r = tok_ids[t];
+            if (r >= 0 && r < dec::kVocab) my[r]++;
+        }
+    }
+    __syncthreads();
+    // 3) exclusive prefix over r → row_start[V+1] (single thread; V tiny). totals[r]
+    //    = Σ_w wcnt[w][r]. row_start is exclusive over rows (CSR).
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int r = 0; r < dec::kVocab; ++r) {
+            row_start[r] = acc;
+            for (int w = 0; w < kW; ++w) acc += wcnt[(int64_t)w * dec::kVocab + r];
+        }
+        row_start[dec::kVocab] = acc;   // == #tokens with a valid row (≤ T)
+    }
+    __syncthreads();
+    // 4) per-(worker,row) base cursor: wcnt[w][r] ← row_start[r] + Σ_{w'<w} cnt[w'][r]
+    //    (ascending-worker prefix WITHIN a row → lower-t chunks land first). One
+    //    thread per row (V≤256 → fits blockDim) scans workers ascending.
+    if (threadIdx.x < dec::kVocab) {
+        const int r = threadIdx.x;
+        int base = row_start[r];
+        for (int w = 0; w < kW; ++w) {
+            int* slot = &wcnt[(int64_t)w * dec::kVocab + r];
+            const int c = *slot;
+            *slot = base;        // becomes the live append cursor for (w,r)
+            base += c;
+        }
+    }
+    __syncthreads();
+    // 5) scatter: each worker walks its chunk ascending t, appending t to perm at
+    //    its per-row cursor. Ascending t within the chunk + ascending-worker bases
+    //    ⇒ globally ascending t per row bucket.
+    if (threadIdx.x < kW) {
+        const int w = threadIdx.x, e0 = c0(w), e1 = c0(w + 1);
+        int* cur = wcnt + (int64_t)w * dec::kVocab;
+        for (int t = e0; t < e1; ++t) {
+            const int r = tok_ids[t];
+            if (r >= 0 && r < dec::kVocab) perm[cur[r]++] = t;
+        }
+    }
+    __syncthreads();
+}
+
+// CONSUME: assemble tok + pos embedding grads from the prebuilt lists. Flat grid-
+// stride over V·d (tok) and S·d (pos) output elements → all CTAs + threads busy,
+// coalesced dh0 reads, fixed ascending-t accumulation per row (deterministic).
 __device__ __forceinline__ void dectc_embed_owner_scan(
-        const DecActs& acts, const int* __restrict__ tok_ids, int T,
+        const DecActs& acts, const int* __restrict__ row_start,
+        const int* __restrict__ perm, int T,
         float* __restrict__ grad, int cta, int nCTA) {
     const int tok_off = kDecOffsets[0];   // tok.weight [V,d]
     const int pos_off = kDecOffsets[1];   // pos.weight [S,d]
-    // tok rows owned by this CTA: r in [0,V) with r % nCTA == cta.
-    for (int r = cta; r < dec::kVocab; r += nCTA) {
-        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
-            float accv = 0.0f;
-            for (int t = 0; t < T; ++t)
-                if (tok_ids[t] == r) accv += __bfloat162float(acts.dh0[(int64_t)t * dec::kD + j]);
-            grad[tok_off + (int64_t)r * dec::kD + j] = accv;
-        }
+    const __nv_bfloat16* __restrict__ dh0 = acts.dh0;
+    const int stride = nCTA * blockDim.x;
+    const int base   = cta * blockDim.x + threadIdx.x;
+    // ── tok grad: element (r,j) over V·d, grid-strided. Walk ONLY row r's tokens
+    //    (perm[row_start[r] .. row_start[r+1])) ascending → coalesced dh0 column
+    //    read across the warp (consecutive j on one token row). ──
+    const int64_t Vd = (int64_t)dec::kVocab * dec::kD;
+    for (int64_t e = base; e < Vd; e += stride) {
+        const int r = (int)(e / dec::kD);
+        const int j = (int)(e - (int64_t)r * dec::kD);
+        const int s0 = row_start[r], s1 = row_start[r + 1];
+        float accv = 0.0f;
+        for (int i = s0; i < s1; ++i)
+            accv += __bfloat162float(dh0[(int64_t)perm[i] * dec::kD + j]);
+        grad[tok_off + e] = accv;
     }
-    // pos rows owned by this CTA: p in [0,S) with p % nCTA == cta.
-    for (int p = cta; p < dec::kSeq; p += nCTA) {
-        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
-            float accv = 0.0f;
-            for (int t = 0; t < T; ++t)
-                if ((t % dec::kSeq) == p) accv += __bfloat162float(acts.dh0[(int64_t)t * dec::kD + j]);
-            grad[pos_off + (int64_t)p * dec::kD + j] = accv;
-        }
+    // ── pos grad: element (p,j) over S·d, grid-strided. Tokens with (t%S)==p are
+    //    t = p, p+S, …, p+(B-1)·S (T=B·S) — closed-form ascending walk, no list. ──
+    const int64_t Sd = (int64_t)dec::kSeq * dec::kD;
+    const int B = T / dec::kSeq;
+    for (int64_t e = base; e < Sd; e += stride) {
+        const int p = (int)(e / dec::kD);
+        const int j = (int)(e - (int64_t)p * dec::kD);
+        float accv = 0.0f;
+        int t = p;
+        for (int i = 0; i < B; ++i, t += dec::kSeq)
+            accv += __bfloat162float(dh0[(int64_t)t * dec::kD + j]);
+        grad[pos_off + e] = accv;
     }
 }
 

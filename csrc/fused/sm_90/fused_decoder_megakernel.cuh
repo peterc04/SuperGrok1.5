@@ -459,7 +459,9 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + dec_tc_opt_reduce_floats(nCTA)     // STAGED-opt (Prodigy) reduce slots
          + dec_tc_muon_floats(nCTA)           // STAGED-opt (Muon) NS per-matrix scratch
          + dec_tc_looksam_floats()            // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
-         + dec_tc_sg2_floats(nCTA);           // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
+         + dec_tc_sg2_floats(nCTA)            // SuperGrok2 meta-net per-CTA scratch
+         + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
+         + 1;                                 // 8-byte realign slack for the int32 lists base
 }
 
 #ifdef SG_DEC_PROFILE
@@ -534,6 +536,16 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     float* sg2_ws_base = sam_grad + kDecTotalElems;
     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+    // Embedding token-list scratch (counting-sort row_start[V+1] + perm[T]), carved
+    // AFTER the SG2 region (term order matches dec_tc_workspace_floats — carving it
+    // LAST keeps every prior region's offset unchanged → the green cells' non-embed
+    // regions are byte-identical). int32 views over the float tail; 8-byte aligned so
+    // the (future) widening to int is safe. Built in the P1 window (cta 0), consumed
+    // in P2 — fenced by the already-present B1 barrier (no new barrier).
+    float* embed_ws = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+    if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
+    int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
+    int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
 
     dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
     dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -552,6 +564,14 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
 #ifdef SG_DEC_PROFILE
     if (threadIdx.x == 0) { unsigned long long _b0b = clock64(); atomicMax(&g_dec_prof_max[7], _b0b - _b0a); }
 #endif
+
+    // ── Build the embedding token lists (counting sort over tok_ids) ONCE on cta 0,
+    //    HERE in the P1 window so it overlaps the other CTAs' fwd/bwd and the
+    //    already-present B1 barrier fences it before the P2 consume — NO new barrier.
+    //    cta 0 then joins P1. The build is O(T), parallel over its worker lanes, so
+    //    it measures ~0.3 ms (≪ P1) — far below the embed-consume time it unlocks. ──
+    if (cta == 0)
+        dectc::dectc_embed_build_lists(tok.tokens, T, embed_row_start, embed_perm);
 
     // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
     //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
@@ -625,8 +645,8 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     if (threadIdx.x == 0) { unsigned long long _dwb = clock64(); atomicMax(&g_dec_prof_max[3], _dwb - _dwa); }
     unsigned long long _gaa = (threadIdx.x == 0) ? clock64() : 0;
 #endif
-    dectc::dectc_dw_biases(spec, grad);
-    dectc::dectc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
+    dectc::dectc_dw_biases(spec, grad, cta, nCTA);
+    dectc::dectc_embed_owner_scan(acts, embed_row_start, embed_perm, T, grad, cta, nCTA);
     dectc::dectc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
     // Loss reduce (fp64) by CTA 0.
     if (cta == 0 && threadIdx.x == 0) {
@@ -764,8 +784,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                 for (int gt = cta; gt < n_dw2; gt += nCTA)
                     dectc::dectc_dw_run_tile<SG_TUNED_TILE_N>(spec2, gt, sam_grad, sm.sA, sm.sB);
             }
-            dectc::dectc_dw_biases(spec2, sam_grad);
-            dectc::dectc_embed_owner_scan(acts, tok.tokens, T, sam_grad, cta, nCTA);
+            dectc::dectc_dw_biases(spec2, sam_grad, cta, nCTA);
+            // Reuse the P1-built token lists: the SAM 2nd pass perturbs WEIGHTS, not
+            // tok_ids, so the token→row mapping (row_start/perm) is unchanged.
+            dectc::dectc_embed_owner_scan(acts, embed_row_start, embed_perm, T, sam_grad, cta, nCTA);
             dectc::dectc_lnvec_reduce(lnvec_base, sam_grad, nCTA, cta);
             bar.sync();   // B2.4f: g_sam fully assembled in sam_grad
             // (d) WRITE the SAM side-channel (into the persistent state slice) + restore p.
