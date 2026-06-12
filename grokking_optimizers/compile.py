@@ -1260,8 +1260,20 @@ def _dim(name: str, dtype: str, values: List[Any], macro: Optional[str],
 
 # Names of dims that change the emitted binary (live SG_TUNED macros + the
 # real --maxrregcount flag). Pallas kwargs are handled separately by kind.
+#
+# #12 — the L3-TC megakernel GEMM/tile dims (tile_m/tile_n + the per-model dW
+# split-K factors) are LIVE: the committed TC substrate headers
+# (csrc/fused/sm_90/model_stage_{decoder,vit,mamba}_tc.cuh) read
+# SG_TUNED_TILE_M / SG_TUNED_TILE_N / SG_TUNED_{DEC,VIT,MB}_DW_SPLITK to size
+# the wgmma tile + the dW split-K grid, so sweeping them changes the emitted
+# cell. They are AUTO-detected as live by _kernel_source_macros() (the scanner
+# sees the tokens in those headers); listing them here is the explicit floor
+# for the degenerate "no kernel tree visible" case. NB: these only move the
+# wall when the REAL TC train step is timed (the dispatch _ops cells do NOT
+# include the TC substrate) — see _make_variant_timer's megakernel-TC timer.
 _LIVE_TUNING_DIMS: frozenset = frozenset({
     "block", "vec", "unroll", "async_depth", "cluster_shape", "maxrregcount",
+    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
 })
 
 # Hard ceiling for the async-copy pipeline depth. The committed kernels clamp
@@ -1885,6 +1897,43 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "SG_TUNED_MEGA_BLOCK", ["device"]),
             _dim("grad_tile", "int", [1024, 2048],
                  "SG_TUNED_GRAD_TILE", ["device"]),
+            # === L3-TC megakernel GEMM / tile dims (#12) =====================
+            # These are the REAL tile-tuning surface the autotuner was missing:
+            # the TC substrate headers (model_stage_{decoder,vit,mamba}_tc.cuh)
+            # size the wgmma fwd/bwd/dW GEMMs from them. Confirmed CONSUMED via a
+            # READ-ONLY grep of csrc/fused/sm_90/*.cuh (the kernel-builder owns
+            # those files; this only registers the dims that already exist):
+            #   SG_TUNED_TILE_M  — decoder (#ifndef 128, kSeq=4) + mamba
+            #                      (#ifndef 64, kSeq=8). Shared macro name.
+            #   SG_TUNED_TILE_N  — decoder + vit + mamba (#ifndef 128, shared).
+            #   SG_TUNED_{DEC,VIT,MB}_DW_SPLITK — per-model dW K-split factor
+            #                      (#ifndef 4 each; G==1 routes the single-CTA
+            #                      path). All three macros exist + are read.
+            # First value == the in-header #ifndef default, so the untuned
+            # (no-JSON) build is byte-identical (same convention as mega_block /
+            # grad_tile above). Kernel static_asserts: TILE_M multiple of 64
+            # (wgmma m64 atom) AND of kSeq (4/8 → every value below divides
+            # both); split-K >= 1. NEEDS-PARITY before a non-default winner
+            # ships (the autotuner cannot prove a resized __shared__ tile or a
+            # re-chunked dW reduce is correct — only the H100 gate can); sets
+            # are kept SMALL per the per-arch cardinality budget.
+            #
+            # DELIBERATELY OMITTED: a ViT TILE_M sweep. ViT uses a DISTINCT
+            # macro SG_TUNED_VIT_TILE_M whose static_assert requires a multiple
+            # of LCM(kSeq=17, 64)=1088 (a ViT sample is 17 rows); 64/128/256
+            # would all FAIL to compile, so it has exactly one legal value
+            # (1088) and is not a sweepable dim here. (model_stage_vit_tc.cuh
+            # reads SG_TUNED_TILE_N from the shared substrate, which IS swept.)
+            _dim("tile_m", "int", [128, 64, 256],
+                 "SG_TUNED_TILE_M", ["device"]),
+            _dim("tile_n", "int", [128, 64, 256],
+                 "SG_TUNED_TILE_N", ["device"]),
+            _dim("dec_dw_splitk", "int", [4, 1, 2, 8],
+                 "SG_TUNED_DEC_DW_SPLITK", ["device"]),
+            _dim("vit_dw_splitk", "int", [4, 1, 2, 8],
+                 "SG_TUNED_VIT_DW_SPLITK", ["device"]),
+            _dim("mb_dw_splitk", "int", [4, 1, 2, 8],
+                 "SG_TUNED_MB_DW_SPLITK", ["device"]),
             # num_stages dropped: SG_TUNED_NUM_STAGES is dead on sm_90 (no kernel
             # reads it). It remains a LIVE Pallas kwarg only (see
             # _build_pallas_space), so it stays in config_key + the cost model.
@@ -1921,6 +1970,17 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "expr": "(not warp_specialization) or block >= 128"},
                 {"name": "cluster_volume",
                  "expr": "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"},
+                # #12 — TC tile constraints mirroring the kernel static_asserts
+                # (model_stage_*_tc.cuh): the wgmma M/N tiles must be multiples
+                # of the 64-wide wgmma atom. Every value in [64,128,256] already
+                # satisfies this, so the rules prune nothing today; they are the
+                # explicit guard that keeps a future value-list edit (e.g. a
+                # non-multiple-of-64 tile) from reaching ptxas and tripping the
+                # static_assert. Split-K factors are all >= 1 by construction.
+                {"name": "tile_m_wgmma_atom",
+                 "expr": "tile_m % 64 == 0"},
+                {"name": "tile_n_wgmma_atom",
+                 "expr": "tile_n % 64 == 0"},
             ],
         },
     }
@@ -12926,6 +12986,266 @@ def _time_validate_fastmath_variants(
     return records
 
 
+# ===========================================================================
+# #12 — REAL L3-TC megakernel step timing (fix the GEMM-blind winner-timer)
+# ===========================================================================
+#
+# DEFECT (HARD BLOCKER): the variant timer (worker / one-shot) times only
+# ``opt.step()`` on a flat dummy param. That is CORRECT for elementwise /
+# optimizer-only kernel dims (block / vec / unroll / async_depth / maxrregcount
+# — those macros land on the optimizer launcher TUs), but it is GEMM-BLIND: the
+# tile / GEMM dims (SG_TUNED_TILE_M/_N, the per-model dW split-K) are read ONLY
+# by the TC substrate headers (model_stage_{decoder,vit,mamba}_tc.cuh), which
+# are pulled in by the STANDALONE real-TC TUs (mega_<model>_real_adamw_tc.cu) —
+# NOT by the dispatch cells linked into _ops (mega_<model>_<opt>.cu include the
+# L1/L3 SURROGATE fused_megakernel.cuh and reference no tile macro). So sweeping
+# a tile dim leaves the timed _ops step byte-identical and the "winner" is noise.
+#
+# FIX: when a config touches a GEMM/tile dim AND the model is TC-capable
+# (decoder/vit/mamba on sm_90), time the REAL fused TC train step instead —
+# build the model's TC TU WITH the config's tuned -D macros and median-time
+# ``mod.tc_train_step`` (CUDA-synced), exactly mirroring tuning/roofline.py
+# (_tc_inputs / _time_tc_kernel) and tuning/decoder_bench.py (build_variant /
+# measure). The cheap opt.step() timer is kept for every other case.
+#
+# This path NEVER runs offline (no GPU): it is only invoked inside the live
+# sweep's timer closure, lazily imports torch + torch.utils.cpp_extension, and
+# returns None (→ caller falls back to the opt.step() timer) on any failure
+# (non-TC model, JIT build blocked, missing TU), so a host without the TC build
+# degrades to exactly the old behaviour.
+
+# Short model token (spec.model / dispatch SHORT_MODELS) -> the real-TC cell TU
+# whose substrate headers consume the tile/split-K macros. Mirrors
+# tuning/roofline.py::_TC_TU_REL (sm_90 only — these are the Hopper TC cells).
+_TC_REAL_STEP_TU: Dict[str, str] = {
+    "decoder": "csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu",
+    "vit":     "csrc/fused/sm_90/mega_vit_real_adamw_tc.cu",
+    "mamba":   "csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu",
+}
+
+# Config dim names whose macros are read ONLY by the real TC GEMM/tile path and
+# are therefore INVISIBLE to the opt.step() timer: a config that varies any of
+# these must be timed via the real TC step or its winner is pure noise. These
+# are exactly the #12 tile dims — SG_TUNED_TILE_M/_N + the per-model dW split-K
+# — confirmed (READ-ONLY grep) to be consumed by model_stage_{decoder,vit,
+# mamba}_tc.cuh, which only the standalone mega_<model>_real_adamw_tc.cu TUs
+# pull in (the dispatch _ops cells include the SURROGATE fused_megakernel.cuh
+# and read none of them).
+#
+# NB mega_block / grad_tile are NOT here on purpose: SG_TUNED_MEGA_BLOCK sets
+# the launch_bounds of the SCALAR decoder megakernel only — the TC megakernel
+# (the wgmma path tc_train_step launches) hardcodes SG_TC_MEGA_BLOCK=256 and
+# reads neither macro — so the real-TC timer is no more sensitive to them than
+# the cheap timer; routing them here would only add a TC rebuild for no signal.
+_GEMM_TILE_DIM_NAMES: frozenset = frozenset({
+    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+})
+
+
+def _canonical_tc_model(model: str) -> Optional[str]:
+    """Map a spec model name (short or canonical) to the short TC key, or None
+    if the model has no real-TC cell. ``transformer_decoder``/``decoder`` →
+    ``decoder``, ``mamba3``/``mamba`` → ``mamba``, ``vit`` → ``vit``."""
+    m = str(model).strip().lower()
+    if m in _TC_REAL_STEP_TU:
+        return m
+    alias = {"transformer_decoder": "decoder", "mamba3": "mamba"}
+    return alias.get(m)
+
+
+def _config_touches_gemm_tile_dim(config: Dict[str, Any],
+                                  dims: List[Dict[str, Any]]) -> bool:
+    """True iff ``config`` carries a GEMM/tile dim that the opt.step() timer is
+    blind to (so this config must be timed on the real TC step). Only dims that
+    are actually LIVE in the space count — a pinned (dead) tile dim never varies
+    so it cannot be the thing being swept."""
+    live_names = {d.get("name") for d in dims if not _is_dead_dim(d)}
+    return any(name in config and name in live_names
+               for name in _GEMM_TILE_DIM_NAMES)
+
+
+# Cache of (model, tuned-tile-flag-signature) -> loaded TC module, so a repeat
+# config (resume / cost-model re-measure) reuses the already-JIT-built TU. The
+# module name embeds the signature so distinct tile configs are distinct
+# coexisting extensions (own build dir + incremental ninja), exactly like
+# tuning/decoder_bench.py's coexisting-variant pattern — never colliding with
+# the production _ops.
+_TC_REAL_STEP_MOD_CACHE: Dict[Tuple[str, str], Any] = {}
+
+
+def _tc_relevant_device_flags(device_extra: List[str]) -> List[str]:
+    """Project the variant's full device -D list down to the tile/split-K macros
+    the TC TU actually honours (the #12 dims). Everything else
+    (block/vec/unroll/async_depth/maxrregcount/cluster/feature macros + the
+    mega_block/grad_tile scalar-path macros) targets the optimizer-launcher or
+    surrogate path, is invisible to the TC kernel, and is dropped — so the TC
+    build's flag set stays minimal and its per-signature module name only varies
+    with the tile dims that actually change the TC binary (no wasted rebuilds on
+    a macro the TC cell ignores)."""
+    keep_macros = (
+        "SG_TUNED_TILE_M", "SG_TUNED_TILE_N",
+        "SG_TUNED_DEC_DW_SPLITK", "SG_TUNED_VIT_DW_SPLITK",
+        "SG_TUNED_MB_DW_SPLITK",
+    )
+    out: List[str] = []
+    for f in device_extra:
+        # Match -D<macro>=... (the only shape resolve_macros emits for these).
+        if f.startswith("-D"):
+            name = f[2:].split("=", 1)[0]
+            if name in keep_macros:
+                out.append(f)
+    return out
+
+
+def _build_tc_real_step_module(model_key: str, tc_flags: List[str],
+                               out_dir: Path, report=None):
+    """JIT-build the model's real-TC cell TU with the tuned tile macros applied,
+    as a coexisting (distinct-name, own-build-dir) extension. Mirrors
+    tuning/decoder_bench.py::build_variant + tuning/roofline.py::_build_tc_module
+    (9.0a, -O3 -std=c++17 --expt-relaxed-constexpr, sm_90a gencode) and adds
+    -DSG_TUNED_GEMM_IMPL=1 to select the wgmma cell driver (the TC engine). Lazy
+    torch import; raises on build failure (caller treats that as "skip → fall
+    back to the cheap timer")."""
+    import os as _os
+    sig = "_".join(sorted(tc_flags)) if tc_flags else "default"
+    key = (model_key, sig)
+    cached = _TC_REAL_STEP_MOD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from torch.utils.cpp_extension import load as _load
+    tu = str(REPO_ROOT / _TC_REAL_STEP_TU[model_key])
+    # Stable, fs-safe module name from the tile signature (decoder_bench style).
+    name = (f"sg_tc_tune_{model_key}_"
+            + hashlib.sha1(sig.encode("utf-8")).hexdigest()[:12])
+    _os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
+    cuda_flags = [
+        "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "-gencode=arch=compute_90a,code=compute_90a",
+        "-DSG_TUNED_GEMM_IMPL=1",     # select the wgmma cell driver (TC engine)
+    ] + list(tc_flags)
+    if report is not None:
+        report.write(f"    [megakernel-tc] building real TC step for "
+                     f"{model_key} with tile flags {tc_flags or '(defaults)'} "
+                     f"(module {name})\n")
+    # torch.utils.cpp_extension.load() requires the build dir to already exist
+    # (it writes build.ninja + a lock file into it); create the coexisting
+    # per-signature dir up front (own dir → incremental ninja, decoder_bench
+    # style, never colliding with production _ops).
+    build_dir = Path(out_dir) / "tc_tune" / name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    mod = _load(
+        name=name, sources=[tu], extra_include_paths=[str(REPO_ROOT)],
+        extra_cuda_cflags=cuda_flags, extra_cflags=["-O3", "-std=c++17"],
+        build_directory=str(build_dir),
+        verbose=False)
+    _TC_REAL_STEP_MOD_CACHE[key] = mod
+    return mod
+
+
+def _tc_real_step_inputs(model_key: str, mod, B: int, dev):
+    """Per-model (params, input, targets, state) for one real TC step at batch
+    B. Mirrors tuning/roofline.py::_tc_inputs — step TIME is independent of
+    param VALUES (the cells' parity is gated elsewhere), so random tensors of
+    the TU's exact TOTAL size suffice. decoder/mamba take int32 tokens [B,seq];
+    vit takes float32 patches [B,NPatch,Patch]."""
+    import torch
+    total = int(mod.TOTAL)
+    gpar = torch.Generator(device=dev).manual_seed(42)
+    params = (torch.randn(total, generator=gpar, device=dev) * 0.02).contiguous()
+    gin = torch.Generator(device=dev).manual_seed(7)
+    if model_key == "vit":
+        from tests.hw.vit_oracle import NUM_PATCHES, PATCH_DIM, VOCAB
+        inp = torch.randn(B, NUM_PATCHES, PATCH_DIM, generator=gin,
+                          device=dev).to(torch.float32).contiguous()
+        tgt = torch.randint(0, VOCAB, (B,), generator=gin,
+                            device=dev).to(torch.int32).contiguous()
+    elif model_key == "mamba":
+        from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
+        inp = torch.randint(0, VOCAB, (B, SEQ), generator=gin,
+                            device=dev).to(torch.int32).contiguous()
+        tgt = torch.randint(0, P_HEAD, (B,), generator=gin,
+                            device=dev).to(torch.int32).contiguous()
+    else:  # decoder
+        from tests.hw.decoder_oracle import VOCAB, SEQ
+        inp = torch.randint(0, VOCAB, (B, SEQ), generator=gin,
+                            device=dev).to(torch.int32).contiguous()
+        tgt = torch.randint(0, VOCAB, (B,), generator=gin,
+                            device=dev).to(torch.int32).contiguous()
+    state = torch.zeros(3 * total, dtype=torch.float32, device=dev)
+    return params, inp, tgt, state
+
+
+def _time_megakernel_tc_step(model: str, device_extra: List[str],
+                             out_dir: Path, *, warmup: int = 8, iters: int = 40,
+                             tc_batch: int = 4096, report=None
+                             ) -> Optional[Dict[str, Any]]:
+    """Median-time the REAL fused TC train step for ``model`` built with the
+    config's tuned tile macros (``device_extra`` is the variant's full device
+    -D list; the TC-relevant subset is projected out). Returns a worker-shaped
+    ``{"timing_ms", "min_ms", "max_ms", "n", "timer": "megakernel-tc"}`` dict,
+    or ``None`` if this is not a TC-capable model or the JIT TC build/launch is
+    unavailable (caller then falls back to the cheap opt.step() timer).
+
+    Timing methodology mirrors roofline._time_tc_kernel / decoder_bench.measure:
+    warmup, CUDA-sync, then ``iters`` synced replays, report the median."""
+    model_key = _canonical_tc_model(model)
+    if model_key is None or model_key not in _TC_REAL_STEP_TU:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    tc_flags = _tc_relevant_device_flags(device_extra)
+    try:
+        dev = torch.device("cuda")
+        mod = _build_tc_real_step_module(model_key, tc_flags, out_dir,
+                                         report=report)
+        # decoder/vit/mamba TC dW K-loop is a 16-step atom → B % 16 == 0.
+        B = int(tc_batch) - (int(tc_batch) % 16)
+        if B <= 0:
+            B = 16
+        params, inp, tgt, state = _tc_real_step_inputs(model_key, mod, B, dev)
+        lr, beta1, beta2, eps, wd = 1e-3, 0.9, 0.98, 1e-8, 0.0
+        bc1, bc2 = 1.0 - beta1, 1.0 - beta2
+
+        def _call():
+            # params.clone() per call: tc_train_step updates params in place, so
+            # cloning keeps every timed step on the same (step-1) workload.
+            return mod.tc_train_step(params.clone(), inp, tgt, state, lr, beta1,
+                                     beta2, eps, wd, bc1, bc2, 1, 0)
+
+        for _ in range(max(1, warmup)):
+            _call()
+        torch.cuda.synchronize()
+        timings: List[float] = []
+        for _ in range(max(1, iters)):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            _call()
+            e.record()
+            torch.cuda.synchronize()
+            timings.append(float(s.elapsed_time(e)))
+        timings.sort()
+        return {
+            "timing_ms": timings[len(timings) // 2],
+            "min_ms":    timings[0],
+            "max_ms":    timings[-1],
+            "n":         len(timings),
+            "timer":     "megakernel-tc",
+            "tc_batch":  B,
+        }
+    except Exception as exc:  # noqa: BLE001 — any TC build/launch failure → fall back
+        if report is not None:
+            report.write(f"    [megakernel-tc] real-step timing unavailable for "
+                         f"{model} ({type(exc).__name__}: {exc}); falling back "
+                         f"to the elementwise opt.step() timer.\n")
+        return None
+
+
 def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         host_cflags_base: List[str],
                         device_cflags_base: List[str],
@@ -13350,7 +13670,28 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # Fix-#2 §3 — timing is DECOUPLED from validation. Time the
         # variant via the worker/one-shot path (pure timing, no dump).
         result = None
-        if worker is not None and worker.alive():
+        # #12 — GEMM-aware timer selection. When this config varies a GEMM/tile
+        # dim (SG_TUNED_TILE_M/_N, per-model dW split-K, mega_block/grad_tile)
+        # AND the model has a real-TC cell (decoder/vit/mamba on sm_90), the
+        # opt.step() timer below is BLIND to it (those macros are read only by
+        # the standalone TC TUs, not the dispatch _ops cells). Time the REAL
+        # fused TC train step instead — built WITH this config's tuned tile
+        # macros (device_extra, computed above) — so the tile dims actually move
+        # the measured wall. Falls back to the cheap timer (result stays None)
+        # for non-megakernel/optimizer-only configs or if the TC JIT build is
+        # unavailable, so elementwise dims keep their correct (and far cheaper)
+        # opt.step() timing.
+        if _config_touches_gemm_tile_dim(config, dims) and \
+                _canonical_tc_model(spec.model) is not None:
+            result = _time_megakernel_tc_step(
+                spec.model, device_extra, spec.out_dir, report=report)
+            if result is not None:
+                report.write(
+                    f"    [megakernel-tc] {ckey[:24]}: real TC step "
+                    f"{result['timing_ms']:.4f} ms "
+                    f"(B={result.get('tc_batch')}, n={result['n']}) — tile dims "
+                    f"are LIVE in this measurement.\n")
+        if result is None and worker is not None and worker.alive():
             result = worker.time(variant_so)
             if result is None:
                 report.write(f"    [worker time failed for {ckey}; "
@@ -16967,17 +17308,22 @@ def _self_test_search_space(run) -> None:
 
         The ceiling is a DEAD-INFLATION guard, not a sampler limit (the tuner
         uses TPE/Bayesian sampling + prefilter and never enumerates). It is set
-        to separate the legitimate all-live space (~1.05e9 with the launch dims
-        registered) from a pin-regression (the four dead macros num_stages /
-        swizzle / warp_specialization / tma carry a 160x product → ~1.7e11),
-        so 10^10 passes the former and still trips on the latter. Raising it to
-        admit live launch dims is recalibration, NOT suppression: no coverage is
-        removed (owner rule: every perf constant stays a swept SG_TUNED dim)."""
+        to separate the legitimate all-live space from a pin-regression (the
+        four dead macros num_stages / swizzle / warp_specialization / tma carry
+        a ~160x product if a pin regressed). #12 added the LIVE L3-TC GEMM/tile
+        dims (tile_m·tile_n·{dec,vit,mb}_dw_splitk = 3·3·4·4·4 = 576x) on top of
+        the launch-dim base (~4.2e9), so the all-live space is now ~2.42e12. The
+        ceiling is recalibrated to 10^13: it admits the all-live space (2.42e12)
+        and still trips on a dead-inflation regression (all-live·160 ≈ 3.9e14).
+        Recalibration to admit genuinely-live dims is NOT suppression — no
+        coverage is removed (owner rule: every perf constant stays a swept
+        SG_TUNED dim, and these tile macros ARE read by model_stage_*_tc.cuh)."""
         space = load_embedded_search_space()
         count = cartesian_count(space, "sm_90")
-        # Sanity bound — all-live sm_90 space is ~10^9; dead-inflation is ~10^11.
+        # Sanity bound — all-live sm_90 space is ~2.4e12 (#12 tile dims);
+        # dead-inflation regression is ~3.9e14.
         assert count > 1_000_000, f"sm_90 count too small: {count}"
-        assert count < 10**10, f"sm_90 count unreasonably large: {count}"
+        assert count < 10**13, f"sm_90 count unreasonably large: {count}"
         # Iterator yields exactly that many items — verify on a tiny slice.
         it = cartesian(space, "sm_90")
         first_few = list(itertools.islice(it, 5))
@@ -17094,12 +17440,14 @@ def _self_test_search_space(run) -> None:
 
         sm_90a is the exception: it additionally carries the registered
         warp-launch dims (min_blocks / prod_regs / cons_regs, sm_90-only macros
-        consumed by the *_sm90.cuh launchers + the fused megakernel), which lift
-        its all-live space to ~10^9. Its ceiling is raised to 10^10 to admit
-        them — that still trips on a dead-dim pin regression (~1.7e11) so the
-        guard's purpose is intact, and no live coverage is removed (owner rule:
-        every perf constant stays a swept SG_TUNED dim, no hand-tuning). Every
-        OTHER arch keeps the tight 10^8 dead-inflation ceiling."""
+        consumed by the *_sm90.cuh launchers + the fused megakernel) AND, since
+        #12, the LIVE L3-TC GEMM/tile dims (tile_m / tile_n / {dec,vit,mb}_dw_
+        splitk — read by model_stage_*_tc.cuh; a 576x product), which lift its
+        all-live space to ~2.42e12. Its ceiling is raised to 10^13 to admit them
+        — that still trips on a dead-dim pin regression (all-live·160 ≈ 3.9e14)
+        so the guard's purpose is intact, and no live coverage is removed (owner
+        rule: every perf constant stays a swept SG_TUNED dim, no hand-tuning).
+        Every OTHER arch keeps the tight 10^8 dead-inflation ceiling."""
         space = build_full_search_space()
         all_arches = _canonical_arches()
         assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
@@ -17108,9 +17456,10 @@ def _self_test_search_space(run) -> None:
             cnt = cartesian_count(space, arch)
             vendor = ARCH_TABLE[arch].vendor
             if vendor in ("cuda", "hip"):
-                # sm_90a carries the extra live warp-launch dims (~10^9); all
-                # other CUDA/HIP arches keep the tight dead-inflation ceiling.
-                hi = 10**10 if arch == "sm_90a" else 10**8
+                # sm_90a carries the extra live warp-launch dims + #12 tile dims
+                # (~2.42e12); all other CUDA/HIP arches keep the tight
+                # dead-inflation ceiling.
+                hi = 10**13 if arch == "sm_90a" else 10**8
                 assert 10_000 <= cnt <= hi, (
                     f"{arch}: count {cnt} out of CUDA/HIP bounds")
             else:  # pallas
@@ -19868,9 +20217,13 @@ def _self_test_silent_degradation(run) -> None:
             ok = inject.export_winner("adamw", "mamba", "sm_90a", combo,
                                       path=jp, macro_map=macro_map)
             assert ok, "export_winner returned False"
-            # (a)+(b) round-trip: the extra dims survive in the JSON.
+            # (a)+(b) round-trip: the extra dims survive in the JSON. #12 — the
+            # winner is keyed per-model now ({arch: {model: {opt: combo}}}); the
+            # export above used model="mamba", so the entry lives under "mamba".
             data = inject.load_tuned(jp)
-            entry = data["sm_90"]["adamw"]
+            assert inject._arch_block_is_nested(data["sm_90"]), (
+                "#12 export must write the per-model nested shape")
+            entry = data["sm_90"]["mamba"]["adamw"]
             assert entry["cluster_shape"] == [2, 2, 1], (
                 f"tuple dim cluster_shape not persisted: {entry.get('cluster_shape')}")
             assert entry["wgmma_shape"] == "m64n128k16", (
@@ -19880,7 +20233,10 @@ def _self_test_silent_degradation(run) -> None:
             assert data["sm_90"].get("_macros", {}).get("wgmma_shape") == \
                 "SG_TUNED_WGMMA_SHAPE", "dim→macro map not recorded in JSON"
             # Consumer side: the right nvcc flags come back, no compile.py import.
-            flags = inject.source_extra_nvcc_flags("adamw", data, "sm_90a")
+            # model="mamba" selects this cell's per-model winner from the nested
+            # tree (None would pick the deterministic-first model, also mamba).
+            flags = inject.source_extra_nvcc_flags("adamw", data, "sm_90a",
+                                                   model="mamba")
             assert "-DSG_TUNED_BLOCK_SIZE=128" in flags
             assert "--maxrregcount=64" in flags
             assert "-DSG_TUNED_WGMMA_SHAPE=m64n128k16" in flags, (
@@ -19900,17 +20256,64 @@ def _self_test_silent_degradation(run) -> None:
             assert "-DSG_TUNED_BLOCK_SIZE=256" in lflags
             assert all("CLUSTER_SHAPE" not in f for f in lflags), (
                 "legacy JSON has no extra dims to emit")
-            # (d) a winner dim with no macro mapping is ignored (no crash).
+            # (d) a winner dim with no macro mapping is ignored (no crash). The
+            # OLD flat shape is still READ via backward-compat (no model key).
             unmapped = {"sm_90": {"adamw": {"block": 64, "vec": 1, "unroll": 1,
                                             "mystery_dim": "x", "model": "m"}}}
+            assert not inject._arch_block_is_nested(unmapped["sm_90"]), (
+                "legacy flat fixture must read as flat (backward-compat)")
             uflags = inject.source_extra_nvcc_flags("adamw", unmapped, "sm_90a")
             assert "-DSG_TUNED_BLOCK_SIZE=64" in uflags
             assert all("mystery" not in f.lower() for f in uflags), (
                 "unmapped dim must be ignored, not emitted")
+            # (e) #12 per-model: tuning the SAME optimizer on a SECOND model must
+            # NOT clobber the first (the whole point — old schema was last-wins).
+            jp2 = str(Path(td) / "_kernel_tuned_permodel.json")
+            assert inject.export_winner(
+                "adamw", "decoder", "sm_90a",
+                {"block": 128, "tile_m": 256, "tile_n": 64,
+                 "dec_dw_splitk": 8}, path=jp2,
+                macro_map=_live_macro_map("sm_90a"))
+            assert inject.export_winner(
+                "adamw", "vit", "sm_90a",
+                {"block": 512, "tile_m": 64, "tile_n": 128,
+                 "vit_dw_splitk": 2}, path=jp2,
+                macro_map=_live_macro_map("sm_90a"))
+            pm = inject.load_tuned(jp2)
+            dflags = inject.source_extra_nvcc_flags("adamw", pm, "sm_90a",
+                                                    model="decoder")
+            vflags = inject.source_extra_nvcc_flags("adamw", pm, "sm_90a",
+                                                    model="vit")
+            assert "-DSG_TUNED_TILE_M=256" in dflags and \
+                   "-DSG_TUNED_DEC_DW_SPLITK=8" in dflags, dflags
+            assert "-DSG_TUNED_TILE_M=64" in vflags and \
+                   "-DSG_TUNED_VIT_DW_SPLITK=2" in vflags, vflags
+            # the cell-TU consumer routes each mega_<model>_<opt> to ITS model.
+            cell_map = inject.compute_source_flags(
+                ["csrc/fused/sm_90/mega_transformer_decoder_adamw.cu",
+                 "csrc/fused/sm_90/mega_vit_adamw.cu"], pm, "sm_90a")
+            assert "-DSG_TUNED_TILE_M=256" in cell_map[
+                "csrc/fused/sm_90/mega_transformer_decoder_adamw.cu"]
+            assert "-DSG_TUNED_TILE_M=64" in cell_map[
+                "csrc/fused/sm_90/mega_vit_adamw.cu"]
+            # (f) migrating an existing OLD-flat JSON upgrades it in place,
+            # preserving each flat entry under its provenance model.
+            jp3 = str(Path(td) / "_kernel_tuned_legacy.json")
+            with open(jp3, "w", encoding="utf-8") as fh:
+                json.dump({"sm_90": {"muon": {"block": 200, "vec": 4,
+                                              "model": "decoder"}}}, fh)
+            assert inject.export_winner("lion", "mamba", "sm_90a",
+                                        {"block": 33}, path=jp3)
+            mg = inject.load_tuned(jp3)
+            assert inject._arch_block_is_nested(mg["sm_90"]), "migrated to nested"
+            assert mg["sm_90"]["decoder"]["muon"]["block"] == 200, mg["sm_90"]
+            assert mg["sm_90"]["mamba"]["lion"]["block"] == 33
             sys.stdout.write(
                 f"    [dim-roundtrip] persisted cluster_shape={entry['cluster_shape']} "
                 f"wgmma_shape={entry['wgmma_shape']!r}; consumer emitted "
-                f"per-axis cluster macros + -DSG_TUNED_WGMMA_SHAPE\n")
+                f"per-axis cluster macros + -DSG_TUNED_WGMMA_SHAPE; #12 per-model "
+                f"schema: decoder/vit adamw winners BOTH survive (no last-wins), "
+                f"cell TUs route per-model, old-flat migrates in place\n")
 
     run("debug_swallow_quiet_default_loud_at_debug",
         test_debug_swallow_quiet_default_loud_at_debug)

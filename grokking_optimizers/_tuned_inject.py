@@ -6,13 +6,21 @@ This module is the single source of truth for lever (b): making the
 
 Producer  : ``grokking_optimizers.compile.build_jit`` calls
             :func:`export_winner` the moment a JIT winner is decided,
-            persisting per-(arch, optimizer) winners to the canonical JSON
-            at ``grokking_optimizers/_kernel_tuned.json``.
+            persisting per-(arch, model, optimizer) winners to the canonical
+            JSON at ``grokking_optimizers/_kernel_tuned.json``.
 Consumer  : ``setup.py``'s ``BuildExtension`` subclass reads that JSON and,
             per CUDA translation unit, appends ``-DSG_TUNED_*`` macros (and
             ``--maxrregcount`` when nonzero) to the nvcc flags of the TUs
             that belong to the matching optimizer — see
             :func:`source_extra_nvcc_flags` and :func:`compute_source_flags`.
+
+SCHEMA (#12) — the JSON is keyed ``{arch: {model: {optimizer: combo}}}`` (the
+canonical short ``model`` token), so tuning the same optimizer on two models no
+longer last-wins; each ``mega_<model>_<opt>.cu`` cell gets ITS model's winner
+(:func:`model_for_source`), shared ``launch_<opt>.cu`` launchers fall back to a
+deterministic model's winner. The OLD flat ``{arch: {optimizer: combo}}`` shape
+is still READ (backward-compat, :func:`_lookup_combo`) and MIGRATED in place on
+the next :func:`export_winner` write, so a pre-#12 JSON keeps working.
 
 IMPORT DISCIPLINE — this module is *pure stdlib* and MUST stay that way.
 It is loaded by ``setup.py`` (which already imports torch, but should not
@@ -121,6 +129,19 @@ OPTIMIZERS: Tuple[str, ...] = (
     "neuralgrok", "prodigy", "supergrok11", "supergrok15", "supergrok2",
 )
 
+# #12 per-model schema — short model keys used in the nested JSON, and the
+# filename-token → short-key map for the megakernel cell TUs. The cell TUs are
+# named mega_<model>_<opt>.cu where <model> is the CANONICAL token
+# (transformer_decoder / mamba3 / vit); the JSON keys are the SHORT names
+# (decoder / mamba / vit) the CLI + dispatch.short_model_name use. Kept as a
+# literal so this stdlib-only module never imports dispatch.
+MODELS: Tuple[str, ...] = ("decoder", "vit", "mamba")
+_MODEL_TOKEN_TO_SHORT: Dict[str, str] = {
+    "decoder": "decoder", "transformer_decoder": "decoder",
+    "vit": "vit",
+    "mamba": "mamba", "mamba3": "mamba",
+}
+
 
 # --------------------------------------------------------------------------
 # Drift guard (design item 1c): verify the MACROS table against the kernel
@@ -189,6 +210,44 @@ def optimizer_for_source(path: str) -> Optional[str]:
     return None
 
 
+def model_for_source(path: str) -> Optional[str]:
+    """Return the SHORT model token a megakernel-cell TU belongs to, or ``None``.
+
+    #12 per-model schema: the INJECTED cells are named ``mega_<model>_<opt>.cu``
+    where ``<model>`` is the canonical token (``transformer_decoder`` /
+    ``mamba3`` / ``vit``); this returns the SHORT key (``decoder`` / ``mamba`` /
+    ``vit``) used in the nested JSON so the consumer can select that cell's
+    per-model winner. Returns ``None`` for a per-optimizer LAUNCHER TU
+    (``launch_<opt>.cu`` is shared across models — it has no single model) and
+    for any TU that does not encode exactly one known optimizer — including the
+    standalone real-TC cells ``mega_<model>_real_adamw_tc.cu`` (whose suffix is
+    ``_real_adamw_tc``, not a bare optimizer, so :func:`optimizer_for_source`
+    already returns ``None``; those are NOT ninja-injection targets — they get
+    their tuned tile macros from compile.py's real-TC-step timer build, not from
+    the per-TU ninja pass). The ``<model>`` is the prefix between ``mega_`` and
+    the trailing ``_<opt>`` token, matched longest-first against the known model
+    tokens so ``transformer_decoder`` wins over a shorter prefix."""
+    base = os.path.basename(str(path))
+    if not base.endswith(".cu"):
+        return None
+    stem = base[:-len(".cu")]
+    if not stem.startswith("mega_"):
+        return None
+    opt = optimizer_for_source(path)
+    if opt is None:
+        return None
+    rest = stem[len("mega_"):]
+    # strip the trailing optimizer token to leave the model token(s).
+    if rest.endswith("_" + opt):
+        model_tok = rest[: -(len("_" + opt))]
+    else:  # rest == opt (no model component) — shouldn't reach here for a cell.
+        return None
+    for known in sorted(_MODEL_TOKEN_TO_SHORT, key=len, reverse=True):
+        if model_tok == known or model_tok.startswith(known + "_"):
+            return _MODEL_TOKEN_TO_SHORT[known]
+    return None
+
+
 # --------------------------------------------------------------------------
 # Flag computation.
 # --------------------------------------------------------------------------
@@ -196,16 +255,85 @@ def optimizer_for_source(path: str) -> Optional[str]:
 # setup.py degrades gracefully (P0.2) without spamming the build log.
 _WARNED_UNMAPPED: set = set()
 
+# Arch-level bookkeeping keys that live alongside the model/optimizer sub-blocks
+# and must NOT be mistaken for a model name during shape detection.
+_ARCH_RESERVED_KEYS = frozenset({"_macros", "_meta"})
+
+
+def _arch_block_is_nested(arch_block: Dict[str, Any]) -> bool:
+    """#12 — distinguish the NEW per-model nested shape
+    ``{model: {optimizer: combo}}`` from the OLD flat shape
+    ``{optimizer: combo}`` for ONE arch block.
+
+    Nested iff some non-reserved key maps to a dict that itself contains at
+    least one known-OPTIMIZER key whose value is a dict (a model→opt→combo
+    nesting). The old flat shape keys directly by optimizer, whose combo dict's
+    values are scalars/lists (never an optimizer→dict nesting), so it returns
+    False. An empty / malformed block is treated as flat (the safe default —
+    the flat reader simply finds nothing)."""
+    for k, v in arch_block.items():
+        if k in _ARCH_RESERVED_KEYS:
+            continue
+        if isinstance(v, dict) and any(
+                opt in v and isinstance(v[opt], dict) for opt in OPTIMIZERS):
+            return True
+    return False
+
+
+def _lookup_combo(arch_block: Dict[str, Any], optimizer: str,
+                  model: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve the winner combo for ``optimizer`` under ``arch_block``, reading
+    BOTH the new per-model nested shape and the old flat shape (#12).
+
+    * NEW nested ``{model: {optimizer: combo}}``:
+        - ``model`` given  → ``arch_block[model][optimizer]``.
+        - ``model`` None   → first model sub-block (deterministic: the JSON's
+          sorted model keys) that records this optimizer. This is the
+          shared-launcher-TU case (``launch_<opt>.cu`` spans all models): it
+          keeps the historical "one winner applies to every TU of this opt"
+          semantics, now picking a stable model's winner.
+    * OLD flat ``{optimizer: combo}``: ``arch_block[optimizer]`` (``model`` is
+      ignored — the old schema had no model dimension).
+
+    Returns the combo dict or ``None`` (absent / wrong shape)."""
+    if _arch_block_is_nested(arch_block):
+        if model is not None:
+            sub = arch_block.get(model)
+            if isinstance(sub, dict):
+                combo = sub.get(optimizer)
+                return combo if isinstance(combo, dict) else None
+            return None
+        # No model context (shared launcher TU): pick a deterministic model
+        # sub-block that has this optimizer.
+        for mkey in sorted(k for k in arch_block
+                           if k not in _ARCH_RESERVED_KEYS):
+            sub = arch_block.get(mkey)
+            if isinstance(sub, dict) and isinstance(sub.get(optimizer), dict):
+                return sub[optimizer]
+        return None
+    # Old flat shape.
+    combo = arch_block.get(optimizer)
+    return combo if isinstance(combo, dict) else None
+
 
 def source_extra_nvcc_flags(optimizer: Optional[str],
                             tuned: Optional[Dict[str, Any]],
-                            arch_key: str) -> List[str]:
+                            arch_key: str,
+                            model: Optional[str] = None) -> List[str]:
     """Extra nvcc flags for ONE optimizer's TUs under ``arch_key``.
 
     Returns ``[]`` when there is nothing tuned for this (arch, optimizer)
     — i.e. when ``optimizer is None`` (ambiguous TU), ``tuned`` is empty/None
     (no JSON), the arch is absent, or the optimizer has no recorded winner.
     Same value is applied to every TU of the same optimizer (design 1b).
+
+    #12 — ``model`` (the SHORT model token for a ``mega_<model>_<opt>.cu`` cell,
+    via :func:`model_for_source`) selects that cell's per-model winner from the
+    NEW nested ``{arch: {model: {optimizer: ...}}}`` schema. ``None`` (a shared
+    ``launch_<opt>.cu`` launcher, or any caller that doesn't know the model)
+    falls back to a deterministic model's winner. The OLD flat
+    ``{arch: {optimizer: ...}}`` schema is still read (``model`` ignored) so a
+    pre-#12 JSON keeps working unchanged. See :func:`_lookup_combo`.
 
     Deterministic order: the five hardcoded SAFE dims first (``_EMIT_ORDER``),
     then any EXTRA persisted macro dims (P0.2) in sorted order. Scalar macro
@@ -222,7 +350,7 @@ def source_extra_nvcc_flags(optimizer: Optional[str],
     arch_block = tuned.get(canon)
     if not isinstance(arch_block, dict):
         return []
-    combo = arch_block.get(optimizer)
+    combo = _lookup_combo(arch_block, optimizer, model)
     if not isinstance(combo, dict):
         return []
     # P0.2 — producer-persisted dim→macro map for the extra (non-SAFE) dims.
@@ -314,18 +442,26 @@ def compute_source_flags(sources: List[str],
     the TUs that resolve to a tuned optimizer. Sources with no per-opt flags
     are OMITTED from the dict (callers treat "absent" as "stock flags").
     Keys preserve the input path string (callers match against the same
-    ``sources`` they passed). A per-optimizer flag list is computed once and
-    shared across that optimizer's TUs.
+    ``sources`` they passed). A per-(optimizer, model) flag list is computed
+    once and shared across TUs with the same (optimizer, model).
+
+    #12 — each ``mega_<model>_<opt>.cu`` cell is keyed by its OWN model
+    (:func:`model_for_source`) so it picks up THAT model's per-model winner from
+    the nested schema; shared ``launch_<opt>.cu`` launchers carry ``model=None``
+    and get a deterministic model's winner. Under the OLD flat schema the model
+    is ignored, so behaviour is identical to before.
     """
     out: Dict[str, List[str]] = {}
-    cache: Dict[Optional[str], List[str]] = {}
+    cache: Dict[Tuple[Optional[str], Optional[str]], List[str]] = {}
     for src in sources:
         opt = optimizer_for_source(src)
         if opt is None:
             continue
-        if opt not in cache:
-            cache[opt] = source_extra_nvcc_flags(opt, tuned, arch_key)
-        flags = cache[opt]
+        model = model_for_source(src)   # None for shared launcher TUs
+        ck = (opt, model)
+        if ck not in cache:
+            cache[ck] = source_extra_nvcc_flags(opt, tuned, arch_key, model)
+        flags = cache[ck]
         if flags:
             out[src] = list(flags)
     return out
@@ -432,12 +568,23 @@ def export_winner(optimizer: str,
                  source: str = "compile.build_jit",
                  version_hash: Optional[str] = None,
                  macro_map: Optional[Dict[str, str]] = None) -> bool:
-    """Persist ONE (arch, optimizer) winner to the canonical JSON.
+    """Persist ONE (arch, model, optimizer) winner to the canonical JSON.
 
-    READ-MERGE-WRITE (design 1a): ``build_jit`` runs a single optimizer, so
-    this merges into any existing JSON rather than overwriting — tuning all
-    11 optimizers in sequence accumulates 11 entries. The write is atomic
-    (tmp file + ``os.replace``) so a reader never sees a half-written file.
+    READ-MERGE-WRITE (design 1a): ``build_jit`` runs a single (model,
+    optimizer), so this merges into any existing JSON rather than overwriting —
+    tuning every (model, optimizer) in sequence accumulates one entry each. The
+    write is atomic (tmp file + ``os.replace``) so a reader never sees a
+    half-written file.
+
+    #12 PER-MODEL SCHEMA: the winner is keyed by ``{arch: {model: {optimizer:
+    combo}}}`` (the canonical short ``model`` token), so tuning the same
+    optimizer on a SECOND model NO LONGER clobbers the first — each (model,
+    optimizer) is its own slot. An existing OLD-flat arch block
+    (``{optimizer: combo}``, pre-#12) is MIGRATED in place on the first write:
+    each flat ``optimizer`` entry is moved under its recorded ``model``
+    provenance (defaulting to this call's ``model`` if absent), then the new
+    winner is merged into the nested tree. The consumer reads both shapes
+    (:func:`_lookup_combo`), so a half-migrated or still-flat JSON stays valid.
 
     ``macro_map`` (P0.2) is the producer-derived ``{dim_name: SG_TUNED_MACRO}``
     map for THIS arch's live search space. The extra (non-SAFE) dims it names
@@ -462,7 +609,7 @@ def export_winner(optimizer: str,
         arch_key = canonical_arch_key(arch)
         payload = _winner_payload(combo, macro_map)
 
-        # Read-merge: start from any existing JSON so sibling optimizers'
+        # Read-merge: start from any existing JSON so sibling (model, optimizer)
         # winners survive. A corrupt existing file is discarded (we cannot
         # safely merge into garbage) but reported via the return value path.
         existing = load_tuned(target) or {}
@@ -471,12 +618,39 @@ def export_winner(optimizer: str,
         arch_block = existing.get(arch_key)
         if not isinstance(arch_block, dict):
             arch_block = {}
+        # #12 — migrate an old-flat arch block ({optimizer: combo}) to the
+        # nested per-model shape ({model: {optimizer: combo}}) before merging, so
+        # a pre-#12 JSON is upgraded in place instead of mixing shapes. Reserved
+        # keys (_macros) are left at the arch level.
+        if not _arch_block_is_nested(arch_block):
+            migrated: Dict[str, Any] = {}
+            for k in list(arch_block.keys()):
+                if k in _ARCH_RESERVED_KEYS:
+                    migrated[k] = arch_block[k]
+                    continue
+                old_entry = arch_block[k]
+                if k in OPTIMIZERS and isinstance(old_entry, dict):
+                    # provenance model recorded inside the flat entry, else this
+                    # call's model (best available).
+                    prov = old_entry.get("model") or model
+                    migrated.setdefault(prov, {})[k] = old_entry
+                else:
+                    # Unknown/foreign key — preserve verbatim so we never drop
+                    # data we don't understand.
+                    migrated[k] = old_entry
+            arch_block = migrated
         entry = dict(payload)
         entry["model"] = model  # provenance: which model's sweep won this.
-        arch_block[optimizer] = entry
+        model_block = arch_block.get(model)
+        if not isinstance(model_block, dict):
+            model_block = {}
+        model_block[optimizer] = entry
+        arch_block[model] = model_block
         # P0.2 — record the dim→macro map for this arch so the consumer can
         # apply the extra (non-SAFE) macros. Merge so sibling optimizers'
-        # contributions accumulate; a per-arch map is shared across its opts.
+        # contributions accumulate; a per-arch map is shared across its opts +
+        # models (it describes the arch's search-space macro names, not a
+        # per-model thing), so it stays at the ARCH level.
         if macro_map:
             existing_map = arch_block.get("_macros")
             if not isinstance(existing_map, dict):
