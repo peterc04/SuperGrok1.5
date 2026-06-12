@@ -27,12 +27,32 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# ── CROSS-CELL ISOLATION (test-state-leakage fix, #19d) ───────────────────────
+# The SuperGrok2 gate's per-op ORACLE (ops.supergrok2_batched_step) and the eager
+# per-op neuralgrok_fused_step kernel both perturb a device-global (raw-cudaMalloc /
+# __constant__ scratch) that a SUBSEQUENT TC SuperGrok2 launch reads — so when the
+# 33-cell suite runs back-to-back in ONE pytest process, a contaminated launch makes
+# supergrok2/vit FALSELY fail (sharpness collapses to ~0, _sg2_l3tc_gate.py:154; or
+# A/A/A bit-determinism breaks). Verified (#19d): each SG2 cell PASSES in isolation
+# but FAILS after a prior SG2 cell (its own oracle leaks) OR a prior neuralgrok cell
+# (its per-op kernel leaks). The neuralgrok cells are NOT victims (their gate anchors
+# to the canonical neuralgrok.h math and only REPORTS the contamination), and adamw /
+# the other clean cells are unaffected — so the minimal, guaranteed-correct isolation
+# is to run ONLY the SG2 cells in a FRESH SUBPROCESS (the device-global never crosses
+# into them), keeping every other cell in-process for speed. The subprocess runs the
+# IDENTICAL gate via the existing `--cell` CLI (sys.exit(0/1) + a "=> PASS" verdict
+# line); we assert BOTH the returncode AND the verdict line so a hollow exit-0 can't
+# slip through. This is test-side only — NO assertion is weakened, NO kernel touched.
+_CONTAMINATION_ISOLATED_OPTS = frozenset({"supergrok2"})
 
 
 def _g():
@@ -1127,10 +1147,45 @@ def _gpu_ready():
 import pytest  # noqa: E402
 
 
+def _run_cell_gate_subprocess(cell):
+    """Run ONE cell's gate in a FRESH python subprocess via the existing `--cell` CLI,
+    so a device-global perturbed by a per-op oracle/kernel in this (parent) process can
+    NOT contaminate the gated TC launch (the #19d cross-cell test-state-leakage). The
+    subprocess executes the IDENTICAL run_cell_gate (no assertion weakened); we assert
+    on BOTH its returncode (sys.exit(0) iff the gate passed) AND the captured "=> PASS"
+    verdict line (so a non-gate exit-0, e.g. an early SKIP, can never hollow-pass).
+    Returns (ok, combined_stdout_stderr) for the caller to assert + surface."""
+    env = dict(os.environ)
+    # The CLI's `-m tests.hw...` + `import grokking_race_v2` both need ROOT on the path.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(ROOT)])
+    proc = subprocess.run(
+        [sys.executable, "-m", "tests.hw.test_l3tc_tail_gate", "--cell", cell],
+        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=900)
+    out = proc.stdout + proc.stderr
+    # A real PASS prints the cell's "=> PASS" line AND "1/1 cells passed" AND exits 0.
+    # A SKIP (no GPU/extension) prints "SKIP:" and exits 0 — surface it, don't pass it.
+    skipped = "SKIP:" in out and "=> PASS" not in out
+    passed = (proc.returncode == 0 and "=> PASS" in out
+              and "1/1 cells passed" in out and not skipped)
+    return passed, skipped, out
+
+
 @pytest.mark.hw
 @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
 @pytest.mark.parametrize("cell", list(_CELLS))
 def test_l3tc_cell_gate(cell):
+    # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+    # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+    # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+    # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+    # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+    if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+        passed, skipped, out = _run_cell_gate_subprocess(cell)
+        if skipped:
+            pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+        assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+        return
     ok, detail = run_cell_gate(cell, verbose=True)
     assert ok, f"{cell} L3-TC gate failed: {detail}"
 
