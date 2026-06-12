@@ -391,6 +391,26 @@ __host__ __device__ __forceinline__ int64_t dec_tc_acts_floats(int T, int B) {
 __host__ __device__ __forceinline__ int64_t dec_tc_dw_part_floats() {
     return (dectc::kDecDwSplitK > 1) ? dectc::dec_dw_part_floats(dectc::kDecDwSplitK) : 0;
 }
+// ── STAGED-opt scratch gate (bench-layout-only carve elision) ────────────────
+// The four STAGED-optimizer scratch regions below (Prodigy reduce / Muon NS /
+// LookSAM 2nd-bwd / SuperGrok2 meta-net) are carved UNCONDITIONALLY on the
+// production path so the opt-agnostic launcher fits every OptId in one workspace.
+// The d-scaled BENCH layout (SG_DEC_BENCH_LAYOUT=1) is adamw-ONLY (decoder_bench.py
+// drives OptId::AdamW exclusively — none of those four optimizers ever runs in the
+// bench TU), so carving them there is pure dead weight. At bench width the SG2
+// region in particular is pathological: dec_sg2_ws_stride_floats() is O(Nmax·d_model)
+// PER CTA and Nmax=4d²=4,194,304 at d=1024 ⇒ ~199 GB over 132 CTAs, OOMing the 80 GB
+// H100 (see the KNOWN DEEP LIMIT note at dec_tc_sg2_floats — SG2's per-CTA workspace
+// DESIGN doesn't scale; a chunked/streamed restructure is the documented deep item,
+// out of scope here per 7656ea6/campaign notes). So we GATE the four regions OFF at
+// bench width: honest scoping (the bench never touches them), NOT correctness
+// suppression. PRODUCTION is byte-identical — kDecStagedOptScratch is true there, so
+// every gated helper folds back to its original value (constexpr bool, -O3 inline).
+#if SG_DEC_BENCH_LAYOUT
+constexpr bool kDecStagedOptScratch = false;   // bench: adamw-only → elide the 4 staged-opt carves
+#else
+constexpr bool kDecStagedOptScratch = true;    // production: carve all 4 (opt-agnostic launcher)
+#endif
 // STAGED-optimizer cross-CTA reduction scratch (Prodigy d-estimate). The Prodigy
 // stage publishes per-CTA (r,s) slots (2*nCTA) + a reduced-d slot (1) — an owner-
 // computes tree (opt_stages_precompute.cuh), NO float atomic. Sized for the
@@ -399,6 +419,7 @@ __host__ __device__ __forceinline__ int64_t dec_tc_dw_part_floats() {
 // allocates one workspace that fits every OptId. Unused by AdamW/Lion/… (their
 // P3 never touches this region), so adding it leaves those cells byte-identical.
 __host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA) {
+    if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): Prodigy never runs
     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
 }
 // ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. IDENTICAL in
@@ -412,6 +433,7 @@ __host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA) {
 //    launcher (dec_tc_launcher_scratch) fits every OptId; unused by every non-Muon cell
 //    (its P2.7/P3-2D branches are if-constexpr'd out → byte-identical). ──
 __host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA) {
+    if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): Muon NS never runs
     // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
     return (int64_t)4 * dectc::kDecMuonMaxNumel
          + (int64_t)dectc::kDecMuonMaxRows * dectc::kDecMuonMaxRows
@@ -428,6 +450,7 @@ __host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA) {
 //    → byte-identical). nrm_partials(nCTA)+inv_norm(1) for the ‖g‖ reduction reuse
 //    the loss workspace (sq_part/coef_bc, as GrokAdamW's P2.5 does), so no extra here. ──
 __host__ __device__ __forceinline__ int64_t dec_tc_looksam_floats() {
+    if (!kDecStagedOptScratch) return 0;      // bench (adamw-only): LookSAM never runs
     return (int64_t)2 * kDecTotalElems;       // [sam_backup | sam_grad]
 }
 // ── SuperGrok2 compile-time dims = the race config (== SG2Dims defaults). The
@@ -462,9 +485,25 @@ __host__ __device__ __forceinline__ int64_t dec_sg2_ws_stride_floats() {
          + sg2_ws_stride<DecSG2Dims>((int64_t)kDecSG2Nmax);
 }
 __host__ __device__ __forceinline__ int64_t dec_tc_sg2_floats(int nCTA) {
+    if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): SG2 never runs — and
+        // its honestly-derived per-CTA stride (4d²·d_model floats) would OOM at d=1024.
     // +1 for the 8-byte realignment slack of sg2_ws_base (the per-CTA slice fronts an
     // int64 row_off64 array; kDecTotalElems is odd, so the base may need a +1 bump).
     return (int64_t)nCTA * dec_sg2_ws_stride_floats() + 1;
+}
+// AGGREGATE of the four STAGED-opt scratch regions (Prodigy reduce | Muon NS |
+// LookSAM 2nd-bwd | SuperGrok2 meta-net), in the kernel's carve order. This is the
+// SINGLE source the host workspace size (dec_tc_workspace_floats) AND the kernel's
+// post-staged-opt offset (embed_ws) are derived from, so the host carve and kernel
+// offsets stay byte-consistent under the kDecStagedOptScratch gate: at bench width
+// all four collapse to 0 (so the embed lists carve right after the dW partials, and
+// the kernel's pointer chain — built from the SAME four gated helpers — lands embed_ws
+// at the identical place); in production each returns its full size (byte-identical).
+__host__ __device__ __forceinline__ int64_t dec_tc_staged_opt_floats(int nCTA) {
+    return dec_tc_opt_reduce_floats(nCTA)     // STAGED-opt (Prodigy) reduce slots
+         + dec_tc_muon_floats(nCTA)           // STAGED-opt (Muon) NS per-matrix scratch
+         + dec_tc_looksam_floats()            // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
+         + dec_tc_sg2_floats(nCTA);           // SuperGrok2 meta-net per-CTA scratch
 }
 __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA) {
     return dec_tc_acts_floats(T, B)
@@ -472,10 +511,8 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + (int64_t)nCTA * dectc::kLnVecElems
          + nCTA + 1
          + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
-         + dec_tc_opt_reduce_floats(nCTA)     // STAGED-opt (Prodigy) reduce slots
-         + dec_tc_muon_floats(nCTA)           // STAGED-opt (Muon) NS per-matrix scratch
-         + dec_tc_looksam_floats()            // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
-         + dec_tc_sg2_floats(nCTA)            // SuperGrok2 meta-net per-CTA scratch
+         + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
+                                              //   gated to 0 at bench width (adamw-only)
          + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
          + 1;                                 // 8-byte realign slack for the int32 lists base
 }
@@ -558,7 +595,20 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // regions are byte-identical). int32 views over the float tail; 8-byte aligned so
     // the (future) widening to int is safe. Built in the P1 window (cta 0), consumed
     // in P2 — fenced by the already-present B1 barrier (no new barrier).
+#if SG_DEC_BENCH_LAYOUT
+    // Bench (adamw-only): the four staged-opt regions are gated to 0, so embed_ws is
+    // the staged-opt block START (== opt_reduce) plus the aggregate (== 0 here). We
+    // derive it from the SAME dec_tc_staged_opt_floats aggregate the host carve
+    // (dec_tc_workspace_floats) uses, so the host size and this offset are provably the
+    // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
+    // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
+    float* embed_ws = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+#else
+    // Production: carve AFTER the (full-size) SG2 region via the existing chain —
+    // BYTE-IDENTICAL to the historical offset (the sg2_ws_base align bump + the
+    // dec_tc_sg2_floats stride are load-bearing for the SG2 int64 row_off64 reads).
     float* embed_ws = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+#endif
     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
     int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
     int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
