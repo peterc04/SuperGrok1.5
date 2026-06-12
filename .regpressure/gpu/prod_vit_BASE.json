@@ -1,0 +1,233 @@
+[
+ {
+  "opt": "adamw",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   124.50980147346854,
+   124.46536792442203,
+   124.41255933605134
+  ],
+  "median_ms": 124.46536792442203,
+  "min_ms": 124.41255933605134,
+  "max_ms": 124.50980147346854,
+  "spread_ms": 0.09724213741719723,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "neuralgrok",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   161.80439689196646,
+   161.52987591922283,
+   161.35549165308475
+  ],
+  "median_ms": 161.52987591922283,
+  "min_ms": 161.35549165308475,
+  "max_ms": 161.80439689196646,
+  "spread_ms": 0.4489052388817072,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "grokadamw",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   121.766148051247,
+   121.7872972600162,
+   121.75294903106987
+  ],
+  "median_ms": 121.766148051247,
+  "min_ms": 121.75294903106987,
+  "max_ms": 121.7872972600162,
+  "spread_ms": 0.03434822894632816,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "supergrok",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   173.87926240451634,
+   174.01814228855073,
+   173.91248143278062
+  ],
+  "median_ms": 173.91248143278062,
+  "min_ms": 173.87926240451634,
+  "max_ms": 174.01814228855073,
+  "spread_ms": 0.13887988403439522,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "supergrok15",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   157.33339636586607,
+   157.47386605478823,
+   157.33791518956423
+  ],
+  "median_ms": 157.33791518956423,
+  "min_ms": 157.33339636586607,
+  "max_ms": 157.47386605478823,
+  "spread_ms": 0.14046968892216682,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "supergrok2",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   806.4169631991535,
+   803.9035630691797,
+   805.1974875014275
+  ],
+  "median_ms": 805.1974875014275,
+  "min_ms": 803.9035630691797,
+  "max_ms": 806.4169631991535,
+  "spread_ms": 2.5134001299738884,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "grokfast",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   124.51770027168095,
+   124.67819776386023,
+   124.6306783799082
+  ],
+  "median_ms": 124.6306783799082,
+  "min_ms": 124.51770027168095,
+  "max_ms": 124.67819776386023,
+  "spread_ms": 0.16049749217927456,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "muon",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   129.41589327529073,
+   129.36225122772157,
+   129.4919788837433
+  ],
+  "median_ms": 129.41589327529073,
+  "min_ms": 129.36225122772157,
+  "max_ms": 129.4919788837433,
+  "spread_ms": 0.1297276560217142,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "lion",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   124.4674482382834,
+   124.38050573691726,
+   124.4453489035368
+  ],
+  "median_ms": 124.4453489035368,
+  "min_ms": 124.38050573691726,
+  "max_ms": 124.4674482382834,
+  "spread_ms": 0.08694250136613846,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "looksam",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   162.53862030804157,
+   164.61954981088638,
+   164.6287780161947
+  ],
+  "median_ms": 164.61954981088638,
+  "min_ms": 162.53862030804157,
+  "max_ms": 164.6287780161947,
+  "spread_ms": 2.0901577081531286,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ },
+ {
+  "opt": "prodigy",
+  "model": "vit",
+  "B": 16384,
+  "timed_steps": 100,
+  "walls_ms": [
+   121.49742684327066,
+   121.44743409007788,
+   121.40616761520505
+  ],
+  "median_ms": 121.44743409007788,
+  "min_ms": 121.40616761520505,
+  "max_ms": 121.49742684327066,
+  "spread_ms": 0.09125922806560993,
+  "l3_fired": 415,
+  "l3_expected": 415,
+  "engines": [
+   "wgmma"
+  ],
+  "wgmma_every_step": true
+ }
+]

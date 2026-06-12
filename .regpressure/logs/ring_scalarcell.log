@@ -1,0 +1,24 @@
+/dev/shm/laneD-ring/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/laneD-ring/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 80 bytes spill stores, 68 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    544 bytes stack frame, 80 bytes spill stores, 68 bytes spill loads
+ptxas info    : Used 80 registers, 544 bytes cumulative stack size, 42968 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+rc=0

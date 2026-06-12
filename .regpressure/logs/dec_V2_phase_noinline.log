@@ -1,0 +1,42 @@
+/dev/shm/expV2/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/expV2/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 288 bytes spill stores, 464 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 8740 bytes spill stores, 8736 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 4680 bytes spill stores, 4684 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 96 bytes spill stores, 304 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 8764 bytes spill stores, 8760 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 4692 bytes spill stores, 4696 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 96 bytes spill stores, 304 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 8764 bytes spill stores, 8760 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 4692 bytes spill stores, 4696 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 96 bytes spill stores, 304 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 8764 bytes spill stores, 8760 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 4692 bytes spill stores, 4696 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 96 bytes spill stores, 256 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4504 bytes spill stores, 4500 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 32 bytes spill stores, 156 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 80 bytes spill stores, 248 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4504 bytes spill stores, 4500 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 52 bytes spill stores, 256 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 128 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4504 bytes spill stores, 4500 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 52 bytes spill stores, 256 bytes spill loads
+Segmentation fault (core dumped)
+rc=139

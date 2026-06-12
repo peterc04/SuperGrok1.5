@@ -1,0 +1,304 @@
+/dev/shm/expV3/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/expV3/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 400 bytes spill stores, 1152 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 192 bytes spill stores, 744 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 192 bytes spill stores, 760 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 192 bytes spill stores, 720 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 96 bytes spill stores, 256 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 220 bytes spill stores, 720 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 80 bytes spill stores, 248 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 284 bytes spill stores, 776 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 128 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 284 bytes spill stores, 776 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 152 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 316 bytes spill stores, 808 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 128 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 284 bytes spill stores, 776 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 136 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 284 bytes spill stores, 776 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 60 bytes spill stores, 128 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 12 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 284 bytes spill stores, 776 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_', 2048 bytes spill stores, 2048 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_', 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2640 bytes stack frame, 400 bytes spill stores, 1152 bytes spill loads
+ptxas info    : Used 255 registers, 2640 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2416 bytes stack frame, 192 bytes spill stores, 744 bytes spill loads
+ptxas info    : Used 255 registers, 2416 bytes cumulative stack size, 43700 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2416 bytes stack frame, 192 bytes spill stores, 760 bytes spill loads
+ptxas info    : Used 255 registers, 2416 bytes cumulative stack size, 43828 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2416 bytes stack frame, 192 bytes spill stores, 720 bytes spill loads
+ptxas info    : Used 255 registers, 2416 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2000 bytes stack frame, 96 bytes spill stores, 256 bytes spill loads
+ptxas info    : Used 255 registers, 2000 bytes cumulative stack size, 43316 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 220 bytes spill stores, 720 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 8 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 8 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1984 bytes stack frame, 80 bytes spill stores, 248 bytes spill loads
+ptxas info    : Used 255 registers, 1984 bytes cumulative stack size, 43444 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 284 bytes spill stores, 776 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1952 bytes stack frame, 60 bytes spill stores, 128 bytes spill loads
+ptxas info    : Used 255 registers, 1952 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 284 bytes spill stores, 776 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1968 bytes stack frame, 60 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 1968 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 316 bytes spill stores, 808 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1952 bytes stack frame, 60 bytes spill stores, 128 bytes spill loads
+ptxas info    : Used 255 registers, 1952 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 284 bytes spill stores, 776 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1952 bytes stack frame, 60 bytes spill stores, 136 bytes spill loads
+ptxas info    : Used 255 registers, 1952 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 284 bytes spill stores, 776 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1952 bytes stack frame, 60 bytes spill stores, 128 bytes spill loads
+ptxas info    : Used 255 registers, 1952 bytes cumulative stack size, 43188 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 284 bytes spill stores, 776 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc22dectc_dw_reduce_splitkILi128EEEvPKNS2_9DecDwSpecEiiPKfPfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16S9_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_14dectc_gemm_fwdILi128EEEvPK13__nv_bfloat16PKfPS5_iiSA_SA_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 2048 bytes spill stores, 2048 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_17dectc_gemm_dx_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 1024 bytes spill stores, 1024 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_18dectc_gemm_fwd_f32ILi128EEEvPK13__nv_bfloat16PKfPfiiPS5_SB_EUliiE_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliiE0_ZS4_ILi128EEvS7_S9_SA_iiSB_SB_EUliifE_EEviiiiT1_T2_T3_SB_SB_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc25tc_gemm_block_unpipelinedILi128ELi2EZNS2_24dectc_dw_run_tile_splitkILi128EEEvPKNS2_9DecDwSpecEiiiPfP13__nv_bfloat16SA_EUliiE_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliiE0_ZS4_ILi128EEvS7_iiiS8_SA_SA_EUliifE_EEviiiiT1_T2_T3_SA_SA_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+rc=0

@@ -1,0 +1,185 @@
+{
+  "peaks": {
+    "fp32_cuda": 66900000000000.0,
+    "tf32_tc": 494700000000000.0,
+    "bf16_tc": 989400000000000.0,
+    "fp8_tc": 1978900000000000.0,
+    "int8_tc": 1978900000000000.0,
+    "hbm_bw": 3350000000000.0
+  },
+  "force_precision": "bf16",
+  "max_batch": 16384,
+  "baseline_for_deltas": "/workspace/SuperGrok1.5/results/h100_grokking_race/archive/roofline_eager_baseline_20260610.json",
+  "baseline_batch_differs": true,
+  "deltas_batch_confounded_note": "deltas_vs_eager compares max-batch rows against a native-batch baseline; a fraction move there mixes batch with path/precision \u2014 read absolute achieved_flops_per_s, not the delta.",
+  "batch_saturation_sweep": {
+    "note": "decoder, min-of-3 wall, quiet GPU (tuner fleet SIGSTOPped). throughput = samples/s \u221d achieved FLOP/s. megakernel = TC tc_train_step (one CTA/SM); eager = lion fwd+bwd+step bf16-autocast.",
+    "megakernel_tc": [
+      {
+        "B": 1024,
+        "wall_ms": 8.82,
+        "throughput_samples_per_s": 116098,
+        "peak_vram_gb": 0.25
+      },
+      {
+        "B": 2048,
+        "wall_ms": 14.374,
+        "throughput_samples_per_s": 142477,
+        "peak_vram_gb": 0.524
+      },
+      {
+        "B": 4096,
+        "wall_ms": 28.714,
+        "throughput_samples_per_s": 142646,
+        "peak_vram_gb": 0.63
+      },
+      {
+        "B": 8192,
+        "wall_ms": 58.173,
+        "throughput_samples_per_s": 140821,
+        "peak_vram_gb": 0.84
+      },
+      {
+        "B": 16384,
+        "wall_ms": 119.077,
+        "throughput_samples_per_s": 137591,
+        "peak_vram_gb": 1.26
+      },
+      {
+        "B": 32768,
+        "wall_ms": 255.077,
+        "throughput_samples_per_s": 128463,
+        "peak_vram_gb": 2.103
+      },
+      {
+        "B": 65536,
+        "wall_ms": 505.165,
+        "throughput_samples_per_s": 129732,
+        "peak_vram_gb": 3.787
+      },
+      {
+        "B": 131072,
+        "wall_ms": 1022.129,
+        "throughput_samples_per_s": 128234,
+        "peak_vram_gb": 7.154
+      }
+    ],
+    "eager_lion": [
+      {
+        "B": 4096,
+        "wall_ms": 6.472,
+        "throughput_samples_per_s": 632904,
+        "peak_vram_gb": 0.22
+      },
+      {
+        "B": 8192,
+        "wall_ms": 14.245,
+        "throughput_samples_per_s": 575065,
+        "peak_vram_gb": 0.368
+      },
+      {
+        "B": 16384,
+        "wall_ms": 14.353,
+        "throughput_samples_per_s": 1141497,
+        "peak_vram_gb": 0.583
+      },
+      {
+        "B": 32768,
+        "wall_ms": 19.007,
+        "throughput_samples_per_s": 1724025,
+        "peak_vram_gb": 1.096
+      },
+      {
+        "B": 65536,
+        "wall_ms": 35.794,
+        "throughput_samples_per_s": 1830900,
+        "peak_vram_gb": 2.12
+      },
+      {
+        "B": 131072,
+        "wall_ms": 69.709,
+        "throughput_samples_per_s": 1880273,
+        "peak_vram_gb": 4.17
+      },
+      {
+        "B": 262144,
+        "wall_ms": 137.169,
+        "throughput_samples_per_s": 1911100,
+        "peak_vram_gb": 8.269
+      }
+    ],
+    "verdict": "megakernel saturates ~8\u00d7 below the owner's 16k estimate (occupancy pinned at 1 CTA/SM); eager saturates ~32-65k. VRAM is NOT the binding constraint at d=128 (literal VRAM-max \u2248 B~1-2M yields no fraction gain). 16384 = fair shared point + megakernel ceiling."
+  },
+  "peak_vram_table": [
+    {
+      "model": "vit",
+      "optimizer": "muon",
+      "path_family": "tc",
+      "path": "L3-TC-megakernel(wgmma)",
+      "batch": 16384,
+      "peak_vram_bytes": 1934056960,
+      "peak_vram_gb": 1.9341
+    }
+  ],
+  "rows": [
+    {
+      "optimizer": "muon",
+      "model": "vit",
+      "precision": "bf16",
+      "precision_requested": "bf16",
+      "l3_engine": "wgmma",
+      "use_amp": false,
+      "path": "L3-TC-megakernel(wgmma)",
+      "path_family": "tc",
+      "l3_steps_fired": 115,
+      "l1_steps_fired": 0,
+      "wall_pass_total_steps": 90,
+      "abi_stale": false,
+      "steps_per_s": 5.768184872456828,
+      "wall_per_step_ms": 173.36476241859296,
+      "flops_per_step": 704353116395.0,
+      "batch": 16384,
+      "peak_vram_bytes": 1934056960,
+      "max_batch_requested": 16384,
+      "seq_for_acts": 16,
+      "dim_for_acts": 128,
+      "layers_for_acts": 2,
+      "bytes_per_step_analytical": 7532913448.0,
+      "achieved_flops_per_s": 4062838990857.4624,
+      "arithmetic_intensity": 93.50341289026848,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 313236433182399.4,
+      "fraction_of_roofline": 0.012970518625755286,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 43451237396.280205,
+      "fraction_of_hbm_bw": 0.012970518625755285,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.15863452274352313
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.17638374743983148
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.17466860115528107
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.1758741163648665
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.17527699237689376
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.17569559188559652
+        }
+      ]
+    }
+  ],
+  "deltas_vs_eager": []
+}

@@ -1,0 +1,80 @@
+/dev/shm/laneB-base/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/laneB-base/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 15400 bytes spill stores, 16020 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 84 bytes spill stores, 204 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 15400 bytes spill stores, 16020 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 84 bytes spill stores, 204 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1376 bytes stack frame, 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : Used 255 registers, 1376 bytes cumulative stack size, 35508 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1376 bytes stack frame, 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : Used 255 registers, 1376 bytes cumulative stack size, 35636 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1376 bytes stack frame, 13300 bytes spill stores, 13656 bytes spill loads
+ptxas info    : Used 255 registers, 1376 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 35124 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 35252 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 34996 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+rc=0

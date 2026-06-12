@@ -1,0 +1,36 @@
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z14gemm_dw_kernelILi128EEvPK13__nv_bfloat16S2_Pfii'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z14gemm_dw_kernelILi96EEvPK13__nv_bfloat16S2_Pfii'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z14gemm_dx_kernelILi128EEvPK13__nv_bfloat16S2_Pfi'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z14gemm_dx_kernelILi96EEvPK13__nv_bfloat16S2_Pfi'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z15gemm_fwd_kernelILi128EEvPK13__nv_bfloat16S2_Pfii'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_Z15gemm_fwd_kernelILi96EEvPK13__nv_bfloat16S2_Pfii'
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+ptxas info    : Compiling entry function '_Z14gemm_dw_kernelILi128EEvPK13__nv_bfloat16S2_Pfii' for 'sm_90a'
+ptxas info    : Function properties for _Z14gemm_dw_kernelILi128EEvPK13__nv_bfloat16S2_Pfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 154 registers
+ptxas info    : Compiling entry function '_Z14gemm_dw_kernelILi96EEvPK13__nv_bfloat16S2_Pfii' for 'sm_90a'
+ptxas info    : Function properties for _Z14gemm_dw_kernelILi96EEvPK13__nv_bfloat16S2_Pfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers
+ptxas info    : Compiling entry function '_Z14gemm_dx_kernelILi128EEvPK13__nv_bfloat16S2_Pfi' for 'sm_90a'
+ptxas info    : Function properties for _Z14gemm_dx_kernelILi128EEvPK13__nv_bfloat16S2_Pfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 154 registers
+ptxas info    : Compiling entry function '_Z14gemm_dx_kernelILi96EEvPK13__nv_bfloat16S2_Pfi' for 'sm_90a'
+ptxas info    : Function properties for _Z14gemm_dx_kernelILi96EEvPK13__nv_bfloat16S2_Pfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers
+ptxas info    : Compiling entry function '_Z15gemm_fwd_kernelILi128EEvPK13__nv_bfloat16S2_Pfii' for 'sm_90a'
+ptxas info    : Function properties for _Z15gemm_fwd_kernelILi128EEvPK13__nv_bfloat16S2_Pfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 185 registers
+ptxas info    : Compiling entry function '_Z15gemm_fwd_kernelILi96EEvPK13__nv_bfloat16S2_Pfii' for 'sm_90a'
+ptxas info    : Function properties for _Z15gemm_fwd_kernelILi96EEvPK13__nv_bfloat16S2_Pfii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 141 registers
+rc=0

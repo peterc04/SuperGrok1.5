@@ -1,0 +1,103 @@
+/dev/shm/expVitS/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/expVitS/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6824 bytes spill stores, 7848 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 5580 bytes spill stores, 5728 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 236 bytes spill stores, 328 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6604 bytes spill stores, 7496 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 5572 bytes spill stores, 5720 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6604 bytes spill stores, 7520 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 5572 bytes spill stores, 5720 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6604 bytes spill stores, 7472 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 5572 bytes spill stores, 5720 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_', 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 4 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 16 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2240 bytes stack frame, 6824 bytes spill stores, 7848 bytes spill loads
+ptxas info    : Used 255 registers, 2240 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+    0 bytes stack frame, 5580 bytes spill stores, 5728 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 236 bytes spill stores, 328 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2016 bytes stack frame, 6604 bytes spill stores, 7496 bytes spill loads
+ptxas info    : Used 255 registers, 2016 bytes cumulative stack size, 10212 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+    0 bytes stack frame, 5572 bytes spill stores, 5720 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2016 bytes stack frame, 6604 bytes spill stores, 7520 bytes spill loads
+ptxas info    : Used 255 registers, 2016 bytes cumulative stack size, 10340 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+    0 bytes stack frame, 5572 bytes spill stores, 5720 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2016 bytes stack frame, 6604 bytes spill stores, 7472 bytes spill loads
+ptxas info    : Used 255 registers, 2016 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc27vittc_forward_tile_outlinedERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+    0 bytes stack frame, 5572 bytes spill stores, 5720 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm905vittc28vittc_backward_tile_outlinedERKNS1_10VitWeightsEiiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKiPfSE_P13__nv_bfloat16SG_SE_
+    0 bytes stack frame, 232 bytes spill stores, 324 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    688 bytes stack frame, 8 bytes spill stores, 4 bytes spill loads
+ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9828 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9956 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    688 bytes stack frame, 8 bytes spill stores, 16 bytes spill loads
+ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+rc=0

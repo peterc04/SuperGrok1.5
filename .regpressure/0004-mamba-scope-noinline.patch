@@ -1,0 +1,117 @@
+diff --git a/csrc/fused/sm_90/model_stage_mamba_tc.cuh b/csrc/fused/sm_90/model_stage_mamba_tc.cuh
+index 2948fc1..7fd074b 100644
+--- a/csrc/fused/sm_90/model_stage_mamba_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_mamba_tc.cuh
+@@ -648,7 +648,7 @@ __device__ __forceinline__ MbPartial mb_partial_bind(float* base) {
+ // __noinline__ (mirrors mbtc_backward_tile): one shared out-of-line frame for the
+ // 2nd-pass cells that call the forward twice, bounding the megakernel's register
+ // footprint so the wgmma accumulator stays register-resident (A/A/A determinism).
+-__device__ __noinline__ float mbtc_forward_tile(
++__device__ float mbtc_forward_tile(
+         const MambaWeights& w, int g0, int nrows, const MbActs& acts,
+         const MbTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+@@ -858,7 +858,7 @@ __device__ __noinline__ float mbtc_forward_tile(
+ // in. The math is unchanged (same code, just not inlined). Warpgroup-uniform call:
+ // the whole CTA enters/exits together, so the wgmma fence/commit/wait choreography
+ // inside is well-formed across the call boundary.
+-__device__ __noinline__ void mbtc_backward_tile(
++__device__ void mbtc_backward_tile(
+         const MambaWeights& w, int g0, int nrows, int B, const MbActs& acts,
+         const MbTileScratch& sc, const MbPartial& part,
+         const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,
+@@ -1116,6 +1116,36 @@ __device__ __noinline__ void mbtc_backward_tile(
+     __syncthreads();
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  SAM-cell-scoped OUT-OF-LINE tile shims (reg-pressure campaign C2). The
++//  unconditional __noinline__ on mbtc_forward_tile/mbtc_backward_tile (the
++//  original LookSAM accumulator-spill fix) taxed EVERY cell with the ABI
++//  out-of-line frame: the single-pass cells carried ~5.7-5.8 KB of callee
++//  spill traffic that the fully-inline allocation does not have (the original
++//  fix note itself records that the single-pass cells stayed under the spill
++//  threshold when inline). SCOPING the outline to the SAM-coupled cells
++//  (LookSAM/SG11/SG15/SG2 -- the ones that genuinely instantiate the tile body
++//  TWICE) keeps their one-shared-frame fix AND returns the single-pass cells
++//  to the cleaner inline allocation. Math identical; warpgroup-uniform call.
++// ════════════════════════════════════════════════════════════════════════
++__device__ __noinline__ float mbtc_forward_tile_outlined(
++        const MambaWeights& w, int g0, int nrows, const MbActs& acts,
++        const MbTileScratch& sc, const int* __restrict__ tok_ids,
++        const int* __restrict__ tgt_ids,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    return mbtc_forward_tile(w, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red);
++}
++__device__ __noinline__ void mbtc_backward_tile_outlined(
++        const MambaWeights& w, int g0, int nrows, int B, const MbActs& acts,
++        const MbTileScratch& sc, const MbPartial& part,
++        const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        float* dBmat_s, float* dCmat_s) {
++    mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok_ids, tgt_ids, sA, sB, red,
++                       dBmat_s, dCmat_s);
++}
++
++
+ // ════════════════════════════════════════════════════════════════════════
+ //  P2 — OUTPUT-STATIONARY dW (the 4 projections × kLayers = 8 weight matrices,
+ //  dW = dYᵀ @ X, K=T). Each split into 64×N output tiles; tile_id % nCTA owns
+diff --git a/csrc/fused/sm_90/fused_mamba_megakernel.cuh b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+index 048cb8a..297df07 100644
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -529,6 +529,12 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+                           float lr, int step, FusedOptState st) {
+     __shared__ MbTcSmem sm;
+     GridBarrier bar = ctx.barrier();
++    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); ONLY they route
++    // through the out-of-line shims (one shared frame). Single-pass cells now
++    // use the inline bodies (the original noinline was unconditional and taxed
++    // them ~5.7 KB of callee spill; campaign C2 scopes it).
++    constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
++                                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
+     const int cta = blockIdx.x;
+     const int nCTA = (int)ctx.n_ctas;
+     const int B = tok.B;
+@@ -609,12 +615,21 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+         const int g0 = ti * nrows_tile;
+         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+         SG_MBTC_PROF_TIC(_pt);
+-        float nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                            sm.sA, sm.sB, sm.red);
++        float nll;
++        if constexpr (kSamCoupled)
++            nll = mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
++                                                   tok.targets, sm.sA, sm.sB, sm.red);
++        else
++            nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
++                                          sm.sA, sm.sB, sm.red);
+         SG_MBTC_PROF_ACC(0, _pt);
+         SG_MBTC_PROF_TIC(_pt);
+-        mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
+-                                 sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
++        if constexpr (kSamCoupled)
++            mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
++                                              tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
++        else
++            mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
++                                     sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+         SG_MBTC_PROF_ACC(1, _pt);
+         if (threadIdx.x == 0) nll_acc += nll;
+         __syncthreads();
+@@ -775,10 +790,10 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+             for (int ti = cta; ti < n_tiles; ti += nCTA) {
+                 const int g0 = ti * nrows_tile;
+                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+-                mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                        sm.sA, sm.sB, sm.red);
+-                mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
+-                                         sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
++                mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
++                                                 tok.targets, sm.sA, sm.sB, sm.red);
++                mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
++                                                  tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+                 __syncthreads();
+             }
+             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY + dh0) + partials complete

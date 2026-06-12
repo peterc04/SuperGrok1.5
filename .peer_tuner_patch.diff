@@ -1,0 +1,205 @@
+diff --git a/csrc/bindings/bindings.cpp b/csrc/bindings/bindings.cpp
+index 9b744c1..36dc6d4 100644
+--- a/csrc/bindings/bindings.cpp
++++ b/csrc/bindings/bindings.cpp
+@@ -114,12 +114,14 @@ DECLARE_MT_GROKADAMW(gfx942)
+ // Public entry points called from Python.
+ // ---------------------------------------------------------------------
+ 
++// Arch case gated by the compiled backend (see helpers.h SG_ARCH_CASE_RET):
++// referencing the non-compiled arch's namespace would leave undefined symbols
++// in the single-backend .so.
+ #define DISPATCH_GROKADAMW(METHOD, ...) \
+  do { \
+  const int a = sg::detect_arch(); \
+  switch (a) { \
+- case 90: return sg::sm90::METHOD(__VA_ARGS__); \
+- case 942: return sg::gfx942::METHOD(__VA_ARGS__); \
++ SG_ARCH_CASE_RET(METHOD, ##__VA_ARGS__) \
+  default: \
+  throw std::runtime_error( \
+  "GrokAdamW dispatch: unsupported arch " + \
+@@ -1264,10 +1266,13 @@ static float dispatch_cosine_gate(
+ {
+  const int sg_arch_ = ::sg::detect_arch();
+  switch (sg_arch_) {
+-
+- case 90: return ::sg::sm90::compute_cosine_gate_fused(smart_grad, mu, gate_temp);
+-
++ // Gate by compiled backend: the non-compiled arch's namespace symbol is
++ // undefined in the single-backend .so (see helpers.h SG_ARCH_CASE_RET).
++#if defined(WITH_HIP)
+  case 942: return ::sg::gfx942::compute_cosine_gate_fused(smart_grad, mu, gate_temp);
++#else
++ case 90: return ::sg::sm90::compute_cosine_gate_fused(smart_grad, mu, gate_temp);
++#endif
+  default:
+  throw std::runtime_error(
+  "compute_cosine_gate_fused: unsupported arch " +
+diff --git a/csrc/bindings/dispatch.cpp b/csrc/bindings/dispatch.cpp
+index d8717c8..12f5d06 100644
+--- a/csrc/bindings/dispatch.cpp
++++ b/csrc/bindings/dispatch.cpp
+@@ -170,9 +170,16 @@ int detect_arch() {
+ // =====================================================================
+ 
+ #if defined(WITH_CUDA) && !defined(WITH_HIP)
+-namespace fused { namespace sm90 {
++namespace fused {
+ // The persistent-megakernel scratch the host zero-initializes (mirror of
+ // csrc/fused/megakernel_common.cuh::PersistentContext — kept layout-identical).
++// MUST live in sg::fused (NOT sg::fused::sm90): the real type the generated
++// cells compile against is sg::fused::PersistentContext (megakernel_common.cuh
++// opens `namespace sg { namespace fused {`). fused_dispatch_table.inc below is
++// included within sg::fused::sm90, so its unqualified `PersistentContext`
++// resolves to this enclosing-namespace type — matching the cell definitions'
++// mangled signatures. Nesting it under sm90 forked the type and left every
++// sg::fused::sm90::mega_* call referencing an undefined sm90-qualified symbol.
+ struct PersistentContext {
+  int* g_next_task;
+  unsigned* g_arrived;
+@@ -180,7 +187,7 @@ struct PersistentContext {
+  int n_tasks;
+  unsigned n_ctas;
+ };
+-}} // namespace fused::sm90
++} // namespace fused
+ // Phase 3 Stage 5: all 33 sm_90 cells are real component compositions
+ // (csrc/fused/sm_90/mega_<model>_<opt>.cu → fused_megakernel.cuh →
+ // opt_components.cuh/model_stages.cuh). This generated table declares every
+@@ -342,7 +349,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
+  "megakernel ABI (PersistentContext.n_tasks / sizes / offsets). "
+  "Use the per-op path for params with > 2^31-1 elements.");
+ 
+- fused::sm90::PersistentContext ctx{
++ fused::PersistentContext ctx{
+  sc.g_next.data_ptr<int>(),
+  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
+  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
+diff --git a/csrc/bindings/helpers.h b/csrc/bindings/helpers.h
+index ab301c0..2e58dc0 100644
+--- a/csrc/bindings/helpers.h
++++ b/csrc/bindings/helpers.h
+@@ -35,13 +35,30 @@ namespace gfx942 {}
+ 
+ } // namespace sg
+ 
++// ── Per-build arch case ──────────────────────────────────────────────
++// Exactly one device backend is compiled per .so (setup.py picks CUDA xor
++// HIP), so only that backend's namespace (sg::sm90 / sg::gfx942) has DEFINED
++// symbols at link time. Emitting the other arch's case still references its
++// non-template functions (e.g. sg::gfx942::moe_filter_active_params, defined
++// only in the HIP .hip TUs) — which leaves them undefined and the .so fails to
++// load under RTLD_NOW. `#if` cannot live inside a macro body, so gate the case
++// at definition time by the build macro. detect_arch() returns the live arch
++// at runtime, so the compiled-out case is never reachable anyway; an arch that
++// doesn't match the compiled backend falls through to the `default:` throw.
++#if defined(WITH_HIP)
++#  define SG_ARCH_CASE_RET(METHOD, ...)  case 942: return ::sg::gfx942::METHOD(__VA_ARGS__);
++#  define SG_ARCH_CASE_VOID(METHOD, ...) case 942: ::sg::gfx942::METHOD(__VA_ARGS__); break;
++#else
++#  define SG_ARCH_CASE_RET(METHOD, ...)  case 90:  return ::sg::sm90::METHOD(__VA_ARGS__);
++#  define SG_ARCH_CASE_VOID(METHOD, ...) case 90:  ::sg::sm90::METHOD(__VA_ARGS__); break;
++#endif
++
+ // ── Dispatch macro: returns from enclosing function ──────────────────
+ #define SG_DISPATCH(METHOD, ...) \
+     do { \
+         const int sg_arch_ = ::sg::detect_arch(); \
+         switch (sg_arch_) { \
+-            case 90:  return ::sg::sm90::METHOD(__VA_ARGS__); \
+-            case 942: return ::sg::gfx942::METHOD(__VA_ARGS__); \
++            SG_ARCH_CASE_RET(METHOD, ##__VA_ARGS__) \
+             default: \
+                 throw std::runtime_error( \
+                     std::string(#METHOD) + " dispatch: unsupported arch " + \
+@@ -54,8 +71,7 @@ namespace gfx942 {}
+     do { \
+         const int sg_arch_ = ::sg::detect_arch(); \
+         switch (sg_arch_) { \
+-            case 90:  ::sg::sm90::METHOD(__VA_ARGS__); break; \
+-            case 942: ::sg::gfx942::METHOD(__VA_ARGS__); break; \
++            SG_ARCH_CASE_VOID(METHOD, ##__VA_ARGS__) \
+             default: \
+                 throw std::runtime_error( \
+                     std::string(#METHOD) + " dispatch: unsupported arch " + \
+diff --git a/setup.py b/setup.py
+index e59b098..268e107 100644
+--- a/setup.py
++++ b/setup.py
+@@ -31,6 +31,44 @@ import torch
+ from setuptools import find_packages, setup
+ from torch.utils.cpp_extension import BuildExtension
+ 
++# Repo root, anchored to this file. The .cu/.cuh sources use repo-root-relative
++# quoted includes (e.g. #include "grokking_optimizers/kernels/sm_90/adamw_sm90.cuh"
++# and "csrc/fused/sm_90/fused_megakernel.cuh"). torch.utils.cpp_extension emits
++# its ninja build file into a TEMP build dir and runs ninja FROM that dir, so a
++# relative "-I." resolves to the temp dir — not the repo root — and every such
++# include fails to resolve. Anchor all in-tree include dirs to _HERE so the
++# `pip install -e .` build matches the standalone `scripts/compile_to_object.sh`
++# gate (which cd's to ROOT before using -I.).
++_HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def _abs_incl(dirs):
++    """Absolutize in-tree include dirs against the repo root (see _HERE)."""
++    return [d if os.path.isabs(d) else os.path.join(_HERE, d) for d in dirs]
++
++
++# torch.utils.cpp_extension injects these four NO_HALF/NO_BFLOAT16 flags into
++# every nvcc compile (its module-level COMMON_NVCC_FLAGS). They disable the
++# implicit __half/__nv_bfloat16 <-> float conversion operators to dodge
++# ambiguity with torch's own c10::Half in TUs that mix both. Our device kernels
++# use raw CUDA __half/__nv_bfloat16 and rely on those conversions throughout
++# (decoder/vit/mamba/attention cast helpers, mamba_scan_adapter, etc.). The
++# in-repo gate (scripts/compile_to_object.sh) compiles WITHOUT these flags — so
++# the whole "33/33 nvcc -c OK" device-code validation was done in the
++# conversions-enabled regime the source targets. Strip them here so the
++# `pip install -e .` build matches that validated regime. nvcc-only: the .cpp
++# host TUs (bindings/dispatch) are compiled by the host compiler and unaffected.
++import torch.utils.cpp_extension as _cppext  # noqa: E402
++
++for _no_conv_flag in (
++    "-D__CUDA_NO_HALF_OPERATORS__",
++    "-D__CUDA_NO_HALF_CONVERSIONS__",
++    "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
++    "-D__CUDA_NO_HALF2_OPERATORS__",
++):
++    while _no_conv_flag in _cppext.COMMON_NVCC_FLAGS:
++        _cppext.COMMON_NVCC_FLAGS.remove(_no_conv_flag)
++
+ # ----------------------------------------------------------------------
+ # Stage-2 unification (Phase 8): source the CUDA device flags from the
+ # autotuner's own flag tables so the install build compiles against the
+@@ -451,7 +489,7 @@ if _has_gpu and _is_hip:
+         # inlined into every backend file. Only csrc/bindings/ (the one
+         # surviving cross-file boundary) and csrc/ (for algorithm-header
+         # absolute-path includes from launch files) remain.
+-        include_dirs=[".", "csrc/bindings", "csrc"],
++        include_dirs=_abs_incl([".", "csrc/bindings", "csrc"]),
+         define_macros=[("WITH_HIP", None)],
+         extra_compile_args={"cxx": hip_cxx, "nvcc": hip_nvcc},
+     )
+@@ -550,7 +588,7 @@ elif _has_gpu:
+     # csrc/common/ and csrc/scan/ were deleted; their content is inlined
+     # into every backend file. Only csrc/bindings/ (the one surviving
+     # cross-file boundary) and csrc/ remain.
+-    cuda_include_dirs = [".", "csrc/bindings", "csrc"]
++    cuda_include_dirs = _abs_incl([".", "csrc/bindings", "csrc"])
+     cuda_define_macros = [("WITH_CUDA", None)]
+     if _with_cutlass:
+         cutlass_archs = []
+@@ -566,10 +604,10 @@ elif _has_gpu:
+             cuda_nvcc.append("-DWITH_CUTLASS")
+             cuda_cxx.append("-DWITH_CUTLASS")
+             cuda_nvcc.append(f"-DCUTLASS_NVCC_ARCHS={';'.join(cutlass_archs)}")
+-            cuda_include_dirs += [
++            cuda_include_dirs += _abs_incl([
+                 "third_party/cutlass/include",
+                 "third_party/cutlass/tools/util/include",
+-            ]
++            ])
+             cuda_define_macros.append(("WITH_CUTLASS", None))
+             print(f"  CUTLASS enabled for archs: {cutlass_archs}")
+         else:

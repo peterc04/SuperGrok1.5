@@ -1,0 +1,150 @@
+/dev/shm/laneB-base/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/dev/shm/laneB-base/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 3640 bytes spill stores, 4364 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4456 bytes spill stores, 4808 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 3068 bytes spill stores, 4900 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 3396 bytes spill stores, 4100 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4420 bytes spill stores, 4552 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 3396 bytes spill stores, 4116 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4420 bytes spill stores, 4552 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 48 bytes spill stores, 108 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4424 bytes spill stores, 4508 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2296 bytes spill stores, 4196 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 3396 bytes spill stores, 4076 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4420 bytes spill stores, 4552 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 16 bytes spill stores, 24 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4308 bytes spill stores, 4496 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2284 bytes spill stores, 4140 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 44 bytes spill stores, 100 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4424 bytes spill stores, 4508 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 4 bytes spill stores, 8 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4308 bytes spill stores, 4496 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2284 bytes spill stores, 4140 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 44 bytes spill stores, 100 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4424 bytes spill stores, 4508 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 44 bytes spill stores, 100 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4424 bytes spill stores, 4508 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 44 bytes spill stores, 100 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf', 4424 bytes spill stores, 4508 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_', 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2976 bytes stack frame, 3640 bytes spill stores, 4364 bytes spill loads
+ptxas info    : Used 255 registers, 2976 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4456 bytes spill stores, 4808 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 3068 bytes spill stores, 4900 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2816 bytes stack frame, 3396 bytes spill stores, 4100 bytes spill loads
+ptxas info    : Used 255 registers, 2816 bytes cumulative stack size, 19396 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4420 bytes spill stores, 4552 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2816 bytes stack frame, 3396 bytes spill stores, 4116 bytes spill loads
+ptxas info    : Used 255 registers, 2816 bytes cumulative stack size, 19524 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4420 bytes spill stores, 4552 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 48 bytes spill stores, 108 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 19012 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4424 bytes spill stores, 4508 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2296 bytes spill stores, 4196 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2816 bytes stack frame, 3396 bytes spill stores, 4076 bytes spill loads
+ptxas info    : Used 255 registers, 2816 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4420 bytes spill stores, 4552 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2540 bytes spill stores, 4448 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2256 bytes stack frame, 16 bytes spill stores, 24 bytes spill loads
+ptxas info    : Used 255 registers, 2256 bytes cumulative stack size, 19140 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4308 bytes spill stores, 4496 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2284 bytes spill stores, 4140 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 44 bytes spill stores, 100 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4424 bytes spill stores, 4508 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2256 bytes stack frame, 4 bytes spill stores, 8 bytes spill loads
+ptxas info    : Used 255 registers, 2256 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4308 bytes spill stores, 4496 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2284 bytes spill stores, 4140 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 44 bytes spill stores, 100 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4424 bytes spill stores, 4508 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 44 bytes spill stores, 100 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4424 bytes spill stores, 4508 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2288 bytes stack frame, 44 bytes spill stores, 100 bytes spill loads
+ptxas info    : Used 255 registers, 2288 bytes cumulative stack size, 18884 bytes smem
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc17mbtc_forward_tileERKNS1_12MambaWeightsEiiRKNS2_6MbActsERKNS2_13MbTileScratchEPKiSD_P13__nv_bfloat16SF_Pf
+    0 bytes stack frame, 4424 bytes spill stores, 4508 bytes spill loads
+ptxas info    : Function properties for _ZN2sg5fused4sm904mbtc18mbtc_backward_tileERKNS1_12MambaWeightsEiiiRKNS2_6MbActsERKNS2_13MbTileScratchERKNS2_9MbPartialEPKiSG_P13__nv_bfloat16SI_PfSJ_SJ_
+    0 bytes stack frame, 2292 bytes spill stores, 4192 bytes spill loads
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+rc=0

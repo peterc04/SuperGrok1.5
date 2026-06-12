@@ -1,0 +1,98 @@
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index 24ca2da..dcb92fd 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -1193,6 +1193,35 @@ __device__ void dectc_backward_tile(
+     __syncthreads();
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  SAM-cell-scoped OUT-OF-LINE tile shims (reg-pressure campaign C2 -- the
++//  mamba precedent, model_stage_mamba_tc.cuh mbtc_forward_tile/backward_tile,
++//  SCOPED).  The SAM-coupled cells (LookSAM/SG11/SG15/SG2) run the heavy tile
++//  fwd+bwd TWICE per step (P1 + the P2.4 SAM 2nd pass); inlining both copies
++//  into one kernel blows the 255-reg budget by ~15 KB of hot-loop spills.
++//  Routing BOTH passes of those cells through these __noinline__ shims gives
++//  one shared out-of-line frame (measured: total spill bytes roughly halve and
++//  leave the entry body nearly clean).  The single-pass cells keep calling the
++//  inline bodies directly -- their allocation (255 regs, ZERO spills) is
++//  byte-identical to the pre-campaign engine, never taxed with an ABI boundary.
++//  Math identical; warpgroup-uniform call (whole CTA enters/exits together) so
++//  the wgmma fence/commit/wait choreography inside is well-formed.
++// ════════════════════════════════════════════════════════════════════════
++__device__ __noinline__ float dectc_forward_tile_outlined(
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
++        const DecTileScratch& sc, const int* __restrict__ tok_ids,
++        const int* __restrict__ tgt_ids,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red);
++}
++__device__ __noinline__ void dectc_backward_tile_outlined(
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
++        const DecTileScratch& sc, const int* __restrict__ tgt_ids,
++        float* __restrict__ lnvec, float* __restrict__ work2,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red);
++}
++
+ // ════════════════════════════════════════════════════════════════════════
+ //  P2 — OUTPUT-STATIONARY dW (the Q2 deliverable). Each of the 9 weight
+ //  matrices dW = dYᵀ @ X (K=T) is split into 64×N output tiles; tile_id %
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index c7cec62..ce158c5 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -542,6 +542,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+                             float lr, int step, FusedOptState st) {
+     __shared__ DecTcSmem sm;
+     GridBarrier bar = ctx.barrier();
++    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
++    // passes through the out-of-line shims (one shared frame, campaign C2). The
++    // single-pass cells keep the inline bodies -- byte-identical allocation.
++    constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
++                                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
+     const int cta = blockIdx.x;
+     const int nCTA = (int)ctx.n_ctas;
+     const int B = tok.B;
+@@ -665,13 +670,22 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c0 = clock64();
+ #endif
+-        float nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                              sm.sA, sm.sB, sm.red);
++        float nll;
++        if constexpr (kSamCoupled)
++            nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
++                                                     tok.targets, sm.sA, sm.sB, sm.red);
++        else
++            nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
++                                            sm.sA, sm.sB, sm.red);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c1 = clock64();
+ #endif
+-        dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
+-                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++        if constexpr (kSamCoupled)
++            dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++        else
++            dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c2 = clock64();
+         if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+@@ -845,10 +859,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+             for (int ti = cta; ti < n_tiles; ti += nCTA) {
+                 const int g0 = ti * nrows_tile;
+                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+-                dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                          sm.sA, sm.sB, sm.red);
+-                dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
+-                                           my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++                dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
++                                                   tok.targets, sm.sA, sm.sB, sm.red);
++                dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                 __syncthreads();
+             }
+             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
