@@ -229,16 +229,31 @@ def _consumer_headers() -> list:
 FUSED_CONSUMER = "csrc/fused/sm_90/opt_components.cuh"
 
 # Canonical per-element apply symbol each optimizer's tail is reached through in
-# the fused consumer (the call token to grep for). Verified against the current
-# opt_components.cuh: adamw_step(33), lion_step(34), grokfast_fused_step(197),
-# grokadamw_step(36), looksam_apply_step(37), prodigy_apply_step(38),
-# neuralgrok_apply_step(226), muon_update_step(233), sg11_sweep_b_step,
-# sg15_sweep_b_step.
+# the fused consumer (the call token to grep for). Verified against the CURRENT
+# opt_components.cuh apply_optimizer<Opt> dispatch (the in-flight refactor has
+# LANDED — every branch makes a real, distinct algo::<sym> call):
+#   adamw       -> algo::adamw_step           (OptId::AdamW)
+#   lion        -> algo::lion_step            (OptId::Lion)
+#   grokfast    -> algo::grokfast_fused_step  (OptId::Grokfast)
+#   grokadamw   -> algo::grokadamw_adam_tail  (OptId::GrokAdamW) — the fused tail
+#                  reaches GrokAdamW through the factored-out canonical tail
+#                  grokadamw_adam_tail (grokadamw.h:79, "the SINGLE source of the
+#                  moment-update + decoupled-WD apply math … bit-identical to the
+#                  tail of grokadamw_step"), NOT grokadamw_step itself. The token
+#                  grokadamw_step DOES still appear in opt_components.cuh — but
+#                  only inside a // comment — so the symbol check below strips
+#                  comments first (else that comment would false-PASS the gate).
+#   looksam     -> algo::looksam_apply_step   (OptId::LookSAM)
+#   prodigy     -> algo::prodigy_apply_step   (OptId::Prodigy)
+#   neuralgrok  -> algo::neuralgrok_apply_step (OptId::NeuralGrok)
+#   muon        -> algo::muon_update_step     (OptId::Muon)
+#   supergrok11 -> algo::sg11_sweep_b_step    (OptId::SuperGrok11)
+#   supergrok15 -> algo::sg15_sweep_b_step    (OptId::SuperGrok15)
 _FUSED_APPLY_SYMBOL = {
     "adamw": "adamw_step",
     "lion": "lion_step",
     "grokfast": "grokfast_fused_step",
-    "grokadamw": "grokadamw_step",
+    "grokadamw": "grokadamw_adam_tail",
     "looksam": "looksam_apply_step",
     "prodigy": "prodigy_apply_step",
     "neuralgrok": "neuralgrok_apply_step",
@@ -342,6 +357,15 @@ def check(structural_only: bool = False) -> list:
     # header AND call its apply symbol. FAIL LOUDLY if the consumer is
     # missing/empty (the old `if fused and …` silently disabled the whole check).
     fused = _read(FUSED_CONSUMER)
+    # Comment-stripped view of the consumer for the apply-SYMBOL assertion: a
+    # symbol name that appears ONLY inside a // or /* */ comment (e.g.
+    # `grokadamw_step` is named in a doc comment, but the real call is
+    # grokadamw_adam_tail) must NOT satisfy the "calls its apply symbol" check —
+    # otherwise a dead include could be masked by a comment that merely mentions
+    # the symbol. The #include check below still scans the raw text (an #include
+    # is never inside a comment when active). _strip_comments_ws also drops
+    # whitespace, which is fine: we only do substring containment on tokens.
+    fused_code = _strip_comments_ws(fused) if fused else ""
     if not fused:
         failures.append(
             f"[structural] fused consumer {FUSED_CONSUMER} is missing/empty — "
@@ -368,20 +392,28 @@ def check(structural_only: bool = False) -> list:
                     f"canonical {_canonical_header(opt)} (the fused tail would "
                     f"reimplement '{opt}' → drift). Add the #include.")
             # Apply-symbol assertion: include without a call is a dead include.
-            # Make this a WARNING (not hard-fail): the sibling's in-flight
-            # opt_components.cuh refactor may rename the apply symbol, and the
-            # canonical-math hashes already pin the math itself — so a stale
-            # symbol name here should keep the guard USABLE, not break the build.
+            # HARD FAIL (#19b): the in-flight opt_components.cuh refactor has
+            # LANDED — apply_optimizer<Opt> now makes a real, distinct
+            # algo::<sym> call for every one of the 10 non-SG2 optimizers, and
+            # _FUSED_APPLY_SYMBOL was re-pointed to match current reality
+            # (notably grokadamw -> grokadamw_adam_tail). So a missing call is a
+            # genuine dead include — the fused tail silently routing '{opt}'
+            # through a different path while the #include sits there unused — and
+            # must break the build, not merely warn. The match is against the
+            # COMMENT-STRIPPED consumer (fused_code) so a symbol named only in a
+            # comment cannot satisfy this (a true-positive gate, not a textual
+            # coincidence). The SG2 exemption above stays a WARN (separate
+            # launch_csa_hca path).
             sym = _FUSED_APPLY_SYMBOL.get(opt)
-            if sym and sym not in fused:
-                _emit_warning(
-                    f"{FUSED_CONSUMER} #includes {_canonical_header(opt)} but "
-                    f"does not appear to CALL its apply symbol "
-                    f"`{sym}` — the fused tail may route '{opt}' through a "
-                    f"different/renamed path (likely the in-flight "
-                    f"opt_components.cuh refactor). Re-point _FUSED_APPLY_SYMBOL "
-                    f"or restore the call. TODO: harden to a hard-fail "
-                    f"post-refactor.")
+            if sym and sym not in fused_code:
+                failures.append(
+                    f"[structural] {FUSED_CONSUMER} #includes "
+                    f"{_canonical_header(opt)} but does NOT CALL its apply "
+                    f"symbol `{sym}` (a dead include — the fused tail routes "
+                    f"'{opt}' through a different/renamed path while the include "
+                    f"sits unused → the single-source invariant is not actually "
+                    f"enforced for '{opt}'). Restore the call or re-point "
+                    f"_FUSED_APPLY_SYMBOL to the symbol the tail now calls.")
 
     # (1b) re-inline detection: a consumer must CALL the canonical step, never
     # re-type the Adam moment-update / apply locally.

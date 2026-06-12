@@ -1315,6 +1315,45 @@ jobs:
       - name: pytest -m "not hw"
         run: PYTHONPATH=. python3 -m pytest tests/ -m "not hw" -q
 
+  # ---------------------------------------------------------------------------
+  # pytest HW gate (#19c) — the HARDWARE-gated L3-TC tail gate + wiring check.
+  # These are the GPU half of the Stage-3 ✅-gate that pytest_cpu's `-m "not hw"`
+  # deliberately excludes: tests/hw/test_l3tc_tail_gate.py (per-cell megakernel-
+  # vs-eager tail parity + A/A/A determinism) and wiring_check.py --require-all
+  # (every routed optimizer×model cell observed on the real engine).
+  #
+  # SAFE ON ubuntu-latest: the gate self-skips cleanly off-GPU — every test is
+  # @pytest.mark.skipif(not _gpu_ready()) where _gpu_ready() requires
+  # torch.cuda.is_available(), so with no device present pytest reports
+  # "N skipped" and exits 0 (verified locally with CUDA_VISIBLE_DEVICES="").
+  # So this job WIRES the gate into CI today (it can no longer silently never
+  # run) while staying green on the CPU runner.
+  #
+  # TO ARM THE GATE FOR REAL: flip `runs-on` from the ubuntu-latest fallback to
+  # the commented self-hosted GPU runner below. On a GPU host with the built
+  # extension, _gpu_ready() returns True, the cells actually execute, and a
+  # tail-parity / determinism / wiring regression FAILS this job.
+  # ---------------------------------------------------------------------------
+  pytest_hw_gate:
+    name: pytest hw gate (L3-TC tail + wiring; skips off-GPU)
+    # runs-on: [self-hosted, gpu]   # <-- uncomment to ARM the gate on a real GPU runner
+    runs-on: ubuntu-latest          # fallback: CPU runner; the gate self-skips (still wired into CI)
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + pytest
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install pytest numpy
+      - name: pytest tests/hw/test_l3tc_tail_gate.py -m hw
+        run: PYTHONPATH=. python3 -m pytest tests/hw/test_l3tc_tail_gate.py -m hw -q
+      - name: wiring_check.py --require-all
+        run: python3 wiring_check.py --require-all
+
   # ===========================================================================
   # NON-BLOCKING QUALITY / SECURITY CHECKS
   # ---------------------------------------------------------------------------
@@ -1547,6 +1586,7 @@ jobs:
       - verify_all
       - profile_maximal
       - pytest_cpu
+      - pytest_hw_gate
     if: always()
     steps:
       - name: Verify all required jobs succeeded
