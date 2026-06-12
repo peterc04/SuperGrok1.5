@@ -297,12 +297,14 @@ def test_export_merge_roundtrip():
 
     data = json.load(open(jp, encoding="utf-8"))
     # both winners survive the merge under the short "sm_90" key.
+    # (#12) write shape is the nested per-model schema {arch: {model: {opt: combo}}}.
     check("sm_90" in data, "sm_90 arch key present")
-    check("adamw" in data["sm_90"] and "muon" in data["sm_90"],
-          "both adamw and muon winners present after merge")
+    check("adamw" in data["sm_90"].get("decoder", {})
+          and "muon" in data["sm_90"].get("vit", {}),
+          "both adamw(decoder) and muon(vit) winners present after merge")
     # only the safe per-TU dims (+ model provenance) persisted; internal
     # autotuner keys and tuple dims dropped.
-    a = data["sm_90"]["adamw"]
+    a = data["sm_90"]["decoder"]["adamw"]
     eq(a["block"], 128, "adamw block persisted")
     eq(a["maxrregcount"], 64, "adamw maxrregcount persisted")
     eq(a.get("model"), "decoder", "adamw model provenance persisted")
@@ -313,9 +315,9 @@ def test_export_merge_roundtrip():
     check("_meta" in data and "timestamp" in data["_meta"],
           "_meta with timestamp present")
 
-    # load_tuned reads it back identically.
+    # load_tuned reads it back identically (nested per-model shape, #12).
     rt = ti.load_tuned(jp)
-    eq(rt["sm_90"]["muon"]["vec"], 4, "load_tuned round-trips muon vec")
+    eq(rt["sm_90"]["vit"]["muon"]["vec"], 4, "load_tuned round-trips muon vec")
 
     # export_winner must NEVER raise / must return False on a bad path,
     # never propagate (fail-closed). Use a path whose "directory" is actually
