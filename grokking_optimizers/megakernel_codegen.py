@@ -757,12 +757,37 @@ _VIT_VOCAB, _VIT_D, _VIT_HEADS, _VIT_LAYERS, _VIT_PATCH, _VIT_NPATCH = \
     97, 128, 4, 2, 49, 16
 _VIT_DFF = 4 * _VIT_D
 
+# ── SIZE-LADDER BENCH VARIANT (d-scaled ViT) ─────────────────────────────────
+# The ViT TC megakernel's compute roofline is diagnosed/optimized at a LARGE model
+# width (the Phase-1-completion size-ladder prerequisite). _VIT_BENCH_D is the
+# width the d-scaled BENCHMARK build compiles at; it does NOT touch the production
+# d=128 path. vit_layout_header() emits BOTH layouts into ONE header, selected by
+# the compile flag SG_VIT_BENCH_LAYOUT (set ONLY by the bench TU / the _ops_bench
+# variant; UNSET → the production d=128 constants, byte-identical default). This
+# mirrors the decoder's SG_DEC_BENCH_LAYOUT dual-branch (commit 79d3840).
+_VIT_BENCH_D = 1024
 
-def _vit_param_sizes() -> List[int]:
+
+def _vit_heads(d: int) -> int:
+    """ViT attention head count for width `d`. The d/64 head-dim rule used by the
+    fit probes (head_dim == 64), with a 4-head floor for the small production
+    width. At d=128 (production) → 4 (head_dim=32, == the committed model class
+    ViT(..., h=4); grokking_race_v2.py:394). At d=1024 (bench) → 16 (head_dim=64).
+    The constraint nn.MultiheadAttention enforces is d % heads == 0, satisfied by
+    both. HEADS does NOT enter the param-layout shapes (every tensor is a function
+    of d/dff/vocab/patch/npatch); it only sizes the attention smem buffers and the
+    SG_VIT_HEADS constant. Keep == the model class's head choice at each width."""
+    return max(d // 64, 4)
+
+
+def _vit_param_sizes(d: int = _VIT_D) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of vit_oracle.py
-    vit_param_layout()). 32 tensors, total 418017. cls_token leads (leaf before
-    the patch_proj submodule)."""
-    d, dff, v, patch, npatch = _VIT_D, _VIT_DFF, _VIT_VOCAB, _VIT_PATCH, _VIT_NPATCH
+    vit_param_layout()). 32 tensors; at d=128 total 418017. cls_token leads (leaf
+    before the patch_proj submodule). `d` is parametric so the d-scaled bench
+    layout (SG_VIT_BENCH_LAYOUT) reuses the SAME shape formula — every per-tensor
+    shape is a function of (d, dff=4d, vocab, patch, npatch), so a single d
+    controls the whole table."""
+    dff, v, patch, npatch = 4 * d, _VIT_VOCAB, _VIT_PATCH, _VIT_NPATCH
     sizes = [1 * 1 * d, d * patch, d, (npatch + 1) * d]   # cls, patch.w/b, pos
     for _ in range(_VIT_LAYERS):
         sizes += [
@@ -776,17 +801,36 @@ def _vit_param_sizes() -> List[int]:
     return sizes
 
 
-def vit_layout_header() -> str:
-    """Emit csrc/fused/sm_90/vit_layout.cuh (the weight-layout mirror +
-    static_asserts + the dynamic-smem budget block). Byte-identical to the
-    hand-written header; a count/total/smem mismatch fails the BUILD."""
-    sizes = _vit_param_sizes()
+def _vit_layout_body(d: int) -> str:
+    """The constants + __constant__ tables + compile-time cross-check + dynamic-smem
+    budget for ONE ViT width `d`. Emitted into ONE of the SG_VIT_BENCH_LAYOUT
+    branches; the branches are mutually exclusive at preprocess time, so reusing the
+    SAME symbol names (kVitOffsets/kVitSizes/vit_layout_check) across both is safe.
+
+    The smem-budget block mirrors sizeof(VitSampleSmem) (model_stage_vit.cuh)
+    field-by-field; every field is a function of (seq, d, dff=4d, heads, npatch,
+    patch, vocab) so a single d (+ its head count) scales it. The `< 227 KB`
+    per-block dynamic-smem cap assert guards the SCALAR ViT megakernel (the only
+    consumer of VitSampleSmem). It is emitted ONLY in the production branch: the
+    bench branch compiles with the scalar megakernel gated OFF
+    (SG_VIT_SCALAR_MEGAKERNEL=0, mirroring the decoder's SG_DEC_SCALAR_MEGAKERNEL),
+    so the cap does not apply — the TC engine that the bench drives uses a small,
+    d-independent static VitTcSmem, not VitSampleSmem."""
+    sizes = _vit_param_sizes(d)
     offsets, acc = [], 0
     for n in sizes:
         offsets.append(acc)
         acc += n
     total = acc
     n_tensors = len(sizes)
+    heads, dff, seq = _vit_heads(d), 4 * d, _VIT_NPATCH + 1
+    npatch, patch, vocab = _VIT_NPATCH, _VIT_PATCH, _VIT_VOCAB
+    # sizeof(VitSampleSmem) in floats, field-by-field (mirrors model_stage_vit.cuh).
+    smem_floats = (npatch * patch + 2 * seq * d + seq * d + seq * 3 * d
+                   + seq * d + seq * d + seq * dff + seq * dff + heads * seq * seq
+                   + seq * d + seq + seq * d + seq + seq * d + seq + seq * d
+                   + vocab + heads * seq * seq + 256)
+    smem_bytes = smem_floats * 4
 
     def _fmt(arr):
         rows = []
@@ -796,50 +840,94 @@ def vit_layout_header() -> str:
 
     sizes_block = _fmt(sizes)
     offsets_block = _fmt(offsets)
-    return f"""#ifndef SG_FUSED_SM90_VIT_LAYOUT_CUH_
-#define SG_FUSED_SM90_VIT_LAYOUT_CUH_
-// ============================================================================
-// csrc/fused/sm_90/vit_layout.cuh — weight-layout mirror for the L3-REAL
-// Vision-Transformer megakernel (PHASE 2).
-//
-// HAND-WRITTEN (PHASE 2 deliverable) — MARKED FOR CODEGEN ADOPTION. The decoder
-// twin (decoder_layout.cuh) is emitted by megakernel_codegen.py --decoder-layout;
-// the integrator should add a `--vit-layout` emitter (mirroring
-// _decoder_param_sizes / decoder_layout_header) whose output is byte-identical to
-// THIS file, then regenerate so it cannot drift. Until then, the numbers below are
-// generated FROM the single source of truth — tests/hw/vit_oracle.py
-// ::vit_param_layout() (asserted == the live model's named_parameters() order in
-// the parity test, tests/hw/test_vit_megakernel.py) — and guarded by the
-// static_asserts below. A count/total mismatch fails the BUILD loudly, never
-// corrupts at dispatch.
-//
-// The flat blob is torch.cat([p.reshape(-1) for _, p in model.named_parameters()]);
-// the kernel addresses tensor i at params + kVitOffsets[i] for kVitSizes[i] elems.
-//
-// named_parameters() ORDER (32 tensors) — note cls_token (a leaf nn.Parameter on
-// the ViT module) is yielded BEFORE the patch_proj submodule's params:
-//   0  cls_token              [1,1,128]
-//   1  patch_proj.weight      [128,49]
-//   2  patch_proj.bias        [128]
-//   3  pos.weight             [17,128]
-//   4..15   layers.0.{{attn.in_proj_w/b, attn.out_proj.w/b, n1.w/b, n2.w/b,
-//                     ff.0.w/b, ff.2.w/b}}
-//   16..27  layers.1.{{...same...}}
-//   28 norm.weight [128]  29 norm.bias [128]  30 out.weight [97,128]  31 out.bias [97]
-// ============================================================================
-
-#include <cstdint>
-
-namespace sg {{ namespace fused {{ namespace sm90 {{
-
-constexpr int SG_VIT_VOCAB  = {_VIT_VOCAB};          // p (head Linear(d, p))
-constexpr int SG_VIT_D      = {_VIT_D};
-constexpr int SG_VIT_HEADS  = {_VIT_HEADS};
+    # ── Dynamic-smem budget block. The production (d=128) branch reproduces the
+    #    historical hand-written wording + arithmetic VERBATIM so the committed
+    #    default branch stays byte-identical (regen-and-diff clean). The bench branch
+    #    emits the SCALED field-by-field arithmetic + drops the `< 227 KB` cap assert
+    #    (it guards ONLY the SCALAR ViT megakernel, which the bench TU compiles out
+    #    via SG_VIT_SCALAR_MEGAKERNEL=0 — mirroring the decoder bench; the TC engine
+    #    the bench drives uses the small d-independent static VitTcSmem). ──
+    if d == _VIT_D:
+        smem_block = """// ── Per-CTA dynamic-smem budget guard. The ViT per-sample working set
+//    (VitSampleSmem, model_stage_vit.cuh) is ≈ 188,080 bytes (≈ 183.67 KB) at
+//    seq=17 — FAR over the 48 KB STATIC __shared__ cap (so it MUST be dynamic
+//    smem), but comfortably UNDER the sm_90 per-block dynamic cap of 227 KB
+//    (232448 B). This bound is the size the launcher passes to
+//    cudaFuncSetAttribute(MaxDynamicSharedMemorySize) + <<<dynamicSMemBytes>>>.
+//    Computed from the field list (all float, 4 B, no padding):
+//      patch 16*49 + layer_in 2*17*128 + final_in 17*128 + qkv 17*384
+//      + ctx 17*128 + x1 17*128 + ff0 17*512 + gact 17*512 + attn 4*17*17
+//      + n1_xhat 17*128 + n1_inv 17 + n2_xhat 17*128 + n2_inv 17
+//      + fn_xhat 17*128 + fn_inv 17 + dh 17*128 + logits 97 + dsc 4*17*17
+//      + red 256  = 47020 floats = 188080 bytes.
+//    (If VitSampleSmem changes, update BOTH this literal and the sum below;
+//    fused_vit_megakernel.cuh static_asserts sizeof(VitSampleSmem) against it.) ─
+constexpr int kVitSampleSmemFloats =
+    16 * 49            // patch[NPATCH][PATCH]
+  + 2 * 17 * 128       // layer_in[LAYERS][SEQ][D]
+  + 17 * 128           // final_in[SEQ][D]
+  + 17 * 384           // qkv[SEQ][3D]
+  + 17 * 128           // ctx[SEQ][D]
+  + 17 * 128           // x1[SEQ][D]
+  + 17 * 512           // ff0[SEQ][DFF]
+  + 17 * 512           // gact[SEQ][DFF]
+  + 4 * 17 * 17        // attn[HEADS][SEQ][SEQ]
+  + 17 * 128 + 17      // n1_xhat[SEQ][D] + n1_inv[SEQ]
+  + 17 * 128 + 17      // n2_xhat[SEQ][D] + n2_inv[SEQ]
+  + 17 * 128 + 17      // fn_xhat[SEQ][D] + fn_inv[SEQ]
+  + 17 * 128           // dh[SEQ][D]
+  + 97                 // logits[VOCAB]
+  + 4 * 17 * 17        // dsc[HEADS][SEQ][SEQ]
+  + 256;               // red[256]
+constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
+static_assert(kVitSampleSmemBytes == 188080,
+              "vit_layout: VitSampleSmem byte budget drifted from 188080.");
+static_assert(kVitSampleSmemBytes < 227 * 1024,
+              "vit_layout: VitSampleSmem exceeds the sm_90 227 KB dynamic-smem "
+              "per-block cap — the megakernel could not launch.");"""
+    else:
+        smem_block = f"""// ── Per-CTA dynamic-smem budget (d-SCALED BENCH). The ViT per-sample working set
+//    (VitSampleSmem, model_stage_vit.cuh) is ≈ {smem_bytes} bytes ({smem_bytes / 1024.0:.2f} KB) at
+//    seq={seq}, D={d}, HEADS={heads} — over the sm_90 227 KB per-block dynamic cap, so
+//    the SCALAR ViT megakernel (the ONLY VitSampleSmem consumer) cannot launch at
+//    this width and is compiled OUT on the bench TU (SG_VIT_SCALAR_MEGAKERNEL=0),
+//    exactly as the decoder bench gates its scalar megakernel. The TC engine the
+//    bench drives uses the small, d-independent static VitTcSmem and DOES fit, so
+//    the `< 227 KB` cap assert below is intentionally NOT emitted in this branch.
+//    Computed from the field list (all float, 4 B, no padding):
+//      patch {npatch}*{patch} + layer_in 2*{seq}*{d} + final_in {seq}*{d} + qkv {seq}*{3 * d}
+//      + ctx {seq}*{d} + x1 {seq}*{d} + ff0 {seq}*{dff} + gact {seq}*{dff} + attn {heads}*{seq}*{seq}
+//      + n1_xhat {seq}*{d} + n1_inv {seq} + n2_xhat {seq}*{d} + n2_inv {seq}
+//      + fn_xhat {seq}*{d} + fn_inv {seq} + dh {seq}*{d} + logits {vocab} + dsc {heads}*{seq}*{seq}
+//      + red 256  = {smem_floats} floats = {smem_bytes} bytes. ─
+constexpr int kVitSampleSmemFloats =
+    {npatch} * {patch}
+  + 2 * {seq} * {d}
+  + {seq} * {d}
+  + {seq} * {3 * d}
+  + {seq} * {d}
+  + {seq} * {d}
+  + {seq} * {dff}
+  + {seq} * {dff}
+  + {heads} * {seq} * {seq}
+  + {seq} * {d} + {seq}
+  + {seq} * {d} + {seq}
+  + {seq} * {d} + {seq}
+  + {seq} * {d}
+  + {vocab}
+  + {heads} * {seq} * {seq}
+  + 256;
+constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
+static_assert(kVitSampleSmemBytes == {smem_bytes},
+              "vit_layout: VitSampleSmem byte budget drifted from {smem_bytes}.");"""
+    return f"""constexpr int SG_VIT_VOCAB  = {_VIT_VOCAB};          // p (head Linear(d, p))
+constexpr int SG_VIT_D      = {d};
+constexpr int SG_VIT_HEADS  = {heads};
 constexpr int SG_VIT_LAYERS = {_VIT_LAYERS};
 constexpr int SG_VIT_PATCH  = {_VIT_PATCH};          // patch pixel count (7×7)
 constexpr int SG_VIT_NPATCH = {_VIT_NPATCH};          // image patches
-constexpr int SG_VIT_SEQ    = SG_VIT_NPATCH + 1;  // 17 (CLS + 16 patches)
-constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // 512
+constexpr int SG_VIT_SEQ    = SG_VIT_NPATCH + 1;  // {seq} (CLS + {npatch} patches)
+constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // {dff}
 
 constexpr int     kVitNumTensors = {n_tensors};
 constexpr int64_t kVitTotalElems = {total};
@@ -888,44 +976,81 @@ static_assert(sum_sizes() == kVitTotalElems,
 static_assert(offsets_consistent(),
               "vit_layout: kVitOffsets[i] != sum(kVitSizes[0..i)). Regenerate.");
 
-// ── Per-CTA dynamic-smem budget guard. The ViT per-sample working set
-//    (VitSampleSmem, model_stage_vit.cuh) is ≈ 188,080 bytes (≈ 183.67 KB) at
-//    seq=17 — FAR over the 48 KB STATIC __shared__ cap (so it MUST be dynamic
-//    smem), but comfortably UNDER the sm_90 per-block dynamic cap of 227 KB
-//    (232448 B). This bound is the size the launcher passes to
-//    cudaFuncSetAttribute(MaxDynamicSharedMemorySize) + <<<dynamicSMemBytes>>>.
-//    Computed from the field list (all float, 4 B, no padding):
-//      patch 16*49 + layer_in 2*17*128 + final_in 17*128 + qkv 17*384
-//      + ctx 17*128 + x1 17*128 + ff0 17*512 + gact 17*512 + attn 4*17*17
-//      + n1_xhat 17*128 + n1_inv 17 + n2_xhat 17*128 + n2_inv 17
-//      + fn_xhat 17*128 + fn_inv 17 + dh 17*128 + logits 97 + dsc 4*17*17
-//      + red 256  = 47020 floats = 188080 bytes.
-//    (If VitSampleSmem changes, update BOTH this literal and the sum below;
-//    fused_vit_megakernel.cuh static_asserts sizeof(VitSampleSmem) against it.) ─
-constexpr int kVitSampleSmemFloats =
-    16 * 49            // patch[NPATCH][PATCH]
-  + 2 * 17 * 128       // layer_in[LAYERS][SEQ][D]
-  + 17 * 128           // final_in[SEQ][D]
-  + 17 * 384           // qkv[SEQ][3D]
-  + 17 * 128           // ctx[SEQ][D]
-  + 17 * 128           // x1[SEQ][D]
-  + 17 * 512           // ff0[SEQ][DFF]
-  + 17 * 512           // gact[SEQ][DFF]
-  + 4 * 17 * 17        // attn[HEADS][SEQ][SEQ]
-  + 17 * 128 + 17      // n1_xhat[SEQ][D] + n1_inv[SEQ]
-  + 17 * 128 + 17      // n2_xhat[SEQ][D] + n2_inv[SEQ]
-  + 17 * 128 + 17      // fn_xhat[SEQ][D] + fn_inv[SEQ]
-  + 17 * 128           // dh[SEQ][D]
-  + 97                 // logits[VOCAB]
-  + 4 * 17 * 17        // dsc[HEADS][SEQ][SEQ]
-  + 256;               // red[256]
-constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
-static_assert(kVitSampleSmemBytes == 188080,
-              "vit_layout: VitSampleSmem byte budget drifted from 188080.");
-static_assert(kVitSampleSmemBytes < 227 * 1024,
-              "vit_layout: VitSampleSmem exceeds the sm_90 227 KB dynamic-smem "
-              "per-block cap — the megakernel could not launch.");
-}}  // namespace vit_layout_check
+{smem_block}
+}}  // namespace vit_layout_check"""
+
+
+def vit_layout_header() -> str:
+    """Emit csrc/fused/sm_90/vit_layout.cuh (the weight-layout mirror +
+    static_asserts + the dynamic-smem budget block).
+
+    Carries TWO layouts under one include guard, selected by the compile flag
+    SG_VIT_BENCH_LAYOUT (the size-ladder d-scaled bench-variant gate):
+      * UNSET (default / production _ops)  -> d={_VIT_D} (33/33 path, byte-identical).
+      * SG_VIT_BENCH_LAYOUT=1 (bench TU)   -> d={_VIT_BENCH_D} (the d-scaled roofline build).
+    Because the branches are #if/#else, any ONE TU sees exactly one (d, heads,
+    table, static-assert) set consistently across every includer; the production
+    build NEVER sees the bench branch (the flag is set only by the variant TU / the
+    _ops_bench extension). Mirrors decoder_layout.cuh's SG_DEC_BENCH_LAYOUT."""
+    prod_body = _vit_layout_body(_VIT_D)
+    bench_body = _vit_layout_body(_VIT_BENCH_D)
+    return f"""#ifndef SG_FUSED_SM90_VIT_LAYOUT_CUH_
+#define SG_FUSED_SM90_VIT_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/vit_layout.cuh — weight-layout mirror for the L3-REAL
+// Vision-Transformer megakernel (PHASE 2).
+//
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --vit-layout > csrc/fused/sm_90/vit_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _vit_param_sizes() (mirrored by tests/hw/vit_oracle.py::vit_param_layout(),
+// asserted == the live model's named_parameters() order in the parity test
+// tests/hw/test_vit_megakernel.py). The flat blob is
+// torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
+// addresses tensor i at params + kVitOffsets[i] for kVitSizes[i] elems.
+//
+// A count/total mismatch fails the BUILD loudly (a static_assert below), never
+// corrupts at dispatch.
+//
+// named_parameters() ORDER (32 tensors) — note cls_token (a leaf nn.Parameter on
+// the ViT module) is yielded BEFORE the patch_proj submodule's params:
+//   0  cls_token              [1,1,128]
+//   1  patch_proj.weight      [128,49]
+//   2  patch_proj.bias        [128]
+//   3  pos.weight             [17,128]
+//   4..15   layers.0.{{attn.in_proj_w/b, attn.out_proj.w/b, n1.w/b, n2.w/b,
+//                     ff.0.w/b, ff.2.w/b}}
+//   16..27  layers.1.{{...same...}}
+//   28 norm.weight [128]  29 norm.bias [128]  30 out.weight [97,128]  31 out.bias [97]
+//
+// ── SG_VIT_BENCH_LAYOUT (size-ladder d-scaled bench variant) ─────────────────
+// Two layouts coexist under the single include guard. SG_VIT_BENCH_LAYOUT is
+// UNSET on the production _ops build (→ the d={_VIT_D} branch, byte-identical to
+// the historical header), and set to 1 ONLY by the d-scaled benchmark TU / the
+// _ops_bench variant extension (→ the d={_VIT_BENCH_D} branch, HEADS={_vit_heads(_VIT_BENCH_D)}
+// via the d/64 head-dim rule). The branches are mutually exclusive at preprocess
+// time, so a TU compiles exactly one consistent (constants, __constant__ table,
+// static-assert) set; production never sees the bench numbers. Mirrors the
+// decoder's SG_DEC_BENCH_LAYOUT (commit 79d3840).
+// ============================================================================
+
+#include <cstdint>
+
+#ifndef SG_VIT_BENCH_LAYOUT
+#define SG_VIT_BENCH_LAYOUT 0
+#endif
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+#if SG_VIT_BENCH_LAYOUT
+// ── d-SCALED BENCH VARIANT (d={_VIT_BENCH_D}): the ViT-megakernel roofline build.
+//    NOT on the production path; selected ONLY by -DSG_VIT_BENCH_LAYOUT=1. ──
+{bench_body}
+#else
+// ── PRODUCTION (d={_VIT_D}): the 33/33 wiring_check path. Byte-identical to the
+//    historical generated header (the default when SG_VIT_BENCH_LAYOUT is unset). ──
+{prod_body}
+#endif  // SG_VIT_BENCH_LAYOUT
 
 }}}}}} // namespace sg::fused::sm90
 

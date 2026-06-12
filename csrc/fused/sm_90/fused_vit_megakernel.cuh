@@ -107,13 +107,36 @@
 #include "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
 #endif
 
+// ============================================================================
+//  SG_VIT_SCALAR_MEGAKERNEL — compile-gate for the LEGACY fp32 SCALAR ViT
+//  megakernel (fused_vit_megakernel<Opt> + launch_fused_vit_megakernel<Opt> below,
+//  which drive the per-sample VitSampleSmem path in model_stage_vit.cuh). The ViT
+//  twin of the decoder's SG_DEC_SCALAR_MEGAKERNEL gate (commit 555c0bc/79d3840).
+//
+//  WHY A GATE (the d-scaling decouple): VitSampleSmem is sized [kSeq×kD]/[kSeq×kDff]
+//  arrays, so its DYNAMIC smem GROWS with SG_VIT_D and at the d-scaled bench width
+//  (d=1024) it is ≈ 1.4 MB — far over the sm_90 227 KB per-block dynamic-smem cap, so
+//  cudaFuncSetAttribute(MaxDynamicSharedMemorySize) would REFUSE it and the scalar
+//  kernel could never launch. The TC engine (fused_vit_megakernel_tc, below) uses a
+//  small d-INDEPENDENT static VitTcSmem and builds/launches at every d. Gating the
+//  dead scalar kernel OFF (-DSG_VIT_SCALAR_MEGAKERNEL=0) lets the WHOLE extension
+//  compile at the bench width (the TC path is what's measured). DEFAULT 1 (ON) → the
+//  d=128 production build is byte-for-byte unchanged: the scalar fp32 fallback stays
+//  wired and the 33/33 wiring gate stays green. The flag changes NOTHING the TC path
+//  touches.
+#ifndef SG_VIT_SCALAR_MEGAKERNEL
+#define SG_VIT_SCALAR_MEGAKERNEL 1
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
+#if SG_VIT_SCALAR_MEGAKERNEL
 // Compile-time guard: the byte budget the launcher uses (sizeof(VitSampleSmem))
 // MUST equal the literal the layout header documents + bounds-checks (227 KB cap).
 static_assert(sizeof(VitSampleSmem) == (size_t)vit_layout_check::kVitSampleSmemBytes,
               "fused_vit_megakernel: sizeof(VitSampleSmem) != the documented "
               "kVitSampleSmemBytes in vit_layout.cuh — update both together.");
+#endif  // SG_VIT_SCALAR_MEGAKERNEL
 
 // Rebase a FusedOptState's per-element state pointers to a parameter-tensor slice
 // at `off` within the flat [m|v|extra] layout. Per-TENSOR fields and all scalars
@@ -156,8 +179,12 @@ struct ViTInputCtx {
     float*       loss_out;  // device float the kernel writes the mean loss into
 };
 
+#if SG_VIT_SCALAR_MEGAKERNEL
 // ── The persistent megakernel (L3-REAL). gridDim.x = #SMs (one CTA/SM), 256
 //    threads/CTA. VitSampleSmem (~183.67 KB) lives in DYNAMIC smem (extern). ────
+//    GATED by SG_VIT_SCALAR_MEGAKERNEL (this fp32 path's VitSampleSmem grows with
+//    SG_VIT_D and overflows the 227 KB dynamic-smem cap at the bench width; OFF lets
+//    the TC path build at scaled d — see the flag note above). ────────────────────
 // sizes/offsets are NOT host-passed: per-tensor numel/offset live in the
 // __constant__ tables kVitSizes/kVitOffsets (vit_layout.cuh), read directly by
 // the reduce + optimizer phases.
@@ -317,6 +344,7 @@ cudaError_t launch_fused_vit_megakernel(
         ctx, params, in, grad, lr, step, st);
     return cudaGetLastError();
 }
+#endif  // SG_VIT_SCALAR_MEGAKERNEL
 
 // ════════════════════════════════════════════════════════════════════════════
 //  WGMMA CELL DRIVER (DESIGN-TC-PIPELINE.md Fork B, the ViT twin of the decoder

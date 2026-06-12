@@ -297,12 +297,16 @@ static std::vector<torch::Tensor> tc_dump_ff2_operands(torch::Tensor params, int
     return {dYff2_1, Xgact1};  // [T*d], [T*dff]
 }
 
+#if SG_VIT_SCALAR_MEGAKERNEL
 // scalar_train_step: the SAME (vit × AdamW) cell run through the SCALAR default
 // launcher (launch_fused_vit_megakernel<AdamW>, which lives OUTSIDE the wgmma
 // guard — so this wgmma-token TU can still call it). ONLY for the step-time gate
 // (times the live scalar path and the TC path BACK-TO-BACK in one process → an
 // honest scalar:TC ratio). NOT the shipped invocation. Returns {loss, reduced
-// grad} like tc_train_step.
+// grad} like tc_train_step. GATED by SG_VIT_SCALAR_MEGAKERNEL: at the d-scaled
+// bench width the scalar megakernel's VitSampleSmem overflows the smem cap and is
+// compiled out (the TC path is what the bench measures), exactly as the decoder
+// bench gates its scalar step.
 static std::vector<torch::Tensor> scalar_train_step(
         torch::Tensor params, torch::Tensor patches, torch::Tensor targets,
         torch::Tensor state, double lr, double beta1, double beta2, double eps,
@@ -366,6 +370,7 @@ static std::vector<torch::Tensor> scalar_train_step(
                         .to(torch::kCPU);
     return {loss_cpu, grad};
 }
+#endif  // SG_VIT_SCALAR_MEGAKERNEL
 
 #ifdef SG_VIT_PROFILE
 // Diagnostic-only: read + reset the per-phase clock64 maxima (cycles). Returns
@@ -404,15 +409,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
            pybind11::arg("ncta_cap") = 0);
     mm.def("tc_dump_ff2_operands", &tc_dump_ff2_operands,
            "gate-only: dump the kernel's stored dY_ff2[L1], X_gact[L1] (fp32 CPU)");
+#if SG_VIT_SCALAR_MEGAKERNEL
     mm.def("scalar_train_step", &scalar_train_step,
            "gate-only: SAME cell via the SCALAR launcher (back-to-back step-time mirror)",
            pybind11::arg("params"), pybind11::arg("patches"), pybind11::arg("targets"),
            pybind11::arg("state"), pybind11::arg("lr"), pybind11::arg("beta1"),
            pybind11::arg("beta2"), pybind11::arg("eps"), pybind11::arg("weight_decay"),
            pybind11::arg("bc1"), pybind11::arg("bc2"), pybind11::arg("step"));
+#endif  // SG_VIT_SCALAR_MEGAKERNEL
     mm.attr("TILE_M") = (int)vittc::kTileM;
     mm.attr("TILE_N") = (int)SG_TUNED_TILE_N;
     mm.attr("TOTAL") = (int)kVitTotalElems;
+    // Compiled-width introspection (the d-scaled bench asserts/reports these).
+    mm.attr("D") = (int)vit::kD;
+    mm.attr("HEADS") = (int)vit::kHeads;
+    mm.attr("LAYERS") = (int)vit::kLayers;
+    mm.attr("SEQ") = (int)vit::kSeq;
+    mm.attr("NPATCH") = (int)vit::kNPatch;
+    mm.attr("PATCH") = (int)vit::kPatch;
+    mm.attr("VOCAB") = (int)vit::kVocab;
 #ifdef SG_VIT_PROFILE
     mm.def("tc_profile_read", &tc_profile_read,
            "diagnostic-only: per-phase clock64 maxima [P1fwd,P1bwd,P2dW,P3opt] (cycles), resets after read");
