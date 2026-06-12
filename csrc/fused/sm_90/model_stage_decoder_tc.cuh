@@ -1161,40 +1161,64 @@ __device__ __forceinline__ void dectc_build_dw_specs(
     hd.grad_off = kDecOffsets[28]; hd.bias_off = kDecOffsets[29]; hd.dY_bias = hd.dY;
 }
 
-// Total number of 64×N dW output tiles across the 9 weights (for the tile loop).
+// ── dW M-atom INTERLEAVE group width (task #13 H3). A dW output "tile" (work
+//    item) owns a GROUP of up to kDecDwIL consecutive m64 atoms instead of one,
+//    so the engine runs kDecDwIL wgmmas/k-step into independent fragments sharing
+//    ONE staged X (B-operand) tile → the H1 win (overlap the MMAs + kDecDwIL× less
+//    X-operand HBM traffic) now applies to the dW K=T contraction (the post-H2
+//    dominant phase). kDecDwIL == the engine's interleave cap kDecMaxIL so the
+//    ring smem (DecTcSmem.sA, sized kDecAtomsPerSlot=min(kAtomsM,kDecMaxIL) A-tiles
+//    per slot) and the selftest-validated dW path (gemm_dw_kernel: MaxAtomsM=8,
+//    kIL=min(8,2)=2) match exactly. Ascending-k per atom is unchanged → numerics
+//    bit-identical + A/A/A determinism. Atoms-per-weight-N-tile / groups: ──
+constexpr int kDecDwIL = kDecMaxIL;
+__device__ __host__ __forceinline__ int dec_dw_atoms(int Nout)  { return (Nout + 63) / 64; }
+__device__ __host__ __forceinline__ int dec_dw_groups(int Nout) {
+    return (dec_dw_atoms(Nout) + kDecDwIL - 1) / kDecDwIL;
+}
+
+// Total number of dW output WORK ITEMS (M-atom groups × N-tiles) across the 9
+// weights (the tile loop count). Each item is a group of <= kDecDwIL m64 atoms.
 template <int N>
 __device__ __forceinline__ int dectc_dw_total_tiles(const DecDwSpec spec[9]) {
     int n = 0;
     for (int s = 0; s < 9; ++s)
-        n += ((spec[s].Nout + 63) / 64) * ((spec[s].Kin + N - 1) / N);
+        n += dec_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
     return n;
 }
 
-// Run ONE global dW tile `gt` (if it belongs to this CTA): decode (weight, M-atom,
-// N-tile), then contract K via the dW GEMM into grad[grad_off]. MaxAtomsM=1.
+// Run ONE global dW work item `gt` (if it belongs to this CTA): decode (weight,
+// M-atom GROUP, N-tile), then contract K via the dW GEMM into grad[grad_off]. The
+// group is up to kDecDwIL stacked m64 atoms → the engine interleaves them (kIL=
+// kDecDwIL): kDecDwIL wgmmas/k-step into independent fragments sharing ONE staged
+// X B-tile (H1's win, now on the dW K=T contraction).
 template <int N>
 __device__ __forceinline__ void dectc_dw_run_tile(
         const DecDwSpec spec[9], int gt, float* __restrict__ grad,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    // Decode gt → (s, m_atom, n_tile).
-    int acc = 0, s = 0, m_atom = 0, n_tile = 0;
+    // Decode gt → (s, m_group, n_tile).
+    int acc = 0, s = 0, m_group = 0, n_tile = 0;
     for (s = 0; s < 9; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = dec_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; break; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
+        acc += ng * nt;
     }
     const DecDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = dec_dw_atoms(sp.Nout);
+    const int a0 = m_group * kDecDwIL;               // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kDecDwIL ? (n_atoms - a0) : kDecDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
     const int k_steps = sp.K / wgs::kWgmmaAtomK;     // K = T or B (must be /16; padded by caller)
     const int Nout = sp.Nout, Kin = sp.Kin;
     const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
-    // The engine (tc_gemm_block_unpipelined, mbase0=mbase, m_atoms=1) passes the
-    // GLOBAL row m = mbase + mn to srcA/out (it adds mbase0 itself), so the
+    // The engine (tc_gemm_block_unpipelined, mbase0=mbase) passes the GLOBAL row
+    // m = mbase + (group-local row) to srcA/out (it adds mbase0 itself), so the
     // accessors use `m` RAW — adding mbase again would double-count (the selftest
-    // passes mbase0=0 and uses m raw; we pass mbase0=mbase and likewise use m raw).
+    // gemm_dw_kernel passes mbase0=0, m_atoms=all, and uses m raw; we shard the
+    // atoms into groups, pass mbase0=mbase, and likewise use m raw).
     // A[m=out, k=t] = dY[t,out]  (transposed read); B[n=in, k=t] = X[t,in] (transposed).
     auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
         return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };
@@ -1202,8 +1226,8 @@ __device__ __forceinline__ void dectc_dw_run_tile(
         int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
     auto out  = [&] (int m, int n, float v) {
         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kDecDwIL>(
+        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1216,22 +1240,30 @@ __device__ __forceinline__ void dectc_dw_run_tile(
 //  parity + A/A/A bit-determinism hold (each partial is the SAME ascending-k fp32
 //  wgmma accumulate; Σ_chunk == full-K sum reassociated into G fp32 blocks).
 //  G==1 routes to the single-CTA dectc_dw_run_tile above (no scratch). Slot (gt,
-//  kc) at dw_part[((gt*G+kc)) * (64*kDecMaxTileN) + row*kDecMaxTileN + col].
-//  Decoder K varies per spec: layer dW K=T, head dW K=B (so kc_steps reads sp.K).
+//  kc) at dw_part[((gt*G+kc)) * (kDecDwIL·64·kDecMaxTileN) + lr*kDecMaxTileN + col]
+//  — each work item gt is an M-atom GROUP (up to kDecDwIL=2 stacked m64 atoms, H3),
+//  so its slot holds kDecDwIL·64 group-local rows (lr). Decoder K varies per spec:
+//  layer dW K=T, head dW K=B (so kc_steps reads sp.K).
 // ════════════════════════════════════════════════════════════════════════
 constexpr int kDecMaxTileN = SG_TUNED_TILE_N;                       // widest dW N-tile
-constexpr int kDecDwTileFloats = wgs::kWgmmaAtomM * kDecMaxTileN;   // 64*N per (gt,kc) slot
+// Floats per (gt,kc) split-K slot: a work item is an M-atom GROUP of up to kDecDwIL
+// stacked m64 atoms → kDecDwIL·64 rows × N cols. (Was 64·N for the 1-atom item.)
+constexpr int kDecDwTileFloats = kDecDwIL * wgs::kWgmmaAtomM * kDecMaxTileN;
 
-// COMPILE-TIME max #dW output tiles (the 9 dW have fixed Nout/Kin; decoder dims
-// are compile-time → constant). per layer: qkv(3d×d), attn_out(d×d), ff0(dff×d),
-// ff2(d×dff), N=kDecMaxTileN; + head(V×d).
+// COMPILE-TIME max #dW output WORK ITEMS (the 9 dW have fixed Nout/Kin; decoder
+// dims are compile-time → constant). per layer: qkv(3d×d), attn_out(d×d), ff0(dff
+// ×d), ff2(d×dff), N=kDecMaxTileN; + head(V×d). The M factor is now M-atom GROUPS
+// of kDecDwIL (ceil(atoms/kDecDwIL)), matching dec_dw_groups — NOT single atoms.
+constexpr int kDecDwMGroups(int Nout) {                 // ceil(ceil(Nout/64)/kDecDwIL)
+    return (((Nout + 63) / 64) + kDecDwIL - 1) / kDecDwIL;
+}
 constexpr int kDecDwTilesPerLayer =
-      ((3*dec::kD + 63)/64) * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // qkv
-    + ((dec::kD   + 63)/64) * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // attn_out
-    + ((dec::kDff + 63)/64) * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // ff0
-    + ((dec::kD   + 63)/64) * ((dec::kDff+ kDecMaxTileN - 1)/kDecMaxTileN);  // ff2
+      kDecDwMGroups(3*dec::kD) * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // qkv
+    + kDecDwMGroups(dec::kD)   * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // attn_out
+    + kDecDwMGroups(dec::kDff) * ((dec::kD  + kDecMaxTileN - 1)/kDecMaxTileN)   // ff0
+    + kDecDwMGroups(dec::kD)   * ((dec::kDff+ kDecMaxTileN - 1)/kDecMaxTileN);  // ff2
 constexpr int kDecDwHeadTiles =
-      ((dec::kVocab + 63)/64) * ((dec::kD + kDecMaxTileN - 1)/kDecMaxTileN);
+      kDecDwMGroups(dec::kVocab) * ((dec::kD + kDecMaxTileN - 1)/kDecMaxTileN);
 constexpr int kDecDwMaxTiles = dec::kLayers * kDecDwTilesPerLayer + kDecDwHeadTiles;
 
 // Split-K dW partial-scratch float count (host carves it from the workspace tail).
@@ -1239,18 +1271,20 @@ __host__ __device__ __forceinline__ int64_t dec_dw_part_floats(int G) {
     return (int64_t)kDecDwMaxTiles * G * kDecDwTileFloats;
 }
 
-// Decode global dW tile index gt → (spec index s, m_atom, n_tile). Single-source.
+// Decode global dW work-item index gt → (spec index s, m_group, n_tile). Single-
+// source: m_group indexes M-atom GROUPS of kDecDwIL (group's first atom = m_group·
+// kDecDwIL, base row = m_group·kDecDwIL·64).
 template <int N>
 __device__ __forceinline__ void dectc_dw_decode(
-        const DecDwSpec spec[9], int gt, int& s, int& m_atom, int& n_tile) {
+        const DecDwSpec spec[9], int gt, int& s, int& m_group, int& n_tile) {
     int acc = 0;
     for (s = 0; s < 9; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = dec_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; return; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; return; }
+        acc += ng * nt;
     }
-    s = 8; m_atom = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+    s = 8; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
 }
 
 // PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. K-chunk uses sp.K
@@ -1265,21 +1299,27 @@ template <int N>
 __device__ __forceinline__ void dectc_dw_run_tile_splitk(
         const DecDwSpec spec[9], int gt, int kc, int G, float* __restrict__ dw_part,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    int s, m_atom, n_tile;
-    dectc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+    int s, m_group, n_tile;
+    dectc_dw_decode<N>(spec, gt, s, m_group, n_tile);
     const DecDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = dec_dw_atoms(sp.Nout);
+    const int a0 = m_group * kDecDwIL;                      // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kDecDwIL ? (n_atoms - a0) : kDecDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int KS = sp.K / wgs::kWgmmaAtomK;                 // total k-atoms (T/16 or B/16)
     const int k0 = (int)(((int64_t)kc       * KS) / G);     // floor-balanced chunk bounds
     const int k1 = (int)(((int64_t)(kc + 1) * KS) / G);
     const int kc_steps = k1 - k0;                          // sums to KS exactly over kc
+    // Slot holds the GROUP's kDecDwIL·64 rows (lr) × N cols (kDecDwTileFloats).
     float* slot = dw_part + ((int64_t)gt * G + kc) * kDecDwTileFloats;
     // Empty-chunk guard (KS<G, i.e. B<64): a k_steps=0 GEMM would emit the
-    // uninitialized accumulator → zero the slot + return instead of running it
-    // (the reduce sums all G slots unconditionally, so an empty chunk MUST be 0).
+    // uninitialized accumulator → zero the WHOLE group slot + return instead of
+    // running it (the reduce sums all G slots unconditionally, so an empty chunk
+    // MUST be 0). Zero the full kDecDwIL·64·N slot (only g_atoms·64 rows are valid
+    // but the reduce reads only valid rows; zeroing all keeps it simple + safe).
     if (kc_steps <= 0) {
-        for (int i = threadIdx.x; i < 64 * N; i += blockDim.x) slot[i] = 0.0f;
+        for (int i = threadIdx.x; i < kDecDwTileFloats; i += blockDim.x) slot[i] = 0.0f;
         __syncthreads();
         return;
     }
@@ -1289,14 +1329,16 @@ __device__ __forceinline__ void dectc_dw_run_tile_splitk(
         return m < Nout ? dY[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Nout + m] : __float2bfloat16(0.f); };
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
         int nn = n0 + n; return nn < Kin ? X[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Kin + nn] : __float2bfloat16(0.f); };
-    // out(mbase+row, col, v): m is GLOBAL (srcA needs it); the slot holds only this
-    // atom's 64 LOCAL rows → index by (m - mbase). A `m<64` guard would never fire
-    // for m_atom>=1 → that slot stays UNWRITTEN (the rel~1.0 dW bug). Local-row fills it.
+    // out(mbase+row, col, v): m is GLOBAL (srcA needs it; engine adds mbase0=mbase);
+    // the slot holds the GROUP's kDecDwIL·64 LOCAL rows → index by (m - mbase). The
+    // engine emits group-local rows in [0, g_atoms·64); writing them by (m-mbase)
+    // fills the lower g_atoms·64 rows (a ragged final group's tail rows stay as the
+    // zeroed/garbage upper rows but the reduce reads only valid rows → never used).
     auto out  = [&] (int m, int n, float v) {
         const int lr = m - mbase;
-        if (lr >= 0 && lr < 64 && n < N) slot[(int64_t)lr * N + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+        if (lr >= 0 && lr < kDecDwIL * 64 && n < N) slot[(int64_t)lr * N + n] = v; };
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kDecDwIL>(
+        mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
 }
 
 // Deterministic reduce: output tile gt (% nCTA) sums its G chunk-partials ascending-kc
@@ -1306,16 +1348,18 @@ __device__ __forceinline__ void dectc_dw_reduce_splitk(
         const DecDwSpec spec[9], int n_dw, int G, const float* __restrict__ dw_part,
         float* __restrict__ grad, int cta, int nCTA) {
     for (int gt = cta; gt < n_dw; gt += nCTA) {
-        int s, m_atom, n_tile;
-        dectc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+        int s, m_group, n_tile;
+        dectc_dw_decode<N>(spec, gt, s, m_group, n_tile);
         const DecDwSpec& sp = spec[s];
-        const int mbase = m_atom * 64;
+        const int mbase = m_group * kDecDwIL * 64;          // group's first global row
         const int n0 = n_tile * N;
         const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
-        const int Nrow = (sp.Nout - mbase) < 64 ? (sp.Nout - mbase) : 64;
+        // Valid group rows: up to kDecDwIL·64, clamped to the weight's row count.
+        const int grp_rows = kDecDwIL * 64;
+        const int Nrow = (sp.Nout - mbase) < grp_rows ? (sp.Nout - mbase) : grp_rows;
         const int64_t base = (int64_t)gt * G * kDecDwTileFloats;
         for (int idx = threadIdx.x; idx < Nrow * n_real; idx += blockDim.x) {
-            const int row = idx / n_real, col = idx % n_real;
+            const int row = idx / n_real, col = idx % n_real;   // row = group-local lr
             float accv = 0.0f;
             for (int kc = 0; kc < G; ++kc)
                 accv += dw_part[base + (int64_t)kc * kDecDwTileFloats + (int64_t)row * N + col];

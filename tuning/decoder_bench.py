@@ -49,10 +49,15 @@ SM_GHZ = 1.98  # H100 SM boost clock (nvidia-smi clocks.max.sm = 1980 MHz)
 _TC_TU = str(ROOT / "csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu")
 
 
-def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool = False):
+def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool = False,
+                  defines: list[str] | None = None):
     """JIT-build the decoder TC cell TU as a coexisting variant extension. Distinct
     module name + own build dir => incremental ninja rebuild, sccache-friendly, and
-    NO collision with the production _ops. Returns the loaded module."""
+    NO collision with the production _ops. Returns the loaded module.
+
+    `defines` is a list of extra "-DKEY=VAL" override flags (e.g. the hill-climb
+    knob sweep: -DSG_TUNED_DEC_DW_SPLITK=8). Each distinct define-set gets its own
+    module name (suffix from the KEY=VAL pairs) so variants coexist + cache cleanly."""
     bench = (d != 128)
     flags = ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
              "-gencode=arch=compute_90a,code=sm_90a",
@@ -70,11 +75,21 @@ def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool 
         flags.append("-DSG_DEC_SCALAR_MEGAKERNEL=0")
     if profile:
         flags.append("-DSG_DEC_PROFILE=1")
+    # Hill-climb knob overrides (-DKEY=VAL). Appended LAST so they win over defaults.
+    suffix = ""
+    if defines:
+        for d_ in defines:
+            flags.append("-D" + d_ if not d_.startswith("-D") else d_)
+        # build a filesystem-safe module suffix from the override KEY=VAL pairs.
+        norm = "_".join(d_.lstrip("-D").replace("=", "").replace(" ", "")
+                        for d_ in defines)
+        suffix = "_" + norm
     if name is None:
         name = "mega_decoder_real_adamw_tc"
         name += "_bench" if bench else "_prod"
         if profile:
             name += "_prof"
+        name += suffix
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
     mod = load(name=name, sources=[_TC_TU],
                extra_include_paths=[str(ROOT)],
@@ -212,13 +227,19 @@ def main():
     ap.add_argument("--profile", action="store_true", help="build with -DSG_DEC_PROFILE and read per-phase clock64")
     ap.add_argument("--ncta-cap", type=int, default=0, help="0 = one CTA/SM (full saturation)")
     ap.add_argument("--verbose-build", action="store_true")
+    ap.add_argument("-D", dest="defines", action="append", default=[],
+                    metavar="KEY=VAL",
+                    help="extra -D compile override (repeatable), e.g. "
+                         "-D SG_TUNED_DEC_DW_SPLITK=8. Each set builds its own variant.")
     args = ap.parse_args()
     assert args.B % 16 == 0, "B must be divisible by 16 (dW K-loop is 16-step atoms)"
 
     print(f"[decoder-bench] building variant: d={args.d} profile={args.profile} "
-          f"(SG_DEC_BENCH_LAYOUT={'1' if args.d != 128 else 'unset'})", flush=True)
+          f"(SG_DEC_BENCH_LAYOUT={'1' if args.d != 128 else 'unset'})"
+          + (f"  defines={args.defines}" if args.defines else ""), flush=True)
     t0 = time.perf_counter()
-    mod = build_variant(args.d, args.profile, verbose=args.verbose_build)
+    mod = build_variant(args.d, args.profile, verbose=args.verbose_build,
+                        defines=args.defines)
     print(f"[decoder-bench] build done in {time.perf_counter()-t0:.1f}s  "
           f"(D={int(mod.D)} TOTAL={int(mod.TOTAL):,} TILE_N={int(mod.TILE_N)} "
           f"HAS_PROFILE={getattr(mod,'HAS_PROFILE',False)})", flush=True)
