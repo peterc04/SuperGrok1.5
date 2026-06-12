@@ -46,6 +46,17 @@ cudaError_t mega_decoder_real_adamw(
     // symmetry with the surrogate cells and forward-compat. Silence the warning.
     (void)sizes; (void)offsets;
 
+#if !SG_DEC_SCALAR_MEGAKERNEL
+    // The legacy fp32 SCALAR decoder megakernel is compile-gated OFF (it does not
+    // fit smem at scaled SG_DEC_D; see the flag note in fused_decoder_megakernel
+    // .cuh). The symbol is retained so dispatch.cpp links, but the fp32 fallback is
+    // unavailable in this build — the production bf16 wgmma TC path carries every
+    // routed cell, so this branch is dead in practice. Refuse LOUDLY (no surrogate).
+    (void)ctx; (void)params; (void)tokens; (void)targets; (void)B; (void)state;
+    (void)grad; (void)workspace; (void)loss_out; (void)lr; (void)step;
+    (void)scalars; (void)stream;
+    return cudaErrorNotSupported;
+#else
     const int64_t total = kDecTotalElems;
     // AdamW state binding: state = [m | v | extra] (3*total) + 1 trailing loss
     // slot. extra is unused by AdamW (rebase_state<AdamW> guards it out).
@@ -64,6 +75,7 @@ cudaError_t mega_decoder_real_adamw(
 
     return launch_fused_decoder_megakernel<OptId::AdamW>(
         ctx, params, tok, grad, lr, step, st, stream);
+#endif  // SG_DEC_SCALAR_MEGAKERNEL
 }
 
 }}}  // namespace sg::fused::sm90

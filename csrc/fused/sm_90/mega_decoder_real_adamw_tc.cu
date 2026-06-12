@@ -174,7 +174,7 @@ static std::vector<torch::Tensor> tc_dump_ff2_operands(torch::Tensor params, int
 
 // scalar_train_step: the SAME (decoder × AdamW) cell run through the SCALAR
 // default launcher (launch_fused_decoder_megakernel<AdamW>, which lives OUTSIDE
-// the wgmma guard at fused_decoder_megakernel.cuh:253 — so this wgmma-token TU
+// the wgmma guard at fused_decoder_megakernel.cuh — so this wgmma-token TU
 // can still call it). This exists ONLY so the step-time gate can time the live
 // scalar path and the TC path BACK-TO-BACK in one process / one contention
 // regime → an honest scalar:TC ratio. The scalar path uses its OWN workspace
@@ -182,6 +182,13 @@ static std::vector<torch::Tensor> tc_dump_ff2_operands(torch::Tensor params, int
 // for nCTA = #SMs (the scalar launcher pins one CTA per SM, no cap). It is NOT
 // the shipped invocation (that is dispatch.cpp via mega_decoder_real_adamw.cu);
 // it is a measurement mirror. Returns {loss, reduced grad} like tc_train_step.
+//
+// GATED by SG_DEC_SCALAR_MEGAKERNEL: the legacy fp32 scalar megakernel does not
+// fit smem at scaled SG_DEC_D (see the flag note in fused_decoder_megakernel.cuh).
+// When OFF, this back-to-back timing mirror is compiled out (its only purpose is
+// the scalar:TC ratio, which is moot when the scalar path is unavailable); the TC
+// gates (tc_train_step) are unaffected.
+#if SG_DEC_SCALAR_MEGAKERNEL
 static std::vector<torch::Tensor> scalar_train_step(
         torch::Tensor params, torch::Tensor tokens, torch::Tensor targets,
         torch::Tensor state, double lr, double beta1, double beta2, double eps,
@@ -247,6 +254,7 @@ static std::vector<torch::Tensor> scalar_train_step(
                         .to(torch::kCPU);
     return {loss_cpu, grad};
 }
+#endif  // SG_DEC_SCALAR_MEGAKERNEL
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.def("tc_train_step", &tc_train_step,
@@ -258,12 +266,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
            pybind11::arg("ncta_cap") = 0);
     mm.def("tc_dump_ff2_operands", &tc_dump_ff2_operands,
            "gate-only: dump the kernel's stored dY_ff2[L1], X_gact[L1] (fp32 CPU)");
+#if SG_DEC_SCALAR_MEGAKERNEL
     mm.def("scalar_train_step", &scalar_train_step,
            "gate-only: SAME cell via the SCALAR launcher (back-to-back step-time mirror)",
            pybind11::arg("params"), pybind11::arg("tokens"), pybind11::arg("targets"),
            pybind11::arg("state"), pybind11::arg("lr"), pybind11::arg("beta1"),
            pybind11::arg("beta2"), pybind11::arg("eps"), pybind11::arg("weight_decay"),
            pybind11::arg("bc1"), pybind11::arg("bc2"), pybind11::arg("step"));
+#endif
     mm.attr("TILE_M") = (int)::sg::fused::sm90::dectc::kTileM;
     mm.attr("TILE_N") = (int)SG_TUNED_TILE_N;
     mm.attr("TOTAL") = (int)kDecTotalElems;

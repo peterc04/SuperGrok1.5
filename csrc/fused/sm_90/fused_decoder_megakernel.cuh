@@ -115,6 +115,28 @@
 #include "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
 #endif
 
+// ============================================================================
+//  SG_DEC_SCALAR_MEGAKERNEL — compile-gate for the LEGACY fp32 SCALAR decoder
+//  megakernel (fused_decoder_megakernel<Opt> + launch_fused_decoder_megakernel
+//  <Opt> below, and the per-sample DecSampleSmem path in model_stages_decoder
+//  .cuh). It is the fp32 fallback cell (dispatch.cpp's !want_wgmma branch, adamw-
+//  only) and is NEVER on the production bf16 wgmma path that wiring_check's 33/33
+//  exercise — the TC engine (fused_decoder_megakernel_tc, below) carries every
+//  routed cell.
+//
+//  WHY A GATE (the d-scaling decouple): DecSampleSmem is sized [kSeq×kD] /
+//  [kSeq×kDff] arrays, so its static smem GROWS with SG_DEC_D and ptxas HARD-STOPS
+//  ("uses too much shared data") at large d (≥768) — a hard compile failure on the
+//  scalar __global__, even though the TC engine's smem (DecTcSmem ~13.5 KB) is
+//  d-INDEPENDENT and builds at every d. Gating the dead scalar kernel OFF
+//  (-DSG_DEC_SCALAR_MEGAKERNEL=0) lets the WHOLE extension compile at scaled d
+//  (the TC path is what's measured). DEFAULT 1 (ON) → the d=128 production build
+//  is byte-for-byte unchanged: the scalar fp32 fallback stays wired and 33/33 stay
+//  green. The flag changes NOTHING the TC path touches.
+#ifndef SG_DEC_SCALAR_MEGAKERNEL
+#define SG_DEC_SCALAR_MEGAKERNEL 1
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
 // Rebase a FusedOptState's per-element state pointers to a parameter-tensor
@@ -158,10 +180,14 @@ struct DecoderTokenCtx {
     float*     loss_out;  // device float the kernel writes the mean loss into
 };
 
+#if SG_DEC_SCALAR_MEGAKERNEL
 // ── The persistent megakernel (L3-REAL). gridDim.x = #SMs (one CTA/SM), 256
 //    threads/CTA. The smem holds ONE DecSampleSmem (≈42 KB, < 48 KB static cap —
 //    no dynamic-smem opt-in, so the occupancy≥1 guard with dynamicSMemBytes=0 in
 //    the launcher is unchanged). ────────────────────────────────────────────────
+//    GATED by SG_DEC_SCALAR_MEGAKERNEL (this legacy fp32 path's DecSampleSmem
+//    grows with SG_DEC_D and ptxas-fails at large d; OFF lets the TC path build
+//    at scaled d — see the flag note above). ────────────────────────────────────
 // sizes/offsets are NOT host-passed: the per-tensor numel/offset live in the
 // generated __constant__ tables kDecSizes/kDecOffsets (decoder_layout.cuh), so
 // the reduce + optimizer phases read them directly. This also lets the host side
@@ -306,6 +332,7 @@ cudaError_t launch_fused_decoder_megakernel(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
+#endif  // SG_DEC_SCALAR_MEGAKERNEL
 
 // ════════════════════════════════════════════════════════════════════════════
 //  WGMMA CELL DRIVER (DESIGN-TC-PIPELINE.md Fork B, R2.3). Compiled only under
