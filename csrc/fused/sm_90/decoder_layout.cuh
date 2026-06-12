@@ -14,12 +14,93 @@
 //
 // A count/total mismatch fails the BUILD loudly (a static_assert below), never
 // corrupts at dispatch.
+//
+// ── SG_DEC_BENCH_LAYOUT (hill-climb d-scaled bench variant) ──────────────────
+// Two layouts coexist under the single include guard. SG_DEC_BENCH_LAYOUT is
+// UNSET on the production _ops build (→ the d=128 branch, byte-identical to
+// the historical header), and set to 1 ONLY by the d-scaled benchmark TU / the
+// _ops_bench variant extension (→ the d=1024 branch). The branches are
+// mutually exclusive at preprocess time, so a TU compiles exactly one consistent
+// (constants, __constant__ table, static-assert) set; production never sees the
+// bench numbers. This is the loop infra for task #13 — see /workspace/.hillclimb_loop.md.
 // ============================================================================
 
 #include <cstdint>
 
+#ifndef SG_DEC_BENCH_LAYOUT
+#define SG_DEC_BENCH_LAYOUT 0
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
+#if SG_DEC_BENCH_LAYOUT
+// ── d-SCALED BENCH VARIANT (d=1024): the persistent-megakernel roofline
+//    build. NOT on the production path; selected ONLY by -DSG_DEC_BENCH_LAYOUT=1. ──
+constexpr int SG_DEC_VOCAB  = 99;
+constexpr int SG_DEC_D      = 1024;
+constexpr int SG_DEC_HEADS  = 4;
+constexpr int SG_DEC_LAYERS = 2;
+constexpr int SG_DEC_SEQ    = 4;
+constexpr int SG_DEC_DFF    = 4 * SG_DEC_D;   // 4096
+
+constexpr int     kDecNumTensors = 30;
+constexpr int64_t kDecTotalElems = 25401443;
+
+// Per-tensor element offsets into the flat param blob, named_parameters() order.
+__device__ __constant__ int kDecOffsets[kDecNumTensors] = {
+    0, 101376, 105472, 3251200, 3254272, 4302848, 4303872, 4304896, 4305920, 4306944,
+    4307968, 8502272, 8506368, 12700672, 12701696, 15847424, 15850496, 16899072, 16900096, 16901120,
+    16902144, 16903168, 16904192, 21098496, 21102592, 25296896, 25297920, 25298944, 25299968, 25401344
+};
+
+// Per-tensor element sizes (numel), same order.
+__device__ __constant__ int kDecSizes[kDecNumTensors] = {
+    101376, 4096, 3145728, 3072, 1048576, 1024, 1024, 1024, 1024, 1024,
+    4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024, 1024, 1024,
+    1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024, 101376, 99
+};
+
+static_assert(kDecNumTensors == 30,
+              "decoder_layout: tensor count drifted. Regenerate via "
+              "megakernel_codegen.py --decoder-layout.");
+static_assert(kDecTotalElems == 25401443,
+              "decoder_layout: total param count drifted. Regenerate.");
+
+// Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
+// __constant__ array can't be folded in a constexpr). These guarantee
+// offsets/sizes/total agree.
+namespace dec_layout_check {
+constexpr int kSizes[kDecNumTensors] = {
+    101376, 4096, 3145728, 3072, 1048576, 1024, 1024, 1024, 1024, 1024,
+    4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024, 1024, 1024,
+    1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024, 101376, 99
+};
+constexpr int kOffsets[kDecNumTensors] = {
+    0, 101376, 105472, 3251200, 3254272, 4302848, 4303872, 4304896, 4305920, 4306944,
+    4307968, 8502272, 8506368, 12700672, 12701696, 15847424, 15850496, 16899072, 16900096, 16901120,
+    16902144, 16903168, 16904192, 21098496, 21102592, 25296896, 25297920, 25298944, 25299968, 25401344
+};
+constexpr int64_t sum_sizes() {
+    int64_t s = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) s += kSizes[i];
+    return s;
+}
+constexpr bool offsets_consistent() {
+    int64_t acc = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) {
+        if (kOffsets[i] != (int)acc) return false;
+        acc += kSizes[i];
+    }
+    return true;
+}
+static_assert(sum_sizes() == kDecTotalElems,
+              "decoder_layout: sum(kDecSizes) != kDecTotalElems. Regenerate.");
+static_assert(offsets_consistent(),
+              "decoder_layout: kDecOffsets[i] != sum(kDecSizes[0..i)). Regenerate.");
+}  // namespace dec_layout_check
+#else
+// ── PRODUCTION (d=128): the 33/33 wiring_check path. Byte-identical to the
+//    historical generated header (the default when SG_DEC_BENCH_LAYOUT is unset). ──
 constexpr int SG_DEC_VOCAB  = 99;
 constexpr int SG_DEC_D      = 128;
 constexpr int SG_DEC_HEADS  = 4;
@@ -82,6 +163,7 @@ static_assert(sum_sizes() == kDecTotalElems,
 static_assert(offsets_consistent(),
               "decoder_layout: kDecOffsets[i] != sum(kDecSizes[0..i)). Regenerate.");
 }  // namespace dec_layout_check
+#endif  // SG_DEC_BENCH_LAYOUT
 
 }}} // namespace sg::fused::sm90
 

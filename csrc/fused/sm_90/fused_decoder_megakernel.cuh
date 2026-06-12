@@ -454,6 +454,21 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + dec_tc_sg2_floats(nCTA);           // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
 }
 
+#ifdef SG_DEC_PROFILE
+// Diagnostic-only (behind SG_DEC_PROFILE; NEVER on the shipped path — the flag is
+// set ONLY by the bench/profile TU, default OFF, so the production _ops is byte-
+// identical). Per-phase clock64() deltas, max across CTAs (= the critical-path
+// duration per phase = the slowest CTA, which is what the host wall sees because
+// the trailing grid barrier waits for the last CTA). Slots (decoder AdamW path):
+//   [0]=P1 fwd, [1]=P1 bwd, [2]=B1 barrier wait, [3]=P2 dW-GEMM loop (+split-K),
+//   [4]=P2 grad-assembly (biases+embed owner-scan+lnvec reduce+loss),
+//   [5]=P3 opt tail, [6]=B2 barrier wait (sync_reset P2->P3), [7]=B0 barrier wait.
+// clock64() is per-SM; a CTA stays on one SM so its own deltas are valid;
+// atomicMax across CTAs gives the slowest CTA per phase. Read host-side via
+// cudaMemcpyFromSymbol (see mega_decoder_real_adamw_tc.cu tc_profile_read).
+__device__ unsigned long long g_dec_prof_max[8];
+#endif
+
 template <OptId Opt>
 __global__ void __launch_bounds__(SG_TC_MEGA_BLOCK)
 fused_decoder_megakernel_tc(PersistentContext ctx,
@@ -522,7 +537,13 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //    written-once → no pre-zero). ──
     for (int i = threadIdx.x; i < dectc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+#ifdef SG_DEC_PROFILE
+    unsigned long long _b0a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     bar.sync();   // B0
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _b0b = clock64(); atomicMax(&g_dec_prof_max[7], _b0b - _b0a); }
+#endif
 
     // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
     //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
@@ -530,18 +551,41 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     const int nrows_tile = dectc::kTileM;
     const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
     float nll_acc = 0.0f;
+#ifdef SG_DEC_PROFILE
+    unsigned long long prof_fwd = 0, prof_bwd = 0;
+#endif
     for (int ti = cta; ti < n_tiles; ti += nCTA) {
         const int g0 = ti * nrows_tile;
         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+#ifdef SG_DEC_PROFILE
+        __syncthreads(); unsigned long long _c0 = clock64();
+#endif
         float nll = dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
                                               sm.sA, sm.sB, sm.red);
+#ifdef SG_DEC_PROFILE
+        __syncthreads(); unsigned long long _c1 = clock64();
+#endif
         dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+#ifdef SG_DEC_PROFILE
+        __syncthreads(); unsigned long long _c2 = clock64();
+        if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+#endif
         if (threadIdx.x == 0) nll_acc += nll;
         __syncthreads();
     }
     if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) {
+        atomicMax(&g_dec_prof_max[0], prof_fwd);
+        atomicMax(&g_dec_prof_max[1], prof_bwd);
+    }
+    unsigned long long _b1a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     bar.sync();   // B1: all acts (X + dY) + LN-vec partials complete
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _b1b = clock64(); atomicMax(&g_dec_prof_max[2], _b1b - _b1a); }
+#endif
 
     // ── P2: assemble all 30 grads into `grad`. dW output-stationary (gt %
     //    nCTA), biases, embedding owner-scan, LN-vec reduce. No partials. The 9
@@ -552,6 +596,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     __syncthreads();
     dectc::DecDwSpec* spec = sm.spec;
     const int n_dw = dectc::dectc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+#ifdef SG_DEC_PROFILE
+    __syncthreads(); unsigned long long _dwa = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     if (kDwG > 1) {
         // SPLIT-K (multi-CTA tiling): fan (n_dw·G) (tile,chunk) partials over the
         // grid so the ~62% idle SMs do work; deterministic ascending-chunk reduce.
@@ -565,6 +612,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
         for (int gt = cta; gt < n_dw; gt += nCTA)
             dectc::dectc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
     }
+#ifdef SG_DEC_PROFILE
+    __syncthreads();
+    if (threadIdx.x == 0) { unsigned long long _dwb = clock64(); atomicMax(&g_dec_prof_max[3], _dwb - _dwa); }
+    unsigned long long _gaa = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     dectc::dectc_dw_biases(spec, grad);
     dectc::dectc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
     dectc::dectc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
@@ -574,8 +626,17 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
         for (int c = 0; c < nCTA; ++c) s += (double)loss_part[c];
         *tok.loss_out = (float)(s / (double)B);
     }
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _gab = clock64(); atomicMax(&g_dec_prof_max[4], _gab - _gaa); }
+#endif
     (void)loss_out;
+#ifdef SG_DEC_PROFILE
+    unsigned long long _b2a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _b2b = clock64(); atomicMax(&g_dec_prof_max[6], _b2b - _b2a); }
+#endif
 
     // ── P2.4 (LookSAM ONLY, SAM steps): the MODEL-COUPLED SAM 2nd backward that
     //    produces st.sam_dir = g_sam − g (INTEGRATION-OPTSTAGES §6). Eager LookSAM,
@@ -1020,6 +1081,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // ── P3: the REAL optimizer tail over the reduced grad (work-steal the 30
     //    tensors). apply_optimizer<Opt> is the canonical csrc/algorithms math. ──
     st.lr = lr;
+#ifdef SG_DEC_PROFILE
+    unsigned long long _p3a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     {
         __shared__ int task_slot;
         TaskQueue q = ctx.queue();
@@ -1096,6 +1160,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
             }
         }
     }
+#ifdef SG_DEC_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _p3b = clock64(); atomicMax(&g_dec_prof_max[5], _p3b - _p3a); }
+#endif
 }
 
 // ncta_cap (default 0): if >0, launch min(n_sms, ncta_cap) CTAs instead of one

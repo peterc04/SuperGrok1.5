@@ -256,6 +256,23 @@ static std::vector<torch::Tensor> scalar_train_step(
 }
 #endif  // SG_DEC_SCALAR_MEGAKERNEL
 
+#ifdef SG_DEC_PROFILE
+// Diagnostic-only (SG_DEC_PROFILE; never shipped — the production _ops never sets
+// this flag). Read + reset the per-phase clock64 maxima (cycles), 8 slots:
+// [0]=P1 fwd, [1]=P1 bwd, [2]=B1 wait, [3]=P2 dW-GEMM, [4]=P2 grad-assembly,
+// [5]=P3 opt tail, [6]=B2 wait, [7]=B0 wait. Call AFTER one tc_train_step; divide
+// by the SM clock (~1.99 GHz boost on H100) to get ms, or read the RATIOS.
+static std::vector<int64_t> tc_profile_read() {
+    unsigned long long h[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    cudaMemcpyFromSymbol(h, ::sg::fused::sm90::g_dec_prof_max, sizeof(h));
+    unsigned long long z[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    cudaMemcpyToSymbol(::sg::fused::sm90::g_dec_prof_max, z, sizeof(z));
+    std::vector<int64_t> out(8);
+    for (int i = 0; i < 8; ++i) out[i] = (int64_t)h[i];
+    return out;
+}
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.def("tc_train_step", &tc_train_step,
            "Fork-B tensor-core decoder fwd+bwd+AdamW step (in place); returns (loss, reduced grad)",
@@ -277,4 +294,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.attr("TILE_M") = (int)::sg::fused::sm90::dectc::kTileM;
     mm.attr("TILE_N") = (int)SG_TUNED_TILE_N;
     mm.attr("TOTAL") = (int)kDecTotalElems;
+    mm.attr("D") = (int)::sg::fused::sm90::SG_DEC_D;          // model width (128 prod / 1024 bench)
+    mm.attr("DFF") = (int)::sg::fused::sm90::SG_DEC_DFF;
+    mm.attr("LAYERS") = (int)::sg::fused::sm90::SG_DEC_LAYERS;
+    mm.attr("SEQ") = (int)::sg::fused::sm90::SG_DEC_SEQ;
+    mm.attr("VOCAB") = (int)::sg::fused::sm90::SG_DEC_VOCAB;
+#ifdef SG_DEC_PROFILE
+    mm.def("tc_profile_read", &tc_profile_read,
+           "diagnostic-only: per-phase clock64 maxima "
+           "[P1fwd,P1bwd,B1wait,P2dW,P2asm,P3opt,B2wait,B0wait] (cycles), resets after read");
+    mm.attr("HAS_PROFILE") = true;
+#else
+    mm.attr("HAS_PROFILE") = false;
+#endif
 }
