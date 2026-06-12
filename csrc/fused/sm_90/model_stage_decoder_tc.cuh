@@ -94,8 +94,24 @@ namespace wgs = ::sg::sm90::wgs;
 #define SG_TUNED_DEC_DW_SPLITK 4
 #endif
 
+// ── M-atom INTERLEAVE width cap (task #13 hill-climb win). The GEMM microkernel
+//    processes stacked m64 atoms in groups of min(MaxAtomsM, this); within a group
+//    the per-k wgmmas (one per atom) issue back-to-back into independent fp32
+//    fragments sharing ONE staged B-tile → the tensor pipe overlaps the MMAs AND
+//    the (HBM-bound) weight B-tile is staged once per group instead of per atom.
+//    Capped (default 2) so the accumulator-register + A-smem cost stays bounded
+//    regardless of m_atoms (a dW tile can be 8 atoms; an 8-wide interleave would
+//    need 8×(N/2) fp32 accumulator regs). 1 = no interleave (the old serial path,
+//    bit-for-bit). Production fwd/dX use kAtomsM=2 → full 2-wide interleave.
+#ifndef SG_TUNED_DEC_GEMM_INTERLEAVE
+#define SG_TUNED_DEC_GEMM_INTERLEAVE 2
+#endif
+
 namespace dectc {
 
+constexpr int kDecMaxIL = SG_TUNED_DEC_GEMM_INTERLEAVE;
+static_assert(kDecMaxIL >= 1 && kDecMaxIL <= 4,
+              "SG_TUNED_DEC_GEMM_INTERLEAVE must be 1 (serial) .. 4");
 constexpr int kDecTcStages = SG_TUNED_DEC_GEMM_STAGES;
 static_assert(kDecTcStages >= 1 && kDecTcStages <= 2,
               "SG_TUNED_DEC_GEMM_STAGES must be 1 (serial) or 2 (double-buffer)");
@@ -284,64 +300,103 @@ __device__ void tc_gemm_block_unpipelined(
     const int nthreads = blockDim.x;            // 256
     const bool in_wg0 = (tid < 128);
     const int tid_wg = tid & 127;
-
-    // One fp32 accumulator fragment per stacked m64 atom (compile-time bound).
-    wgs::WgmmaAccum<N> acc[MaxAtomsM];
     constexpr int S = kDecTcStages;
 
-    // Stage tile `k` of atom `mbase` into ring slot `k % S` (smem{A,B} are ring bases).
-    auto stage_k = [&] (int mbase, int k) {
+    // ── M-ATOM-INTERLEAVED wgmma pipeline (overlaps the tensor pipe + HALVES the
+    //    redundant B-tile staging; THE hill-climb win, task #13). The OLD body ran
+    //    each stacked m64 atom's k-chain to completion SEQUENTIALLY (atom0 chain →
+    //    atom0 epilogue → atom1 chain → …): every wgmma was followed by a per-issue
+    //    wait, the shared B (weight) tile was re-staged ONCE PER ATOM, and the atom-a
+    //    epilogue stores interleaved with atom-a+1's first wgmma (ptxas C7515).
+    //
+    //    Here, atoms are processed in GROUPS of kIL (= min(MaxAtomsM, kDecMaxIL)).
+    //    Within a group, EACH k-step issues the kIL wgmmas (one per atom) BACK-TO-
+    //    BACK into their OWN fp32 fragments, sharing ONE staged B-tile, before the
+    //    single per-k wait. Two wins: (1) the kIL atoms are INDEPENDENT (distinct
+    //    M-rows / accumulators) → the tensor pipe overlaps their MMA execution
+    //    instead of paying each latency raw; (2) the B-tile is staged ONCE for the
+    //    whole group instead of kIL times → the (HBM-bound) weight-operand traffic
+    //    drops kIL×. Measured: d=1024 B=16384 step 2084→1624 ms (+28% TF/s).
+    //
+    //    kIL is CAPPED (kDecMaxIL=2) so the register/smem cost is bounded regardless
+    //    of m_atoms (the dW micro-gate runs Nout=512 → 8 atoms; an 8-wide interleave
+    //    would need 8×64 accumulator regs). Groups reuse the SAME ring slots
+    //    sequentially (like the old atom loop). Per-atom accumulation stays
+    //    ASCENDING-k (k=0 overwrite, k>0 add) → numerics bit-identical + A/A/A
+    //    determinism UNCHANGED. Ring stages kIL A-tiles (slot sl, atom-in-group ai at
+    //    +ai·kDecTcSmemA1) + ONE shared B-tile; smem{A} must hold kIL·kDecTcStages
+    //    tiles (DecTcSmem sizes it for kAtomsM=production max).
+    constexpr int kIL = (MaxAtomsM < kDecMaxIL) ? MaxAtomsM : kDecMaxIL;
+    wgs::WgmmaAccum<N> acc[kIL];                 // kIL live fragments per group
+
+    // Stage k-tile for a group of `g_atoms` (<= kIL) atoms based at `gbase`: the
+    // g_atoms A-tiles (rows gbase+ai·64) + the shared B-tile, into ring slot k % S.
+    auto stage_k = [&] (int gbase, int g_atoms, int k) {
         const int sl = k % S;
-        stage_kmajor_tile<wgs::kWgmmaAtomM>(
-            smemA + (int64_t)sl * kDecTcSmemA1, k * wgs::kWgmmaAtomK,
-            [&] (int mn, int kk) { return srcA(mbase + mn, kk); }, tid, nthreads);
+        for (int ai = 0; ai < g_atoms; ++ai) {
+            const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+            stage_kmajor_tile<wgs::kWgmmaAtomM>(
+                smemA + ((int64_t)sl * kIL + ai) * kDecTcSmemA1, k * wgs::kWgmmaAtomK,
+                [&] (int mn, int kk) { return srcA(mbase + mn, kk); }, tid, nthreads);
+        }
         stage_kmajor_tile<N>(
             smemB + (int64_t)sl * kDecTcSmemB1, k * wgs::kWgmmaAtomK,
             [&] (int mn, int kk) { return srcB(mn, kk); }, tid, nthreads);
     };
-    auto issue_k = [&] (int a, int k) {
+    // Issue the group's g_atoms wgmmas for staged slot k (k=0 overwrite else accum).
+    auto issue_k = [&] (int g_atoms, int k) {
         const int sl = k % S;
-        wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(
-            smemA + (int64_t)sl * kDecTcSmemA1);
         wgs::SmemDesc dB = wgs::make_desc_B_kmajor<N, wgs::kSwizzleNone>(
             smemB + (int64_t)sl * kDecTcSmemB1);
-        if (k == 0) wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[a], dA, dB);
-        else        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[a], dA, dB);
+        #pragma unroll
+        for (int ai = 0; ai < kIL; ++ai) {
+            if (ai >= g_atoms) break;
+            wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(
+                smemA + ((int64_t)sl * kIL + ai) * kDecTcSmemA1);
+            if (k == 0) wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[ai], dA, dB);
+            else        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[ai], dA, dB);
+        }
     };
 
-    // For each stacked atom (M-base = mbase0 + a*64), run the full k-chain.
+    // Loop M-atom GROUPS of kIL; each group runs its own k-chain into kIL fragments.
     #pragma unroll 1
-    for (int a = 0; a < m_atoms; ++a) {
-        const int mbase = mbase0 + a * wgs::kWgmmaAtomM;
-        // Prologue: stage tile 0; make visible; fence.
-        stage_k(mbase, 0);
+    for (int g0 = 0; g0 < m_atoms; g0 += kIL) {
+        const int gbase = mbase0 + g0 * wgs::kWgmmaAtomM;
+        const int g_atoms = (m_atoms - g0) < kIL ? (m_atoms - g0) : kIL;
+        // Prologue: stage tile 0 (the group's atoms); make visible; fence ONCE.
+        stage_k(gbase, g_atoms, 0);
         __syncthreads();
         if (in_wg0) wgs::wgmma_fence();
-        // Steady state (S=2 single-in-flight double-buffer): issue wgmma(k) on the
-        // already-staged slot k&1 (async), THEN stage tile k+1 into the OTHER slot
-        // (its HBM loads overlap the MMA), THEN wait_group<0> + sync (wgmma(k) done
-        // reading slot k&1; stage(k+1) visible; slot k&1 reuse-safe). S=1 collapses
-        // to the validated serial path (stage k+1 into the single slot AFTER wait).
+        // Steady state (S=2 single group in flight): issue the g_atoms wgmmas for
+        // slot k%S (async, overlapping in the tensor pipe), THEN stage tile k+1 into
+        // the OTHER slot (HBM loads overlap the MMAs), THEN wait_group<0> + sync. S=1
+        // collapses to staging into the single slot AFTER the wait (serial, exact).
         #pragma unroll 1
         for (int k = 0; k < k_steps; ++k) {
-            if (in_wg0) { issue_k(a, k); wgs::wgmma_commit_group(); }
+            if (in_wg0) { issue_k(g_atoms, k); wgs::wgmma_commit_group(); }
             if (S > 1) {
-                if (k + 1 < k_steps) stage_k(mbase, k + 1);
+                if (k + 1 < k_steps) stage_k(gbase, g_atoms, k + 1);
                 if (in_wg0) wgs::wgmma_wait_group<0>();
                 __syncthreads();
             } else {
                 if (in_wg0) wgs::wgmma_wait_group<0>();
                 __syncthreads();
-                if (k + 1 < k_steps) { stage_k(mbase, k + 1); __syncthreads(); }
+                if (k + 1 < k_steps) { stage_k(gbase, g_atoms, k + 1); __syncthreads(); }
             }
         }
-        // Epilogue: warpgroup 0 owns the fp32 fragment; decode + emit (real cols).
+        // Epilogue: warpgroup 0 owns the fp32 fragments; decode + emit (real cols).
+        // All reads happen AFTER the final wait_group<0> — no overlap with any wgmma.
         if (in_wg0) {
             #pragma unroll
-            for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
-                int row, col;
-                wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
-                if (col < n_real) out(mbase + row, col, acc[a].c[i]);
+            for (int ai = 0; ai < kIL; ++ai) {
+                if (ai >= g_atoms) break;
+                const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+                #pragma unroll
+                for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
+                    int row, col;
+                    wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
+                    if (col < n_real) out(mbase + row, col, acc[ai].c[i]);
+                }
             }
         }
         __syncthreads();

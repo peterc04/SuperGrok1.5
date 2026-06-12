@@ -353,10 +353,18 @@ cudaError_t launch_fused_decoder_megakernel(
 //    stack: keeps the launch's local-memory reservation small so the persistent
 //    kernel places on a memory-tight GPU). ──
 struct DecTcSmem {
-    // kDecTcStages A(64×16) + kDecTcStages B(N×16) bf16 tiles — the GEMM K-loop
-    // double-buffer ring (slot s at sA + s*64*16 / sB + s*N*16). At S=2 + N=128
-    // the ring is 2·(2KB+4KB)=12KB; DecTcSmem total ~13.5KB ≪ the 48KB static cap.
-    __nv_bfloat16 sA[dectc::kDecTcStages * 64 * 16];
+    // GEMM K-loop ring. The M-atom-interleaved wgmma pipeline stages up to
+    // kDecAtomsPerSlot A(64×16) tiles per slot (one per stacked m64 atom in an
+    // interleave GROUP, issued back-to-back into independent fp32 fragments so the
+    // tensor pipe overlaps them) + ONE shared B(N×16) tile per slot. Layout:
+    // A-tiles packed [slot][atom-in-group] (slot s, atom ai at
+    // sA + (s*kDecAtomsPerSlot + ai)*64*16); B [slot] at sB + s*N*16.
+    // kDecAtomsPerSlot = min(kAtomsM, kDecMaxIL) = the widest interleave group any
+    // call site uses (fwd/dX = kAtomsM=2; dW = 1). At S=2, =2, N=128 the ring is
+    // 2·(2·2KB + 4KB)=16KB; DecTcSmem total ~17.5KB ≪ the 48KB static cap.
+    static constexpr int kDecAtomsPerSlot =
+        (dectc::kAtomsM < dectc::kDecMaxIL) ? dectc::kAtomsM : dectc::kDecMaxIL;
+    __nv_bfloat16 sA[dectc::kDecTcStages * kDecAtomsPerSlot * 64 * 16];
     __nv_bfloat16 sB[dectc::kDecTcStages * SG_TUNED_TILE_N * 16];
     float red[256];
     dectc::DecDwSpec spec[9];
