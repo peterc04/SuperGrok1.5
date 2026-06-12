@@ -3233,9 +3233,13 @@ def _pgo_workload_main(argv: Optional[List[str]] = None) -> int:
     if args.so:
         import importlib.util as _ilu
         ops_mod = f"{pkg}._ops"
+        # #12: load under the name the .so was BUILT as (PyInit_<filename
+        # stem before the first '.'>: product "_ops...", JIT variants
+        # "grokking_compiled_<...>"), then alias as <pkg>._ops.
+        _mod_name = os.path.basename(str(args.so)).split(".", 1)[0]
         if ops_mod in sys.modules:
             del sys.modules[ops_mod]
-        _spec = _ilu.spec_from_file_location(ops_mod, str(args.so))
+        _spec = _ilu.spec_from_file_location(_mod_name, str(args.so))
         if _spec is None or _spec.loader is None:
             raise RuntimeError(f"could not load .so: {args.so}")
         _mod = _ilu.module_from_spec(_spec)
@@ -3587,7 +3591,7 @@ def event_median_ms(opt_class: str, *, size: int = 4096,
 # ===========================================================================
 
 _WORKER_BODY = r"""
-import sys, json, importlib.util, traceback, time
+import sys, os, json, importlib.util, traceback, time
 try:
     import torch
 except ImportError as exc:
@@ -3597,10 +3601,24 @@ except ImportError as exc:
 
 
 def _load_so(so_path):
-    if "__PKG__._ops" in sys.modules:
-        del sys.modules["__PKG__._ops"]
-    spec = importlib.util.spec_from_file_location(
-        "__PKG__._ops", so_path)
+    # #12: an extension .so exports PyInit_<the name it was BUILT as> —
+    # bindings.cpp follows TORCH_EXTENSION_NAME, so a JIT variant exports
+    # PyInit_grokking_compiled_<...> while the product exports PyInit__ops.
+    # ExtensionFileLoader looks up PyInit_<last dot-component of the spec
+    # name>, so derive that name from the FILENAME (everything before the
+    # first '.': "_ops.cpython-311-x86_64-linux-gnu.so" -> "_ops",
+    # "grokking_compiled_<opt>_<model>_<arch>_<cfg>.so" -> the variant name),
+    # then alias the loaded module as __PKG__._ops so package imports bind it.
+    mod_name = os.path.basename(str(so_path)).split(".", 1)[0]
+    # Evict the package AND all its submodules first: dispatch._LazyOps
+    # memoizes the resolved _ops module (plus a per-attribute cache, plus
+    # optimizer instances bind() kernel fns), so merely re-seeding
+    # sys.modules["__PKG__._ops"] would leave every later variant in this
+    # persistent worker silently timing the FIRST variant's binary.
+    for _k in [k for k in list(sys.modules)
+               if k == "__PKG__" or k.startswith("__PKG__.")]:
+        del sys.modules[_k]
+    spec = importlib.util.spec_from_file_location(mod_name, so_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     sys.modules["__PKG__._ops"] = mod
@@ -3687,10 +3705,20 @@ def _time_with_events(opt_class, size, warmup, iters, l2_bytes=0):
     from importlib import import_module
     grok = import_module("__PKG__")
     OptCls = getattr(grok, opt_class)
-    torch.manual_seed(0)
+    # Use a PRIVATE cuda generator, never the default one: this fallback runs
+    # after _time_with_graph failed, and a FAILED torch.cuda.graph capture can
+    # leave the DEFAULT generator in captured state — the next default-gen
+    # torch.randn then raises "Offset increment outside graph capture
+    # encountered unexpectedly" and the whole time op errors out (the
+    # graph->event fallback could never actually run; observed 2026-06-12,
+    # #12 GPU validation). A fresh side generator has no capture association.
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(0)
     p = torch.nn.Parameter(
-        torch.randn(size, size, device="cuda", dtype=torch.float32))
-    g = torch.randn_like(p)
+        torch.randn(size, size, device="cuda", dtype=torch.float32,
+                    generator=gen))
+    g = torch.randn(size, size, device="cuda", dtype=torch.float32,
+                    generator=gen)
     for _ in range(max(1, warmup)):
         p.grad = g.clone()
         opt = OptCls([p], lr=1e-3)
@@ -4375,8 +4403,21 @@ class TimingWorker:
                 try:
                     return json.loads(line)
                 except json.JSONDecodeError:
-                    self._error_log.append(("decode", line[:500]))
-                    return None
+                    # Non-JSON line on the merged stdout+stderr stream. The
+                    # worker is spawned with stderr=STDOUT, so torch/runtime
+                    # banners (e.g. the pynvml FutureWarning some torch
+                    # builds print on EVERY import) and the worker body's own
+                    # stderr notices (the graph→event fallback warning) land
+                    # interleaved with the JSON protocol. They are
+                    # diagnostics, not protocol: record and SKIP, keep
+                    # reading until the deadline. Returning None here (the
+                    # old behaviour) made start()'s ready-handshake fail on
+                    # any host whose torch import prints a single warning —
+                    # the persistent TimingWorker could never start
+                    # (observed 2026-06-12 during #12 GPU validation).
+                    self._error_log.append(("non-json", line[:500]))
+                    line = ""
+                    continue
             line += ch
         self._error_log.append(("timeout", f"after {timeout}s"))
         return None
@@ -10214,6 +10255,24 @@ def _masquerade_compiler_name(shim: Path, cache_tool: str,
     return base
 
 
+def _resolve_real_nvcc() -> str:
+    """The nvcc BINARY torch's cpp_extension would use (``$CUDA_HOME/bin/
+    nvcc``), for wrapping in a compiler cache. Falls back to plain ``"nvcc"``
+    (PATH resolution) only when torch/CUDA_HOME cannot name a real file —
+    matching the historical behaviour on hosts without a discoverable
+    toolkit root."""
+    try:
+        from torch.utils import cpp_extension as _ce
+        cuda_home = getattr(_ce, "CUDA_HOME", None)
+        if cuda_home:
+            cand = Path(cuda_home) / "bin" / "nvcc"
+            if cand.is_file():
+                return str(cand)
+    except Exception as _swexc:  # noqa: BLE001 — fall back to PATH form.
+        _debug_swallow('_resolve_real_nvcc', _swexc)
+    return "nvcc"
+
+
 def _sccache_env() -> Dict[str, str]:
     """Detect ccache (preferred for host TUs) and sccache (preferred for
     NVCC), wire whichever is present. Honour ``SCCACHE_REDIS_ENDPOINT``
@@ -10249,7 +10308,15 @@ def _sccache_env() -> Dict[str, str]:
             # NVCC through sccache via torch's SUPPORTED knob (PYTORCH_NVCC), NOT
             # CUDA_NVCC_EXECUTABLE (a CMake var cpp_extension ignores). Space-form
             # is safe here — torch writes it verbatim into ninja, never which's it.
-            out["PYTORCH_NVCC"] = f"{sccache} nvcc"
+            # Wrap the REAL nvcc binary (what torch itself would resolve:
+            # $CUDA_HOME/bin/nvcc), not PATH-spelled "nvcc": on pods where the
+            # first `nvcc` on PATH is itself a caching wrapper SCRIPT (e.g.
+            # /usr/local/sccache-shim/nvcc `exec sccache nvcc`), sccache would
+            # be asked to treat a bash script as the compiler and dies with
+            # "Compiler not supported" — observed 2026-06-12, it broke every
+            # JIT .cu compile. On hosts whose PATH nvcc IS the real binary
+            # this resolves to the same compiler as before.
+            out["PYTORCH_NVCC"] = f"{sccache} {_resolve_real_nvcc()}"
         for k in ("SCCACHE_REDIS_ENDPOINT", "SCCACHE_REDIS", "SCCACHE_S3_BUCKET"):
             if k in os.environ:
                 out[k] = os.environ[k]
@@ -11747,14 +11814,51 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
         host_cflags = list(host_cflags) + extra_host
     if extra_device:
         device_cflags = list(device_cflags) + extra_device
+    # Host-memory guard (#12 GPU validation): honour an operator-set MAX_JOBS /
+    # NVCC_THREADS env cap if present, else default to NCPUS / 8. On
+    # memory-cgroup-limited hosts the full NCPUS ninja fan-out OOM-kills
+    # cc1plus/cicc on the CUTLASS TUs; an outer `MAX_JOBS=N` bounds the fan-out
+    # without changing default behaviour when unset.
+    _maxjobs_env = os.environ.get("MAX_JOBS")
+    try:
+        _maxjobs = int(_maxjobs_env) if _maxjobs_env else NCPUS
+    except (TypeError, ValueError):
+        _maxjobs = NCPUS
+    _nvcc_threads = os.environ.get("NVCC_THREADS") or "8"
     overlay = {
-        "MAX_JOBS": NCPUS,
+        "MAX_JOBS": _maxjobs,
         "NINJA_STATUS": "[%f/%t %es] ",
         "TORCH_CUDA_VERBOSE_BUILD": "1",
-        "CMAKE_BUILD_PARALLEL_LEVEL": NCPUS,
-        "NVCC_THREADS": "8",
+        "CMAKE_BUILD_PARALLEL_LEVEL": _maxjobs,
+        "NVCC_THREADS": _nvcc_threads,
         **_sccache_env(),
     }
+    # #12 GPU validation: torch's JIT ninja writer appends its OWN
+    # _get_cuda_arch_flags() — from TORCH_CUDA_ARCH_LIST or, when unset, the
+    # DETECTED device capability ("9.0" on H100, never the "a" form). The
+    # detected pair adds -gencode=arch=compute_90,code=sm_90, whose ptxas pass
+    # rejects the arch-accelerated instructions the kernels use (setmaxnreg /
+    # wgmma are compute_90a-only) and EVERY sm_90 variant build dies. Pin the
+    # list to this build's OWN target arch (parsed from the entry's SASS
+    # gencodes, so it stays correct for every CUDA arch in the table and for
+    # cross-arch sweeps on a different host GPU); torch then appends a
+    # duplicate of a -gencode we already pass, which nvcc dedups. An explicit
+    # operator TORCH_CUDA_ARCH_LIST always wins. Same fix as
+    # _build_tc_real_step_module's setdefault("TORCH_CUDA_ARCH_LIST","9.0a"),
+    # generalized per-arch and scoped to the overlay instead of leaked into
+    # os.environ.
+    _entry = get_arch_entry(spec.arch)
+    if _entry.vendor == "cuda" and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        _sass = []
+        for _g in _entry.nvcc_gencode:
+            _m = re.search(r"code=sm_(\d+)([a-z]?)", _g)
+            if _m:
+                _num, _suf = int(_m.group(1)), _m.group(2)
+                _tok = f"{_num // 10}.{_num % 10}{_suf}"
+                if _tok not in _sass:
+                    _sass.append(_tok)
+        if _sass:
+            overlay["TORCH_CUDA_ARCH_LIST"] = ";".join(_sass)
     if "CCACHE_DIR" in overlay:
         report.write(f"  ccache:    {overlay['CCACHE_DIR']}\n")
     if "SCCACHE_DIR" in overlay:
@@ -11776,6 +11880,14 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 with_cuda=with_cuda,
             )
         except Exception as exc:
+            # #12 history: bindings.cpp used to pin PYBIND11_MODULE(_ops), so
+            # load()'s final import-by-extension-name step could NEVER succeed
+            # for a JIT module named grokking_compiled_<...> even though the
+            # artifact linked fine. bindings.cpp now follows
+            # TORCH_EXTENSION_NAME (which load() defines to ``module_name``),
+            # so the import succeeds and ANY exception that lands here —
+            # including an ImportError — is a real build/link/init failure
+            # that must stay loud.
             elapsed = time.monotonic() - t0
             # Stream — debug-flags: collect ALL ninja / log content so the
             # failure-summary builder can scan for the first nvcc error.
@@ -13798,8 +13910,18 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
 
 def _short_key(ckey: str) -> str:
-    """Shorten a config key for use in a directory name (avoids OS path limits)."""
-    if len(ckey) <= 80:
+    """Shorten a config key for use in directory/module names.
+
+    Hash unless the key is BOTH short (OS path limits) and a clean
+    ``[A-Za-z0-9_]`` token: the result is embedded in the JIT variant's
+    module name, which since the #12 fix is consumed by bindings.cpp's
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME-follower) — i.e. it must be a valid
+    C/Python identifier fragment (``PyInit_<name>``). Raw ``config_key``
+    strings carry ``=``/``.``/``-`` and would break the variant COMPILE.
+    Hashing (vs sanitizing) also keeps distinct configs injective — two keys
+    differing only in punctuation must not collapse onto one build dir/.so.
+    """
+    if len(ckey) <= 80 and re.fullmatch(r"[A-Za-z0-9_]+", ckey):
         return ckey
     return hashlib.sha1(ckey.encode("utf-8")).hexdigest()[:16]
 
@@ -13808,17 +13930,28 @@ def _short_key(ckey: str) -> str:
 # One-shot timing fallback (kept from v2 for worker-crash resilience)
 # ---------------------------------------------------------------------------
 
+# NOTE: this template goes through str.format() — every LITERAL brace must be
+# doubled ({{ }}). The un-escaped dict literals made .format() raise
+# KeyError('"error"') on EVERY call, so the one-shot fallback could never run
+# (latent at HEAD: the self-tests splice a fake_oneshot over it, and the
+# persistent-worker path normally answers first). Found + fixed during the
+# #12 GPU validation.
 _TIMING_SCRIPT = r"""
 import sys, os, json, importlib.util, traceback
 try:
     import torch
     if not torch.cuda.is_available():
-        print(json.dumps({"error": "torch.cuda.is_available() == False"}))
+        print(json.dumps({{"error": "torch.cuda.is_available() == False"}}))
         sys.exit(1)
     so_path = {so_path!r}
+    # #12: the .so exports PyInit_<the name it was built as> (bindings.cpp
+    # follows TORCH_EXTENSION_NAME: JIT variants are grokking_compiled_<...>,
+    # the product is _ops). Load under that name — derived from the filename —
+    # then alias as {package}._ops so the package import binds it.
+    mod_name = os.path.basename(so_path).split(".", 1)[0]
     if "{package}._ops" in sys.modules:
         del sys.modules["{package}._ops"]
-    spec = importlib.util.spec_from_file_location("{package}._ops", so_path)
+    spec = importlib.util.spec_from_file_location(mod_name, so_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     sys.modules["{package}._ops"] = mod
@@ -13843,14 +13976,14 @@ try:
         torch.cuda.synchronize()
         timings.append(s.elapsed_time(e))
     timings.sort()
-    print(json.dumps({
+    print(json.dumps({{
         "timing_ms": timings[len(timings) // 2],
         "min_ms":    timings[0],
         "max_ms":    timings[-1],
         "n":         len(timings),
-    }))
+    }}))
 except Exception as exc:
-    print(json.dumps({"error": str(exc), "tb": traceback.format_exc()}))
+    print(json.dumps({{"error": str(exc), "tb": traceback.format_exc()}}))
     sys.exit(1)
 """
 

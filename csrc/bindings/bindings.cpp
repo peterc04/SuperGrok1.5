@@ -3436,7 +3436,32 @@ void register_model_bindings(pybind11::module_& m);
 // now so the Python guard can be added without a coordinated ABI bump.
 constexpr int GROK_ABI_SCHEMA = 1;
 
-PYBIND11_MODULE(_ops, m) {
+// ── Module name (#12 tuner-JIT fix) ──────────────────────────────────
+// The module must export the PyInit_<name> of the name it is BUILT as, or the
+// importing side can never bind it. TORCH_EXTENSION_NAME is supplied by BOTH
+// build paths:
+//   • product/AOT: torch's BuildExtension defines it from the last component
+//     of the extension name ("grokking_optimizers._ops" → _ops), so the
+//     shipped .so still exports PyInit__ops — identical to the old pinned
+//     name;
+//   • JIT (compile.py autotuner variants): torch.utils.cpp_extension.load()
+//     defines it to the variant module name (grokking_compiled_<opt>_<model>_
+//     <arch>_<cfg>), so load()'s final import-by-name step — structurally
+//     impossible under the old pinned `_ops` (#12: no JIT variant could ever
+//     import; the autotuner could not time real variants) — now succeeds.
+// SG_OPS_PYMODULE is a DELIBERATE level of indirection, not noise:
+// setup.py::_collect and compile.py::_owns_extension_module_tu use the
+// literal text `PYBIND11_MODULE(` immediately followed by the torch
+// extension-name macro as the content marker for standalone self-test/driver
+// TUs that must be EXCLUDED from _ops-style builds. Spelling that pattern
+// literally here (in code OR in this comment) could make a filter drop
+// bindings.cpp itself from every build. Do NOT "simplify" this away.
+#ifndef TORCH_EXTENSION_NAME
+#define TORCH_EXTENSION_NAME _ops  // bare compiles outside torch's builders
+#endif
+#define SG_OPS_PYMODULE TORCH_EXTENSION_NAME
+
+PYBIND11_MODULE(SG_OPS_PYMODULE, m) {
  m.doc() = "Grokking Optimizers — specialized per-arch C++/CUDA/HIP kernels";
 
  // Exported-ABI schema version (see GROK_ABI_SCHEMA above). Bump on ANY
