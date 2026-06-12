@@ -441,7 +441,9 @@ __host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats() {
 //    row_off64 staging prefix (kVitNumTensors int64 = 2*N floats — the adapter that
 //    builds SG2State.row_off (const int64_t*) from __constant__ int kVitOffsets). ──
 using VitSG2Dims = SG2Dims<>;
-constexpr int kVitSG2Nmax = 65536;   // max(kVitSizes)
+// max(kVitSizes), re-derived from the layout table (vit_layout.cuh) so the SAME SG2
+// tail is correctly sized at ANY ladder width — was a d=128-pinned 65536.
+constexpr int kVitSG2Nmax = kVitMaxTensorNumel;   // == vit_layout_check::max_size()
 __host__ __device__ __forceinline__ int64_t vit_sg2_ws_stride_floats() {
     return (int64_t)2 * kVitNumTensors
          + sg2_ws_stride<VitSG2Dims>((int64_t)kVitSG2Nmax);

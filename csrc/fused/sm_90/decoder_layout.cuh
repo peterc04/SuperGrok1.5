@@ -93,11 +93,25 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kDecTotalElems,
               "decoder_layout: sum(kDecSizes) != kDecTotalElems. Regenerate.");
 static_assert(offsets_consistent(),
               "decoder_layout: kDecOffsets[i] != sum(kDecSizes[0..i)). Regenerate.");
 }  // namespace dec_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. dec_tc_sg2_floats /
+// dec_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kDecMaxTensorNumel = dec_layout_check::max_size();
 #else
 // ── PRODUCTION (d=128): the 33/33 wiring_check path. Byte-identical to the
 //    historical generated header (the default when SG_DEC_BENCH_LAYOUT is unset). ──
@@ -158,11 +172,25 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kDecTotalElems,
               "decoder_layout: sum(kDecSizes) != kDecTotalElems. Regenerate.");
 static_assert(offsets_consistent(),
               "decoder_layout: kDecOffsets[i] != sum(kDecSizes[0..i)). Regenerate.");
 }  // namespace dec_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. dec_tc_sg2_floats /
+// dec_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kDecMaxTensorNumel = dec_layout_check::max_size();
 #endif  // SG_DEC_BENCH_LAYOUT
 
 }}} // namespace sg::fused::sm90

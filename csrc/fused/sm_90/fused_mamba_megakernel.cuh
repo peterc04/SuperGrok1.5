@@ -491,7 +491,10 @@ __host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA) {
 //    unused by every non-SG2 cell (its P3-SG2 phase is if-constexpr'd out →
 //    byte-identical). ──
 using MbSG2Dims = SG2Dims<>;
-constexpr int kMbSG2Nmax = 65536;   // max(kMambaSizes) — in_proj [512,128] (the per-CTA carve bound)
+// max(kMambaSizes), re-derived from the layout table (mamba3_layout.cuh) so the SAME
+// SG2 tail is correctly sized at ANY ladder width — was a d=128-pinned 65536 (in_proj
+// [512,128] at d=128, the per-CTA carve bound).
+constexpr int kMbSG2Nmax = kMambaMaxTensorNumel;   // == mamba_layout_check::max_size()
 __host__ __device__ __forceinline__ int64_t mb_sg2_ws_stride_floats() {
     return (int64_t)2 * kMambaNumTensors
          + sg2_ws_stride<MbSG2Dims>((int64_t)kMbSG2Nmax);

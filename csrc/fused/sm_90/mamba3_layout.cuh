@@ -100,12 +100,26 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kMambaNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kMambaTotalElems,
               "mamba3_layout: sum(kMambaSizes) != kMambaTotalElems. Re-derive "
               "from tests/hw/mamba_oracle.py::mamba_param_layout().");
 static_assert(offsets_consistent(),
               "mamba3_layout: kMambaOffsets[i] != sum(kMambaSizes[0..i)).");
 }  // namespace mamba_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. mb_tc_sg2_floats /
+// mb_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kMambaMaxTensorNumel = mamba_layout_check::max_size();
 
 // ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh), d-SCALED BENCH.
 //    At D=1024: d_inner=2048, dt_rank=64, dbc=96. sizeof(MambaSampleSmem) is
@@ -187,12 +201,26 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kMambaNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kMambaTotalElems,
               "mamba3_layout: sum(kMambaSizes) != kMambaTotalElems. Re-derive "
               "from tests/hw/mamba_oracle.py::mamba_param_layout().");
 static_assert(offsets_consistent(),
               "mamba3_layout: kMambaOffsets[i] != sum(kMambaSizes[0..i)).");
 }  // namespace mamba_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. mb_tc_sg2_floats /
+// mb_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kMambaMaxTensorNumel = mamba_layout_check::max_size();
 
 // ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh). The Mamba CTA
 //    smem EXCEEDS the 48 KB static cap (d_inner=256 + both-layer caching), so the

@@ -433,10 +433,26 @@ __host__ __device__ __forceinline__ int64_t dec_tc_looksam_floats() {
 // ── SuperGrok2 compile-time dims = the race config (== SG2Dims defaults). The
 //    composed megakernel reads weights from HBM, so the only SG2 workspace is the
 //    per-CTA meta-net scratch (sg2_ws_stride, sized for the LARGEST tensor — the
-//    65536-element ff weights — which bounds every tensor's intermediates + the
+//    ff weights at d=128 — which bounds every tensor's intermediates + the
 //    in-kernel segmented-sort key/idx/perm/unsort). ──
 using DecSG2Dims = SG2Dims<>;
-constexpr int kDecSG2Nmax = 65536;   // max(kDecSizes) — the per-CTA carve upper bound
+// max(kDecSizes), re-derived from the layout table (decoder_layout.cuh) so the SAME
+// SG2 tail is correctly sized at ANY ladder width — was a d=128-pinned 65536. The
+// per-CTA carve upper bound: the largest per-tensor numel.
+constexpr int kDecSG2Nmax = kDecMaxTensorNumel;   // == dec_layout_check::max_size()
+// ── KNOWN DEEP LIMIT (task #24 Part B): dec_sg2_ws_stride_floats() is
+//    O(kDecSG2Nmax · SG2Dims::d_model) ≈ 50·Nmax floats PER CTA, and dec_tc_sg2_floats
+//    carves it for nCTA (one CTA/SM, 132 on H100). At the d=1024 bench width Nmax=4d²
+//    =4,194,304 ⇒ ~377 M floats/CTA × 132 ≈ 199 GB — over the 80 GB H100 HBM, so the
+//    decoder d=1024 bench OOMs on this carve (empirically: "Tried to allocate 191.97
+//    GiB"). The d=128 pin (65536) hid this by UNDER-sizing a region adamw never
+//    touches; the correct de-derivation EXPOSES it. This is a STRUCTURAL property of
+//    the SG2 per-CTA workspace (it materializes the largest tensor's full CSA/HCA/PEER
+//    intermediates), NOT a constexpr fix — making the SG2 cell run at d=1024 needs the
+//    workspace CHUNKED/streamed over the tensor (a tail restructure, intentionally out
+//    of scope per the Part-B directive). The de-pin itself is correct (production d=128
+//    unchanged: Nmax==65536; fits at d≤512: ~50 GB). Same limit applies to
+//    vit_sg2_ws_stride_floats / mb_sg2_ws_stride_floats (kVitSG2Nmax/kMbSG2Nmax).
 // Per-CTA SG2 slice = row_off64 staging (kDecNumTensors int64 = 2*N floats) + the
 // meta-net scratch (sized for the largest tensor). The row_off64 prefix lets the
 // SG2State.row_off (const int64_t*) be built on-device from the __constant__ int

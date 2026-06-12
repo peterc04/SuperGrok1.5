@@ -112,6 +112,15 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kVitNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kVitTotalElems,
               "vit_layout: sum(kVitSizes) != kVitTotalElems. Regenerate.");
 static_assert(offsets_consistent(),
@@ -152,6 +161,11 @@ constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
 static_assert(kVitSampleSmemBytes == 1434384,
               "vit_layout: VitSampleSmem byte budget drifted from 1434384.");
 }  // namespace vit_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. vit_tc_sg2_floats /
+// vit_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kVitMaxTensorNumel = vit_layout_check::max_size();
 #else
 // ── PRODUCTION (d=128): the 33/33 wiring_check path. Byte-identical to the
 //    historical generated header (the default when SG_VIT_BENCH_LAYOUT is unset). ──
@@ -218,6 +232,15 @@ constexpr bool offsets_consistent() {
     }
     return true;
 }
+// Largest per-tensor numel (folds at compile time from the layout table). The
+// d-INDEPENDENT optimizer tails (SuperGrok2's per-CTA workspace stride, sized for
+// the LARGEST tensor) re-derive their capacity from THIS instead of a d=128-pinned
+// 65536 literal, so the SAME tail code is correct at every ladder width.
+constexpr int max_size() {
+    int m = 0;
+    for (int i = 0; i < kVitNumTensors; ++i) if (kSizes[i] > m) m = kSizes[i];
+    return m;
+}
 static_assert(sum_sizes() == kVitTotalElems,
               "vit_layout: sum(kVitSizes) != kVitTotalElems. Regenerate.");
 static_assert(offsets_consistent(),
@@ -261,6 +284,11 @@ static_assert(kVitSampleSmemBytes < 227 * 1024,
               "vit_layout: VitSampleSmem exceeds the sm_90 227 KB dynamic-smem "
               "per-block cap — the megakernel could not launch.");
 }  // namespace vit_layout_check
+
+// Largest per-tensor numel, hoisted to namespace scope. vit_tc_sg2_floats /
+// vit_sg2_ws_stride_floats size their per-CTA SuperGrok2 workspace from THIS
+// (max tensor numel) rather than a d=128-pinned 65536, so the tail is ladder-correct.
+constexpr int kVitMaxTensorNumel = vit_layout_check::max_size();
 #endif  // SG_VIT_BENCH_LAYOUT
 
 }}} // namespace sg::fused::sm90
