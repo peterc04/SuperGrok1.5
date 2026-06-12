@@ -17,9 +17,9 @@ import tuning.decoder_bench as db  # noqa: E402
 PHASE = db.PHASE_NAMES  # P2_dW_GEMM is index 3
 
 
-def run_one(d, B, G, reps=3):
-    mod = db.build_variant(d, profile=True, defines=[f"SG_TUNED_DEC_DW_SPLITK={G}"])
-    res = db.measure(mod, d, B, reps=reps, warmup=5, iters=10, profile=True, ncta_cap=0)
+def run_one(d, B, G, reps=3, profile=False):
+    mod = db.build_variant(d, profile=profile, defines=[f"SG_TUNED_DEC_DW_SPLITK={G}"])
+    res = db.measure(mod, d, B, reps=reps, warmup=4, iters=10, profile=profile, ncta_cap=0)
     dw_ms = float("nan")
     if "phase_cycles" in res:
         dw_ms = res["phase_cycles"][3] / (db.SM_GHZ * 1e9) * 1e3
@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--ds", type=str, default="1024,128")
     ap.add_argument("--B", type=int, default=16384)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--profile", action="store_true",
+                    help="also read P2_dW_GEMM phase ms (slower: doubles the measure loop)")
     args = ap.parse_args()
     Gs = [int(x) for x in args.Gs.split(",")]
     ds = [int(x) for x in args.ds.split(",")]
@@ -42,7 +44,7 @@ def main():
         print(f"\n{'='*64}\n[splitk-sweep] d={d} B={args.B}\n{'='*64}", flush=True)
         for G in Gs:
             print(f"  -- building+timing G={G} ...", flush=True)
-            wall, tf, dw = run_one(d, args.B, G, args.reps)
+            wall, tf, dw = run_one(d, args.B, G, args.reps, args.profile)
             results[d].append((G, wall, tf, dw))
             print(f"  G={G:<2d}  wall={wall:8.3f} ms  {tf:6.3f} TF/s  "
                   f"P2_dW_GEMM={dw:8.3f} ms", flush=True)
