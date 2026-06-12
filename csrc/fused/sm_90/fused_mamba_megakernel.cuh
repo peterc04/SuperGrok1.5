@@ -105,8 +105,30 @@
 #include "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
 #endif
 
+// ============================================================================
+//  SG_MB_SCALAR_MEGAKERNEL — compile-gate for the LEGACY fp32 SCALAR Mamba
+//  megakernel (fused_mamba_megakernel<Opt> + launch_fused_mamba_megakernel<Opt>
+//  below, which drive the per-sample MambaSampleSmem path in model_stage_mamba3.cuh).
+//  The mamba twin of the decoder's SG_DEC_SCALAR_MEGAKERNEL gate (commit 555c0bc).
+//
+//  WHY A GATE (the d-scaling decouple): MambaSampleSmem is sized [kSeq×kD]/[kSeq×
+//  kDInner] arrays, so its DYNAMIC smem GROWS with SG_MB_D and at the d-scaled bench
+//  width (d=1024) it is ≈ 1.1 MB — far over the sm_90 ~228 KB/SM budget, so
+//  cudaFuncSetAttribute(MaxDynamicSharedMemorySize) would REFUSE it and the scalar
+//  kernel could never place one block/SM. The TC engine (fused_mamba_megakernel_tc,
+//  below) uses a small d-INDEPENDENT static MbTcSmem and builds/launches at every d.
+//  Gating the dead scalar kernel OFF (-DSG_MB_SCALAR_MEGAKERNEL=0) lets the WHOLE
+//  extension compile at the bench width (the TC path is what's measured). DEFAULT 1
+//  (ON) → the d=128 production build is byte-for-byte unchanged: the scalar fp32
+//  fallback stays wired and the 33/33 wiring gate stays green. The flag changes
+//  NOTHING the TC path touches.
+#ifndef SG_MB_SCALAR_MEGAKERNEL
+#define SG_MB_SCALAR_MEGAKERNEL 1
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
+#if SG_MB_SCALAR_MEGAKERNEL
 // Compile-time guard: the byte budget the launcher uses (kMambaSmemBytes) MUST
 // equal sizeof(MambaSampleSmem). model_stage_mamba3.cuh already static_asserts
 // the same equality (it pins kMambaSmemFloats to the actual struct); we restate
@@ -114,6 +136,7 @@ namespace sg { namespace fused { namespace sm90 {
 static_assert((int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
               "fused_mamba_megakernel: sizeof(MambaSampleSmem) != the documented "
               "kMambaSmemBytes in mamba3_layout.cuh — update kMambaSmemFloats.");
+#endif  // SG_MB_SCALAR_MEGAKERNEL
 
 // Rebase a FusedOptState's per-element state pointers to a parameter-tensor slice
 // at `off` within the flat [m|v|extra] layout. Per-TENSOR fields and all scalars
@@ -159,8 +182,12 @@ struct MambaTokenCtx {
     float*     loss_out;  // device float the kernel writes the mean loss into
 };
 
+#if SG_MB_SCALAR_MEGAKERNEL
 // ── The persistent megakernel (L3-REAL). gridDim.x = #SMs (one CTA/SM), 256
 //    threads/CTA. MambaSampleSmem (~141.72 KB) lives in DYNAMIC smem (extern). ──
+//    GATED by SG_MB_SCALAR_MEGAKERNEL (this fp32 path's MambaSampleSmem grows with
+//    SG_MB_D and overflows the ~228 KB/SM budget at the bench width; OFF lets the TC
+//    path build at scaled d — see the flag note above). ────────────────────────────
 // sizes/offsets are NOT host-passed: per-tensor numel/offset live in the
 // __constant__ tables kMambaSizes/kMambaOffsets (mamba3_layout.cuh), read directly
 // by the reduce + optimizer phases.
@@ -323,6 +350,7 @@ cudaError_t launch_fused_mamba_megakernel(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
+#endif  // SG_MB_SCALAR_MEGAKERNEL
 
 // ════════════════════════════════════════════════════════════════════════════
 //  WGMMA CELL DRIVER (Fork B, R2 Mamba TC). Compiled only under the wgmma token;

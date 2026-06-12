@@ -1069,15 +1069,37 @@ namespace sg {{ namespace fused {{ namespace sm90 {{
 # __init__ visual order. Keep these constants == mamba_oracle.py.
 _MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_D, _MAMBA_LAYERS, _MAMBA_SEQ = 99, 97, 128, 2, 8
 _MAMBA_DINNER, _MAMBA_STATE, _MAMBA_DTRANK, _MAMBA_CONVK = 256, 16, 8, 3
+_MAMBA_EXPAND = 2  # d_inner = d * expand_factor (SelectiveSSMLayer:415)
+
+# ── SIZE-LADDER BENCH VARIANT (d-scaled Mamba) ───────────────────────────────
+# The Mamba TC megakernel's compute roofline is diagnosed/optimized at a LARGE
+# model width (the Phase-1-completion size-ladder prerequisite). _MAMBA_BENCH_D is
+# the width the d-scaled BENCHMARK build compiles at; it does NOT touch the
+# production d=128 path. mamba_layout_header() emits BOTH layouts into ONE header,
+# selected by the compile flag SG_MB_BENCH_LAYOUT (set ONLY by the bench TU; UNSET
+# → the production d=128 constants, byte-identical default). Mirrors the decoder's
+# SG_DEC_BENCH_LAYOUT dual-branch (commit 79d3840). At d=1024: d_inner=2*1024=2048,
+# dt_rank=max(1024//16,1)=64 (state_dim=16 and conv_k=3 are width-invariant).
+_MAMBA_BENCH_D = 1024
 
 
-def _mamba_param_sizes() -> List[int]:
+def _mamba_dims(d: int) -> tuple:
+    """The Mamba per-width derived dims (SelectiveSSMLayer:413-416): d_inner=2d,
+    dt_rank=max(d//16,1); state_dim and conv kernel are width-invariant. Returns
+    (d_inner, state, dt_rank, conv_k)."""
+    return (_MAMBA_EXPAND * d, _MAMBA_STATE, max(d // 16, 1), _MAMBA_CONVK)
+
+
+def _mamba_param_sizes(d: int = _MAMBA_D) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of mamba_oracle.py
-    mamba_param_layout()). 28 tensors, total 259425. Per layer the leaf-before-
-    submodule order is A_log, D, in_proj, conv1d.w, conv1d.b, x_proj, dt_proj.w,
-    dt_proj.b, out_proj, norm.w, norm.b."""
-    d, v, ph, seq = _MAMBA_D, _MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_SEQ
-    di, st, dtr, ck = _MAMBA_DINNER, _MAMBA_STATE, _MAMBA_DTRANK, _MAMBA_CONVK
+    mamba_param_layout()). 28 tensors; at d=128 total 259425. Per layer the
+    leaf-before-submodule order is A_log, D, in_proj, conv1d.w, conv1d.b, x_proj,
+    dt_proj.w, dt_proj.b, out_proj, norm.w, norm.b. `d` is parametric so the
+    d-scaled bench layout (SG_MB_BENCH_LAYOUT) reuses the SAME shape formula — every
+    per-tensor shape is a function of (d, d_inner=2d, state, dt_rank=max(d//16,1),
+    conv_k, vocab, phead, seq), so a single d controls the whole table."""
+    v, ph, seq = _MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_SEQ
+    di, st, dtr, ck = _mamba_dims(d)
     sizes = [v * d, seq * d]                          # tok, pos
     for _ in range(_MAMBA_LAYERS):
         sizes += [
@@ -1096,22 +1118,43 @@ def _mamba_param_sizes() -> List[int]:
     return sizes
 
 
-def mamba_layout_header() -> str:
-    """Emit csrc/fused/sm_90/mamba3_layout.cuh (the weight-layout mirror +
-    static_asserts + the dynamic-smem budget block). Byte-identical to the
-    hand-written header; a count/total/smem mismatch fails the BUILD.
+def _mamba_layout_body(d: int) -> str:
+    """The constants + __constant__ tables + compile-time cross-check + dynamic-smem
+    budget for ONE Mamba width `d`. Emitted into ONE of the SG_MB_BENCH_LAYOUT
+    branches; the branches are mutually exclusive at preprocess time, so reusing the
+    SAME symbol names (kMambaOffsets/kMambaSizes/mamba_layout_check) across both is
+    safe.
 
     kMambaSmemFloats is the FIELD-BY-FIELD element count of MambaSampleSmem
     (model_stage_mamba3.cuh), NOT a sizeof() (this generator is host Python, not
-    nvcc). The 36281 total is documented field-by-field in the emitted comment.
-    """
-    sizes = _mamba_param_sizes()
+    nvcc); every field is a function of (seq, d, d_inner=2d, state, dbc=dt_rank+2state,
+    phead), so a single d scales it. The `< 224 KB` per-SM cap assert guards the
+    SCALAR Mamba megakernel (the only MambaSampleSmem consumer). It is emitted ONLY
+    in the production branch: the bench branch compiles with the scalar megakernel
+    gated OFF (SG_MB_SCALAR_MEGAKERNEL=0, mirroring the decoder), so the cap does not
+    apply — the TC engine the bench drives uses a small d-independent static
+    MbTcSmem, not MambaSampleSmem."""
+    sizes = _mamba_param_sizes(d)
     offsets, acc = [], 0
     for n in sizes:
         offsets.append(acc)
         acc += n
     total = acc
     n_tensors = len(sizes)
+    di, st, dtr, ck = _mamba_dims(d)
+    seq, ph = _MAMBA_SEQ, _MAMBA_PHEAD
+    dbc = dtr + 2 * st
+    # sizeof(MambaSampleSmem) in floats, field-by-field (mirrors model_stage_mamba3.cuh).
+    act_per = 5 * seq * di + 2 * seq * st + seq * d + seq   # x_main_raw,z,conv,dt_pre,y_scan(5) + Bmat,Cmat(2) + ln_xhat + ln_inv
+    smem_floats = (2 * seq * d + seq * d                    # layer_in + final_in
+                   + _MAMBA_LAYERS * act_per                # act[LAYERS]
+                   + seq * d + seq + ph                     # fn_xhat + fn_inv + logits
+                   + 2 * seq * d                            # dh, dr
+                   + 3 * seq * di                           # adj_a, adj_b, adj_c
+                   + seq * dbc                              # dbc
+                   + 2 * seq * st                           # dBmat, dCmat
+                   + 256)                                   # red
+    smem_bytes = smem_floats * 4
 
     def _fmt(arr):
         rows = []
@@ -1121,43 +1164,70 @@ def mamba_layout_header() -> str:
 
     sizes_block = _fmt(sizes)
     offsets_block = _fmt(offsets)
-    return f"""#ifndef SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
-#define SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
-// ============================================================================
-// csrc/fused/sm_90/mamba3_layout.cuh — weight-layout mirror for the L3-REAL
-// Mamba megakernel (PHASE 2).
+    # ── Dynamic-smem budget block. Production (d=128) reproduces the historical
+    #    hand-written wording + the 36281 literal VERBATIM (byte-identical default
+    #    branch). The bench branch emits the SCALED count + drops the `< 224 KB` cap
+    #    assert (it guards ONLY the SCALAR Mamba megakernel, which the bench TU
+    #    compiles out via SG_MB_SCALAR_MEGAKERNEL=0; the TC engine uses the small
+    #    d-independent static MbTcSmem). ──
+    if d == _MAMBA_D:
+        smem_block = """// ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh). The Mamba CTA
+//    smem EXCEEDS the 48 KB static cap (d_inner=256 + both-layer caching), so the
+//    launcher MUST declare it DYNAMIC and opt in via
+//    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+//    kMambaSmemBytes) before launch (sm_90 has ~228 KB smem/SM; one persistent
+//    block/SM still places, occupancy>=1 holds, NO CUDA graphs). This is the
+//    HONEST deviation from the decoder's <48 KB static footprint — see the
+//    SMEM BUDGET note in model_stage_mamba3.cuh and INTEGRATION-MAMBA.md.
 //
-// HAND-WRITTEN (not generated): megakernel_codegen.py is OFF-LIMITS for this
-// phase per the owner directive, so this header is hand-derived from the SINGLE
-// SOURCE OF TRUTH tests/hw/mamba_oracle.py::mamba_param_layout(), which is
-// asserted == the eager model's named_parameters() ORDER + count + total in the
-// parity test (tests/hw/test_mamba_megakernel.py). When megakernel_codegen.py is
-// later extended with a --mamba-layout emitter (the decoder pattern), this file
-// becomes its generated output; until then the numbers below are pinned by the
-// static_asserts and the Python parity test. The flat blob is
-// torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
-// addresses tensor i at params + kMambaOffsets[i] for kMambaSizes[i] elements.
-//
-// CRITICAL ORDERING NOTE: PyTorch yields a module's OWN nn.Parameters before its
-// submodules, so within each SelectiveSSMLayer **A_log and D come BEFORE in_proj**
-// (NOT the __init__ visual order). The order below matches the verified dump.
-//
-// A count/total mismatch fails the BUILD loudly (the static_asserts below), never
-// corrupts at dispatch.
-// ============================================================================
-
-#include <cstdint>
-
-namespace sg {{ namespace fused {{ namespace sm90 {{
-
-constexpr int SG_MB_VOCAB  = {_MAMBA_VOCAB};    // ntok (tok embedding rows)
+//    The number below is a static_assert-guarded mirror of sizeof(MambaSampleSmem)
+//    computed field-by-field (all fields are float, 4-byte aligned -> no padding):
+//      layer_in   [2][8][128]              = 2048
+//      final_in   [8][128]                 = 1024
+//      act[2].{ x_main_raw,z,conv,dt_pre,y_scan [8][256] (5*2048),
+//               Bmat,Cmat [8][16] (2*128), ln_xhat [8][128], ln_inv [8] }
+//                 per layer = 11528 ; x2  = 23056
+//      fn_xhat[8][128]=1024; fn_inv[8]=8; logits[97]=97
+//      dh,dr [8][128] (2*1024); adj_a,adj_b,adj_c [8][256] (3*2048)
+//      dbc [8][40]=320; dBmat,dCmat [8][16] (2*128); red[256]
+//      ------------------------------------------------------- = 36281 floats
+constexpr int64_t kMambaSmemFloats = 36281;
+constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 145124
+static_assert(kMambaSmemBytes > 48 * 1024,
+              "mamba3_layout: if the smem ever drops below 48KB, switch the "
+              "launcher back to STATIC smem (no opt-in needed).");
+static_assert(kMambaSmemBytes < 224 * 1024,
+              "mamba3_layout: CTA smem exceeds the sm_90 ~228KB/SM budget; "
+              "one-block-per-SM would fail to place (GridBarrier hang). Shrink "
+              "the live set (e.g. drop a cached LayerAct buffer).");"""
+    else:
+        smem_block = f"""// ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh), d-SCALED BENCH.
+//    At D={d}: d_inner={di}, dt_rank={dtr}, dbc={dbc}. sizeof(MambaSampleSmem) is
+//    {smem_bytes} bytes ({smem_bytes / 1024.0:.2f} KB) — OVER the sm_90 ~228 KB/SM
+//    budget, so the SCALAR Mamba megakernel (the ONLY MambaSampleSmem consumer)
+//    cannot place one block/SM at this width and is compiled OUT on the bench TU
+//    (SG_MB_SCALAR_MEGAKERNEL=0), exactly as the decoder bench gates its scalar
+//    megakernel. The TC engine the bench drives uses the small d-independent static
+//    MbTcSmem and DOES fit, so the `< 224 KB` cap assert is intentionally NOT
+//    emitted in this branch. Field-by-field (all float, 4 B, no padding):
+//      layer_in 2*{seq}*{d} + final_in {seq}*{d}
+//      + act[{_MAMBA_LAYERS}] each (5*{seq}*{di} + 2*{seq}*{st} + {seq}*{d} + {seq}) = {act_per}
+//      + fn_xhat {seq}*{d} + fn_inv {seq} + logits {ph}
+//      + dh,dr 2*{seq}*{d} + adj_a/b/c 3*{seq}*{di} + dbc {seq}*{dbc}
+//      + dBmat,dCmat 2*{seq}*{st} + red 256  = {smem_floats} floats = {smem_bytes} bytes
+constexpr int64_t kMambaSmemFloats = {smem_floats};
+constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // {smem_bytes}
+static_assert(kMambaSmemBytes > 48 * 1024,
+              "mamba3_layout: if the smem ever drops below 48KB, switch the "
+              "launcher back to STATIC smem (no opt-in needed).");"""
+    return f"""constexpr int SG_MB_VOCAB  = {_MAMBA_VOCAB};    // ntok (tok embedding rows)
 constexpr int SG_MB_PHEAD  = {_MAMBA_PHEAD};    // p (head width = out Linear cols)
-constexpr int SG_MB_D      = {_MAMBA_D};   // d_model
+constexpr int SG_MB_D      = {d};   // d_model
 constexpr int SG_MB_LAYERS = {_MAMBA_LAYERS};     // nl
 constexpr int SG_MB_SEQ    = {_MAMBA_SEQ};     // seq_len
-constexpr int SG_MB_DINNER = {_MAMBA_DINNER};   // d_inner (= d * expand_factor=2)
+constexpr int SG_MB_DINNER = {di};   // d_inner (= d * expand_factor=2)
 constexpr int SG_MB_STATE  = {_MAMBA_STATE};    // state_dim
-constexpr int SG_MB_DTRANK = {_MAMBA_DTRANK};     // dt_rank = max(d/16,1)
+constexpr int SG_MB_DTRANK = {dtr};     // dt_rank = max(d/16,1)
 constexpr int SG_MB_CONVK  = {_MAMBA_CONVK};     // conv1d kernel size
 
 constexpr int     kMambaNumTensors = {n_tensors};
@@ -1176,7 +1246,7 @@ __device__ __constant__ int kMambaSizes[kMambaNumTensors] = {{
 static_assert(kMambaNumTensors == {n_tensors},
               "mamba3_layout: tensor count drifted from the oracle layout (28).");
 static_assert(kMambaTotalElems == {total},
-              "mamba3_layout: total param count drifted (259425).");
+              "mamba3_layout: total param count drifted ({total}).");
 
 // Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
 // __constant__ array can't be folded in a constexpr).
@@ -1207,35 +1277,73 @@ static_assert(offsets_consistent(),
               "mamba3_layout: kMambaOffsets[i] != sum(kMambaSizes[0..i)).");
 }}  // namespace mamba_layout_check
 
-// ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh). The Mamba CTA
-//    smem EXCEEDS the 48 KB static cap (d_inner=256 + both-layer caching), so the
-//    launcher MUST declare it DYNAMIC and opt in via
-//    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-//    kMambaSmemBytes) before launch (sm_90 has ~228 KB smem/SM; one persistent
-//    block/SM still places, occupancy>=1 holds, NO CUDA graphs). This is the
-//    HONEST deviation from the decoder's <48 KB static footprint — see the
-//    SMEM BUDGET note in model_stage_mamba3.cuh and INTEGRATION-MAMBA.md.
+{smem_block}"""
+
+
+def mamba_layout_header() -> str:
+    """Emit csrc/fused/sm_90/mamba3_layout.cuh (the weight-layout mirror +
+    static_asserts + the dynamic-smem budget block).
+
+    Carries TWO layouts under one include guard, selected by the compile flag
+    SG_MB_BENCH_LAYOUT (the size-ladder d-scaled bench-variant gate):
+      * UNSET (default / production _ops)  -> d={_MAMBA_D} (33/33 path, byte-identical).
+      * SG_MB_BENCH_LAYOUT=1 (bench TU)    -> d={_MAMBA_BENCH_D} (the d-scaled roofline build).
+    Because the branches are #if/#else, any ONE TU sees exactly one (d, d_inner,
+    dt_rank, table, static-assert) set consistently across every includer; the
+    production build NEVER sees the bench branch (the flag is set only by the variant
+    TU / the _ops_bench extension). Mirrors decoder_layout.cuh's SG_DEC_BENCH_LAYOUT."""
+    prod_body = _mamba_layout_body(_MAMBA_D)
+    bench_body = _mamba_layout_body(_MAMBA_BENCH_D)
+    return f"""#ifndef SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
+#define SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/mamba3_layout.cuh — weight-layout mirror for the L3-REAL
+// Mamba megakernel (PHASE 2).
 //
-//    The number below is a static_assert-guarded mirror of sizeof(MambaSampleSmem)
-//    computed field-by-field (all fields are float, 4-byte aligned -> no padding):
-//      layer_in   [2][8][128]              = 2048
-//      final_in   [8][128]                 = 1024
-//      act[2].{{ x_main_raw,z,conv,dt_pre,y_scan [8][256] (5*2048),
-//               Bmat,Cmat [8][16] (2*128), ln_xhat [8][128], ln_inv [8] }}
-//                 per layer = 11528 ; x2  = 23056
-//      fn_xhat[8][128]=1024; fn_inv[8]=8; logits[97]=97
-//      dh,dr [8][128] (2*1024); adj_a,adj_b,adj_c [8][256] (3*2048)
-//      dbc [8][40]=320; dBmat,dCmat [8][16] (2*128); red[256]
-//      ------------------------------------------------------- = 36281 floats
-constexpr int64_t kMambaSmemFloats = 36281;
-constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 145124
-static_assert(kMambaSmemBytes > 48 * 1024,
-              "mamba3_layout: if the smem ever drops below 48KB, switch the "
-              "launcher back to STATIC smem (no opt-in needed).");
-static_assert(kMambaSmemBytes < 224 * 1024,
-              "mamba3_layout: CTA smem exceeds the sm_90 ~228KB/SM budget; "
-              "one-block-per-SM would fail to place (GridBarrier hang). Shrink "
-              "the live set (e.g. drop a cached LayerAct buffer).");
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --mamba-layout > csrc/fused/sm_90/mamba3_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _mamba_param_sizes() (mirrored by tests/hw/mamba_oracle.py::mamba_param_layout(),
+// asserted == the eager model's named_parameters() ORDER + count + total in the
+// parity test tests/hw/test_mamba_megakernel.py). The flat blob is
+// torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
+// addresses tensor i at params + kMambaOffsets[i] for kMambaSizes[i] elements.
+//
+// CRITICAL ORDERING NOTE: PyTorch yields a module's OWN nn.Parameters before its
+// submodules, so within each SelectiveSSMLayer **A_log and D come BEFORE in_proj**
+// (NOT the __init__ visual order). The order below matches the verified dump.
+//
+// A count/total mismatch fails the BUILD loudly (the static_asserts below), never
+// corrupts at dispatch.
+//
+// ── SG_MB_BENCH_LAYOUT (size-ladder d-scaled bench variant) ──────────────────
+// Two layouts coexist under the single include guard. SG_MB_BENCH_LAYOUT is UNSET
+// on the production _ops build (→ the d={_MAMBA_D} branch, byte-identical to the
+// historical header), and set to 1 ONLY by the d-scaled benchmark TU / the
+// _ops_bench variant extension (→ the d={_MAMBA_BENCH_D} branch: d_inner={_mamba_dims(_MAMBA_BENCH_D)[0]},
+// dt_rank={_mamba_dims(_MAMBA_BENCH_D)[2]}). The branches are mutually exclusive at preprocess time,
+// so a TU compiles exactly one consistent (constants, __constant__ table,
+// static-assert) set; production never sees the bench numbers. Mirrors the
+// decoder's SG_DEC_BENCH_LAYOUT (commit 79d3840).
+// ============================================================================
+
+#include <cstdint>
+
+#ifndef SG_MB_BENCH_LAYOUT
+#define SG_MB_BENCH_LAYOUT 0
+#endif
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+#if SG_MB_BENCH_LAYOUT
+// ── d-SCALED BENCH VARIANT (d={_MAMBA_BENCH_D}): the Mamba-megakernel roofline build.
+//    NOT on the production path; selected ONLY by -DSG_MB_BENCH_LAYOUT=1. ──
+{bench_body}
+#else
+// ── PRODUCTION (d={_MAMBA_D}): the 33/33 wiring_check path. Byte-identical to the
+//    historical generated header (the default when SG_MB_BENCH_LAYOUT is unset). ──
+{prod_body}
+#endif  // SG_MB_BENCH_LAYOUT
 
 }}}}}} // namespace sg::fused::sm90
 

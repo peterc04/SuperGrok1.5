@@ -171,6 +171,7 @@ static std::vector<torch::Tensor> tc_dump_outproj_operands(torch::Tensor params,
     return {dYout1, Xyg1};   // [T*d], [T*d_inner]
 }
 
+#if SG_MB_SCALAR_MEGAKERNEL
 // scalar_train_step: the SAME (mamba × AdamW) cell run through the SCALAR default
 // launcher (launch_fused_mamba_megakernel<AdamW>, OUTSIDE the wgmma guard — this
 // wgmma-token TU can still call it). For the step-time gate to time scalar and TC
@@ -178,7 +179,10 @@ static std::vector<torch::Tensor> tc_dump_outproj_operands(torch::Tensor params,
 // The scalar path uses its OWN workspace (nCTA*total partials + nCTA loss + 1).
 // NOT the shipped invocation (that is dispatch.cpp via mega_mamba_real_adamw.cu);
 // a measurement mirror. Returns {loss, reduced grad}. NOTE: the scalar mamba
-// kernel needs ~142KB DYNAMIC smem (its launcher does the opt-in internally).
+// kernel needs ~142KB DYNAMIC smem (its launcher does the opt-in internally). GATED
+// by SG_MB_SCALAR_MEGAKERNEL: at the d-scaled bench width the scalar megakernel's
+// MambaSampleSmem overflows the smem budget and is compiled out (the TC path is what
+// the bench measures), exactly as the decoder bench gates its scalar step.
 static std::vector<torch::Tensor> scalar_train_step(
         torch::Tensor params, torch::Tensor tokens, torch::Tensor targets,
         torch::Tensor state, double lr, double beta1, double beta2, double eps,
@@ -242,6 +246,7 @@ static std::vector<torch::Tensor> scalar_train_step(
                         .to(torch::kCPU);
     return {loss_cpu, grad};
 }
+#endif  // SG_MB_SCALAR_MEGAKERNEL
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.def("tc_train_step", &tc_train_step,
@@ -253,13 +258,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
            pybind11::arg("ncta_cap") = 0);
     mm.def("tc_dump_outproj_operands", &tc_dump_outproj_operands,
            "gate-only: dump the kernel's stored dY_dyout[L1], X_ygated[L1] (fp32 CPU)");
+#if SG_MB_SCALAR_MEGAKERNEL
     mm.def("scalar_train_step", &scalar_train_step,
            "gate-only: SAME cell via the SCALAR launcher (back-to-back step-time mirror)",
            pybind11::arg("params"), pybind11::arg("tokens"), pybind11::arg("targets"),
            pybind11::arg("state"), pybind11::arg("lr"), pybind11::arg("beta1"),
            pybind11::arg("beta2"), pybind11::arg("eps"), pybind11::arg("weight_decay"),
            pybind11::arg("bc1"), pybind11::arg("bc2"), pybind11::arg("step"));
+#endif  // SG_MB_SCALAR_MEGAKERNEL
     mm.attr("TILE_M") = (int)mbtc::kTileM;
     mm.attr("TILE_N") = (int)SG_TUNED_TILE_N;
     mm.attr("TOTAL") = (int)kMambaTotalElems;
+    // Compiled-width introspection (the d-scaled bench asserts/reports these).
+    mm.attr("D") = (int)mb::kD;
+    mm.attr("DINNER") = (int)mb::kDInner;
+    mm.attr("DTRANK") = (int)mb::kDtRank;
+    mm.attr("LAYERS") = (int)mb::kLayers;
+    mm.attr("SEQ") = (int)mb::kSeq;
+    mm.attr("STATE") = (int)mb::kState;
+    mm.attr("VOCAB") = (int)mb::kVocab;
+    mm.attr("PHEAD") = (int)mb::kPHead;
 }
