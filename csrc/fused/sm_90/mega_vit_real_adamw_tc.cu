@@ -46,7 +46,12 @@ using ::sg::fused::sm90::kVitNumTensors;
 //  one tiny GEMM on a single CTA (256 thr) returning the fp32 result. ──────────
 // ════════════════════════════════════════════════════════════════════════════
 
-static size_t arena_bytes() { return (size_t)(64 * 16 + 128 * 16) * sizeof(__nv_bfloat16) + 256; }
+// Ring smem: kVitAtomsPerSlot A(64×16) tiles [the M-atom interleave group] + one
+// B(N=128×16) tile. Without the kVitAtomsPerSlot factor the interleaved engine
+// stages the group's 2nd A-tile out of bounds (illegal access).
+static size_t arena_bytes() {
+    return (size_t)(vittc::kVitAtomsPerSlot * 64 * 16 + 128 * 16) * sizeof(__nv_bfloat16) + 256;
+}
 
 // (fwd) Y[M,Nout] = X[M,Kin] @ W[Nout,Kin]^T. M = TILE_M (17 atoms). N-tiled.
 template <int N>
@@ -55,7 +60,7 @@ gemm_fwd_kernel(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __rest
                 float* __restrict__ D, int Kin, int Nout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
-    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + 64 * 16;
+    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + vittc::kVitAtomsPerSlot * 64 * 16;
     const int M = vittc::kTileM, m_atoms = M / 64, k_steps = Kin / 16;
     for (int n0 = 0; n0 < Nout; n0 += N) {
         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
@@ -78,7 +83,7 @@ gemm_dx_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
                float* __restrict__ dX, int Nout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
-    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + 64 * 16;
+    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + vittc::kVitAtomsPerSlot * 64 * 16;
     const int M = vittc::kTileM, m_atoms = M / 64, k_steps = Nout / 16;
     auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return dY[(int64_t)m * Nout + k]; };
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 { return W[(int64_t)k * N + n]; };
@@ -97,7 +102,7 @@ gemm_dw_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
                float* __restrict__ dW, int Nout, int T) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
-    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + 64 * 16;
+    __nv_bfloat16* sA = smem; __nv_bfloat16* sB = sA + vittc::kVitAtomsPerSlot * 64 * 16;
     const int k_steps = T / 16, m_atoms = (Nout + 63) / 64;   // up to 8 for Nout=512
     auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
         return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };

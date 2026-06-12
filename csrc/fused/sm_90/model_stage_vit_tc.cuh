@@ -106,10 +106,30 @@ namespace wgs = ::sg::sm90::wgs;
 #define SG_TUNED_VIT_DW_SPLITK 4
 #endif
 
+// ── M-atom INTERLEAVE width cap (task #24 — the decoder H1+H3 hill-climb win,
+//    ported to the ViT twin). The GEMM microkernel processes stacked m64 atoms in
+//    groups of min(MaxAtomsM, this); within a group the per-k wgmmas (one per atom)
+//    issue back-to-back into INDEPENDENT fp32 fragments sharing ONE staged B-tile →
+//    the tensor pipe overlaps the MMAs AND the (HBM-bound) B-operand tile is staged
+//    once per group instead of per atom. Capped (default 2) so the accumulator-
+//    register + A-smem cost stays bounded regardless of m_atoms (a ViT token tile is
+//    kAtomsM=17 atoms, and a dW tile up to 8; an N-wide interleave needs N·(width/2)
+//    fp32 accumulator regs). 1 = no interleave (the old serial path, bit-for-bit).
+//    Per-atom accumulation stays ASCENDING-k → numerics bit-identical + A/A/A
+//    determinism unchanged. (ViT's TILE_M=1088 / LCM-1088 constraint is UNTOUCHED —
+//    this only regroups the m64-atom issue order, not the tile size.)
+#ifndef SG_TUNED_VIT_GEMM_INTERLEAVE
+#define SG_TUNED_VIT_GEMM_INTERLEAVE 2
+#endif
+
 namespace vittc {
 
 constexpr int kVitDwSplitK = SG_TUNED_VIT_DW_SPLITK;
 static_assert(kVitDwSplitK >= 1, "SG_TUNED_VIT_DW_SPLITK must be >= 1");
+
+constexpr int kVitMaxIL = SG_TUNED_VIT_GEMM_INTERLEAVE;
+static_assert(kVitMaxIL >= 1 && kVitMaxIL <= 4,
+              "SG_TUNED_VIT_GEMM_INTERLEAVE must be 1 (serial) .. 4");
 
 // ── Muon 2D-weight table (the matrices Newton-Schulz orthogonalizes). The eager
 //    Muon auto-splits params by p.ndim: ndim==2 → NS, everything else → AdamW
@@ -159,6 +179,16 @@ static_assert(kTileM % vit::kSeq == 0,
 constexpr int kAtomsM = kTileM / wgs::kWgmmaAtomM;   // stacked m64 atoms per tile (17)
 constexpr int kSamplesPerTile = kTileM / vit::kSeq;  // 64 for TILE_M=1088
 constexpr int kPatchPerTile = kSamplesPerTile * vit::kNPatch;  // patch rows per tile
+
+// One staged A(64×16) tile (bf16 element count). The M-atom-interleaved engine
+// stages kIL of these per k-step (atom-in-group ai at smemA + ai·kVitTcSmemA1)
+// sharing ONE B(N×16) tile; the smem arena (VitTcSmem.sA / the selftest arena)
+// holds kVitAtomsPerSlot of them. kVitAtomsPerSlot = the widest interleave group
+// any call site uses (fwd/dX = min(kAtomsM,kVitMaxIL); dW = min(8,kVitMaxIL)) —
+// both cap at kVitMaxIL, so it IS kVitMaxIL whenever the model has >= that many
+// atoms (ViT token tiles are 17, dW up to 8, so always >= 2 for the default).
+constexpr int kVitTcSmemA1 = wgs::kWgmmaAtomM * wgs::kWgmmaAtomK;   // 64*16 bf16
+constexpr int kVitAtomsPerSlot = kVitMaxIL;                        // A-tiles the arena holds
 
 // ── LN vector-grad partials layout (the 10 tile-local γ/β grads). Order MUST
 //    match the vit_layout tensor indices of {n1.w, n1.b, n2.w, n2.b}×L plus
@@ -289,53 +319,83 @@ __device__ void tc_gemm_block_unpipelined(
     const bool in_wg0 = (tid < 128);
     const int tid_wg = tid & 127;
 
-    // ── CODEGEN FIX (correctness/codegen, NOT a perf knob): use ONE accumulator
-    // reused per m-atom, NOT `WgmmaAccum<N> acc[MaxAtomsM]`. Each m-atom's
-    // accumulator is FULLY CONSUMED (stored via out()) at the end of its
-    // iteration before the next m-atom's k-loop begins (k==0 uses ScaleD=0 →
-    // overwrite, no carry across atoms), so a single live accumulator is
-    // numerically identical. The array version indexed `acc[a]` under the
-    // `#pragma unroll 1` runtime-`a` loop, which GPU registers cannot address
-    // dynamically → ptxas placed the 17-wide (vit kAtomsM) array in LOCAL memory
-    // (5024 B stack frame) and emitted C7515: "wgmma.mma_async serialized due to
-    // non-wgmma instructions DEFINING accumulator registers" — i.e. every wgmma
-    // was forced to fully serialize around the local-mem round-trip of acc[a].
-    // The single register-resident accumulator removes that serialization. The
-    // ascending-k order + one-CTA tile ownership (determinism) are unchanged.
+    // ── M-ATOM-INTERLEAVED wgmma pipeline (task #24, the decoder H1 win ported to
+    //    the ViT twin). The OLD body ran each stacked m64 atom's k-chain to
+    //    completion SEQUENTIALLY into ONE reused accumulator (atom0 chain → atom0
+    //    store → atom1 chain → …), re-staging the shared B (operand) tile ONCE PER
+    //    ATOM. (That single-accumulator form was itself a codegen fix: the original
+    //    `WgmmaAccum<N> acc[MaxAtomsM]` indexed by the runtime atom `a` placed the
+    //    17-wide ViT array in LOCAL memory — 5024 B stack — and serialized every
+    //    wgmma via C7515 round-trips. A single register-resident accumulator removed
+    //    that; but it also re-staged B per atom and left the MMAs back-to-back-
+    //    serialized within the same fp32 fragment.)
+    //
+    //    Here atoms are processed in GROUPS of kIL (= min(MaxAtomsM, kVitMaxIL),
+    //    compile-time, default 2). Within a group each k-step stages the kIL A-tiles
+    //    (atom-in-group ai at smemA + ai·kVitTcSmemA1) + ONE shared B-tile, then
+    //    issues the kIL wgmmas (one per atom) BACK-TO-BACK into their OWN fp32
+    //    fragments before the single per-k wait. Two wins: (1) the kIL atoms are
+    //    INDEPENDENT (distinct M-rows / accumulators) → the tensor pipe overlaps
+    //    their MMA execution instead of paying each latency raw; (2) the B-tile is
+    //    staged ONCE per group instead of kIL times → the (HBM-bound) operand
+    //    traffic drops kIL×. kIL stays CAPPED at 2 so the accumulator array
+    //    `acc[kIL]` (= kIL·N/2 fp32 regs) is register-resident (NOT the spilling
+    //    17-wide array) and ptxas can address it (compile-time unrolled). Per-atom
+    //    accumulation stays ASCENDING-k (k=0 ScaleD=0 overwrite, k>0 ScaleD=1 add)
+    //    → numerics bit-identical + A/A/A determinism UNCHANGED. (Unpipelined: this
+    //    engine has no S-stage ring; the win is purely the within-group overlap +
+    //    B-staging-sharing.)
+    constexpr int kIL = (MaxAtomsM < kVitMaxIL) ? MaxAtomsM : kVitMaxIL;
     #pragma unroll 1
-    for (int a = 0; a < m_atoms; ++a) {
-        wgs::WgmmaAccum<N> acc;
-        const int mbase = mbase0 + a * wgs::kWgmmaAtomM;
+    for (int g0 = 0; g0 < m_atoms; g0 += kIL) {
+        const int gbase = mbase0 + g0 * wgs::kWgmmaAtomM;
+        const int g_atoms = (m_atoms - g0) < kIL ? (m_atoms - g0) : kIL;
+        wgs::WgmmaAccum<N> acc[kIL];            // kIL live fragments per group
         if (in_wg0) wgs::wgmma_fence();
         #pragma unroll 1
         for (int k = 0; k < k_steps; ++k) {
-            stage_kmajor_tile<wgs::kWgmmaAtomM>(
-                smemA, k * wgs::kWgmmaAtomK,
-                [&] (int mn, int kk) { return srcA(mbase + mn, kk); },
-                tid, nthreads);
+            #pragma unroll
+            for (int ai = 0; ai < kIL; ++ai) {
+                if (ai >= g_atoms) break;
+                const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+                stage_kmajor_tile<wgs::kWgmmaAtomM>(
+                    smemA + (int64_t)ai * kVitTcSmemA1, k * wgs::kWgmmaAtomK,
+                    [&] (int mn, int kk) { return srcA(mbase + mn, kk); },
+                    tid, nthreads);
+            }
             stage_kmajor_tile<N>(
                 smemB, k * wgs::kWgmmaAtomK,
                 [&] (int mn, int kk) { return srcB(mn, kk); },
                 tid, nthreads);
-            __syncthreads();   // staged tile visible to the whole CTA
+            __syncthreads();   // staged tiles visible to the whole CTA
             if (in_wg0) {
-                wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(smemA);
                 wgs::SmemDesc dB = wgs::make_desc_B_kmajor<N, wgs::kSwizzleNone>(smemB);
-                if (k == 0)
-                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc, dA, dB);
-                else
-                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc, dA, dB);
+                #pragma unroll
+                for (int ai = 0; ai < kIL; ++ai) {
+                    if (ai >= g_atoms) break;
+                    wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(
+                        smemA + (int64_t)ai * kVitTcSmemA1);
+                    if (k == 0)
+                        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[ai], dA, dB);
+                    else
+                        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[ai], dA, dB);
+                }
                 wgs::wgmma_commit_group();
                 wgs::wgmma_wait_group<0>();
             }
-            __syncthreads();   // MMA done reading smem before next stage overwrites
+            __syncthreads();   // MMAs done reading smem before next stage overwrites
         }
         if (in_wg0) {
             #pragma unroll
-            for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
-                int row, col;
-                wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
-                if (col < n_real) out(mbase + row, col, acc.c[i]);
+            for (int ai = 0; ai < kIL; ++ai) {
+                if (ai >= g_atoms) break;
+                const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+                #pragma unroll
+                for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
+                    int row, col;
+                    wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
+                    if (col < n_real) out(mbase + row, col, acc[ai].c[i]);
+                }
             }
         }
         __syncthreads();
@@ -1098,33 +1158,61 @@ __device__ __forceinline__ void vittc_build_dw_specs(
 }
 
 // Total number of 64×N dW output tiles across the 10 weights (for the tile loop).
-// The N-tiling is over Kin (the in-dim), padded so the GEMM N covers it.
+// ── dW M-atom INTERLEAVE group width (task #24 H3 port). A dW output "tile"
+//    (work item) owns a GROUP of up to kVitDwIL consecutive m64 atoms instead of
+//    one, so the engine runs kVitDwIL wgmmas/k-step into independent fragments
+//    sharing ONE staged X (B-operand) tile → the H1 win (overlap the MMAs +
+//    kVitDwIL× less X-operand HBM traffic) now applies to the dW K=T contraction.
+//    kVitDwIL == the engine's interleave cap kVitMaxIL so the ring smem
+//    (VitTcSmem.sA, sized kVitAtomsPerSlot=kVitMaxIL A-tiles/slot) and the
+//    selftest-validated dW path (gemm_dw_kernel: MaxAtomsM=8, kIL=2) match exactly.
+//    Ascending-k per atom is unchanged → numerics bit-identical + A/A/A
+//    determinism. ViT dW atom counts: patch_proj(d=128→2), qkv(3d=384→6),
+//    attn_out(d=128→2), ff0(dff=512→8), ff2(d=128→2), head(V=97→2) — all EVEN, but
+//    the ragged-tail logic (g_atoms = min) is kept for safety (no even shortcut). ──
+constexpr int kVitDwIL = kVitMaxIL;
+__device__ __host__ __forceinline__ int vit_dw_atoms(int Nout)  { return (Nout + 63) / 64; }
+__device__ __host__ __forceinline__ int vit_dw_groups(int Nout) {
+    return (vit_dw_atoms(Nout) + kVitDwIL - 1) / kVitDwIL;
+}
+
+// Total number of dW output WORK ITEMS (M-atom groups × N-tiles) across the 10
+// weights. The N-tiling is over Kin (the in-dim), padded so the GEMM N covers it.
 template <int N>
 __device__ __forceinline__ int vittc_dw_total_tiles(const VitDwSpec spec[10]) {
     int n = 0;
     for (int s = 0; s < 10; ++s)
-        n += ((spec[s].Nout + 63) / 64) * ((spec[s].Kin + N - 1) / N);
+        n += vit_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
     return n;
 }
 
-// Run ONE global dW tile `gt` (if it belongs to this CTA). MaxAtomsM=1 (one 64×N
-// tile). For patch_proj (kind==1) the dY adjoint is dh0's PATCH rows: dh0 is
-// [T,d] token-row-major; its patch rows for sample si, patch p are at token row
-// si*kSeq + (1+p). The dW contracts over the Tp patch rows in ascending patch
-// order (k=0..Tp-1 maps to si=k/kNPatch, p=k%kNPatch → token row si*kSeq+1+p).
+// Run ONE global dW WORK ITEM `gt` (if it belongs to this CTA): decode (weight,
+// M-atom GROUP, N-tile), then contract K via the dW GEMM into grad. The group is
+// up to kVitDwIL stacked m64 atoms → the engine interleaves them (kIL=kVitDwIL):
+// kVitDwIL wgmmas/k-step into independent fragments sharing ONE staged X B-tile
+// (H1's win, now on the dW K contraction). For patch_proj (kind==1) the dY adjoint
+// is dh0's PATCH rows: dh0 is [T,d] token-row-major; its patch rows for sample si,
+// patch p are at token row si*kSeq + (1+p). The dW contracts over the Tp patch rows
+// in ascending patch order (k=0..Tp-1 maps to si=k/kNPatch, p=k%kNPatch → token row
+// si*kSeq+1+p). The engine adds mbase0=mbase and passes the GLOBAL row m to the
+// accessors/out; the out lambda writes grad by global m (m<Nout guard handles a
+// ragged final group), so multi-atom groups need no per-atom shimming here.
 template <int N>
 __device__ __forceinline__ void vittc_dw_run_tile(
         const VitDwSpec spec[10], int gt, const __nv_bfloat16* __restrict__ dh0,
         float* __restrict__ grad, __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    int acc = 0, s = 0, m_atom = 0, n_tile = 0;
+    int acc = 0, s = 0, m_group = 0, n_tile = 0;
     for (s = 0; s < 10; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = vit_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; break; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
+        acc += ng * nt;
     }
     const VitDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = vit_dw_atoms(sp.Nout);
+    const int a0 = m_group * kVitDwIL;               // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kVitDwIL ? (n_atoms - a0) : kVitDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
     const int Nout = sp.Nout, Kin = sp.Kin;
@@ -1146,8 +1234,8 @@ __device__ __forceinline__ void vittc_dw_run_tile(
             return X[(int64_t)k * Kin + nn]; };
         auto out  = [&] (int m, int n, float v) {
             if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
-        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-            mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+            mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
         return;
     }
     const int k_steps = sp.K / wgs::kWgmmaAtomK;     // K = T or B (must be /16; padded by caller)
@@ -1158,8 +1246,8 @@ __device__ __forceinline__ void vittc_dw_run_tile(
         int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
     auto out  = [&] (int m, int n, float v) {
         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1181,43 +1269,53 @@ __device__ __forceinline__ void vittc_dw_run_tile(
 //  (exact multiples of 16), exactly like the decoder.
 // ════════════════════════════════════════════════════════════════════════
 constexpr int kVitMaxTileN = SG_TUNED_TILE_N;                       // widest dW N-tile
-constexpr int kVitDwTileFloats = wgs::kWgmmaAtomM * kVitMaxTileN;   // 64*N per (gt,kc) slot
+// Floats per (gt,kc) split-K slot: a work item is an M-atom GROUP of up to kVitDwIL
+// stacked m64 atoms → kVitDwIL·64 rows × N cols. (Was 64·N for the 1-atom item.)
+constexpr int kVitDwTileFloats = kVitDwIL * wgs::kWgmmaAtomM * kVitMaxTileN;
 
-// COMPILE-TIME max #dW output tiles (the 10 dW have fixed Nout/Kin; ViT dims are
-// compile-time → constant). Mirrors vittc_dw_total_tiles at N=kVitMaxTileN.
+// COMPILE-TIME max #dW output WORK ITEMS (the 10 dW have fixed Nout/Kin; ViT dims
+// are compile-time → constant). Mirrors vittc_dw_total_tiles at N=kVitMaxTileN. The
+// M factor is M-atom GROUPS of kVitDwIL (ceil(ceil(Nout/64)/kVitDwIL)), matching
+// vit_dw_groups — NOT single atoms.
 //   patch_proj(d×patch) + per-layer[qkv(3d×d),attn_out(d×d),ff0(dff×d),ff2(d×dff)]
 //   ×kLayers + head(V×d).
+constexpr int kVitDwMGroups(int Nout) {                 // ceil(ceil(Nout/64)/kVitDwIL)
+    return (((Nout + 63) / 64) + kVitDwIL - 1) / kVitDwIL;
+}
 constexpr int kVitDwTilesPerLayer =
-      ((3*vit::kD + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // qkv
-    + ((vit::kD   + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // attn_out
-    + ((vit::kDff + 63)/64) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // ff0
-    + ((vit::kD   + 63)/64) * ((vit::kDff + kVitMaxTileN - 1)/kVitMaxTileN);  // ff2
+      kVitDwMGroups(3*vit::kD) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // qkv
+    + kVitDwMGroups(vit::kD)   * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // attn_out
+    + kVitDwMGroups(vit::kDff) * ((vit::kD   + kVitMaxTileN - 1)/kVitMaxTileN)   // ff0
+    + kVitDwMGroups(vit::kD)   * ((vit::kDff + kVitMaxTileN - 1)/kVitMaxTileN);  // ff2
 constexpr int kVitDwPatchTiles =
-      ((vit::kD + 63)/64) * ((vit::kPatch + kVitMaxTileN - 1)/kVitMaxTileN);  // patch_proj
+      kVitDwMGroups(vit::kD) * ((vit::kPatch + kVitMaxTileN - 1)/kVitMaxTileN);  // patch_proj
 constexpr int kVitDwHeadTiles =
-      ((vit::kVocab + 63)/64) * ((vit::kD + kVitMaxTileN - 1)/kVitMaxTileN);  // head
+      kVitDwMGroups(vit::kVocab) * ((vit::kD + kVitMaxTileN - 1)/kVitMaxTileN);  // head
 constexpr int kVitDwMaxTiles =
       kVitDwPatchTiles + vit::kLayers * kVitDwTilesPerLayer + kVitDwHeadTiles;
 
 // Split-K dW partial-scratch float count (host carves it from the workspace tail).
-// 0 when G==1 → no extra scratch (the single-CTA path is byte-identical).
+// 0 when G==1 → no extra scratch (the single-CTA path is byte-identical). The total
+// (groups·kVitDwIL·64·N) == (atoms·64·N) for even atom counts; for ViT all 10 dW
+// have EVEN atom counts (2/6/2/8/2/2) so it is exactly unchanged vs the per-atom form.
 __host__ __device__ __forceinline__ int64_t vit_dw_part_floats(int G) {
     return (G > 1) ? (int64_t)kVitDwMaxTiles * G * kVitDwTileFloats : 0;
 }
 
-// Decode global dW tile index gt → (spec index s, m_atom, n_tile). Single-source
-// (the SAME walk vittc_dw_run_tile + vittc_dw_total_tiles use).
+// Decode global dW work-item index gt → (spec index s, m_group, n_tile). Single-
+// source (the SAME walk vittc_dw_run_tile + vittc_dw_total_tiles use): m_group
+// indexes M-atom GROUPS of kVitDwIL (group's first atom = m_group·kVitDwIL).
 template <int N>
 __device__ __forceinline__ void vittc_dw_decode(
-        const VitDwSpec spec[10], int gt, int& s, int& m_atom, int& n_tile) {
+        const VitDwSpec spec[10], int gt, int& s, int& m_group, int& n_tile) {
     int acc = 0;
     for (s = 0; s < 10; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = vit_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; return; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; return; }
+        acc += ng * nt;
     }
-    s = 9; m_atom = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+    s = 9; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
 }
 
 // PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. FLOOR-BALANCED
@@ -1233,10 +1331,13 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
         const VitDwSpec spec[10], int gt, int kc, int G,
         const __nv_bfloat16* __restrict__ dh0,
         float* __restrict__ dw_part, __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    int s, m_atom, n_tile;
-    vittc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+    int s, m_group, n_tile;
+    vittc_dw_decode<N>(spec, gt, s, m_group, n_tile);
     const VitDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = vit_dw_atoms(sp.Nout);
+    const int a0 = m_group * kVitDwIL;                      // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kVitDwIL ? (n_atoms - a0) : kVitDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int Nout = sp.Nout, Kin = sp.Kin;
     // KS = total k-atoms. kind==1 (patch_proj): K=Tp patch rows padded UP to /16.
@@ -1247,17 +1348,24 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
     const int k0 = (int)(((int64_t)kc       * KS) / G);          // floor-balanced
     const int k1 = (int)(((int64_t)(kc + 1) * KS) / G);
     const int kc_steps = k1 - k0;
+    // Slot holds the GROUP's kVitDwIL·64 local rows (lr) × N cols (kVitDwTileFloats).
     float* slot = dw_part + ((int64_t)gt * G + kc) * kVitDwTileFloats;
     // Empty-chunk guard (KS<G): a k_steps=0 GEMM would emit the uninitialized
-    // accumulator → zero the slot + return (the reduce sums all G slots).
+    // accumulator → zero the WHOLE group slot + return (the reduce sums all G slots;
+    // an empty chunk MUST be 0). Only g_atoms·64 rows are valid but zeroing the full
+    // kVitDwIL·64·N slot keeps it simple + safe (the reduce reads only valid rows).
     if (kc_steps <= 0) {
-        for (int i = threadIdx.x; i < 64 * N; i += blockDim.x) slot[i] = 0.0f;
+        for (int i = threadIdx.x; i < kVitDwTileFloats; i += blockDim.x) slot[i] = 0.0f;
         __syncthreads();
         return;
     }
+    // out(mbase+row, col, v): m is GLOBAL (srcA needs it; engine adds mbase0=mbase);
+    // the slot holds the GROUP's kVitDwIL·64 LOCAL rows → index by (m - mbase). A
+    // ragged final group's tail rows stay zeroed/unwritten but the reduce reads only
+    // valid rows → never used. (A `lr<64` clamp would lose atom>=1's rows → the dW bug.)
     auto out = [&] (int m, int n, float v) {
         const int lr = m - mbase;
-        if (lr >= 0 && lr < 64 && n < N) slot[(int64_t)lr * N + n] = v; };
+        if (lr >= 0 && lr < kVitDwIL * 64 && n < N) slot[(int64_t)lr * N + n] = v; };
     if (sp.kind == 1) {
         // patch_proj: A[m=out,k=patchrow]=dh0[token row of patchrow, out] (transposed);
         // B[n=in,k=patchrow]=X_patch[patchrow,in]. The k index here is the LOCAL chunk
@@ -1274,8 +1382,8 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
             const int gk = k0 * wgs::kWgmmaAtomK + k;
             int nn = n0 + n; if (nn >= Kin || gk >= Tp) return __float2bfloat16(0.f);
             return X[(int64_t)gk * Kin + nn]; };
-        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-            mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+            mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
         return;
     }
     // kind==0: A[m=out,k=t]=dY[t,out]; B[n=in,k=t]=X[t,in] (both transposed reads).
@@ -1284,27 +1392,31 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
         return m < Nout ? dY[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Nout + m] : __float2bfloat16(0.f); };
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
         int nn = n0 + n; return nn < Kin ? X[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Kin + nn] : __float2bfloat16(0.f); };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+        mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
 }
 
-// Deterministic reduce: output tile gt (% nCTA) sums its G chunk-partials
-// ascending-kc → grad. SAME (gt → geometry) decode as the partial.
+// Deterministic reduce: output work item gt (% nCTA) sums its G chunk-partials
+// ascending-kc → grad. SAME (gt → geometry) decode as the partial. Each work item
+// is an M-atom GROUP (up to kVitDwIL stacked m64 atoms, H3), so its slot holds the
+// group's kVitDwIL·64 group-local rows (row); mbase is the group's first global row.
 template <int N>
 __device__ __forceinline__ void vittc_dw_reduce_splitk(
         const VitDwSpec spec[10], int n_dw, int G, const float* __restrict__ dw_part,
         float* __restrict__ grad, int cta, int nCTA) {
     for (int gt = cta; gt < n_dw; gt += nCTA) {
-        int s, m_atom, n_tile;
-        vittc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+        int s, m_group, n_tile;
+        vittc_dw_decode<N>(spec, gt, s, m_group, n_tile);
         const VitDwSpec& sp = spec[s];
-        const int mbase = m_atom * 64;
+        const int mbase = m_group * kVitDwIL * 64;          // group's first global row
         const int n0 = n_tile * N;
         const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
-        const int Nrow = (sp.Nout - mbase) < 64 ? (sp.Nout - mbase) : 64;
+        // Valid group rows: up to kVitDwIL·64, clamped to the weight's row count.
+        const int grp_rows = kVitDwIL * 64;
+        const int Nrow = (sp.Nout - mbase) < grp_rows ? (sp.Nout - mbase) : grp_rows;
         const int64_t base = (int64_t)gt * G * kVitDwTileFloats;
         for (int idx = threadIdx.x; idx < Nrow * n_real; idx += blockDim.x) {
-            const int row = idx / n_real, col = idx % n_real;
+            const int row = idx / n_real, col = idx % n_real;   // row = group-local lr
             float accv = 0.0f;
             for (int kc = 0; kc < G; ++kc)
                 accv += dw_part[base + (int64_t)kc * kVitDwTileFloats + (int64_t)row * N + col];

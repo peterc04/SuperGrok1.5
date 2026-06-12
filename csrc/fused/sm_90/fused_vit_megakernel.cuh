@@ -337,11 +337,16 @@ cudaError_t launch_fused_vit_megakernel(
 // validated selftest ran no split. We match it.
 #define SG_VIT_TC_MEGA_BLOCK 256
 
-// ── smem arena for the unpipelined engine: one A(64×16) + one B(N×16) bf16 tile
-//    + the 256-float reduction slot + the 10 dW specs (identical for all threads
-//    → shared, not per-thread stack). 16B-aligned. N = SG_TUNED_TILE_N. ──
+// ── smem arena for the unpipelined engine. The M-atom-interleaved wgmma pipeline
+//    (task #24, decoder H1+H3 port) stages kVitAtomsPerSlot A(64×16) tiles per
+//    k-step (one per stacked m64 atom in an interleave GROUP, issued back-to-back
+//    into independent fp32 fragments so the tensor pipe overlaps them; atom-in-
+//    group ai at sA + ai·kVitTcSmemA1) + ONE shared B(N×16) tile. kVitAtomsPerSlot
+//    = kVitMaxIL (the interleave cap, default 2). Plus the 256-float reduction slot
+//    + the 10 dW specs (identical for all threads → shared, not per-thread stack).
+//    16B-aligned. N = SG_TUNED_TILE_N. ──
 struct VitTcSmem {
-    __nv_bfloat16 sA[64 * 16];
+    __nv_bfloat16 sA[vittc::kVitAtomsPerSlot * 64 * 16];
     __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
     float red[256];
     vittc::VitDwSpec spec[10];
