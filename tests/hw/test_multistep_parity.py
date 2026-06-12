@@ -372,8 +372,23 @@ def test_prodigy_multistep_parity():
     # into the kernel state slot AND the eager state at step-2 entry, so p0−p = delta
     # is nonzero + EXACT on every side → the candidate clears d_prev and d MOVES off
     # d0 deterministically (the stable owner-block-unit technique).
+    #
+    # The SIGN of delta is load-bearing for d-MOVEMENT, not just its magnitude. The
+    # Prodigy d-candidate is d_coef·r_ema/|s_ema| with r_ema ∝ <g, p0−p> = <g, delta>;
+    # since d = max(d_prev, candidate), d only MOVES off d0 when that inner product is
+    # POSITIVE. A sign-RANDOM delta gives <g, delta> ≈ 0 with a coin-flip sign — and
+    # for the decoder's (and vit's) actual step-1 reduced grad it comes out NEGATIVE
+    # (measured <g, delta>≈−3.6e-3 decoder / −3.2e-3 vit at seed 12345), so the
+    # candidate is negative and d stays frozen at d0 → the vacuity guard (assert (b))
+    # fires even though the kernel d-update is correct. (This was the latent bug in
+    # the sign-random construction shared with tuning/_prodigy_owner_block_unit.py.)
+    # Fix: build a reproducible MAGNITUDE and ALIGN its sign with the step-1 reduced
+    # grad at injection time so <g, delta> = Σ|g|·|delta_mag| > 0 STRONGLY (≈+1.0),
+    # which moves d deterministically off d0 while keeping the anchor EXACT + identical
+    # on the kernel and both eager sides. delta is filled in-place at the inject step.
     gen = torch.Generator(device=dev).manual_seed(12345)
-    delta = (torch.rand(total, generator=gen, device=dev) - 0.5) * 2.0 * PR_DELTA_SCALE
+    delta_mag = torch.rand(total, generator=gen, device=dev) * PR_DELTA_SCALE  # |δ|∈[0,scale)
+    delta = torch.zeros(total, device=dev)   # filled = delta_mag·sign(g) at inject step
 
     def _inject_anchor_eager(opt_obj, named):
         """Overwrite each param's eager param_init with p_e+delta and reset the
@@ -433,6 +448,13 @@ def test_prodigy_multistep_parity():
         # so the step≥2 d-update sees a known nonzero p0−p and d moves off d0. (The
         # control is anchored too so its ONLY difference from the reference is d_coef.)
         if step == PR_ANCHOR_INJECT_STEP - 1:
+            # Fill delta = |delta_mag|·sign(g) using THIS step's reduced grad so the
+            # step≥2 d-update sees <g, delta> = Σ|g|·|delta_mag| > 0 and d MOVES off d0
+            # (a sign-random delta gives a coin-flip inner product that is NEGATIVE here
+            # → d frozen at d0 → vacuous gate). delta is filled in-place so the kernel +
+            # both eager anchor injectors (which close over `delta`) inject the IDENTICAL,
+            # now-sign-aligned, anchor. The grad is byte-identical across kernel/eager.
+            delta.copy_(delta_mag * grad.sign())
             _inject_anchor_kernel(cache[canon]["state"])
             _inject_anchor_eager(opt_ref, named_ref)
             _inject_anchor_eager(opt_ctl, named_ctl)
