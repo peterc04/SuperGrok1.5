@@ -152,6 +152,26 @@ constexpr int kMbTcStages = SG_TUNED_MB_GEMM_STAGES;
 static_assert(kMbTcStages >= 1 && kMbTcStages <= 2,
               "SG_TUNED_MB_GEMM_STAGES must be 1 (serial) or 2 (double-buffer)");
 
+// ── M-atom INTERLEAVE width cap (task #24 — the decoder H1+H3 hill-climb win,
+//    ported to the Mamba twin). The GEMM microkernel processes stacked m64 atoms in
+//    groups of min(MaxAtomsM, this); within a group the per-k wgmmas (one per atom)
+//    issue back-to-back into INDEPENDENT fp32 fragments sharing ONE staged B-tile →
+//    the tensor pipe overlaps the MMAs AND the (HBM-bound) B-operand tile is staged
+//    once per group instead of per atom. Capped (default 2) so the accumulator-
+//    register + A-smem cost stays bounded (Mamba's production tile is kAtomsM=2 for
+//    fwd/dX, and a dW tile up to 8 atoms; capping at 2 keeps acc[kIL] at 2 fragments
+//    = N regs). 1 = no interleave (the old serial path, bit-for-bit). Per-atom
+//    accumulation stays ASCENDING-k → numerics bit-identical + A/A/A determinism.
+//    CAVEAT (task #24): the Mamba TC megakernel is occupancy-1 at 255 regs with a
+//    thin spill margin — if the dW 2-wide fragment pushes ptxas past the budget into
+//    refused occupancy, fall back to kIL=1 for Mamba (this knob = 1).
+#ifndef SG_TUNED_MB_GEMM_INTERLEAVE
+#define SG_TUNED_MB_GEMM_INTERLEAVE 2
+#endif
+constexpr int kMbMaxIL = SG_TUNED_MB_GEMM_INTERLEAVE;
+static_assert(kMbMaxIL >= 1 && kMbMaxIL <= 4,
+              "SG_TUNED_MB_GEMM_INTERLEAVE must be 1 (serial) .. 4");
+
 // SPLIT-K factor for the P2 projection dW (the named "multi-CTA tiling"). The 8
 // dW yield only ~36 output tiles → ~73% of 132 SMs idle in P2; G chunks the K=T
 // contraction so the grid sees n_dw·G items. G=4 → ~144 items ≈ full grid (one
@@ -165,6 +185,12 @@ constexpr int kMbDwSplitK = SG_TUNED_MB_DW_SPLITK;
 static_assert(kMbDwSplitK >= 1, "SG_TUNED_MB_DW_SPLITK must be >= 1");
 constexpr int kMbTcSmemA1 = wgs::kWgmmaAtomM * wgs::kWgmmaAtomK;   // 64*16 bf16
 constexpr int kMbTcSmemB1 = SG_TUNED_TILE_N * wgs::kWgmmaAtomK;    // N*16 bf16
+// A-tiles the ring holds PER SLOT: kMbAtomsPerSlot = min(kAtomsM, kMbMaxIL) = the
+// widest interleave group any call site uses (fwd/dX = kAtomsM=2; dW = kMbMaxIL).
+// The M-atom-interleaved engine stages this many A-tiles per ring slot (slot sl,
+// atom-in-group ai at smemA + (sl*kMbAtomsPerSlot + ai)*kMbTcSmemA1); the megakernel
+// arena (MbTcSmem.sA) is sized kMbTcStages·kMbAtomsPerSlot tiles.
+constexpr int kMbAtomsPerSlot = (kAtomsM < kMbMaxIL) ? kAtomsM : kMbMaxIL;
 
 // ════════════════════════════════════════════════════════════════════════
 //  MUON 2D-WEIGHT TABLE — the ndim==2 mamba weights orthogonalized by the
@@ -241,71 +267,101 @@ __device__ void tc_gemm_block_unpipelined(
     const int tid_wg = tid & 127;
     constexpr int S = kMbTcStages;
 
-    wgs::WgmmaAccum<N> acc[MaxAtomsM];
+    // ── M-ATOM-INTERLEAVED wgmma pipeline (task #24, the decoder H1 win ported to
+    //    the Mamba twin; the Mamba engine already had the S-stage ring so this is a
+    //    near-verbatim port). The OLD body ran each stacked m64 atom's k-chain to
+    //    completion SEQUENTIALLY (atom0 chain → atom0 epilogue → atom1 chain → …),
+    //    re-staging the shared B (operand) tile ONCE PER ATOM. Here atoms are
+    //    processed in GROUPS of kIL (= min(MaxAtomsM, kMbMaxIL)). Within a group each
+    //    k-step issues the kIL wgmmas (one per atom) BACK-TO-BACK into their OWN fp32
+    //    fragments, sharing ONE staged B-tile, before the single per-k wait. Two
+    //    wins: (1) the kIL atoms are INDEPENDENT (distinct M-rows / accumulators) →
+    //    the tensor pipe overlaps their MMA execution; (2) the B-tile is staged ONCE
+    //    per group instead of kIL times → the (HBM-bound) operand traffic drops kIL×.
+    //    kIL is CAPPED (kMbMaxIL=2) so the register/smem cost is bounded regardless of
+    //    m_atoms (a dW tile can be 8 atoms). Groups reuse the SAME ring slots
+    //    sequentially. Per-atom accumulation stays ASCENDING-k (k=0 overwrite, k>0
+    //    add) → numerics bit-identical + A/A/A determinism UNCHANGED. Ring stages kIL
+    //    A-tiles (slot sl, atom-in-group ai at +ai·kMbTcSmemA1 within the slot) + ONE
+    //    shared B-tile; smemA must hold kMbAtomsPerSlot·kMbTcStages tiles.
+    constexpr int kIL = (MaxAtomsM < kMbMaxIL) ? MaxAtomsM : kMbMaxIL;
+    wgs::WgmmaAccum<N> acc[kIL];                 // kIL live fragments per group
 
-    // Stage tile `k` of atom `mbase` into ring slot `k % S`.
-    auto stage_k = [&] (int mbase, int k) {
+    // Stage k-tile for a group of `g_atoms` (<= kIL) atoms based at `gbase`: the
+    // g_atoms A-tiles (rows gbase+ai·64) + the shared B-tile, into ring slot k % S.
+    auto stage_k = [&] (int gbase, int g_atoms, int k) {
         const int s = k % S;
-        stage_kmajor_tile<wgs::kWgmmaAtomM>(
-            smemA + (int64_t)s * kMbTcSmemA1, k * wgs::kWgmmaAtomK,
-            [&] (int mn, int kk) { return srcA(mbase + mn, kk); }, tid, nthreads);
+        for (int ai = 0; ai < g_atoms; ++ai) {
+            const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+            stage_kmajor_tile<wgs::kWgmmaAtomM>(
+                smemA + ((int64_t)s * kMbAtomsPerSlot + ai) * kMbTcSmemA1, k * wgs::kWgmmaAtomK,
+                [&] (int mn, int kk) { return srcA(mbase + mn, kk); }, tid, nthreads);
+        }
         stage_kmajor_tile<N>(
             smemB + (int64_t)s * kMbTcSmemB1, k * wgs::kWgmmaAtomK,
             [&] (int mn, int kk) { return srcB(mn, kk); }, tid, nthreads);
     };
-    // Issue the wgmma reading ring slot `k % S` into acc[a] (ScaleD per k).
-    auto issue_k = [&] (int a, int k) {
+    // Issue the group's g_atoms wgmmas for staged slot k (k=0 overwrite else accum).
+    auto issue_k = [&] (int g_atoms, int k) {
         const int s = k % S;
-        wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(
-            smemA + (int64_t)s * kMbTcSmemA1);
         wgs::SmemDesc dB = wgs::make_desc_B_kmajor<N, wgs::kSwizzleNone>(
             smemB + (int64_t)s * kMbTcSmemB1);
-        if (k == 0) wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[a], dA, dB);
-        else        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[a], dA, dB);
+        #pragma unroll
+        for (int ai = 0; ai < kIL; ++ai) {
+            if (ai >= g_atoms) break;
+            wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(
+                smemA + ((int64_t)s * kMbAtomsPerSlot + ai) * kMbTcSmemA1);
+            if (k == 0) wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[ai], dA, dB);
+            else        wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[ai], dA, dB);
+        }
     };
 
+    // Loop M-atom GROUPS of kIL; each group runs its own k-chain into kIL fragments.
     #pragma unroll 1
-    for (int a = 0; a < m_atoms; ++a) {
-        const int mbase = mbase0 + a * wgs::kWgmmaAtomM;
-        // ── Prologue: stage tile 0 into slot 0; make it visible; fence. ──
-        stage_k(mbase, 0);
+    for (int g0 = 0; g0 < m_atoms; g0 += kIL) {
+        const int gbase = mbase0 + g0 * wgs::kWgmmaAtomM;
+        const int g_atoms = (m_atoms - g0) < kIL ? (m_atoms - g0) : kIL;
+        // ── Prologue: stage tile 0 (the group's atoms) into slot 0; visible; fence. ──
+        stage_k(gbase, g_atoms, 0);
         __syncthreads();                 // tile 0 visible to the wgmma below
         if (in_wg0) wgs::wgmma_fence();
-        // ── Steady state (S=2 single-in-flight double-buffer): issue wgmma(k)
-        //    on the already-staged slot k&1 (async), THEN stage tile k+1 into the
-        //    OTHER slot (k+1)&1 — its HBM operand loads run CONCURRENTLY with the
-        //    async MMA — THEN wait_group<0> (wgmma(k) done reading slot k&1) and
-        //    __syncthreads (stage(k+1) visible AND slot k&1 reuse-safe for k+2).
-        //    Invariant: stage(k+1)'s slot was last read by wgmma(k-1), retired by
-        //    iter k-1's wait+sync; the per-iter wait_group<0> is load-bearing (it
-        //    is what makes a slot reusable). S=1 collapses to the serial path
-        //    (issue → stage(none for k+1 since stages share a slot)… handled
-        //    below): for S==1 we stage k+1 into the SAME slot AFTER the wait, so
-        //    it is bit-identical to the old per-k stage→sync→issue→wait. ─────────
+        // ── Steady state (S=2 single group in flight): issue the g_atoms wgmmas for
+        //    slot k%S (async, overlapping in the tensor pipe), THEN stage tile k+1
+        //    into the OTHER slot (its HBM loads overlap the MMAs), THEN wait_group<0>
+        //    + sync (group's wgmmas done reading slot k&1; stage(k+1) visible; slot
+        //    reuse-safe). S=1 collapses to staging into the single slot AFTER the
+        //    wait (serial, bit-identical to the old per-k stage→sync→issue→wait). ──
         #pragma unroll 1
         for (int k = 0; k < k_steps; ++k) {
             if (in_wg0) {
-                issue_k(a, k);
+                issue_k(g_atoms, k);
                 wgs::wgmma_commit_group();
             }
             if (S > 1) {
                 // Double-buffer: prefetch k+1 into the other slot, overlapping wgmma(k).
-                if (k + 1 < k_steps) stage_k(mbase, k + 1);
-                if (in_wg0) wgs::wgmma_wait_group<0>();   // wgmma(k) done reading slot k&1
+                if (k + 1 < k_steps) stage_k(gbase, g_atoms, k + 1);
+                if (in_wg0) wgs::wgmma_wait_group<0>();   // group's wgmmas done reading slot k&1
                 __syncthreads();                          // stage(k+1) visible; slot k&1 free
             } else {
                 // Serial (S==1, single slot): wait, then stage next into the slot.
                 if (in_wg0) wgs::wgmma_wait_group<0>();
-                __syncthreads();                          // wgmma(k) done reading the slot
-                if (k + 1 < k_steps) { stage_k(mbase, k + 1); __syncthreads(); }
+                __syncthreads();                          // group's wgmmas done reading the slot
+                if (k + 1 < k_steps) { stage_k(gbase, g_atoms, k + 1); __syncthreads(); }
             }
         }
+        // Epilogue: warpgroup 0 owns the fp32 fragments; decode + emit (real cols).
+        // All reads happen AFTER the final wait_group<0> — no overlap with any wgmma.
         if (in_wg0) {
             #pragma unroll
-            for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
-                int row, col;
-                wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
-                if (col < n_real) out(mbase + row, col, acc[a].c[i]);
+            for (int ai = 0; ai < kIL; ++ai) {
+                if (ai >= g_atoms) break;
+                const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+                #pragma unroll
+                for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
+                    int row, col;
+                    wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
+                    if (col < n_real) out(mbase + row, col, acc[ai].c[i]);
+                }
             }
         }
         __syncthreads();
@@ -1111,29 +1167,55 @@ __device__ __forceinline__ void mbtc_build_dw_specs(
     }
 }
 
+// ── dW M-atom INTERLEAVE group width (task #24 H3 port). A dW output "tile" (work
+//    item) owns a GROUP of up to kMbDwIL consecutive m64 atoms instead of one, so
+//    the engine runs kMbDwIL wgmmas/k-step into independent fragments sharing ONE
+//    staged X (B-operand) tile → the H1 win (overlap the MMAs + kMbDwIL× less
+//    X-operand HBM traffic) now applies to the dW K=T contraction. kMbDwIL ==
+//    kMbMaxIL so the ring smem (MbTcSmem.sA, sized kMbAtomsPerSlot A-tiles/slot)
+//    matches. Ascending-k per atom is unchanged → numerics bit-identical + A/A/A.
+//    Mamba dW atom counts: in_proj(2·dInner=512→8), x_proj(dbc=40→1 — ODD, a single
+//    group of 1 atom), dt_proj(dInner=256→4), out_proj(d=128→2). The ragged-tail
+//    logic (g_atoms = min) handles x_proj's lone atom correctly (NO even shortcut). ──
+constexpr int kMbDwIL = kMbMaxIL;
+__device__ __host__ __forceinline__ int mb_dw_atoms(int Nout)  { return (Nout + 63) / 64; }
+__device__ __host__ __forceinline__ int mb_dw_groups(int Nout) {
+    return (mb_dw_atoms(Nout) + kMbDwIL - 1) / kMbDwIL;
+}
+
+// Total number of dW output WORK ITEMS (M-atom groups × N-tiles) across the 8
+// weights (the tile loop count). Each item is a group of <= kMbDwIL m64 atoms.
 template <int N>
 __device__ __forceinline__ int mbtc_dw_total_tiles(const MbDwSpec spec[8]) {
     int n = 0;
     for (int s = 0; s < 8; ++s)
-        n += ((spec[s].Nout + 63) / 64) * ((spec[s].Kin + N - 1) / N);
+        n += mb_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
     return n;
 }
 
-// Run ONE global dW tile gt (if owned): dW = dYᵀ @ X, contract K=T. Both operands
-// transposed-staged. K=T is a multiple of 16 (host enforces B%16==0 → T=B·8).
+// Run ONE global dW WORK ITEM gt (if owned): decode (weight, M-atom GROUP, N-tile),
+// then dW = dYᵀ @ X, contract K=T. Both operands transposed-staged. K=T is a multiple
+// of 16 (host enforces B%16==0 → T=B·8). The group is up to kMbDwIL stacked m64 atoms
+// → the engine interleaves them (kIL=kMbDwIL): kMbDwIL wgmmas/k-step into independent
+// fragments sharing ONE staged X B-tile (H1's win on the dW K=T contraction). The
+// engine adds mbase0=mbase and passes the GLOBAL row m to out (m<Nout guard handles a
+// ragged final group), so the direct grad write needs no per-atom shimming here.
 template <int N>
 __device__ __forceinline__ void mbtc_dw_run_tile(
         const MbDwSpec spec[8], int gt, float* __restrict__ grad,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    int acc = 0, s = 0, m_atom = 0, n_tile = 0;
+    int acc = 0, s = 0, m_group = 0, n_tile = 0;
     for (s = 0; s < 8; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = mb_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; break; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
+        acc += ng * nt;
     }
     const MbDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = mb_dw_atoms(sp.Nout);
+    const int a0 = m_group * kMbDwIL;                // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kMbDwIL ? (n_atoms - a0) : kMbDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
     const int k_steps = sp.T / wgs::kWgmmaAtomK;
@@ -1146,8 +1228,8 @@ __device__ __forceinline__ void mbtc_dw_run_tile(
         int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
     auto out  = [&] (int m, int n, float v) {
         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kMbDwIL>(
+        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1171,17 +1253,27 @@ __device__ __forceinline__ void mbtc_dw_run_tile(
 //  (mbase+row)*Kin + n0+col]. Biases (dt_proj only) stay in mbtc_dw_biases.
 // ════════════════════════════════════════════════════════════════════════
 constexpr int kMbMaxTileN = SG_TUNED_TILE_N;                      // widest dW N-tile
-constexpr int kMbDwTileFloats = wgs::kWgmmaAtomM * kMbMaxTileN;   // 64*N per (gt,kc) slot
+// Floats per (gt,kc) split-K slot: a work item is an M-atom GROUP of up to kMbDwIL
+// stacked m64 atoms → kMbDwIL·64 rows × N cols. (Was 64·N for the 1-atom item.)
+constexpr int kMbDwTileFloats = kMbDwIL * wgs::kWgmmaAtomM * kMbMaxTileN;
 
 // COMPILE-TIME max #dW output tiles (the 8 projection dW have fixed Nout/Kin —
 // mamba dims are compile-time — so n_dw is a constant; mbtc_dw_total_tiles
 // returns this at runtime, but the host needs it to size the split-K scratch).
 //   per layer: in(512×128), x_proj(40×256), dt_proj(256×8), out(128×256), N=kMbMaxTileN
+//   The M factor is now M-atom GROUPS of kMbDwIL (ceil(ceil(Nout/64)/kMbDwIL)),
+//   matching mb_dw_groups — NOT single atoms. (x_proj's 40→1-atom→1-group reserves a
+//   full kMbDwIL·64-row slot of which 64 rows are valid; the reduce reads only valid
+//   rows. groups·kMbDwIL·64·N == atoms·64·N only for EVEN atom counts; x_proj is odd
+//   so its split-K scratch grows by one 64×N slot per N-tile per chunk — accepted.)
+constexpr int kMbDwMGroups(int Nout) {                 // ceil(ceil(Nout/64)/kMbDwIL)
+    return (((Nout + 63) / 64) + kMbDwIL - 1) / kMbDwIL;
+}
 constexpr int kMbDwTilesPerLayer =
-      ((2*mb::kDInner + 63)/64) * ((mb::kD + kMbMaxTileN - 1)/kMbMaxTileN)      // in_proj
-    + ((mb::kDbc + 63)/64)      * ((mb::kDInner + kMbMaxTileN - 1)/kMbMaxTileN) // x_proj
-    + ((mb::kDInner + 63)/64)   * ((mb::kDtRank + kMbMaxTileN - 1)/kMbMaxTileN) // dt_proj
-    + ((mb::kD + 63)/64)        * ((mb::kDInner + kMbMaxTileN - 1)/kMbMaxTileN);// out_proj
+      kMbDwMGroups(2*mb::kDInner) * ((mb::kD + kMbMaxTileN - 1)/kMbMaxTileN)      // in_proj
+    + kMbDwMGroups(mb::kDbc)      * ((mb::kDInner + kMbMaxTileN - 1)/kMbMaxTileN) // x_proj
+    + kMbDwMGroups(mb::kDInner)   * ((mb::kDtRank + kMbMaxTileN - 1)/kMbMaxTileN) // dt_proj
+    + kMbDwMGroups(mb::kD)        * ((mb::kDInner + kMbMaxTileN - 1)/kMbMaxTileN);// out_proj
 constexpr int kMbDwMaxTiles = mb::kLayers * kMbDwTilesPerLayer;
 
 // Split-K dW partial-scratch float count (host carves it from the workspace tail):
@@ -1190,33 +1282,39 @@ __host__ __device__ __forceinline__ int64_t mb_dw_part_floats(int G) {
     return (int64_t)kMbDwMaxTiles * G * kMbDwTileFloats;
 }
 
-// Decode global dW tile index gt → (spec index s, m_atom, n_tile). Shared by the
-// partial pass + the reduce so the (gt → tile geometry) map is single-source.
+// Decode global dW work-item index gt → (spec index s, m_group, n_tile). Shared by
+// the partial pass + the reduce so the (gt → geometry) map is single-source.
+// m_group indexes M-atom GROUPS of kMbDwIL (group's first atom = m_group·kMbDwIL).
 template <int N>
 __device__ __forceinline__ void mbtc_dw_decode(
-        const MbDwSpec spec[8], int gt, int& s, int& m_atom, int& n_tile) {
+        const MbDwSpec spec[8], int gt, int& s, int& m_group, int& n_tile) {
     int acc = 0;
     for (s = 0; s < 8; ++s) {
-        const int ma = (spec[s].Nout + 63) / 64;
+        const int ng = mb_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
-        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; return; }
-        acc += ma * nt;
+        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; return; }
+        acc += ng * nt;
     }
-    s = 7; m_atom = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+    s = 7; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
 }
 
-// PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. K-chunk =
+// PARTIAL dW for global work item gt over K-chunk kc of G → dw_part. K-chunk =
 // [kc*kc_steps, (kc+1)*kc_steps) in 16-wide k-atoms; the launcher chooses
-// G | (T/16) so chunks are equal + 16-aligned. Fresh ScaleD=0 per chunk → a
-// true partial. Writes the full 64×N tile contiguously into the (gt,kc) slot.
+// G | (T/16) so chunks are equal + 16-aligned (NEVER empty → no zero guard needed).
+// Fresh ScaleD=0 per chunk → a true partial. Each work item gt is an M-atom GROUP
+// (up to kMbDwIL stacked m64 atoms, H3) → the engine interleaves them; the slot holds
+// the group's kMbDwIL·64 group-local rows. Writes the full group tile into (gt,kc).
 template <int N>
 __device__ __forceinline__ void mbtc_dw_run_tile_splitk(
         const MbDwSpec spec[8], int gt, int kc, int G, float* __restrict__ dw_part,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
-    int s, m_atom, n_tile;
-    mbtc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+    int s, m_group, n_tile;
+    mbtc_dw_decode<N>(spec, gt, s, m_group, n_tile);
     const MbDwSpec& sp = spec[s];
-    const int mbase = m_atom * 64;
+    const int n_atoms = mb_dw_atoms(sp.Nout);
+    const int a0 = m_group * kMbDwIL;                      // first atom of the group
+    const int g_atoms = (n_atoms - a0) < kMbDwIL ? (n_atoms - a0) : kMbDwIL;
+    const int mbase = a0 * 64;
     const int n0 = n_tile * N;
     const int kc_steps = (sp.T / wgs::kWgmmaAtomK) / G;   // equal chunks (G | k_steps_total)
     const int k0 = kc * kc_steps;
@@ -1228,35 +1326,39 @@ __device__ __forceinline__ void mbtc_dw_run_tile_splitk(
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
         int nn = n0 + n; return nn < Kin ? X[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Kin + nn] : __float2bfloat16(0.f); };
     float* slot = dw_part + ((int64_t)gt * G + kc) * kMbDwTileFloats;
-    // The GEMM calls out(mbase+row, col, v) with GLOBAL m = mbase+row (srcA reads
-    // dY[m·Nout] so m MUST stay global), but the slot holds only THIS atom's 64
-    // LOCAL rows → index by (m - mbase). A `m < 64` guard would NEVER fire for
-    // m_atom>=1 (mbase>=64) → that atom's slot stays UNWRITTEN and the reduce sums
-    // garbage (the rel~1.0 dW bug). Local-row indexing fills every slot fully.
+    // out(mbase+row, col, v): m is GLOBAL (srcA reads dY[m·Nout]; engine adds
+    // mbase0=mbase), the slot holds the GROUP's kMbDwIL·64 LOCAL rows → index by
+    // (m - mbase). The engine emits group-local rows in [0, g_atoms·64); a `lr<64`
+    // clamp would lose atom>=1's rows (the rel~1.0 dW bug). A ragged final group's
+    // tail rows stay unwritten but the reduce reads only valid rows → never used.
     auto out  = [&] (int m, int n, float v) {
         const int lr = m - mbase;
-        if (lr >= 0 && lr < 64 && n < N) slot[(int64_t)lr * N + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
-        mbase, /*m_atoms=*/1, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
+        if (lr >= 0 && lr < kMbDwIL * 64 && n < N) slot[(int64_t)lr * N + n] = v; };
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kMbDwIL>(
+        mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
 }
 
-// Deterministic reduce: output tile gt (% nCTA) sums its G chunk-partials in
-// ASCENDING kc and scatters to grad. Same (gt → geometry) decode as the partial.
+// Deterministic reduce: output work item gt (% nCTA) sums its G chunk-partials in
+// ASCENDING kc and scatters to grad. Same (gt → geometry) decode as the partial. Each
+// work item is an M-atom GROUP (up to kMbDwIL stacked m64 atoms, H3) → its slot holds
+// the group's kMbDwIL·64 group-local rows; mbase is the group's first global row.
 template <int N>
 __device__ __forceinline__ void mbtc_dw_reduce_splitk(
         const MbDwSpec spec[8], int n_dw, int G, const float* __restrict__ dw_part,
         float* __restrict__ grad, int cta, int nCTA) {
     for (int gt = cta; gt < n_dw; gt += nCTA) {
-        int s, m_atom, n_tile;
-        mbtc_dw_decode<N>(spec, gt, s, m_atom, n_tile);
+        int s, m_group, n_tile;
+        mbtc_dw_decode<N>(spec, gt, s, m_group, n_tile);
         const MbDwSpec& sp = spec[s];
-        const int mbase = m_atom * 64;
+        const int mbase = m_group * kMbDwIL * 64;           // group's first global row
         const int n0 = n_tile * N;
         const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
-        const int Nrow = (sp.Nout - mbase) < 64 ? (sp.Nout - mbase) : 64;
+        // Valid group rows: up to kMbDwIL·64, clamped to the weight's row count.
+        const int grp_rows = kMbDwIL * 64;
+        const int Nrow = (sp.Nout - mbase) < grp_rows ? (sp.Nout - mbase) : grp_rows;
         const int64_t base = (int64_t)gt * G * kMbDwTileFloats;
         for (int idx = threadIdx.x; idx < Nrow * n_real; idx += blockDim.x) {
-            const int row = idx / n_real, col = idx % n_real;
+            const int row = idx / n_real, col = idx % n_real;   // row = group-local lr
             float accv = 0.0f;
             for (int kc = 0; kc < G; ++kc)            // ascending chunk → deterministic
                 accv += dw_part[base + (int64_t)kc * kMbDwTileFloats + (int64_t)row * N + col];

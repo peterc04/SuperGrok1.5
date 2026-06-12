@@ -376,14 +376,18 @@ cudaError_t launch_fused_mamba_megakernel(
 #define SG_MBTC_PROF_ACC(slot, t0) do {} while (0)
 #endif
 
-// ── Static smem arena: kMbTcStages A(64×16) + kMbTcStages B(N×16) bf16 tiles
-//    (the GEMM K-loop double-buffer ring — slot s at sA + s*64*16 / sB +
-//    s*N*16) + the 256-float reduction slot + the scan-bwd cross-channel reduce
-//    targets (dBmat/dCmat, [kSeq×kState] each) + the 8 dW specs (shared, not
-//    per-thread stack). At S=2 + N=128 the ring is 2·(2KB+4KB)=12KB; MbTcSmem
-//    total ~14.6KB ≪ the 48KB static cap (the TC launcher uses static smem). ──
+// ── Static smem arena. The M-atom-interleaved wgmma pipeline (task #24, decoder
+//    H1+H3 port) stages kMbAtomsPerSlot A(64×16) tiles per ring slot (one per
+//    stacked m64 atom in an interleave GROUP, issued back-to-back into independent
+//    fp32 fragments so the tensor pipe overlaps them; slot s, atom-in-group ai at
+//    sA + (s*kMbAtomsPerSlot + ai)*64*16) + ONE shared B(N×16) tile per slot (slot s
+//    at sB + s*N*16). kMbAtomsPerSlot = min(kAtomsM, kMbMaxIL) (fwd/dX = 2; dW = 2).
+//    Plus the 256-float reduction slot + the scan-bwd cross-channel reduce targets
+//    (dBmat/dCmat, [kSeq×kState] each) + the 8 dW specs (shared, not per-thread
+//    stack). At S=2 + =2 + N=128 the ring is 2·(2·2KB+4KB)=16KB; MbTcSmem total
+//    ~16.6KB ≪ the 48KB static cap (the TC launcher uses static smem). ──
 struct MbTcSmem {
-    __nv_bfloat16 sA[mbtc::kMbTcStages * 64 * 16];
+    __nv_bfloat16 sA[mbtc::kMbTcStages * mbtc::kMbAtomsPerSlot * 64 * 16];
     __nv_bfloat16 sB[mbtc::kMbTcStages * SG_TUNED_TILE_N * 16];
     float red[256];
     float dBmat[mb::kSeq * mb::kState];
