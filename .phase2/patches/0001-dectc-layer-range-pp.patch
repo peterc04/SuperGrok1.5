@@ -1,0 +1,189 @@
+PP layer-range parametrization of the decoder TC tile functions (#25 phase-2, Lane C)
+
+WHAT: dectc_forward_tile / dectc_backward_tile gain `template <int Llo = 0,
+int Lhi = dec::kLayers>` + fp32 boundary-adjoint args (dh_in/dh_out, default
+nullptr), realizing the design §4.1 PP stage cut:
+  * Llo>0  skips the embedding (X_in[Llo] = upstream stage's handoff in acts)
+           and writes the final running adjoint to dh_out (fp32 [T,d]) instead
+           of the bf16 dh0;
+  * Lhi<kLayers skips head/CE (returns 0 NLL; the boundary layer's n2 output
+           goes to X_in[Lhi] via the existing li+1<kLayers branch) and seeds
+           the backward's running adjoint from dh_in (fp32 [T,d]).
+The fp32 dh carrier is bit-preserving: in the fused path the inter-layer
+adjoint never rounds to bf16, so a PP stage composition can be BIT-IDENTICAL
+to the single-launch kernel (gated by tests/hw/test_pp2_loopback_determinism.py).
+
+DEFAULT-INSTANTIATION IDENTITY (design §1.2 discipline): every existing call
+site compiles unchanged (all-defaulted template params); PTX of the production
+<OptId::AdamW> wgmma megakernel instantiation was diffed patched-vs-unpatched
+on 2026-06-12: 16,543 lines each, sole delta = one `mov.u32 %r3655, 0;`
+scheduled one line earlier (same instruction, same register — scheduling
+jitter, zero semantic delta). SG_DECTC_LAYER_RANGE 1 is the patch-presence
+marker pp_stage_decoder_tc.cuh #errors on and the PP tests skip-loudly on.
+
+APPLY:  git apply .phase2/patches/0001-dectc-layer-range-pp.patch
+VERIFY: nvcc-compile mega_decoder_real_adamw_tc.cu (proven 2026-06-12, shadow
+        tree) + the PTX diff above; then run the PP runbook entries.
+
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh	2026-06-12 10:12:39.363653799 +0000
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh	2026-06-12 19:21:46.536364890 +0000
+@@ -724,24 +724,39 @@
+ //  BIASES (in/out/ff0/ff2) are folded in fp32 at these points (the oracle adds
+ //  them in fp32 after the bf16 matmul); LN β + head out_b were already applied.
+ // ════════════════════════════════════════════════════════════════════════
++// ── PP LAYER-RANGE parametrization (design §4.1, task #25 phase-2): the tile
++//    runs layers [Llo, Lhi). The defaults <0, kLayers> fold every gate below to
++//    the historical single-stage body (byte-identical math; the symbol gains
++//    template mangling only). A PP stage instantiates a sub-range: Llo>0 skips
++//    the embedding (X_in[Llo] is the upstream stage's handoff, already in acts);
++//    Lhi<kLayers skips head/CE (the boundary layer writes X_in[Lhi] — the fwd
++//    handoff — via the existing li+1<kLayers branch) and contributes 0 NLL.
++//    SG_DECTC_LAYER_RANGE is the patch-presence marker pp_stage_decoder_tc.cuh
++//    and the PP tests gate on (loud #error / skip when unpatched).
++#define SG_DECTC_LAYER_RANGE 1
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ float dectc_forward_tile(
+         const DecWeights& w, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    static_assert(0 <= Llo && Llo < Lhi && Lhi <= dec::kLayers,
++                  "dectc_forward_tile: [Llo,Lhi) must be a non-empty layer range");
+     const int nsamp = nrows / dec::kSeq;
+-    // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+-    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+-        const int r = idx / dec::kD, j = idx % dec::kD;
+-        const int g = g0 + r;
+-        const int tid = tok_ids[g];
+-        const int sp = g % dec::kSeq;            // position within the sample
+-        float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
+-        acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
++    if constexpr (Llo == 0) {
++        // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
++            const int r = idx / dec::kD, j = idx % dec::kD;
++            const int g = g0 + r;
++            const int tid = tok_ids[g];
++            const int sp = g % dec::kSeq;            // position within the sample
++            float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
++            acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
++        }
++        __syncthreads();
+     }
+-    __syncthreads();
+ 
+-    for (int li = 0; li < dec::kLayers; ++li) {
++    for (int li = Llo; li < Lhi; ++li) {
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+@@ -819,8 +834,14 @@
+         }
+     }
+ 
+-    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
+-    //    finalin holds the last-layer n2 output [nrows,d] fp32. ──
++    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only —
++    //    LAST STAGE ONLY (Lhi==kLayers). A non-final PP stage's boundary output
++    //    went to X_in[Lhi] above; it has no head and contributes 0 NLL. ──
++    if constexpr (Lhi != dec::kLayers) {
++        (void)nsamp; (void)tgt_ids;
++        return 0.0f;
++    } else {
++    //    finalin holds the last-layer n2 output [nrows,d] fp32.
+     float nll_acc = 0.0f;
+     for (int si = 0; si < nsamp; ++si) {
+         const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+@@ -866,6 +887,7 @@
+         __syncthreads();
+     }
+     return nll_acc;
++    }  // if constexpr (Lhi == dec::kLayers)
+ }
+ 
+ // Attention BACKWARD over a tile (the oracle's 3-pass form, tile-batched).
+@@ -962,11 +984,23 @@
+ //  buffer `work2` (caller passes both, each [nrows×dff]); dh (running adjoint)
+ //  is the dedicated scratch.dh.
+ // ════════════════════════════════════════════════════════════════════════
++// PP LAYER-RANGE (design §4.1): runs layers [Lhi-1 .. Llo] backward. Defaults
++// reproduce the historical body. A non-LAST stage (Lhi<kLayers) starts its
++// running adjoint from `dh_in` — the DOWNSTREAM stage's fp32 [T,d] boundary
++// handoff (grad wrt this stage's last n2 output; fp32 carrier preserves bits —
++// in the fused path this value never rounds to bf16). A non-FIRST stage
++// (Llo>0) writes its final running adjoint to `dh_out` (fp32 [T,d]) instead of
++// the bf16 dh0 embedding adjoint.
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ void dectc_backward_tile(
+         const DecWeights& w, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        const float* __restrict__ dh_in = nullptr,
++        float* __restrict__ dh_out = nullptr) {
++    static_assert(0 <= Llo && Llo < Lhi && Lhi <= dec::kLayers,
++                  "dectc_backward_tile: [Llo,Lhi) must be a non-empty layer range");
+     const int nsamp = nrows / dec::kSeq;
+     // LN-vec partial slots (dense order; see kLnVecTensorIdx).
+     float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+@@ -982,7 +1016,16 @@
+ 
+     // ── CE bwd (per sample): dlogits = (softmax - onehot)/B, overwrite logits.
+     //    head bwd: dY_logits[si] = dlogits (the head dW operand); dhn = dlogits@out_w.
+-    //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others). ──
++    //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others).
++    //    LAST STAGE ONLY — a non-last PP stage seeds sc.dh from dh_in instead. ──
++    if constexpr (Lhi != dec::kLayers) {
++        // PP: the running adjoint starts from the downstream stage's fp32
++        // boundary handoff (grad wrt X_in[Lhi]'s pre-bf16 fp32 value).
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            sc.dh[idx] = dh_in[(int64_t)g0 * dec::kD + idx];
++        __syncthreads();
++        (void)B; (void)tgt_ids;
++    } else {
+     // First zero scratch.dh for the whole tile (only last positions get grad).
+     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+     __syncthreads();
+@@ -1042,12 +1085,13 @@
+             __syncthreads();
+         }
+     }
+-    // scratch.dh now = grad wrt last-layer output [nrows,d] (only last positions nonzero).
++    }  // if constexpr (Lhi == dec::kLayers)
++    // scratch.dh now = grad wrt this stage's last-layer output [nrows,d].
+ 
+     // ── per-layer backward (reverse). dh is the running adjoint (grad wrt the
+     //    layer's n2 output). All fwd intermediates are in scratch/DecActs (NO
+     //    recompute). ──
+-    for (int li = dec::kLayers - 1; li >= 0; --li) {
++    for (int li = Lhi - 1; li >= Llo; --li) {
+         const DecWeights::Layer& L = w.layer[li];
+         // n2 bwd: dh → dr2 (work fp32), accumulate n2 γ/β. xhat=n2x[li], inv=n2i[li].
+         dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+@@ -1109,11 +1153,20 @@
+         __syncthreads();
+     }
+ 
+-    // ── embedding bwd: dh = grad wrt h0 [nrows,d]. Write dh0 acts (bf16); the
+-    //    tok/pos owner-scan (P2) reads dh0 by global token row. ──
+-    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+-        acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
+-    __syncthreads();
++    if constexpr (Llo == 0) {
++        // ── embedding bwd: dh = grad wrt h0 [nrows,d]. Write dh0 acts (bf16);
++        //    the tok/pos owner-scan (P2) reads dh0 by global token row. ──
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
++        __syncthreads();
++    } else {
++        // PP: hand the running adjoint UP to the upstream stage in fp32 — the
++        // bit-preserving carrier (bf16 would round the boundary adjoint and
++        // break the stage-composition bit-exactness gate).
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            dh_out[(int64_t)g0 * dec::kD + idx] = sc.dh[idx];
++        __syncthreads();
++    }
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════

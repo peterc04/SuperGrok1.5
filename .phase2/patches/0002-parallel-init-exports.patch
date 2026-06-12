@@ -1,0 +1,58 @@
+parallel/__init__ re-exports for the phase-2 pipeline + zero3 modules (#25, OPTIONAL)
+
+Ergonomics only: grokking_optimizers.parallel.{pipeline,zero3} are fully
+importable via their module paths without this patch (the tests import them
+that way). Apply if the package-level names are wanted:
+    git apply .phase2/patches/0002-parallel-init-exports.patch
+Import-safety preserved: pipeline is pure python; zero3 guards torch at call
+time — the package stays CPU/CI import-safe (verified 2026-06-12 by importing
+the patched package in a shadow copy: build_1f1b_schedule/Zero3FlatParamStore
+resolve and smoke-run).
+
+--- a/grokking_optimizers/parallel/__init__.py	2026-06-12 08:24:47.266596754 +0000
++++ b/grokking_optimizers/parallel/__init__.py	2026-06-12 19:50:33.018447991 +0000
+@@ -33,6 +33,27 @@
+     shard_mode_for_optimizer,
+ )
+ 
++# Phase-2 additions (task #25): the 1F1B pipeline schedule/stage partition
++# (design §4) and the ZeRO-3 flat-blob gather/release + sharded checkpoint
++# (design §3). Both are torch-optional at import (pipeline is pure python;
++# zero3 guards its torch use), so this package stays CPU/CI import-safe.
++from grokking_optimizers.parallel.pipeline import (
++    build_1f1b_schedule,
++    bubble_fraction,
++    handoff_plan,
++    run_1f1b,
++    stage_layer_ranges,
++    stage_tensor_ownership,
++    validate_1f1b_schedule,
++)
++from grokking_optimizers.parallel.zero3 import (
++    FlatShardPlan,
++    Zero3FlatParamStore,
++    flat_plan_for_optimizer,
++    load_sharded_checkpoint,
++    save_sharded_checkpoint,
++)
++
+ __all__ = [
+     "ShardPlan",
+     "TensorPlacement",
+@@ -40,4 +61,16 @@
+     "partition_elementwise_even",
+     "partition_tensor_granular",
+     "shard_mode_for_optimizer",
++    "build_1f1b_schedule",
++    "bubble_fraction",
++    "handoff_plan",
++    "run_1f1b",
++    "stage_layer_ranges",
++    "stage_tensor_ownership",
++    "validate_1f1b_schedule",
++    "FlatShardPlan",
++    "Zero3FlatParamStore",
++    "flat_plan_for_optimizer",
++    "load_sharded_checkpoint",
++    "save_sharded_checkpoint",
+ ]
