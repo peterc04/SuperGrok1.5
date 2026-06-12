@@ -427,7 +427,7 @@ def test_supergrok11_interpret_parity(size, seed):
             dict(phi_b2=b2v, alpha=alpha, lr=lr, beta1=b1, beta2=b2, eps=eps,
                  wd=wd, bc1=bc1, bc2=bc2),
             n_out=4)
-        # Reference: mu = phi(g, sharp); cosine gate; sg11 step.
+        # Reference: mu = phi(g, sharp); sigmoid-of-cosine gate; sg11 step.
         # ref_sg_phi_forward is the PER-ELEMENT meta-net (scalar grad/sharp); to
         # evaluate it on the whole [N] vector at once, add a trailing axis so the
         # [H] hidden broadcasts over N -> pre is [N, H], output is [N].
@@ -436,7 +436,10 @@ def test_supergrok11_interpret_parity(size, seed):
         gn = (_t(g) * _t(momentum)).sum()
         gdg = (_t(g) * _t(g)).sum()
         gdm = (_t(momentum) * _t(momentum)).sum()
-        gate = torch.clamp(gn / torch.sqrt(gdg * gdm + 1e-12), 0.0, 1.0)
+        # gate = sigmoid(gate_temp * cos) — the canonical sg11_finalize_gate. The
+        # interp call omits gate_temperature, so the Pallas step uses its default 5.0.
+        cos = gn / torch.sqrt(gdg * gdm + 1e-12)
+        gate = torch.sigmoid(5.0 * cos)
         rp, rm, rv = ref_sg11_step(
             _t(p), _t(g), _t(m), _t(v), mu, gate=float(gate), alpha=alpha,
             lr=lr, beta1=b1, beta2=b2, eps=eps, wd=wd, t=t)

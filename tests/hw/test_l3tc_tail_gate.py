@@ -416,7 +416,7 @@ _CELLS = {
                         sam_dir_tol=2e-2),
     # supergrok11 (decoder/vit — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
     # (P2.4, sharpness=(g_sam−g)²) + the per-TENSOR meta-net mu/gate precompute (P2.45,
-    # mu=rescale·phi(g,sharpness), gate=clamp(cos(g,mu),0,1)) are IN-KERNEL phases; the apply
+    # mu=rescale·phi(g,sharpness), gate=sigmoid(gate_temp·cos(g,mu))) are IN-KERNEL phases; the apply
     # tail (sg11_sweep_b_step: smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. The gate
     # (factory: warmup_steps=0 ⇒ ramp=1, rescale=0.1 ⇒ mu!=0) validates FOUR surfaces vs the
     # canonical fp64 math (run_cell_gate's opt=="supergrok11"/"supergrok15" branch):
@@ -581,6 +581,7 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     """Dedicated SuperGrok11/15 gate: validate the kernel vs the CANONICAL fp64 math its
     apply_optimizer<SG> calls (ref_sg11_step/ref_sg15_step + ref_sg_phi_forward), plus the
     SAM 2nd backward (sharpness) vs the bf16-faithful oracle. Returns (ok, detail)."""
+    import math
     import torch
     from grokking_optimizers.dispatch import _opt_scalars_from, fused_train_step
     from tests.hw.test_reference_parity import (ref_sg11_step, ref_sg15_step,
@@ -600,6 +601,7 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     sg_rescale = float(scalars.get("sg_rescale", 0.0))
     rho = float(scalars.get("rho", 0.05))
     gate_global = float(scalars.get("gate", 0.0))   # SG15 host scalar (SG11: per-tensor cosine)
+    gate_temp = float(scalars.get("gate_temp", 5.0)) # SG11 cosine-gate temperature
     sam_on = float(scalars.get("looksam_sam", 0.0))
     beta1, beta2 = float(scalars["beta1"]), float(scalars["beta2"])
     lr, eps, wd = float(scalars["lr"]), float(scalars["eps"]), float(scalars["weight_decay"])
@@ -663,10 +665,12 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
         pt = p_before_t[o:o + k]
         zt = torch.zeros(k, dtype=torch.float64, device=dev)
         if opt == "supergrok11":
-            # per-tensor cosine gate (the kernel's P2.45 gate): clamp(<g,mu>/sqrt(|g|²|mu|²+1e-12),0,1).
+            # per-tensor gate (the kernel's P2.45 finalizer sg11_finalize_gate):
+            # cos = <g,mu>/sqrt(|g|²|mu|²+1e-12); gate = sigmoid(gate_temp·cos).
             num = (gt * mut).sum()
             den = torch.sqrt((gt * gt).sum() * (mut * mut).sum() + 1e-12)
-            gate_t = float(torch.clamp(num / den, 0.0, 1.0)) if den > 0 else 0.0
+            cos_t = float(num / den) if den > 0 else 0.0
+            gate_t = 1.0 / (1.0 + math.exp(-gate_temp * cos_t))
             pn, mn, vn = ref_sg11_step(pt, gt, zt, zt, mut, gate=gate_t, alpha=alpha,
                                        lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
         else:

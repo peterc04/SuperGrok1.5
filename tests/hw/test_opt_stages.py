@@ -181,7 +181,7 @@ def test_prodigy_owner_sum_is_partition_independent():
 
 
 # ===========================================================================
-#  (3c) SUPERGROK11 — meta-MLP mu + per-TENSOR cosine gate (block tree).
+#  (3c) SUPERGROK11 — meta-MLP mu + per-TENSOR gate=sigmoid(gate_temp*cos) (block tree).
 # ===========================================================================
 
 def _sg11_mu_mirror(grad, sharpness, W1, b1, W2, b2, rescale):
@@ -198,35 +198,36 @@ def _sg11_mu_mirror(grad, sharpness, W1, b1, W2, b2, rescale):
     return (rescale * out).reshape(grad.shape)
 
 
-def _sg11_gate_mirror_fp32(grad, mu):
-    """Mirror sg11_precompute_gate_for_tensor (== compute_cosine_gate_fused,
-    supergrok11_sm90.cuh:280-285) in fp32 with the block-tree reduction shape.
-    sg == grad (the alpha=0 mu_metanet makes smart_grad == grad). gate_temp is
-    IGNORED (the function ignores it). Returns clamp(cosine, 0, 1)."""
+def _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0):
+    """Mirror sg11_precompute_mu_and_gate_for_tensor's finalizer (== compute_cosine_
+    gate_fused == sg11_finalize_gate, algorithms/supergrok11.h) in fp32 with the
+    block-tree reduction shape. sg == grad (the alpha=0 mu_metanet makes smart_grad
+    == grad). Returns gate = sigmoid(gate_temp * cos(grad, mu)) (the cosine SIGNAL
+    squashed by the temperature-scaled sigmoid, NOT a bare clamp)."""
     g = _f32(grad).flatten()
     u = _f32(mu).flatten()
     num = _block_tree_sum_fp32(g * u)
     den_g = _block_tree_sum_fp32(g * g)
     den_m = _block_tree_sum_fp32(u * u)
     denom = math.sqrt(den_g * den_m + 1e-12)
-    gate = (num / denom) if denom > 0.0 else 0.0
-    return min(max(gate, 0.0), 1.0)
+    cos = (num / denom) if denom > 0.0 else 0.0
+    return 1.0 / (1.0 + math.exp(-gate_temp * cos))
 
 
-def _sg11_gate_oracle_fp64(grad, mu):
-    """fp64 cosine gate oracle: clamp(<g,mu>/sqrt(|g|^2 |mu|^2 + 1e-12), 0, 1)."""
+def _sg11_gate_oracle_fp64(grad, mu, gate_temp=5.0):
+    """fp64 gate oracle: sigmoid(gate_temp * <g,mu>/sqrt(|g|^2 |mu|^2 + 1e-12))."""
     g = _f64(grad).flatten()
     u = _f64(mu).flatten()
     num = float((g * u).sum())
     den_g = float((g * g).sum())
     den_m = float((u * u).sum())
     denom = math.sqrt(den_g * den_m + 1e-12)
-    gate = (num / denom) if denom > 0.0 else 0.0
-    return min(max(gate, 0.0), 1.0)
+    cos = (num / denom) if denom > 0.0 else 0.0
+    return 1.0 / (1.0 + math.exp(-gate_temp * cos))
 
 
 def test_sg11_cosine_gate_matches_fp64_oracle():
-    """Per-tensor cosine gate (block tree) vs the fp64 cosine oracle."""
+    """Per-tensor sigmoid-of-cosine gate (block tree) vs the fp64 oracle."""
     torch.manual_seed(2)
     H = 32
     W1 = torch.randn(H * 2, dtype=torch.float64) * 0.1
@@ -245,18 +246,28 @@ def test_sg11_cosine_gate_matches_fp64_oracle():
         assert 0.0 <= gate_stage <= 1.0
 
 
-def test_sg11_gate_ignores_gate_temp():
-    """Mirror the CODE not the comment: compute_cosine_gate_fused does a bare
-    clamp of the raw cosine and DOES NOT apply gate_temp (no sigmoid(t*cos)).
-    The mirror has no gate_temp parameter; this test documents that the value is
-    purely the clamped cosine (independent of any temperature)."""
+def test_sg11_gate_applies_gate_temp():
+    """Mirror the CODE: sg11_finalize_gate applies gate = sigmoid(gate_temp*cos)
+    — so the gate is the TEMPERATURE-SCALED SIGMOID of the cosine, NOT a bare
+    clamp. Two teeth: (a) the gate equals sigmoid(gate_temp*cos) (vs the raw
+    clamped cosine it used to be), and (b) raising gate_temp moves the gate toward
+    1 for a positive cosine (a bare clamp would be temperature-invariant)."""
     torch.manual_seed(3)
     grad = torch.randn(400, dtype=torch.float64)
-    mu = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)
-    gate = _sg11_gate_mirror_fp32(grad, mu)
-    # The raw clamped cosine — no temperature transform applied.
-    raw = _sg11_gate_oracle_fp64(grad, mu)
-    assert math.isclose(gate, raw, rel_tol=1e-4, abs_tol=1e-6)
+    mu = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)  # positive cos
+    # (a) gate == sigmoid(gate_temp*cos), and DIFFERS from the bare clamped cosine.
+    g = _f64(grad).flatten(); u = _f64(mu).flatten()
+    cos = float((g * u).sum()) / math.sqrt(
+        float((g * g).sum()) * float((u * u).sum()) + 1e-12)
+    clamped_cos = min(max(cos, 0.0), 1.0)
+    gate5 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0)
+    assert math.isclose(gate5, 1.0 / (1.0 + math.exp(-5.0 * cos)),
+                        rel_tol=1e-4, abs_tol=1e-6)
+    assert not math.isclose(gate5, clamped_cos, rel_tol=1e-3, abs_tol=1e-3)
+    # (b) temperature is genuinely consumed: higher temp ⇒ gate closer to 1 (cos>0).
+    gate1 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=1.0)
+    gate20 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=20.0)
+    assert gate1 < gate5 < gate20
 
 
 def _sg11_mu_and_gate_for_tensor(grad_T, sharp_T, W1, b1, W2, b2, rescale):

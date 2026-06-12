@@ -1371,7 +1371,7 @@ void supergrok11_fused_step(
 
  // Canonical SuperGrok v1.1 mixing (csrc/algorithms/supergrok11.h:101,
  // Pallas ref launch_supergrok11.py, oracle ref_sg11_step):
- //   gate       = clamp(cosine(grad, mu), 0, 1)
+ //   gate       = sigmoid(gate_temp * cosine(grad, mu))  (sg11_finalize_gate)
  //   smart_grad = grad + lamb_eff * mu                  (applied ONCE)
  //   AdamW on smart_grad.
  // The base correction (1-gate)*alpha SHRINKS as grad/mu alignment (gate)
@@ -3504,7 +3504,13 @@ PYBIND11_MODULE(_ops, m) {
  // SharpnessMetaNet rescale so the kernel's P2.45 meta-net mu precompute (mu =
  // rescale·phi(g, sharpness)) runs the live mechanism; the phi weights + sharpness
  // buffer ride the STATE buffer (cell-scattered), so only this scalar is in the ABI.
- py::arg("sg_rescale") = 0.0f);
+ py::arg("sg_rescale") = 0.0f,
+ // SuperGrok11 cosine-gate temperature (decoder/vit/mamba L3-TC). Trailing
+ // defaulted arg → back-compat (inert 1.0 for every non-SG11 cell). The SG11
+ // cell passes the SharpnessMetaNet gate_temperature so the kernel's P2.45
+ // finalizer computes gate = sigmoid(gate_temp · cos(grad, mu)) (the cosine
+ // SIGNAL preserved; only the final squashing is the temperature-scaled sigmoid).
+ py::arg("gate_temp") = 1.0f);
 
  // SuperGrok2 DEDICATED L3-TC entry (decoder/vit). The FULL CSA/HCA/PEER/GRU
  // meta-net as the optimizer phase: in-kernel SEGMENTED SORT (STAGE -1) + SAM 2nd

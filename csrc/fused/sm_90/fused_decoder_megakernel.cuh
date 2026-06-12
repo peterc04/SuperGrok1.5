@@ -906,8 +906,8 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // ── P2.45 (SuperGrok11/15 ONLY) staged into P3: the per-TENSOR meta-net mu
     //    precompute (INTEGRATION-OPTSTAGES §4/§5). SINGLE task-queue drain, NO grid
     //    barrier: each tensor T is SELF-CONTAINED — mu(T) = sg_rescale·phi(g[T],
-    //    sharpness[T]) (per element) and, for SG11, the per-tensor cosine gate(T) =
-    //    clamp(cos(g[T], mu[T]), 0, 1) depend ONLY on T's own elements (never on any
+    //    sharpness[T]) (per element) and, for SG11, the per-tensor gate(T) =
+    //    sigmoid(gate_temp·cos(g[T], mu[T])) depend ONLY on T's own elements (never on any
     //    other tensor's mu), so mu(+gate)→apply fuse into ONE body the SAME CTA owns
     //    end-to-end inside the EXISTING P3 drain (every thread of a CTA claims the same
     //    tensor t via the block-level task_slot, so the helper's __syncthreads/block-
@@ -1020,7 +1020,7 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
             }
             // SuperGrok11/15 meta-net mu (+ SG11 per-tensor gate) precompute for THIS
             // tensor, BEFORE the apply reads ts.mu/ts.gate. mu(T)=sg_rescale·phi(g,
-            // sharpness) over [off,off+n); SG11 also computes the clamped cosine gate(T)
+            // sharpness) over [off,off+n); SG11 also computes the gate(T)=sigmoid(gate_temp·cos)
             // (block-uniform __syncthreads/reduce — the whole CTA owns t). SG15's gate is
             // st.gate (host sigmoid(accuracy)). Helpers index grad/sharpness/mu by off+i,
             // so pass the BASE pointers (st.mu, grad, st.sharpness) + off; the apply then
@@ -1030,8 +1030,8 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                                                            : st.sg_phi_b2;
                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
                     st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
-                    b2, st.sg_rescale, off, n);
-                ts.gate = g8;            // per-tensor cosine gate the apply tail reads
+                    b2, st.sg_rescale, off, n, st.gate_temp);
+                ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
                 __syncthreads();         // mu(T) fully written + gate broadcast before apply
             } else if constexpr (Opt == OptId::SuperGrok15) {
                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]

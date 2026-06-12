@@ -13,7 +13,7 @@
 //       3-quantity reduction (num = Σ g·m, den_g = Σ g², den_m = Σ m²) computed
 //       TOGETHER in one pass: three DPP wavefront reduces, an LDS block tree per
 //       quantity, then three AGENT-scope global atomics. The host forms the
-//       gate = clamp(num / sqrt(den_g·den_m), 0, 1), replacing the ATen
+//       gate = sigmoid(gate_temp · num / sqrt(den_g·den_m)), replacing the ATen
 //       `.sum()`/`.norm()` triple.
 //
 // COMPILE ROUTING (two passes, one header):
@@ -39,7 +39,7 @@
 //   Per element:
 //     mu = phi_mlp(grad, sharpness)        — 2-input × H × 1 MLP
 //     cosine = sum(grad * momentum) / (||grad|| * ||momentum||)
-//     gate   = clamp(cosine, 0, 1)
+//     gate   = sigmoid(gate_temp * cosine)
 //     smart_grad = g + (1-gate) * alpha * mu
 //     AdamW(smart_grad)
 // The cosine numerator + two denominators are global reductions.
@@ -115,7 +115,11 @@ void launch_supergrok11_step(
     float phi_b2,
     float alpha,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2
+    float bc1, float bc2,
+    // SG11 cosine-gate temperature: gate = sigmoid(gate_temp * cos(grad, momentum))
+    // (the canonical sg11_finalize_gate). Defaulted for back-compat callers; the
+    // cosine SIGNAL is preserved, only the final squashing is the temp-scaled sigmoid.
+    float gate_temp = 5.0f
 ) {
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
@@ -138,7 +142,7 @@ void launch_supergrok11_step(
 #if defined(__HIPCC__)
         // LIVE (hipcc): §5 cosine-gate reduce — one pass yields num=Σg·m,
         // den_g=Σg², den_m=Σm² via DPP wave→block→AGENT atomics (replacing the
-        // ATen .sum()/.norm() triple). gate = clamp(num / sqrt(den_g·den_m),0,1).
+        // ATen .sum()/.norm() triple). gate = sigmoid(gate_temp·num/sqrt(den_g·den_m)).
         float gate;
         {
             auto gfc  = gf.contiguous();
@@ -158,15 +162,15 @@ void launch_supergrok11_step(
             float den_g = h_acc[1].item<float>();
             float den_m = h_acc[2].item<float>();
             float denom = sqrtf(den_g * den_m);
-            gate = (denom > 1e-12f) ? (num / denom) : 0.0f;
-            gate = std::min(std::max(gate, 0.0f), 1.0f);
+            float cos = (denom > 1e-12f) ? (num / denom) : 0.0f;
+            gate = 1.0f / (1.0f + expf(-gate_temp * cos));  // sigmoid(gate_temp*cos)
         }
 #else
         float dot = (gf * mom).sum().item<float>();
         float ng = gf.norm().item<float>();
         float nm = mom.norm().item<float>();
-        float gate = (ng * nm > 1e-12f) ? (dot / (ng * nm)) : 0.0f;
-        gate = std::min(std::max(gate, 0.0f), 1.0f);
+        float cos = (ng * nm > 1e-12f) ? (dot / (ng * nm)) : 0.0f;
+        float gate = 1.0f / (1.0f + expf(-gate_temp * cos));  // sigmoid(gate_temp*cos)
 #endif
 
         // Sweep B: smart_grad + Adam
@@ -245,7 +249,9 @@ void launch_sg11_sharpness_restore(
 float compute_cosine_gate_fused(
     torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
 ) {
-    // cos_sim(smart_grad, mu) clamped to [0, 1]
+    // gate = sigmoid(gate_temp * cos_sim(smart_grad, mu)) — the canonical
+    // sg11_finalize_gate (csrc/algorithms/supergrok11.h). The cosine SIGNAL is the
+    // SG11 discriminator; only the final squashing is the temp-scaled sigmoid.
     auto sg_f = smart_grad.to(torch::kFloat32).flatten().contiguous();
     auto mu_f = mu.to(torch::kFloat32).flatten().contiguous();
 #if defined(__HIPCC__)
@@ -264,15 +270,15 @@ float compute_cosine_gate_fused(
     auto h_acc = acc.cpu();
     float num = h_acc[0].item<float>(), den_g = h_acc[1].item<float>(), den_m = h_acc[2].item<float>();
     float denom = sqrtf(den_g * den_m + 1e-12f);
-    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
-    return std::min(std::max(gate, 0.0f), 1.0f);
+    float cos = (denom > 0.0f) ? (num / denom) : 0.0f;
+    return 1.0f / (1.0f + expf(-gate_temp * cos));
 #else
     float num = (sg_f * mu_f).sum().item<float>();
     float den_g = (sg_f * sg_f).sum().item<float>();
     float den_m = (mu_f * mu_f).sum().item<float>();
     float denom = sqrtf(den_g * den_m + 1e-12f);
-    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
-    return std::min(std::max(gate, 0.0f), 1.0f);
+    float cos = (denom > 0.0f) ? (num / denom) : 0.0f;
+    return 1.0f / (1.0f + expf(-gate_temp * cos));
 #endif
 }
 
@@ -288,7 +294,7 @@ float compute_cosine_gate_fused(
 //                      stream, g_ptr, m_ptr, acc, acc+1, acc+2, n);
 //   // host then: num=acc[0]; den_g=acc[1]; den_m=acc[2];
 //   //            denom = sqrtf(den_g*den_m + 1e-12f);
-//   //            gate  = clamp(num / denom, 0, 1);
+//   //            gate  = sigmoid(gate_temp * num / denom);
 // The per-element meta-net MLP + smart_grad + Adam apply stay on the ATen host
 // path (pure elementwise — no MFMA/DPP value). The §5 kernel is
 // COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh.
@@ -341,7 +347,7 @@ static GrokGridDim   gridDim;
 //   num   = Σ_i g_i · m_i        (g·m dot product)
 //   den_g = Σ_i g_i²             (‖g‖² )
 //   den_m = Σ_i m_i²             (‖m‖² )
-// then on the host: gate = clamp(num / sqrt(den_g·den_m + 1e-12), 0, 1).
+// then on the host: gate = sigmoid(gate_temp · num / sqrt(den_g·den_m + 1e-12)).
 // Each thread accumulates all THREE partials, then we run THREE independent
 // wave→block→AGENT-atomic trees (the standard 2-level tree from the spec):
 //   1. each thread grid-strides, accumulating num/den_g/den_m;

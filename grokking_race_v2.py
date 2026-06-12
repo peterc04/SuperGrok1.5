@@ -1251,7 +1251,7 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # the REAL fwd+bwd + the MODEL-COUPLED SAM 2nd backward (P2.4: on every-k SAM steps
         # perturb p'=p+(rho/‖g‖)·g → 2nd in-kernel fwd+bwd at p' → sharpness=(g_sam−g)², cached
         # in the persistent state slice) + the per-tensor meta-net mu/gate precompute (P2.45:
-        # mu=rescale·phi(g,sharpness), gate=clamp(cos(g,mu),0,1)) + the SG11 apply (smart_grad=
+        # mu=rescale·phi(g,sharpness), gate=sigmoid(gate_temp·cos(g,mu))) + the SG11 apply (smart_grad=
         # g+(1−gate)·alpha·mu → AdamW), ALL in-kernel — ZERO intermediate launches. If it ran we
         # SKIP the eager fwd/bwd/step (params updated in place by the kernel, which owns the
         # weight + m/v update).

@@ -50,6 +50,7 @@ namespace sg { namespace sm90 {
 namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::sg11_phi_forward;
 using ::sg::algorithms::sg11_adam_tail;
+using ::sg::algorithms::sg11_finalize_gate;
 // NOTE: sg11_sweep_a_step / sg11_sweep_b_step were the per-element bodies of the
 // two-sweep cosine-gate path (sg11_sweep_a_kernel / sg11_sweep_b_kernel /
 // launch_supergrok11_step). That path was DEAD device code — no binding and no
@@ -271,7 +272,11 @@ void launch_sg11_sharpness_restore(
         });
 }
 
-// Cosine gate: cos_sim(smart_grad, mu) clamped to [0,1].
+// Cosine gate: gate = sigmoid(gate_temp * cos_sim(smart_grad, mu)). The cosine
+// SIGNAL (what makes SG11 distinct from SG15's sigmoid-of-accuracy gate) is
+// preserved; the final squashing is the canonical sigmoid (sg11_finalize_gate,
+// algorithms/supergrok11.h) using the plumbed gate_temp — NOT the historical
+// bare clamp that ignored the temperature.
 float compute_cosine_gate_fused(
     torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
 ) {
@@ -280,9 +285,7 @@ float compute_cosine_gate_fused(
     float num = (sg_f * mu_f).sum().item<float>();
     float den_g = (sg_f * sg_f).sum().item<float>();
     float den_m = (mu_f * mu_f).sum().item<float>();
-    float denom = sqrtf(den_g * den_m + 1e-12f);
-    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
-    return fminf(fmaxf(gate, 0.0f), 1.0f);
+    return ::sg::algorithms::sg11_finalize_gate(num, den_g, den_m, gate_temp);
 }
 
 }} // namespace sg::sm90

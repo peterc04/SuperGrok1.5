@@ -925,7 +925,7 @@ _FUSED_L3_REAL = frozenset({
     # sharpness=(g_sam−g)² (supergrok11_sm90.cuh:246, NOT looksam's sam_dir=g_sam−g), the
     # 2nd MLP input. ON TOP of that 2nd pass runs a per-TENSOR meta-net mu precompute (P2.45,
     # staged into the P3 drain): mu=sg_rescale·phi(g,sharpness) over each tensor + a per-tensor
-    # cosine gate (clamp(cos(g,mu),0,1)), via sg11_precompute_mu_and_gate_for_tensor<32>
+    # gate=sigmoid(gate_temp·cos(g,mu)), via sg11_precompute_mu_and_gate_for_tensor<32>
     # (opt_stages_precompute.cuh, CPU-fp64-validated 9/9). The apply tail (sg11_sweep_b_step:
     # smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. SharpnessMetaNet hidden_dim=32
     # (NOT 64 — a known prior bug). The phi weights + sharpness ride the extended state buffer
@@ -1272,6 +1272,12 @@ def _opt_scalars_from(optimizer, step):
         import math as _math
         rescale = float(optimizer.meta_net.get_weights()[4])
         out["sg_rescale"] = rescale
+        # SG11 cosine-gate temperature: the kernel's P2.45 finalizer computes
+        # gate = sigmoid(gate_temp · cos(grad, mu)) (sg11_finalize_gate). SG15's gate
+        # is the host st.gate scalar and ignores this, but forwarding it is inert there
+        # (the SG15 precompute runs NO cosine finalizer). Default 5.0 = the SG11/SG15
+        # SharpnessMetaNet gate_temperature default.
+        out["gate_temp"] = float(getattr(optimizer, "gate_temperature", 5.0))
         out["rho"] = float(getattr(optimizer, "sam_rho", 0.05))
         # SAM cadence: the race fires sam_step every sam_freq = max(1, meta_update_freq*2)
         # steps (train_supergrok). The eager should-SAM check is step % sam_freq == 0 (1-based
@@ -2077,6 +2083,8 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
     # are forwarded by the generic _extra_scalars branches above when present in scalars.)
     if "sg_rescale" in scalars:
         _extra_scalars["sg_rescale"] = scalars["sg_rescale"]
+    if "gate_temp" in scalars:
+        _extra_scalars["gate_temp"] = scalars["gate_temp"]
     if "alpha_max" in scalars:
         _extra_scalars["alpha_max"] = scalars["alpha_max"]
     if "gate" in scalars:

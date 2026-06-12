@@ -227,11 +227,13 @@ struct FusedScalars {
        // sam_dir). Inert defaults (0.0) for every non-LookSAM caller; byte-identical.
        rho, looksam_sam,
        // SuperGrok11/15 append-only widening (decoder/vit L3-TC, meta-net mu) — KEEP
-       // IN LOCK-STEP with the real fused::sm90::FusedScalars (opt_components.cuh): one
-       // trailing field. sg_rescale = the SharpnessMetaNet rescale (mu = rescale·phi).
-       // The phi weights + sharpness are DEVICE pointers the cell binds directly; only
-       // this scalar flows through the POD. Inert default (0.0) for every non-SG caller.
-       sg_rescale;
+       // IN LOCK-STEP with the real fused::sm90::FusedScalars (opt_components.cuh): two
+       // trailing fields. sg_rescale = the SharpnessMetaNet rescale (mu = rescale·phi);
+       // gate_temp = the SG11 cosine-gate temperature (gate = sigmoid(gate_temp·cos),
+       // sg11_finalize_gate). The phi weights + sharpness are DEVICE pointers the cell
+       // binds directly; only these scalars flow through the POD. Inert defaults
+       // (sg_rescale=0.0, gate_temp=1.0) for every non-SG caller.
+       sg_rescale, gate_temp;
 };
 } // namespace sm90
 } // namespace fused
@@ -762,7 +764,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // only this scalar flows through the ABI. Flows into FusedScalars → the kernel's P2.45
  // meta-net mu precompute. SG also reuses `rho` (its SAM perturbation radius) + `alpha`
  // (the meta-net strength). A stale _ops without this arg trips the TypeError latch.
- float sg_rescale) {
+ float sg_rescale,
+ // SuperGrok11 cosine-gate temperature (decoder/vit/mamba L3-TC). gate =
+ // sigmoid(gate_temp · cos(grad, mu)) in the P2.45 finalizer (sg11_finalize_gate).
+ // Trailing defaulted arg (back-compat); inert default 1.0 for every non-SG11 cell.
+ float gate_temp) {
  int arch = detect_arch();
  // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
  // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
@@ -890,7 +896,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (decoder L3-TC
  rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
- sg_rescale};          // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
+ sg_rescale,           // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
+ gate_temp};           // SuperGrok11 cosine-gate temperature (sigmoid(gate_temp·cos))
  // STAGED NS). MUST be passed here — the mirror FusedScalars (line 204) declares
  // aux_* with NO in-class default, so omitting them aggregate-inits to 0.0 (→ the
  // 1D AdamW tail would run β1=β2=0: m=g/v=g², the (1b) state FAIL this fixes).
@@ -1025,7 +1032,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
  rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
- sg_rescale};          // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
+ sg_rescale,           // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
+ gate_temp};           // SuperGrok11 cosine-gate temperature (sigmoid(gate_temp·cos))
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
@@ -1202,7 +1210,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
  rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells).
- sg_rescale};          // SuperGrok11/15 meta-net rescale (inert; mamba SG is gated out).
+ sg_rescale,           // SuperGrok11/15 meta-net rescale (live for the mamba SG cells).
+ gate_temp};           // SuperGrok11 cosine-gate temperature (sigmoid(gate_temp·cos))
  // MUST be passed (the mirror FusedScalars declares all 26 fields with NO in-class
  // defaults — omitting these aggregate-inits them to 0.0, which for LookSAM means
  // rho=0/looksam_sam=0 → the P2.4 SAM phase is INERT and sam_dir never gets written).

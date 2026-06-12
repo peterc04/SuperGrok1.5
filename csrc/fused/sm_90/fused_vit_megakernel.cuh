@@ -1025,8 +1025,8 @@ fused_vit_megakernel_tc(PersistentContext ctx,
                                                            : st.sg_phi_b2;
                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
                     st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
-                    b2, st.sg_rescale, off, n);
-                ts.gate = g8;            // per-tensor cosine gate the apply tail reads
+                    b2, st.sg_rescale, off, n, st.gate_temp);
+                ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
                 __syncthreads();         // mu(T) fully written + gate broadcast before apply
             } else if constexpr (Opt == OptId::SuperGrok15) {
                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]

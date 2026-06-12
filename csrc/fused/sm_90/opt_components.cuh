@@ -196,6 +196,11 @@ struct FusedOptState {
     const float* sg_phi_W2 = nullptr;   // [kSgPhiHidden]
     float        sg_phi_b2 = 0.0f;      // read on-device from sg_phi_W2[kSgPhiHidden]
     float        sg_rescale = 0.0f;     // SharpnessMetaNet rescale (mu = rescale·phi)
+    // SG11 gate temperature: gate = sigmoid(gate_temp · cos(grad, mu)) (the per-
+    // tensor cosine finalizer sg11_finalize_gate, algorithms/supergrok11.h). Inert
+    // default 1.0f for every non-SG11 cell (it never reads gate_temp); SG15's gate
+    // is a host scalar (st.gate) and ignores this field.
+    float        gate_temp = 1.0f;
     // ── SuperGrok2 (decoder/vit L3-TC, FULL CSA/HCA/PEER/GRU meta-net as the
     //    optimizer phase). The composed megakernel runs sg2_meta_stages per tensor
     //    INSTEAD of apply_optimizer<SuperGrok2> (which is only the Adam-on-smart_grad
@@ -321,6 +326,13 @@ struct FusedScalars {
     //    Inert default (0.0 ⇒ mu=0 ⇒ the SG tail degenerates to AdamW on g) for every
     //    non-SG caller; layout stays byte-identical (only the SG P2.45 phase + tail read it).
     float sg_rescale  = 0.0f;
+    // ── SuperGrok11 append-only widening (decoder/vit/mamba L3-TC, per-tensor cosine
+    //    gate). gate_temp = the SharpnessMetaNet gate_temperature; the P2.45 cosine
+    //    finalizer computes gate = sigmoid(gate_temp · cos(grad, mu)) (sg11_finalize_
+    //    gate, algorithms/supergrok11.h). KEEP IN LOCK-STEP with the dispatch.cpp +
+    //    gfx942 FusedScalars mirrors (one trailing field). Inert default 1.0f for
+    //    every non-SG11 caller (SG15's gate is the host st.gate scalar; this is unread).
+    float gate_temp   = 1.0f;
 };
 
 // Fold the runtime scalars into a FusedOptState (pointers are bound separately
@@ -357,6 +369,7 @@ __host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
     st.rho          = s.rho;         // LookSAM / SuperGrok11/15 SAM perturbation radius
     st.looksam_sam  = s.looksam_sam; // LookSAM every-k SAM-step gate (1=run 2nd bwd)
     st.sg_rescale   = s.sg_rescale;  // SuperGrok11/15 SharpnessMetaNet rescale (mu=rescale·phi)
+    st.gate_temp    = s.gate_temp;   // SuperGrok11 cosine-gate temperature (sigmoid(gate_temp·cos))
     // st.d_factor is NOT host-bound for the STAGED-d cell: the kernel's Prodigy
     // reduction stage computes it on-device (between B2 and P3) and stashes it.
     // st.param_init / st.prodigy_persist are device pointers bound by the cell.

@@ -79,7 +79,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // the STATE buffer (cell-scattered), so only this scalar is in the ABI.
                 // Trailing defaulted arg = inert (0.0) for every non-SG cell. Keep in
                 // sync with the dispatch.cpp definition + the pybind py::arg list.
-                float sg_rescale = 0.0f);
+                float sg_rescale = 0.0f,
+                // SuperGrok11 cosine-gate temperature (decoder/vit/mamba L3-TC). The
+                // P2.45 finalizer computes gate = sigmoid(gate_temp · cos(grad, mu))
+                // (sg11_finalize_gate). Trailing defaulted arg = inert (1.0) for every
+                // non-SG11 cell. Keep in sync with the dispatch.cpp definition + the
+                // pybind py::arg list.
+                float gate_temp = 1.0f);
 
 // ── SuperGrok2 DEDICATED L3-TC entry (decoder/vit). SG2's optimizer phase is the
 //    FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward →

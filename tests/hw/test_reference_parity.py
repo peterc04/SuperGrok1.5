@@ -185,10 +185,13 @@ def ref_prodigy_apply_step(p, g, m, v, s_track, *, d, beta1, beta2, eps, wd,
     return p_new, mm, vv, s_track_new
 
 
-# ── supergrok11.h (cosine-gated meta-net) ────────────────────────────────────
+# ── supergrok11.h (sigmoid-of-cosine-gated meta-net) ─────────────────────────
 def ref_sg11_step(p, g, m, v, mu, *, gate, alpha, lr, beta1, beta2, eps, wd, t):
     """smart_grad = g + (1 - gate)*alpha*mu; AdamW on smart_grad.
-       gate is the pre-reduced, clamped cosine similarity."""
+       gate is the pre-reduced gate = sigmoid(gate_temp * cos_sim(grad, momentum))
+       (the canonical sg11_finalize_gate). Callers that compute the cosine feed
+       its sigmoid in here (see sg11_gate_ref / parity_gate_h100._cosine_gate_ref /
+       test_l3tc_tail_gate's per-tensor gate)."""
     p, g, m, v, mu = map(_f64, (p, g, m, v, mu))
     smart_grad = g + (1.0 - gate) * alpha * mu
     bc1 = 1.0 - beta1 ** t

@@ -1,8 +1,14 @@
 """
 SuperGrok v1.1 — C++/CUDA Accelerated Grokking Optimizer
 
-Uses cosine similarity gating (per-parameter) instead of sigmoid gating.
-Otherwise similar to SuperGrok v1.5 (meta-net, SAM, bilevel).
+Gate = sigmoid(gate_temperature * cos_sim(grad, momentum)) — a SIGMOID of the
+per-parameter cosine similarity between grad and momentum. What distinguishes
+v1.1 from v1.5 is the gate SIGNAL (the per-parameter cosine here vs. v1.5's
+training-accuracy scalar), not the squashing function (both end in a sigmoid).
+The gate (and the cosine reductions it needs) is computed in the C++/CUDA
+kernel — see compute_cosine_gate_fused / sg11_finalize_gate
+(csrc/algorithms/supergrok11.h). Otherwise similar to SuperGrok v1.5 (meta-net,
+SAM, bilevel).
 """
 
 import math
@@ -80,7 +86,10 @@ class SharpnessMetaNet(nn.Module):
 
 
 class SuperGrok11(Optimizer):
-    r"""SuperGrok v1.1 — C++/CUDA with cosine similarity gating."""
+    r"""SuperGrok v1.1 — C++/CUDA with sigmoid-of-cosine-similarity gating.
+
+    gate = sigmoid(gate_temperature * cos_sim(grad, momentum)); the per-parameter
+    cosine is the gate SIGNAL (vs. SG15's accuracy scalar). Computed in-kernel."""
 
     def __init__(
         self,

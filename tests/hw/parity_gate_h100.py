@@ -250,8 +250,9 @@ def section3_supergrok_metanet() -> None:
 #   AGAIN g_eff = smart_grad + (ramp*gate*lamb)*mu — a coefficient that GREW
 #   with the gate (wrong polarity), destroying the solution as rescale trained.
 #   Canonical (supergrok11.h:101 / Pallas ref / ref_sg11_step) is the SINGLE
-#   gated correction smart_grad = g + (1-gate)*alpha*mu with gate=cos(g,mu),
-#   which SHRINKS as alignment grows so the solution HOLDS.
+#   gated correction smart_grad = g + (1-gate)*alpha*mu with
+#   gate=sigmoid(gate_temp*cos(g,mu)), which SHRINKS as alignment grows so the
+#   solution HOLDS.
 #
 #   Section 3 only validated the mu buffer. This validates the ENTIRE param /
 #   moment update against the fp64 oracle. Crucially the reference gate is
@@ -259,15 +260,18 @@ def section3_supergrok_metanet() -> None:
 #   kernel — so the gate FAILS if the kernel regresses to cos(smart_grad,mu),
 #   reintroduces the lamb*mu second add, or uses the wrong polarity.
 # ===========================================================================
-def _cosine_gate_ref(grad: torch.Tensor, mu: torch.Tensor) -> float:
-    """clamp(cos(grad, mu), 0, 1) in fp64 — matches compute_cosine_gate_fused
-       (num/sqrt(den_g*den_m + 1e-12))."""
+def _cosine_gate_ref(grad: torch.Tensor, mu: torch.Tensor,
+                     gate_temp: float = 5.0) -> float:
+    """sigmoid(gate_temp * cos(grad, mu)) in fp64 — matches compute_cosine_gate_fused
+       (cos = num/sqrt(den_g*den_m + 1e-12); gate = sigmoid(gate_temp*cos), the
+       canonical sg11_finalize_gate). The cosine SIGNAL is preserved; only the final
+       squashing is the temperature-scaled sigmoid (no longer a bare clamp)."""
     g = grad.double().reshape(-1)
     m = mu.double().reshape(-1)
     num = (g * m).sum()
     den = torch.sqrt((g * g).sum() * (m * m).sum() + 1e-12)
-    gate = (num / den) if float(den) > 0.0 else torch.tensor(0.0, dtype=torch.float64)
-    return float(torch.clamp(gate, 0.0, 1.0))
+    cos = (num / den) if float(den) > 0.0 else torch.tensor(0.0, dtype=torch.float64)
+    return float(torch.sigmoid(gate_temp * cos))
 
 
 def section3b_supergrok11_full_update() -> None:
@@ -324,9 +328,9 @@ def section3b_supergrok11_full_update() -> None:
             1.0, 1.0, gate_temp, 0.0)
         torch.cuda.synchronize()
 
-        # Independent fp64 reference. gate = clamp(cos(grad, mu_buffer),0,1) where
-        # mu_buffer is the kernel's own mu output (= rescale*MLP, validated in §3).
-        gate_ref = _cosine_gate_ref(g0, mu.double())
+        # Independent fp64 reference. gate = sigmoid(gate_temp*cos(grad, mu_buffer))
+        # where mu_buffer is the kernel's own mu output (= rescale*MLP, validated in §3).
+        gate_ref = _cosine_gate_ref(g0, mu.double(), gate_temp)
         p_exp, m_exp, v_exp = ref_sg11_step(
             p0, g0, ea0, eas0, mu.double(),
             gate=gate_ref, alpha=alpha, lr=lr, beta1=beta1, beta2=beta2,
@@ -335,11 +339,15 @@ def section3b_supergrok11_full_update() -> None:
         dp = (p.double() - p_exp).abs().max().item()
         dm = (ea.double() - m_exp).abs().max().item()
         dv = (eas.double() - v_exp).abs().max().item()
-        # The gate MUST be exercised in (0,1), else this test is vacuous.
-        gate_ok = 0.01 < gate_ref < 0.99
+        # The gate MUST be exercised in a NON-degenerate sigmoid range, else this
+        # test is vacuous. gate = sigmoid(gate_temp*cos) with a positive cosine
+        # (the W1 grad column is positive-mean, sharpness zeroed) ⇒ cos in (0,1) ⇒
+        # gate in (0.5, ~0.993): assert it cleared the 0.5 floor (cos>0 truly fed in)
+        # and is not saturated at 1.
+        gate_ok = 0.5 < gate_ref < 0.999
         passed = dp < 1e-4 and dm < 1e-4 and dv < 1e-4 and gate_ok
         record("supergrok11 full update", passed,
-               f"gate={gate_ref:.3f} (want 0.01..0.99) "
+               f"gate={gate_ref:.3f} (want 0.5..0.999, sigmoid(gate_temp*cos)) "
                f"max|dp|={dp:.2e} |dm|={dm:.2e} |dv|={dv:.2e} (tol 1e-4)")
 
         # FIX 2 teeth: lamb is now a LIVE multiplier. Re-run identically but with
@@ -357,7 +365,7 @@ def section3b_supergrok11_full_update() -> None:
             [t], [alpha], [beta1], W1, b1, W2, b2, rescale, H,
             beta2, lr, wd, eps, L, 1.0, gate_temp, 0.0)
         torch.cuda.synchronize()
-        gate2 = _cosine_gate_ref(g0, mu2.double())  # mu2 == mu (same inputs)
+        gate2 = _cosine_gate_ref(g0, mu2.double(), gate_temp)  # mu2 == mu (same inputs)
         smart2 = g0 + L * (1.0 - gate2) * alpha * mu2.double()
         m2_exp = (1.0 - beta1) * smart2  # zero-init first moment
         dm2 = (ea2.double() - m2_exp).abs().max().item()

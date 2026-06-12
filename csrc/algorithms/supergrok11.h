@@ -7,8 +7,12 @@
 // batched fused-kernel logic from supergrok11_fused_step.
 //
 // Element-wise MLP gradient transformation with cosine-similarity gating.
-// Same structure as v1.5 but the gating term is the cosine between grad
+// Same structure as v1.5 but the gating SIGNAL is the cosine between grad
 // and momentum (computed per-parameter), not a sigmoid of training accuracy.
+// The gate is the SIGMOID of that cosine signal scaled by gate_temperature —
+// what distinguishes SG11 from SG15 is WHICH quantity feeds the sigmoid (the
+// per-parameter cosine here vs. SG15's training-accuracy scalar), not the
+// final squashing function.
 //
 // Calling convention: bc1, bc2 are passed un-inverted —
 //   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
@@ -22,7 +26,8 @@
 //     gate_den_m += momentum * momentum
 //
 //   Sweep B — apply:
-//     gate = clamp(gate_num / sqrt(gate_den_g * gate_den_m + eps), 0, 1)
+//     cos  = gate_num / sqrt(gate_den_g * gate_den_m + eps)   // cos_sim(grad, momentum)
+//     gate = sigmoid(gate_temperature * cos)                  // see sg11_finalize_gate
 //     smart_grad = grad + (1 - gate) * alpha * mu
 //     AdamW step on smart_grad with trust-ratio scaling.
 
@@ -54,6 +59,30 @@ __device__ __forceinline__ float sg11_phi_forward(
     return h_acc + b2;
 }
 
+// CANONICAL gate finalization (THE single source). Turns the three pre-reduced
+// cosine accumulators into the scalar gate the apply tail consumes:
+//   cos  = gate_num / sqrt(gate_den_g * gate_den_m + eps)   // cos_sim(grad, momentum)
+//   gate = sigmoid(gate_temp * cos) = 1 / (1 + exp(-gate_temp * cos))
+// The cosine SIGNAL is what makes SG11 distinct from SG15 (which feeds training
+// accuracy into its sigmoid); only the FINAL squashing is a sigmoid here, using
+// the plumbed gate_temperature (NOT a bare clamp — the historical impl clamped
+// the raw cosine and ignored the temperature). Both CUDA consumers (the per-op
+// compute_cosine_gate_fused and the L3-TC sg11_precompute_mu_and_gate_for_tensor)
+// derive from THIS; the Python/Pallas/test references mirror the same expression.
+__host__ __device__ __forceinline__ float sg11_finalize_gate(
+    const float gate_num,
+    const float gate_den_g,
+    const float gate_den_m,
+    const float gate_temp,
+    const float eps = 1e-12f
+) {
+    const float denom = sqrtf(gate_den_g * gate_den_m + eps);
+    const float cos_sim = (denom > 0.0f) ? (gate_num / denom) : 0.0f;
+    // expf (NOT the device-only __expf) so this single source compiles on the
+    // HOST consumer (compute_cosine_gate_fused) and the DEVICE consumer alike.
+    return 1.0f / (1.0f + expf(-gate_temp * cos_sim));
+}
+
 // Sweep A per-element: compute mu and contribute to cosine reductions.
 template <typename GradT>
 __device__ __forceinline__ void sg11_sweep_a_step(
@@ -83,7 +112,7 @@ __device__ __forceinline__ void sg11_sweep_b_step(
     float* __restrict__ exp_avg_sq,
     const GradT* __restrict__ grad,
     const float* __restrict__ mu,
-    const float gate,            // pre-reduced cosine similarity, clamped
+    const float gate,            // pre-reduced gate = sigmoid(gate_temp * cos_sim)
     const float alpha,           // meta-net strength
     const float lr,
     const float beta1,

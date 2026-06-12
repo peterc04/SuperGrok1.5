@@ -136,15 +136,20 @@ def launch_supergrok11_step(
     alpha: float,
     lr: float, beta1: float, beta2: float, eps: float, wd: float,
     bc1: float, bc2: float,
+    gate_temperature: float = 5.0,
 ) -> Tuple[jnp.ndarray, ...]:
     mu = phi_forward(grad, sharpness, phi_W1, phi_b1, phi_W2, phi_b2)
 
-    # Cosine gate
+    # Gate = sigmoid(gate_temperature * cos_sim(grad, momentum)) — the canonical
+    # sg11_finalize_gate (csrc/algorithms/supergrok11.h). The cosine SIGNAL is the
+    # SG11 discriminator (vs SG15's accuracy gate); only the final squashing is the
+    # temperature-scaled sigmoid, NOT a bare clamp.
     gn = jnp.sum(grad * momentum)
     gdg = jnp.sum(grad * grad)
     gdm = jnp.sum(momentum * momentum)
     denom_g = jnp.sqrt(gdg * gdm + 1e-12)
-    gate = jnp.clip(gn / denom_g, 0.0, 1.0)
+    cos = gn / denom_g
+    gate = 1.0 / (1.0 + jnp.exp(-gate_temperature * cos))
 
     smart = grad + (1.0 - gate) * alpha * mu
     m = beta1 * exp_avg + (1.0 - beta1) * smart
