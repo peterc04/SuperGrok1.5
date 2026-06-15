@@ -1,0 +1,7 @@
+[decoder-bench] building variant: d=1024 profile=False (SG_DEC_BENCH_LAYOUT=1)
+[decoder-bench] build done in 66.5s  (D=1024 TOTAL=25,401,443 TILE_N=128 HAS_PROFILE=False)
+
+[decoder-bench] d=1024  B=4096  params=25,401,443
+  wall/step = 247.527 ms  (median of reps ['248.13', '247.53', '246.90', '244.74', '248.27'])
+  steps/s   = 4.0400
+  GEMM FLOPs/step = 2.477e+12  => achieved 10.008 TF/s (1.01% of 989 TF/s bf16 dense roofline)

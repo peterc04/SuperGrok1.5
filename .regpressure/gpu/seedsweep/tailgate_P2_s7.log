@@ -1,0 +1,328 @@
+  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=2.388e-07 v=9.566e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.934e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=2.208e-07 v=9.085e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=3.467e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=2.210e-07 v=9.106e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.F  (1a) params vs REAL eager: max|Δp|=1.446e-06 rel=4.206e-07 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs canonical neuralgrok.h: m=2.333e-07 v=1.027e-06 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=6.081e-03 v=1.220e-02 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.860e-05 rel=4.674e-06 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs canonical neuralgrok.h: m=2.581e-07 v=9.781e-07 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=6.521e-02 v=1.262e-01 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=2.283e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=3.467e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=2.040e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=8.344e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=7.451e-09 rel=1.871e-09 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.863e-09 rel=5.411e-10 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=5.821e-11 rel=1.462e-11 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.859e-06 rel=5.511e-07 (tol 2e-03) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.825e-06 rel=4.676e-07 (tol 2e-03) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.485e-06 rel=3.803e-07 (tol 2e-03) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs REAL eager: m=6.204e-08 v=6.458e-08 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=8.288e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.369e-07 rel=3.980e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs REAL eager: m=6.017e-08 v=1.215e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=1.488e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.014e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs canonical SG: m=2.295e-07 v=9.828e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.378e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.475e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.436e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs canonical SG: m=1.966e-07 v=1.067e-06 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.974e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=6.519e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.007e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs canonical SG: m=2.229e-07 v=9.336e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.378e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.475e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.436e-08 (tol 1e-04) OK  loss=4.68430
+  (1b) STATE vs canonical SG: m=2.208e-07 v=9.584e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.974e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=6.519e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.684296/4.684296/4.684296  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs REAL eager: m=7.494e-08 v=9.422e-08 ema=n/a (tol 1e-4) FAIL — kernel state != reference
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=2.008e-02 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) FAIL — kernel sam_dir != bf16-faithful 2nd backward
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  OK
+F  (1a) params vs canonical SG: max-rel=3.008e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs canonical SG: m=2.591e-07 v=9.065e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.317e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) FAIL
+  (B) mu vs rescale·phi(g,sharpness): rel=3.948e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+F  (1a) params vs canonical SG: max-rel=3.009e-08 (tol 1e-04) OK  loss=4.73225
+  (1b) STATE vs canonical SG: m=2.652e-07 v=9.291e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.317e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) FAIL
+  (B) mu vs rescale·phi(g,sharpness): rel=3.948e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.732254/4.732254/4.732254  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+F...
+=================================== FAILURES ===================================
+___________________ test_l3tc_cell_gate[neuralgrok/decoder] ____________________
+
+cell = 'neuralgrok/decoder'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+>       ok, detail = run_cell_gate(cell, verbose=True)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/hw/test_l3tc_tail_gate.py:1189: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cell_key = 'neuralgrok/decoder', verbose = True
+
+    def run_cell_gate(cell_key, verbose=True):
+        """Run gates (1)+(2) for one converted cell. Returns (ok, detail)."""
+        from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
+                                                  canonicalize_model, fused_train_step)
+        spec = _CELLS[cell_key]
+        model, opt = spec["model"], spec["opt"]
+        # ── SuperGrok2 dedicated gate (the LAST/hardest cell). SG2's optimizer phase is the
+        # FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward +
+        # sg2_meta_stages), validated against the per-op ORACLE (ops.supergrok2_batched_step,
+        # the SAME low-rank indexer) — NOT the eager opt.step() (its bilevel/sam/ramp binding
+        # is not the L3 apply). tests/hw/_sg2_l3tc_gate owns the (B1)+(A/A/A)+(tie-probe)+(N>64
+        # CSA fidelity probe) verdict; short-circuit run_cell_gate to it.
+        if opt == "supergrok2":
+            from tests.hw._sg2_l3tc_gate import run_sg2_gate
+            return run_sg2_gate(model, verbose=verbose)
+        g, c, m, data, dev = _build_cell(model)
+        canon = canonicalize_model(model)
+        # Precondition: the cell must actually be wired L3-TC (wgmma) — else the gate is
+        # meaningless. has_l3_real + gemm_impl_for_cell are the production gates.
+        assert has_l3_real(canon, opt), f"{cell_key}: not L3-REAL (wire it first)"
+        eng = gemm_impl_for_cell(canon, opt, "bf16")
+        assert eng == "wgmma", f"{cell_key}: bf16 engine is {eng!r}, expected wgmma"
+    
+        tx, ty = data[0], data[1]
+        # A live optimizer carrying the EXACT production hyperparameters (drives the
+        # kernel's scalars via _opt_scalars_from inside fused_train_step).
+        opt_obj = spec["factory"](g, m.parameters(), c)
+    
+        # Snapshot the initial flat params (named_parameters order) BEFORE the step.
+        named0 = [(n, p) for n, p in m.named_parameters() if p.requires_grad]
+        total = sum(p.numel() for _, p in named0)
+        p_before = torch.empty(total, device=dev)
+        off = 0
+        for _, p in named0:
+            n = p.numel(); p_before[off:off + n].copy_(p.data.reshape(-1)); off += n
+    
+        # ── (1) megakernel-vs-REAL-EAGER single-step: run ONE production L3-TC step (the
+        # SAME route the race takes), capturing the TC-reduced grad + the post-step
+        # params. The state cache starts at zero (m=v=extra=0).
+        cache = {}
+        loss, grad = fused_train_step(canon, opt, m, opt_obj, tx, ty,
+                                      state_cache=cache, step=1, return_grad=True,
+                                      gemm_impl="wgmma")
+        # params after the kernel step (named order → flat).
+        p_after = torch.empty(total, device=dev)
+        off = 0
+        for _, p in named0:
+            n = p.numel(); p_after[off:off + n].copy_(p.data.reshape(-1)); off += n
+    
+        # ── SuperGrok11/15 dedicated gate (MODEL-COUPLED SAM 2nd backward + meta-net mu).
+        # The SG path does NOT run the eager opt.step() comparison (its bilevel/ramp binding is
+        # not the L3 apply): it validates the kernel against the CANONICAL fp64 math the kernel's
+        # apply_optimizer<SG> calls — the same single-source as ref_sg11_step/ref_sg15_step — plus
+        # the SAM 2nd backward (sharpness) vs the bf16-faithful oracle and mu vs rescale·phi. Short-
+        # circuits run_cell_gate (it owns its own (1a/1b)+(A/B)+(2) verdict).
+        if opt in ("supergrok11", "supergrok15"):
+            ok, detail = _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon,
+                                           opt_obj, grad, loss, p_after, total,
+                                           named0, cache, verbose)
+            return ok, detail
+    
+        # REFERENCE = the REAL eager optimizer (not a header re-transcription). Build a
+        # FRESH model with the SAME init (same seed), INJECT the kernel's TC-reduced grad
+        # into each p.grad (so both sides consume the BYTE-IDENTICAL gradient — the bf16-TC
+        # grad — isolating the optimizer TAIL math), then run ONE real opt.step() from
+        # zero state. A mechanism the real optimizer has but apply_optimizer<Opt> drops
+        # (grad_clip, per-layer schedule, adaptive alpha) SHOWS UP here as a param mismatch.
+        g_r, c_r, m_ref, data_r, dev_r = _build_cell(model)
+        named_ref = [(n, p) for n, p in m_ref.named_parameters() if p.requires_grad]
+        # confirm the fresh model's init matches p_before (same seed) — the reference is
+        # only valid if it starts from the kernel's input params.
+        p_ref_before = torch.cat([p.data.reshape(-1) for _, p in named_ref])
+        assert torch.equal(p_ref_before, p_before), \
+            f"{cell_key}: reference model init != kernel init (seed mismatch)"
+        opt_ref = spec["factory"](g_r, m_ref.parameters(), c_r)
+        # NEURALGROK: the kernel read the psi-net weights the host scattered from
+        # opt_obj.psi_pack() into the `extra` slice (fused_train_step). The eager
+        # reference must therefore hold the SAME amplifier weights, or it would apply a
+        # DIFFERENT psi(|g|) and the state would diverge for a reason that is NOT a
+        # dropped mechanism. opt_obj and opt_ref draw independent random amplifier inits,
+        # so copy opt_obj's amplifier into opt_ref and mark its kernel-weight snapshot
+        # dirty (so the eager step re-extracts the copied weights). This isolates the
+        # check to the TAIL+psi MATH (the gate's purpose), exactly as the SAME-grad
+        # injection isolates it from the bwd.
+        if opt == "neuralgrok":
+            opt_ref.amplifier.load_state_dict(opt_obj.amplifier.state_dict())
+            opt_ref.mark_amplifier_dirty()
+        # Scatter the kernel's flat TC grad into the reference params' .grad (layout order).
+        off = 0
+        for _, p in named_ref:
+            n = p.numel()
+            p.grad = grad[off:off + n].reshape(p.shape).clone()
+            off += n
+        # NEURALGROK clip-inertness GUARD (no-suppression honesty): the eager NeuralGrok
+        # binding applies a GLOBAL grad-norm clip (helpers.h clip_grad_norms_device_side)
+        # to grad_clip=1.0 BEFORE the apply; the kernel's neuralgrok.h tail does NOT clip.
+        # The two paths match ONLY when the clip is inert (global grad-norm <= grad_clip).
+        # Assert it here so a step where the clip WOULD fire fails LOUD instead of hollow-
+        # passing on a coincidentally-small step-1 norm. (grad_clip<=0 disables the clip,
+        # so the guard is vacuously satisfied there — the kernel is then exactly faithful.)
+        if opt == "neuralgrok":
+            gclip = float(opt_ref.param_groups[0].get("grad_clip", 0.0))
+            if gclip > 0.0:
+                gnorm = grad.detach().double().norm().item()  # global L2 over all tensors
+>               assert gnorm <= gclip + 1e-6, (
+                    f"{cell_key}: eager NeuralGrok grad-norm clip would FIRE "
+                    f"(global grad-norm {gnorm:.4f} > grad_clip {gclip}); the kernel's "
+                    f"neuralgrok.h tail does not clip, so this step's parity would be a "
+                    f"hollow pass. The clip is the one eager-binding mechanism the "
+                    f"single-launch tail cannot carry — at the gated step it must be inert.")
+E               AssertionError: neuralgrok/decoder: eager NeuralGrok grad-norm clip would FIRE (global grad-norm 1.0750 > grad_clip 1.0); the kernel's neuralgrok.h tail does not clip, so this step's parity would be a hollow pass. The clip is the one eager-binding mechanism the single-launch tail cannot carry — at the gated step it must be inert.
+E               assert 1.0749604040812968 <= (1.0 + 1e-06)
+
+tests/hw/test_l3tc_tail_gate.py:861: AssertionError
+______________________ test_l3tc_cell_gate[looksam/mamba] ______________________
+
+cell = 'looksam/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: looksam/mamba L3-TC gate failed: {'rel_err': 5.992623918923154e-08, 'loss': 4.732253551483154, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+____________________ test_l3tc_cell_gate[supergrok11/mamba] ____________________
+
+cell = 'supergrok11/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: supergrok11/mamba L3-TC gate failed: {'param_rel': 3.007612638337322e-08, 'sharp_rel': 0.023166013930627394, 'mu_rel': 3.948466535690899e-07, 'loss': 4.732253551483154, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+____________________ test_l3tc_cell_gate[supergrok15/mamba] ____________________
+
+cell = 'supergrok15/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: supergrok15/mamba L3-TC gate failed: {'param_rel': 3.009277299251565e-08, 'sharp_rel': 0.023166013930627394, 'mu_rel': 3.948466535690899e-07, 'loss': 4.732253551483154, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+=========================== short test summary info ============================
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[neuralgrok/decoder]
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[looksam/mamba] - ...
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[supergrok11/mamba]
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[supergrok15/mamba]
+4 failed, 29 passed in 321.66s (0:05:21)

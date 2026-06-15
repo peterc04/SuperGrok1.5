@@ -1,0 +1,9 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[mamba-bench] building variant: d=128 (SG_MB_BENCH_LAYOUT=unset)
+[mamba-bench] build 57.8s  D=128 DINNER=256 DTRANK=8 TILE_M=128 TOTAL=259,425 TILE_N=128
+
+[mamba-bench] d=128  B=4096  params=259,425
+  wall/step = 25.1337 ms  (median of ['25.060', '25.171', '25.170', '25.134', '25.105'])
+  steps/s   = 39.7872
+  GEMM FLOPs/step = 4.379e+10  => achieved 1.742 TF/s (0.18% of 989 TF/s bf16 dense roofline)

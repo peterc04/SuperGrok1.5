@@ -1,0 +1,8 @@
+[l3tc-gate] neuralgrok/decoder
+  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.993e-08 (tol 1e-04) OK  loss=4.79686
+  (1b) STATE vs canonical neuralgrok.h: m=3.270e-07 v=1.097e-06 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=0.000e+00 v=0.000e+00 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.796858/4.796858/4.796858  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] 1/1 cells passed

@@ -513,6 +513,7 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
          + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
                                               //   gated to 0 at bench width (adamw-only)
+         + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1)
          + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
          + 1;                                 // 8-byte realign slack for the int32 lists base
 }
@@ -541,6 +542,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                             float lr, int step, FusedOptState st) {
     __shared__ DecTcSmem sm;
     GridBarrier bar = ctx.barrier();
+    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
+    // passes through the out-of-line shims (one shared frame, campaign C2). The
+    // single-pass cells keep the inline bodies -- byte-identical allocation.
+    constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
+                                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
     const int cta = blockIdx.x;
     const int nCTA = (int)ctx.n_ctas;
     const int B = tok.B;
@@ -602,12 +608,15 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // (dec_tc_workspace_floats) uses, so the host size and this offset are provably the
     // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
     // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
-    float* embed_ws = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+    float* wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
 #else
-    // Production: carve AFTER the (full-size) SG2 region via the existing chain —
-    // BYTE-IDENTICAL to the historical offset (the sg2_ws_base align bump + the
-    // dec_tc_sg2_floats stride are load-bearing for the SG2 int64 row_off64 reads).
-    float* embed_ws = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+    // Production: carve AFTER the (full-size) SG2 region via the existing chain
+    // (the sg2_ws_base align bump + the dec_tc_sg2_floats stride are load-bearing
+    // for the SG2 int64 row_off64 reads). The bf16 weight pre-stage cache (C1)
+    // is interposed here; embed lists stay carve-LAST.
+    float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
 #endif
     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
     int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
@@ -618,11 +627,18 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     float* my_lnvec = lnvec_base + (int64_t)cta * dectc::kLnVecElems;
 
     DecWeights w = dec_bind(params);
+    // bf16 weight pre-stage cache (C1): bound over its workspace carve; FILLED in
+    // P0 below (fenced by B0 before any P1 GEMM stages from it).
+    __nv_bfloat16* wbf_cache = reinterpret_cast<__nv_bfloat16*>(wbf_f);
+    dectc::DecWBf wb = dectc::dec_wbf_bind(wbf_cache);
 
     // ── P0: zero this CTA's LN-vec partials + loss slot (dW/embed grads are
     //    written-once → no pre-zero). ──
     for (int i = threadIdx.x; i < dectc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+    // C1: fill the bf16 weight cache (grid-strided, element-owned, deterministic);
+    // B0 fences it before any P1 GEMM stages from it.
+    dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
 #ifdef SG_DEC_PROFILE
     unsigned long long _b0a = (threadIdx.x == 0) ? clock64() : 0;
 #endif
@@ -654,13 +670,22 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
 #ifdef SG_DEC_PROFILE
         __syncthreads(); unsigned long long _c0 = clock64();
 #endif
-        float nll = dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                              sm.sA, sm.sB, sm.red);
+        float nll;
+        if constexpr (kSamCoupled)
+            nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
+                                                     tok.targets, sm.sA, sm.sB, sm.red);
+        else
+            nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
+                                            sm.sA, sm.sB, sm.red);
 #ifdef SG_DEC_PROFILE
         __syncthreads(); unsigned long long _c1 = clock64();
 #endif
-        dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
-                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+        if constexpr (kSamCoupled)
+            dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
+                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+        else
+            dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
+                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
 #ifdef SG_DEC_PROFILE
         __syncthreads(); unsigned long long _c2 = clock64();
         if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
@@ -817,6 +842,13 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                 }
             }
             bar.sync();   // B2.4c: all params perturbed before the 2nd forward reads them
+            // C1: re-fill the bf16 weight cache from the PERTURBED params (the 2nd
+            // fwd/bwd GEMMs must consume bf16(p'), exactly what the on-read path saw).
+            // Element-owned + barrier-fenced -> deterministic. (After the restore in
+            // (d) the cache is stale; nothing reads it again this step -- the next
+            // step's P0 re-converts from the restored params.)
+            dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
+            bar.sync();   // B2.4c2: bf16 weight cache (p') complete before the 2nd forward
             // (c) SECOND fwd+bwd at the perturbed weights → g_sam in `sam_grad`. Mirror
             //     P1 + P2 EXACTLY, but: re-zero the lnvec partials (they accumulate),
             //     do NOT write the loss (keep the first-pass loss), and assemble into
@@ -827,10 +859,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
             for (int ti = cta; ti < n_tiles; ti += nCTA) {
                 const int g0 = ti * nrows_tile;
                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
-                dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                          sm.sA, sm.sB, sm.red);
-                dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
-                                           my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
+                                                   tok.targets, sm.sA, sm.sB, sm.red);
+                dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
+                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
                 __syncthreads();
             }
             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
@@ -891,7 +923,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //    + the eager-side clip must both see the unclipped reduced grad); the
     //    coefficient is applied per-element inside apply_optimizer<GrokAdamW>.
     //    Guarded so every other opt's P3 is byte-identical (no extra barrier/work).
-    if constexpr (Opt == OptId::GrokAdamW) {
+    //    EXTENDED to NeuralGrok: eager neuralgrok applies the SAME global grad-norm
+    //    clip (clip_grad_norms_device_side, grad_clip=1.0) before psi+amp — reuse
+    //    this exact performant+deterministic machinery (apply_optimizer<NeuralGrok>
+    //    consumes st.clip_coef). Every non-{GrokAdamW,NeuralGrok} opt stays byte-identical.
+    if constexpr (Opt == OptId::GrokAdamW || Opt == OptId::NeuralGrok) {
         // Reuse the (now-consumed) loss workspace: loss_part[nCTA] holds per-CTA
         // partial sum-of-squares; loss_out (1 float) broadcasts clip_coef. The
         // reduced loss is already in *tok.loss_out (state), so this is free scratch.

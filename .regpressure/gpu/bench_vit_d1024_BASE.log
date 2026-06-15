@@ -1,0 +1,16 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[vit-bench] building variant: d=1024 (SG_VIT_BENCH_LAYOUT=1)
+[vit-bench] build 0.1s  D=1024 HEADS=16 TILE_M=1088 TOTAL=25,363,553 TILE_N=128
+Traceback (most recent call last):
+  File "/workspace/SuperGrok1.5/tuning/vit_bench.py", line 164, in <module>
+    main()
+  File "/workspace/SuperGrok1.5/tuning/vit_bench.py", line 151, in main
+    res = measure(mod, args.d, args.B, args.reps, args.warmup, args.iters)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/SuperGrok1.5/tuning/vit_bench.py", line 102, in measure
+    call()
+  File "/workspace/SuperGrok1.5/tuning/vit_bench.py", line 98, in call
+    return mod.tc_train_step(params, patches, targets, state, lr, beta1, beta2,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 203.76 GiB. GPU 0 has a total capacity of 79.19 GiB of which 78.05 GiB is free. Process 333431 has 58.06 MiB memory in use. Including non-PyTorch memory, this process has 1.07 GiB memory in use. Of the allocated memory 399.28 MiB is allocated by PyTorch, and 90.72 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

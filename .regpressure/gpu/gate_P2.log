@@ -1,0 +1,3 @@
+=== [P2] build (_ops incremental, full parallelism) ===
+build.sh: done in 7m50s
+=== [P2] wiring_check --require-all ===

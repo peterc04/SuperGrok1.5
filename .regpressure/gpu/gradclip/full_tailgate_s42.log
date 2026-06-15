@@ -1,0 +1,110 @@
+  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=2.162e-07 v=9.589e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.656e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=2.030e-07 v=9.511e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=2.828e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=4.768e-07 rel=1.131e-07 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=2.333e-07 v=9.133e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical neuralgrok.h: m=2.281e-07 v=9.816e-07 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=0.000e+00 v=0.000e+00 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=2.828e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical neuralgrok.h: m=2.495e-07 v=1.003e-06 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=0.000e+00 v=0.000e+00 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs canonical neuralgrok.h: m=2.904e-07 v=1.022e-06 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=0.000e+00 v=0.000e+00 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=4.034e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=2.828e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=1.407e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=6.606e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=3.725e-09 rel=8.826e-10 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=7.451e-09 rel=1.765e-09 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.819e-12 rel=4.310e-13 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.598e-06 rel=3.862e-07 (tol 2e-03) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.386e-06 rel=3.349e-07 (tol 2e-03) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.289e-06 rel=3.116e-07 (tol 2e-03) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs REAL eager: m=1.413e-07 v=1.675e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=1.573e-02 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.656e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs REAL eager: m=4.327e-08 v=3.141e-08 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=1.356e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=2.843e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical SG: m=2.882e-07 v=8.987e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.407e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.464e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=4.040e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical SG: m=2.663e-07 v=9.754e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.122e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.702e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=2.843e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical SG: m=2.595e-07 v=9.750e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.407e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.464e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=4.040e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical SG: m=2.436e-07 v=9.776e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=2.122e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.702e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs REAL eager: m=5.796e-08 v=1.127e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=6.250e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=5.570e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs canonical SG: m=2.526e-07 v=8.799e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=7.123e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.759e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=5.570e-08 (tol 1e-04) OK  loss=4.75426
+  (1b) STATE vs canonical SG: m=2.800e-07 v=8.836e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=7.123e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.759e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.754265/4.754265/4.754265  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+....
+33 passed in 331.79s (0:05:31)

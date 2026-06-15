@@ -1,0 +1,190 @@
+  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=2.024e-07 v=9.167e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.586e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=2.031e-07 v=1.038e-06 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=3.293e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=2.540e-07 v=9.020e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=0.000e+00 rel=0.000e+00 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=6.270e-06 rel=1.600e-06 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs canonical neuralgrok.h: m=3.214e-07 v=8.317e-07 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=3.289e-02 v=6.687e-02 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=3.293e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs canonical neuralgrok.h: m=2.996e-07 v=8.432e-07 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=4.824e-04 v=9.649e-04 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-06 rel=6.084e-07 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs canonical neuralgrok.h: m=3.723e-07 v=1.209e-06 ema=n/a (tol 1e-4) OK
+       [diag] eager per-op kernel vs canonical: m=4.041e-03 v=8.065e-03 (large => eager cross-cell contamination, out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=3.777e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=5.960e-08 rel=1.646e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=1.408e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=9.589e-08 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=9.313e-10 rel=2.374e-10 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=3.725e-09 rel=1.028e-09 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=5.821e-11 rel=1.484e-11 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.444e-06 rel=6.873e-07 (tol 2e-03) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.431e-06 rel=3.723e-07 (tol 2e-03) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.092e-06 rel=2.839e-07 (tol 2e-03) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=0.000e+00 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs REAL eager: m=5.517e-08 v=1.021e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=7.136e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=1.192e-07 rel=3.293e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs REAL eager: m=8.241e-08 v=5.698e-08 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=1.157e-03 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) OK
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.060e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs canonical SG: m=2.407e-07 v=1.044e-06 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.296e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.315e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.204e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs canonical SG: m=2.666e-07 v=9.406e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.786e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.016e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.060e-08 (tol 1e-04) OK  loss=4.75614
+  (1b) STATE vs canonical SG: m=2.294e-07 v=9.334e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.296e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.315e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.756142/4.756142/4.756142  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs canonical SG: max-rel=3.204e-08 (tol 1e-04) OK  loss=4.72679
+  (1b) STATE vs canonical SG: m=2.640e-07 v=1.002e-06 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=1.786e-03 (tol 2e-02, bf16-TC vs bf16-faithful floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.016e-06 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.726789/4.726789/4.726789  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+.  (1a) params vs REAL eager: max|Δp|=2.384e-07 rel=6.084e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs REAL eager: m=4.360e-08 v=6.379e-08 ema=n/a (tol 1e-4) FAIL — kernel state != reference
+  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel=2.359e-02 (tol 2e-02, kernel bf16-TC vs bf16-faithful fp64 oracle = the DESIGN bf16 floor) FAIL — kernel sam_dir != bf16-faithful 2nd backward
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  OK
+F  (1a) params vs canonical SG: max-rel=3.051e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs canonical SG: m=2.543e-07 v=9.360e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=3.076e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) FAIL
+  (B) mu vs rescale·phi(g,sharpness): rel=5.985e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+F  (1a) params vs canonical SG: max-rel=3.064e-08 (tol 1e-04) OK  loss=4.71947
+  (1b) STATE vs canonical SG: m=2.371e-07 v=9.786e-07 (tol 1e-4) OK
+  (A) sharpness vs bf16-faithful 2nd backward: rel=3.076e-02 (tol 2e-02, bf16-TC vs bf16-faithful floor) FAIL
+  (B) mu vs rescale·phi(g,sharpness): rel=5.985e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.719471/4.719471/4.719471  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+F...
+=================================== FAILURES ===================================
+______________________ test_l3tc_cell_gate[looksam/mamba] ______________________
+
+cell = 'looksam/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: looksam/mamba L3-TC gate failed: {'rel_err': 6.084021801240361e-08, 'loss': 4.719470500946045, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+____________________ test_l3tc_cell_gate[supergrok11/mamba] ____________________
+
+cell = 'supergrok11/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: supergrok11/mamba L3-TC gate failed: {'param_rel': 3.051213865207037e-08, 'sharp_rel': 0.03076265038414576, 'mu_rel': 5.984572887581842e-07, 'loss': 4.719470500946045, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+____________________ test_l3tc_cell_gate[supergrok15/mamba] ____________________
+
+cell = 'supergrok15/mamba'
+
+    @pytest.mark.hw
+    @pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
+    @pytest.mark.parametrize("cell", list(_CELLS))
+    def test_l3tc_cell_gate(cell):
+        # CROSS-CELL ISOLATION (#19d): the SG2 cells' per-op oracle (and the eager per-op
+        # neuralgrok kernel) leak a device-global into a SUBSEQUENT TC SG2 launch, so the
+        # SG2 cells FALSELY fail when the full suite runs back-to-back in one process. Run
+        # ONLY those cells in a fresh subprocess (the device-global can't cross in); the
+        # clean cells stay in-process for speed. See _CONTAMINATION_ISOLATED_OPTS.
+        if _CELLS[cell]["opt"] in _CONTAMINATION_ISOLATED_OPTS:
+            passed, skipped, out = _run_cell_gate_subprocess(cell)
+            if skipped:
+                pytest.skip(f"{cell}: subprocess gate SKIPPED (no GPU/extension)\n{out}")
+            assert passed, f"{cell} L3-TC gate failed (isolated subprocess):\n{out}"
+            return
+        ok, detail = run_cell_gate(cell, verbose=True)
+>       assert ok, f"{cell} L3-TC gate failed: {detail}"
+E       AssertionError: supergrok15/mamba L3-TC gate failed: {'param_rel': 3.064094559172442e-08, 'sharp_rel': 0.03076265038414576, 'mu_rel': 5.984572887581842e-07, 'loss': 4.719470500946045, 'det': True}
+E       assert False
+
+tests/hw/test_l3tc_tail_gate.py:1190: AssertionError
+=========================== short test summary info ============================
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[looksam/mamba] - ...
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[supergrok11/mamba]
+FAILED tests/hw/test_l3tc_tail_gate.py::test_l3tc_cell_gate[supergrok15/mamba]
+3 failed, 30 passed in 322.82s (0:05:22)

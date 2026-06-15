@@ -1,0 +1,420 @@
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index ee2004d..ce158c5 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -513,6 +513,7 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
+          + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
+          + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
+                                               //   gated to 0 at bench width (adamw-only)
++         + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1)
+          + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
+          + 1;                                 // 8-byte realign slack for the int32 lists base
+ }
+@@ -541,6 +542,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+                             float lr, int step, FusedOptState st) {
+     __shared__ DecTcSmem sm;
+     GridBarrier bar = ctx.barrier();
++    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
++    // passes through the out-of-line shims (one shared frame, campaign C2). The
++    // single-pass cells keep the inline bodies -- byte-identical allocation.
++    constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
++                                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
+     const int cta = blockIdx.x;
+     const int nCTA = (int)ctx.n_ctas;
+     const int B = tok.B;
+@@ -602,12 +608,15 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+     // (dec_tc_workspace_floats) uses, so the host size and this offset are provably the
+     // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
+     // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
+-    float* embed_ws = opt_reduce + dec_tc_staged_opt_floats(nCTA);
++    float* wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA);
++    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+ #else
+-    // Production: carve AFTER the (full-size) SG2 region via the existing chain —
+-    // BYTE-IDENTICAL to the historical offset (the sg2_ws_base align bump + the
+-    // dec_tc_sg2_floats stride are load-bearing for the SG2 int64 row_off64 reads).
+-    float* embed_ws = sg2_ws_base + dec_tc_sg2_floats(nCTA);
++    // Production: carve AFTER the (full-size) SG2 region via the existing chain
++    // (the sg2_ws_base align bump + the dec_tc_sg2_floats stride are load-bearing
++    // for the SG2 int64 row_off64 reads). The bf16 weight pre-stage cache (C1)
++    // is interposed here; embed lists stay carve-LAST.
++    float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA);
++    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+ #endif
+     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
+     int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
+@@ -618,11 +627,18 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+     float* my_lnvec = lnvec_base + (int64_t)cta * dectc::kLnVecElems;
+ 
+     DecWeights w = dec_bind(params);
++    // bf16 weight pre-stage cache (C1): bound over its workspace carve; FILLED in
++    // P0 below (fenced by B0 before any P1 GEMM stages from it).
++    __nv_bfloat16* wbf_cache = reinterpret_cast<__nv_bfloat16*>(wbf_f);
++    dectc::DecWBf wb = dectc::dec_wbf_bind(wbf_cache);
+ 
+     // ── P0: zero this CTA's LN-vec partials + loss slot (dW/embed grads are
+     //    written-once → no pre-zero). ──
+     for (int i = threadIdx.x; i < dectc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
+     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
++    // C1: fill the bf16 weight cache (grid-strided, element-owned, deterministic);
++    // B0 fences it before any P1 GEMM stages from it.
++    dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
+ #ifdef SG_DEC_PROFILE
+     unsigned long long _b0a = (threadIdx.x == 0) ? clock64() : 0;
+ #endif
+@@ -654,13 +670,22 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c0 = clock64();
+ #endif
+-        float nll = dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                              sm.sA, sm.sB, sm.red);
++        float nll;
++        if constexpr (kSamCoupled)
++            nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
++                                                     tok.targets, sm.sA, sm.sB, sm.red);
++        else
++            nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
++                                            sm.sA, sm.sB, sm.red);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c1 = clock64();
+ #endif
+-        dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
+-                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++        if constexpr (kSamCoupled)
++            dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++        else
++            dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c2 = clock64();
+         if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+@@ -817,6 +842,13 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+                 }
+             }
+             bar.sync();   // B2.4c: all params perturbed before the 2nd forward reads them
++            // C1: re-fill the bf16 weight cache from the PERTURBED params (the 2nd
++            // fwd/bwd GEMMs must consume bf16(p'), exactly what the on-read path saw).
++            // Element-owned + barrier-fenced -> deterministic. (After the restore in
++            // (d) the cache is stale; nothing reads it again this step -- the next
++            // step's P0 re-converts from the restored params.)
++            dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
++            bar.sync();   // B2.4c2: bf16 weight cache (p') complete before the 2nd forward
+             // (c) SECOND fwd+bwd at the perturbed weights → g_sam in `sam_grad`. Mirror
+             //     P1 + P2 EXACTLY, but: re-zero the lnvec partials (they accumulate),
+             //     do NOT write the loss (keep the first-pass loss), and assemble into
+@@ -827,10 +859,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+             for (int ti = cta; ti < n_tiles; ti += nCTA) {
+                 const int g0 = ti * nrows_tile;
+                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+-                dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                          sm.sA, sm.sB, sm.red);
+-                dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
+-                                           my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++                dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
++                                                   tok.targets, sm.sA, sm.sB, sm.red);
++                dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
++                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                 __syncthreads();
+             }
+             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index 76f02d7..0eb279f 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -233,6 +233,79 @@ __device__ __forceinline__ DecActs dec_acts_bind(__nv_bfloat16* p, int T, int B)
+     return a;
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  bf16 WEIGHT PRE-STAGE (reg-pressure campaign C1 + cp.async-ring blocker (a)).
++//  The fwd/dX GEMMs' B operand was the fp32 params blob CONVERTED ON READ
++//  (__float2bfloat16 inside the staging accessor). That conversion web is the
++//  measured marginal register demand of the K-loop (the pure-bf16 dW path
++//  allocates spill-free at the same accumulator width while the fp32-read
++//  fwd/dX paths spill ~2.2 KB when isolated), and it is the documented blocker
++//  (a) of the cp.async/TMA ring: an async copy cannot convert, so the dominant
++//  operand could not stream. Fix: convert ONCE per step into a bf16 weight
++//  cache carved from the workspace, and stage the GEMM B operand from the
++//  cache. cache[i] = __float2bfloat16(params[i]) is the IDENTICAL deterministic
++//  per-element rounding the on-read path performed -> every GEMM consumes
++//  BIT-IDENTICAL operand values; numerics/parity/A-A-A are unchanged BY
++//  CONSTRUCTION (pure caching of a pure function; no reorder, no reassociation).
++//
++//  Only the 8 per-layer GEMM weight matrices (in_w/out_w/ff0_w/ff2_w x layers)
++//  are cached: they are the ONLY fp32->bf16 on-read GEMM operands (the head
++//  runs scalar fp32 per the oracle; embeddings/biases/LN are scalar fp32; the
++//  dW GEMM operands are bf16 acts already). All sizes derive from the layout
++//  constants -- no problem-specific hardcoding; the bench layout scales it.
++// ════════════════════════════════════════════════════════════════════════
++struct DecWBf {
++    const __nv_bfloat16* in_w[dec::kLayers];    // [3d, d]  per layer
++    const __nv_bfloat16* out_w[dec::kLayers];   // [d, d]   per layer
++    const __nv_bfloat16* ff0_w[dec::kLayers];   // [dff, d] per layer
++    const __nv_bfloat16* ff2_w[dec::kLayers];   // [d, dff] per layer
++};
++constexpr int64_t kWbfInW        = (int64_t)3 * dec::kD * dec::kD;
++constexpr int64_t kWbfOutW       = (int64_t)dec::kD * dec::kD;
++constexpr int64_t kWbfFf0W       = (int64_t)dec::kDff * dec::kD;
++constexpr int64_t kWbfFf2W       = (int64_t)dec::kD * dec::kDff;
++constexpr int64_t kWbfLayerElems = kWbfInW + kWbfOutW + kWbfFf0W + kWbfFf2W;
++constexpr int64_t kWbfTotalElems = (int64_t)dec::kLayers * kWbfLayerElems;
++// Workspace floats the cache occupies (bf16 elems -> float units, rounded up).
++__host__ __device__ __forceinline__ int64_t dec_wbf_floats() {
++    return (kWbfTotalElems + 1) / 2;
++}
++__device__ __forceinline__ DecWBf dec_wbf_bind(const __nv_bfloat16* c) {
++    DecWBf wb;
++    #pragma unroll
++    for (int li = 0; li < dec::kLayers; ++li) {
++        const __nv_bfloat16* b = c + (int64_t)li * kWbfLayerElems;
++        wb.in_w[li]  = b;
++        wb.out_w[li] = b + kWbfInW;
++        wb.ff0_w[li] = b + kWbfInW + kWbfOutW;
++        wb.ff2_w[li] = b + kWbfInW + kWbfOutW + kWbfFf0W;
++    }
++    return wb;
++}
++// Grid-strided fp32->bf16 convert of the 8 matrices into the cache. Element-
++// owned (each cache index written by exactly one thread), no atomics ->
++// deterministic. Caller fences with the existing grid barrier before any GEMM
++// reads the cache (P0->B0; the SAM re-convert gets its own barrier). The
++// kDecOffsets index of [in_w,out_w,ff0_w,ff2_w] for layer li is {2,4,10,12} +
++// 12*li (the 12-tensors-per-layer stride of the generated layout -- the same
++// indices dectc_build_dw_specs walks).
++__device__ __forceinline__ void dectc_wbf_convert(
++        const float* __restrict__ params, __nv_bfloat16* __restrict__ cache,
++        int cta, int nCTA) {
++    const int64_t stride = (int64_t)nCTA * blockDim.x;
++    for (int64_t i = (int64_t)cta * blockDim.x + threadIdx.x;
++         i < kWbfTotalElems; i += stride) {
++        const int   li = (int)(i / kWbfLayerElems);
++        const int64_t r = i % kWbfLayerElems;
++        int wi; int64_t off;
++        if      (r < kWbfInW)                       { wi = 2;  off = r; }
++        else if (r < kWbfInW + kWbfOutW)            { wi = 4;  off = r - kWbfInW; }
++        else if (r < kWbfInW + kWbfOutW + kWbfFf0W) { wi = 10; off = r - kWbfInW - kWbfOutW; }
++        else                                        { wi = 12; off = r - kWbfInW - kWbfOutW - kWbfFf0W; }
++        cache[i] = __float2bfloat16(params[(int64_t)kDecOffsets[wi + li * 12] + off]);
++    }
++}
++
+ // ════════════════════════════════════════════════════════════════════════
+ //  Canonical Major-K smem stager. The ss-wgmma operand smem tile (MN rows x
+ //  K=16 bf16) MUST be in the CUTLASS Major-K INTERLEAVE layout (wgmma.cuh):
+@@ -431,15 +504,17 @@ __device__ void tc_gemm_block_unpipelined(
+ // read as fp32 (2×) in fwd/dX — a perf-phase optimization, not a correctness gate.
+ template <int N>
+ __device__ __forceinline__ void dectc_gemm_fwd(
+-        const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+         __nv_bfloat16* __restrict__ Yout, int Kin, int Nout,
+         __nv_bfloat16* sA, __nv_bfloat16* sB) {
+     const int k_steps = Kin / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+         auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return X[(int64_t)m * Kin + k]; };
++        // W is the PRE-STAGED bf16 cache (dec_wbf_bind) -- a pure bf16 copy, no
++        // fp32 read / convert in the staging loop (C1; values bit-identical).
+         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+-            int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
++            int nn = n0 + n; return nn < Nout ? W[(int64_t)nn * Kin + k] : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) {
+             Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+@@ -452,15 +527,16 @@ __device__ __forceinline__ void dectc_gemm_fwd(
+ // fp32 at `Yf32`.
+ template <int N>
+ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+-        const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+         float* __restrict__ Yf32, int Kin, int Nout,
+         __nv_bfloat16* sA, __nv_bfloat16* sB) {
+     const int k_steps = Kin / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+         auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return X[(int64_t)m * Kin + k]; };
++        // W = pre-staged bf16 cache (C1) -- pure copy staging, bit-identical values.
+         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+-            int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
++            int nn = n0 + n; return nn < Nout ? W[(int64_t)nn * Kin + k] : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+             0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+@@ -472,6 +548,50 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+ // srcB(n=kin, k=out) = W[out·Kin + kin] (fp32 → bf16 on read). Writes fp32 dX
+ // [M,Kin] (LN/elementwise bwd consume it fp32).
+ template <int N>
++__device__ __forceinline__ void dectc_gemm_dx_f32(
++        const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __restrict__ W,
++        float* __restrict__ dXf32, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++    const int k_steps = Nout / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Kin; n0 += N) {
++        const int n_real = (Kin - n0) < N ? (Kin - n0) : N;
++        auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return dY[(int64_t)m * Nout + k]; };
++        // B[n=kin, k=out] = W[out, kin]  (transposed read of the PRE-STAGED bf16
++        // cache, C1 -- pure copy staging, bit-identical values).
++        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
++            int nn = n0 + n; return nn < Kin ? W[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
++        auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
++        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
++    }
++}
++
++// ── fp32-W OVERLOADS (TP-path compatibility; pre-C1 convert-on-read bodies).
++//    The C1 weight pre-stage scoped the megakernel's GEMM B operand to the bf16
++//    cache, but the TENSOR-PARALLEL layer (csrc/fused/sm_90/tp_layer.cuh and its
++//    JIT test binding tests/hw/tp_loopback_binding.cu) stages PER-RANK fp32
++//    weight SHARDS that live outside the megakernel workspace — no C1 cache
++//    exists there. These overloads carry the EXACT pre-C1 accessor bodies
++//    (`__float2bfloat16(W[...])` on read — deterministic, bit-identical to what
++//    the TP path always consumed), selected by the fp32 pointer type. The
++//    megakernel never calls them (its W is the bf16 cache). ──
++template <int N>
++__device__ __forceinline__ void dectc_gemm_fwd_f32(
++        const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
++        float* __restrict__ Yf32, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return X[(int64_t)m * Kin + k]; };
++        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
++            int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
++        auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
++        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
++    }
++}
++template <int N>
+ __device__ __forceinline__ void dectc_gemm_dx_f32(
+         const __nv_bfloat16* __restrict__ dY, const float* __restrict__ W,
+         float* __restrict__ dXf32, int Kin, int Nout,
+@@ -725,7 +845,7 @@ __device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq
+ //  them in fp32 after the bf16 matmul); LN β + head out_b were already applied.
+ // ════════════════════════════════════════════════════════════════════════
+ __device__ float dectc_forward_tile(
+-        const DecWeights& w, int g0, int nrows, const DecActs& acts,
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+@@ -745,7 +865,7 @@ __device__ float dectc_forward_tile(
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+-        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB);
++        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB);
+         __syncthreads();
+         // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+         // matches the bf16-faithful oracle qkv = bf(x_in @ bf(in_w)^T + in_b)).
+@@ -764,7 +884,7 @@ __device__ float dectc_forward_tile(
+         }
+         __syncthreads();
+         // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
+-        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, L.out_w,
++        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+                                             sc.work, dec::kD, dec::kD, sA, sB);
+         __syncthreads();
+         // r1 = Xin + a + out_b → work (fp32). out_b folded here (the GEMM did W only)
+@@ -784,7 +904,7 @@ __device__ float dectc_forward_tile(
+         // ff0 = X_x1 @ ff0_w^T (+ ff0_b)  (N=dff, K=d). fp32 → work; (pre+b) bf16 →
+         // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+         // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
+-        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, L.ff0_w,
++        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
+                                             sc.work, dec::kD, dec::kDff, sA, sB);
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
+@@ -795,7 +915,7 @@ __device__ float dectc_forward_tile(
+         }
+         __syncthreads();
+         // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
+-        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, L.ff2_w,
++        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
+                                             sc.work, dec::kDff, dec::kD, sA, sB);
+         __syncthreads();
+         // r2 = x1 + ff2 + ff2_b → work (fp32). x1 lives in the dedicated fp32 buffer
+@@ -963,7 +1083,7 @@ __device__ __forceinline__ void dectc_attn_bwd_tile(
+ //  is the dedicated scratch.dh.
+ // ════════════════════════════════════════════════════════════════════════
+ __device__ void dectc_backward_tile(
+-        const DecWeights& w, int g0, int nrows, int B, const DecActs& acts,
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+@@ -1060,7 +1180,7 @@ __device__ void dectc_backward_tile(
+         __syncthreads();
+         // ff2 dX: dgact = dff2 @ ff2_w  (N=dff, K=d). fp32 → tw? need a [nrows,dff] buffer.
+         //   Use sc.work (currently dr2, no longer needed — dx1 saved in work2, dff2 in acts).
+-        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, L.ff2_w,
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, wb.ff2_w[li],
+                                            sc.work, dec::kDff, dec::kD, sA, sB);  // dgact [nrows,dff]
+         __syncthreads();
+         // dff0 = dgact * gelu'(ff0pre) → dY_ff0 acts (bf16) AND keep fp32 in sc.work for dX.
+@@ -1072,7 +1192,7 @@ __device__ void dectc_backward_tile(
+         __syncthreads();
+         // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
+         //   → sc.x1 (free now — fwd x1 consumed); then add to work2.
+-        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, L.ff0_w,
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, wb.ff0_w[li],
+                                            sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB);  // dx1_ffn [nrows,d]
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+@@ -1090,7 +1210,7 @@ __device__ void dectc_backward_tile(
+         }
+         __syncthreads();
+         // out_proj dX: dctx = da @ out_w  (N=d, K=d). fp32 → sc.work (dctx [nrows,d]).
+-        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, L.out_w,
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+                                            sc.work, dec::kD, dec::kD, sA, sB);  // dctx
+         __syncthreads();
+         // attention bwd: (qkv[li], attn[li], dctx=work) → dqkv [nrows,3d] fp32 into
+@@ -1101,7 +1221,7 @@ __device__ void dectc_backward_tile(
+         __syncthreads();
+         // in_proj dX: dx_in_attn = dqkv @ in_w  (output width Kin=d, contract Nout=3d).
+         //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+-        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, L.in_w,
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, wb.in_w[li],
+                                            sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB);  // dx_in_attn
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+@@ -1116,6 +1236,35 @@ __device__ void dectc_backward_tile(
+     __syncthreads();
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  SAM-cell-scoped OUT-OF-LINE tile shims (reg-pressure campaign C2 -- the
++//  mamba precedent, model_stage_mamba_tc.cuh mbtc_forward_tile/backward_tile,
++//  SCOPED).  The SAM-coupled cells (LookSAM/SG11/SG15/SG2) run the heavy tile
++//  fwd+bwd TWICE per step (P1 + the P2.4 SAM 2nd pass); inlining both copies
++//  into one kernel blows the 255-reg budget by ~15 KB of hot-loop spills.
++//  Routing BOTH passes of those cells through these __noinline__ shims gives
++//  one shared out-of-line frame (measured: total spill bytes roughly halve and
++//  leave the entry body nearly clean).  The single-pass cells keep calling the
++//  inline bodies directly -- their allocation (255 regs, ZERO spills) is
++//  byte-identical to the pre-campaign engine, never taxed with an ABI boundary.
++//  Math identical; warpgroup-uniform call (whole CTA enters/exits together) so
++//  the wgmma fence/commit/wait choreography inside is well-formed.
++// ════════════════════════════════════════════════════════════════════════
++__device__ __noinline__ float dectc_forward_tile_outlined(
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
++        const DecTileScratch& sc, const int* __restrict__ tok_ids,
++        const int* __restrict__ tgt_ids,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red);
++}
++__device__ __noinline__ void dectc_backward_tile_outlined(
++        const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
++        const DecTileScratch& sc, const int* __restrict__ tgt_ids,
++        float* __restrict__ lnvec, float* __restrict__ work2,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red);
++}
++
+ // ════════════════════════════════════════════════════════════════════════
+ //  P2 — OUTPUT-STATIONARY dW (the Q2 deliverable). Each of the 9 weight
+ //  matrices dW = dYᵀ @ X (K=T) is split into 64×N output tiles; tile_id %

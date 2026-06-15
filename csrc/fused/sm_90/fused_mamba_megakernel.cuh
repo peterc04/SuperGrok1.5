@@ -840,7 +840,8 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     //    apply_optimizer<GrokAdamW>. Guarded so every other opt's P3 is byte-identical
     //    (no extra barrier/work). loss_part (nCTA) + loss_out (1) are free scratch
     //    here: the reduced loss is already in *tok.loss_out (a separate pointer).
-    if constexpr (Opt == OptId::GrokAdamW) {
+    //    EXTENDED to NeuralGrok (same eager global clip; consumed in apply_optimizer<NeuralGrok>).
+    if constexpr (Opt == OptId::GrokAdamW || Opt == OptId::NeuralGrok) {
         float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
         float* coef_bc = loss_out;           // [1] broadcast clip_coef
         const int64_t total = kMambaTotalElems;

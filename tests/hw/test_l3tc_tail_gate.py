@@ -215,6 +215,17 @@ def _neuralgrok_canonical_mv(grad, opt_obj, step):
     """
     dev = grad.device
     g64 = grad.double()
+    # GLOBAL grad-norm clip — eager neuralgrok clips the reduced grad IN-PLACE (via
+    # clip_grad_norms_device_side) BEFORE psi+amp, and the L3-TC kernel now matches it
+    # (P2.5, extended to NeuralGrok). Apply the SAME clip to the reference so (1b) tracks
+    # the kernel when the clip FIRES (global grad-norm > grad_clip, e.g. seed 7); inert
+    # (coef=1) when norm<=clip. total_norm = sqrt(Σ g²) over the reduced grad == both the
+    # kernel's P2.5 norm and eager's clip_grad_norms_device_side norm.
+    _gclip = float(opt_obj.param_groups[0].get("grad_clip", 0.0))
+    if _gclip > 0.0:
+        _tn = g64.norm().item()
+        if _tn > _gclip:
+            g64 = g64 * (_gclip / (_tn + 1e-6))
     ag = g64.abs()
     pack = opt_obj.psi_pack(device=dev).double()
     H = (pack.numel() - 1) // 3
@@ -526,7 +537,7 @@ _CELLS = {
 _BLOCKED_EVIDENCE = {}
 
 
-def _build_cell(model, seed=42):
+def _build_cell(model, seed=int(os.environ.get("GATE_SEED", "42"))):
     """Build the live race model + one real batch + the L3-REAL flat layout.
 
     DETERMINISM (load-bearing for gate 2): build_model does NOT reseed from
@@ -847,23 +858,13 @@ def run_cell_gate(cell_key, verbose=True):
         n = p.numel()
         p.grad = grad[off:off + n].reshape(p.shape).clone()
         off += n
-    # NEURALGROK clip-inertness GUARD (no-suppression honesty): the eager NeuralGrok
-    # binding applies a GLOBAL grad-norm clip (helpers.h clip_grad_norms_device_side)
-    # to grad_clip=1.0 BEFORE the apply; the kernel's neuralgrok.h tail does NOT clip.
-    # The two paths match ONLY when the clip is inert (global grad-norm <= grad_clip).
-    # Assert it here so a step where the clip WOULD fire fails LOUD instead of hollow-
-    # passing on a coincidentally-small step-1 norm. (grad_clip<=0 disables the clip,
-    # so the guard is vacuously satisfied there — the kernel is then exactly faithful.)
+    # NEURALGROK global grad-norm clip: the L3-TC neuralgrok tail NOW applies the SAME
+    # eager clip (kernel P2.5 extended to NeuralGrok; apply_optimizer<NeuralGrok> reads
+    # st.clip_coef and scales the grad before psi+amp, matching clip_grad_norms_device_
+    # side). The former clip-inertness assert is OBSOLETE — when the clip fires, both the
+    # kernel and the eager reference clip identically, so the parity is real (not hollow)
+    # at any seed (incl. seeds where step-1 global grad-norm > grad_clip, e.g. seed 7).
     if opt == "neuralgrok":
-        gclip = float(opt_ref.param_groups[0].get("grad_clip", 0.0))
-        if gclip > 0.0:
-            gnorm = grad.detach().double().norm().item()  # global L2 over all tensors
-            assert gnorm <= gclip + 1e-6, (
-                f"{cell_key}: eager NeuralGrok grad-norm clip would FIRE "
-                f"(global grad-norm {gnorm:.4f} > grad_clip {gclip}); the kernel's "
-                f"neuralgrok.h tail does not clip, so this step's parity would be a "
-                f"hollow pass. The clip is the one eager-binding mechanism the "
-                f"single-launch tail cannot carry — at the gated step it must be inert.")
         # The decoder/vit TC launcher uses raw cudaMalloc scratch (DecTcLauncherScratch),
         # so the caching-allocator layout differs after the kernel ran. Fully sync the
         # device before the eager reference's per-op neuralgrok kernel so its psi-weight

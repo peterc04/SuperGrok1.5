@@ -791,7 +791,8 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //    is byte-identical (no extra barrier/work). Reuses loss_part/loss_out as free
     //    scratch (the reduced loss is already in *in.loss_out; the dW partials are
     //    consumed → that whole region after loss_out is also free).
-    if constexpr (Opt == OptId::GrokAdamW) {
+    //    EXTENDED to NeuralGrok (same eager global clip; consumed in apply_optimizer<NeuralGrok>).
+    if constexpr (Opt == OptId::GrokAdamW || Opt == OptId::NeuralGrok) {
         float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
         float* coef_bc = loss_out;           // [1] broadcast clip_coef
         const int64_t total_e = kVitTotalElems;

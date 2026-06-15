@@ -62,9 +62,10 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int64_t idx
+    const int64_t idx,
+    const float clip_coef = 1.0f   // eager GLOBAL grad-norm clip coef (1.0 = inert); applied before psi+amp
 ) {
-    const float g = static_cast<float>(grad[idx]);
+    const float g = static_cast<float>(grad[idx]) * clip_coef;
     const float p = static_cast<float>(param[idx]);
 
     const float g_amp = (psi_scale * alpha + beta) * g;

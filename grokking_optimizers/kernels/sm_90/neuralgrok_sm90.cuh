@@ -50,7 +50,14 @@ using ::sg::algorithms::neuralgrok_apply_step;
 using ::sg::algorithms::neuralgrok_adam_tail;
 
 // Compile-time hidden width specializations (H = 8, 16, 32, 64, 128).
-constexpr int NG_H = 64;
+// MUST match the deployed amplifier width: OPTIMIZER_CONFIGS["neuralgrok"] pins
+// neural_hidden=16 and the L3-TC megakernel uses kPsiHidden=16, and get_weights()
+// returns 16-wide W1/b1/W2. This was 64, which staged+read 48 floats OUT-OF-BOUNDS
+// past the 16-wide weight arrays (usually adjacent zeros -> inert, but allocation-
+// layout-dependent garbage caused flaky one-off parity misses, e.g. seed-123).
+// TODO(robustness): dispatch the kernel template on the RUNTIME hidden_dim so
+// non-16 configs (incl. the _Amplifier ctor default 128) are also correct.
+constexpr int NG_H = 16;
 
 // Minimum resident blocks/SM. The psi-net forward is compute-heavy per element
 // but the bound is still memory traffic on the Adam state; cap registers so

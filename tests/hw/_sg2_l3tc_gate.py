@@ -22,6 +22,7 @@ tests.hw._sg2_l3tc_gate --model decoder).
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def _g():
     return g
 
 
-def _build(model, seed=42):
+def _build(model, seed=int(os.environ.get("GATE_SEED", "42"))):
     g = _g()
     c = dict(g.DEFAULT_CONFIG)
     c.update({"model_type": model, "use_amp": False, "use_fused": True,

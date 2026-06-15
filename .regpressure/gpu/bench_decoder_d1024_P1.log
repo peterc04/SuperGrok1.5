@@ -1,0 +1,9 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[decoder-bench] building variant: d=1024 profile=False (SG_DEC_BENCH_LAYOUT=1)
+[decoder-bench] build done in 68.9s  (D=1024 TOTAL=25,401,443 TILE_N=128 HAS_PROFILE=False)
+
+[decoder-bench] d=1024  B=4096  params=25,401,443
+  wall/step = 247.237 ms  (median of reps ['247.24', '248.41', '246.75', '248.29', '246.74'])
+  steps/s   = 4.0447
+  GEMM FLOPs/step = 2.477e+12  => achieved 10.020 TF/s (1.01% of 989 TF/s bf16 dense roofline)

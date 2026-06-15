@@ -482,12 +482,17 @@ __device__ __forceinline__ void apply_optimizer(
         // This threads the real psi_b2 bias (previously stuck at 0.0).
         const float psi_b2 = (st.psi_W2 != nullptr) ? st.psi_W2[kPsiHidden]
                                                      : st.psi_b2;
+        // GLOBAL grad-norm clip (eager neuralgrok clips grad IN-PLACE via
+        // clip_grad_norms_device_side BEFORE psi+amp). st.clip_coef is computed in the
+        // megakernel's P2.5 (extended to NeuralGrok); 1.0 when grad_clip<=0 or norm<=clip.
+        // psi reads |clipped grad|; the apply scales grad by the same coef internally.
+        const float gc = grad[idx] * st.clip_coef;
         const float psi = algo::neuralgrok_psi_forward<kPsiHidden>(
-            fabsf(grad[idx]), st.psi_W1, st.psi_b1, st.psi_W2, psi_b2);
+            fabsf(gc), st.psi_W1, st.psi_b1, st.psi_W2, psi_b2);
         algo::neuralgrok_apply_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, grad, psi,
             st.alpha, st.beta, st.lr, st.beta1, st.beta2, st.eps, st.wd,
-            st.bc1, st.bc2, idx);
+            st.bc1, st.bc2, idx, st.clip_coef);
     } else if constexpr (Opt == OptId::Muon) {
         // 2D params: NS-orthogonalized direction precomputed; tail is the
         // momentum-decayed scaled apply. (1D params use AdamW upstream.)

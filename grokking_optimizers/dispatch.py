@@ -1104,11 +1104,12 @@ _FUSED_ANNOUNCED = False
 
 
 def announce_fused_readiness(force: bool = False) -> None:
-    """Print, ONCE per process, which cells take the L1 megakernel path.
+    """Print, ONCE per process, the PRODUCTION execution path.
 
-    Loud + honest at run start: lists the whitelisted (model, optimizer) cells
-    that will use the fused optimizer-tail megakernel and notes that every other
-    cell uses the eager/per-op path. Idempotent (guarded by ``_FUSED_ANNOUNCED``).
+    Loud + honest at run start: all whitelisted (model, optimizer) cells run the
+    real fwd+bwd+optimizer in ONE persistent L3-TC wgmma megakernel; the eager/
+    per-op and scalar kernels are NOT on the race path (on-decline fallback +
+    dev/gate oracles only). Idempotent (guarded by ``_FUSED_ANNOUNCED``).
     """
     global _FUSED_ANNOUNCED
     if _FUSED_ANNOUNCED and not force:
@@ -1117,12 +1118,13 @@ def announce_fused_readiness(force: bool = False) -> None:
     ready = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_READY)
     l3_real = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_L3_REAL)
     msg = (
-        f"[fused] L3-REAL fused-train path (real fwd+bwd+opt in ONE persistent "
-        f"kernel) ENABLED for {len(l3_real)} cell(s): {', '.join(l3_real)}. "
-        f"L1 fused-optimizer-tail path ENABLED for {len(ready)} cell(s): "
-        f"{', '.join(ready)}. All other (model, optimizer) cells use the "
-        f"eager/per-op path (the surrogate L3 cells are compiled but unused by "
-        f"the race; see BUILD_AND_VALIDATE.md §PHASE-1).")
+        f"[fused] PRODUCTION path = L3-TC persistent megakernel (real fwd+bwd+"
+        f"optimizer in ONE wgmma kernel) for all {len(l3_real)} (model, optimizer) "
+        f"cell(s): {', '.join(l3_real)}. Eager/per-op + scalar kernels are NOT on "
+        f"the race path -- they run only as the on-decline fallback (AMP / non-sm_90 "
+        f"/ stale-ABI, loudly flagged DEGRADED) and as dev/gate oracles. "
+        f"(L1 fused-optimizer-tail available for {len(ready)} cell(s) as a legacy "
+        f"sub-tier, superseded by L3-TC where both apply.)")
     # Print to stderr so the run-start banner is ALWAYS visible (the module
     # logger has a NullHandler by default, so logger.warning would be silent
     # unless GROK_LOG_LEVEL is set). Also log it for structured-log consumers.
@@ -1180,6 +1182,13 @@ def _opt_scalars_from(optimizer, step):
         # fused_step maps to the FusedScalars.beta field the apply reads.
         out["alpha"] = float(g["alpha"])
         out["beta"] = float(g["beta"])
+        # NeuralGrok ALSO applies the eager GLOBAL grad-norm clip (clip_grad_norms_
+        # device_side, grad_clip default 1.0) in-place before psi+amp. Thread it so
+        # the kernel's P2.5 clip (extended from grokadamw-only to neuralgrok) fires
+        # for neuralgrok too; without it the L3-TC tail wouldn't clip (the gap the
+        # multi-seed sweep surfaced at seeds where step-1 grad-norm > grad_clip).
+        if "grad_clip" in g:
+            out["grad_clip"] = float(g["grad_clip"])
     elif "alpha" in g and "lamb" in g:   # grokadamw (also lion has no alpha key)
         out["lamb"] = float(g["lamb"])
         # GrokAdamW decoder L3-TC — ALL THREE mechanisms thread here:
