@@ -13885,7 +13885,11 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     regime="normal", seed=0,
                     out_npy=variant_dump_dir / ("cand_%s.npy" % _short_key(ckey)),
                     report=report)
-                result = {"timing_ms": _hook_ms}
+                # Match the timer-result schema _make_trial_record reads. The hook
+                # returns one representative median; min/max mirror it (single stat)
+                # and n=1 (one reported measurement). "timer"="hook" tags provenance.
+                result = {"timing_ms": _hook_ms, "min_ms": _hook_ms,
+                          "max_ms": _hook_ms, "n": 1, "timer": "hook"}
             except Exception as _hexc:
                 report.write("    [tune_hook] timing/capture failed for %s: %s\n"
                              % (ckey, _hexc))
