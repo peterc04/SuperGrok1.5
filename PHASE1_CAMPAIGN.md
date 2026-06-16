@@ -9,6 +9,10 @@ Cross-refs: `HANDOFF.md`, `BUILD_AND_VALIDATE.md`, `AUTOTUNE_LINKAGE.md`,
 Owner goal: **maximize work on the single H100 before the 8×H100 clock starts** (the 8×
 instance is ~8× the billing), then hand off cleanly.
 
+**Execution directive (owner):** use **MAXIMAL agent parallelism** — fan out as many concurrent
+CPU swarm agents as the work allows (GPU validation still serializes). **All agents run Opus 4.8 1M
+(`claude-opus-4-8[1m]`, the session model — default inherit, never downgrade) at MAX effort.**
+
 ---
 
 ## 0. Project phases (only two)
