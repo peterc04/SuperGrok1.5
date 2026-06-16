@@ -102,3 +102,24 @@ NOTE (not a bug, flagged for the 8x builder): `gather_full` tensor-granular bran
   - ②' ff0 dX bwd reduce: cited `:1075` → ACTUAL `dx1 += dff0 @ ff0_w` GEMM at **1392-1395**.
   - ①' in_proj dX bwd reduce: cited `:1104` → ACTUAL `dx_in_attn = dqkv @ in_w` GEMM at **1421-1423**, residual fold `sc.dh += sc.work` at 1427.
   FIX: update the comment in tp_layer.cuh (my-scope file) to the current lines so the 8x TP-insertion builder lands at the right call sites. This is documentation only — NO math change, NO production-TU edit. Severity: MINOR (the math/transport are gated correctly; this is builder guidance that would otherwise send the 8x author to the wrong lines inside a GEMM helper).
+
+### F7 — distributed_step.py — REVIEWED CLEAN
+`grokking_optimizers/parallel/distributed_step.py` (251 lines). The §6.2 [0]-[5] decomposition is correct:
+- `fixed_order_allreduce_grad`: all_gather (order-free data movement) then ASCENDING-RANK fp32 accumulate then `/world` — the §2.7/§6.4 fixed-order reduce. world=1 returns grad unchanged (identity). cuda.synchronize() fences the megakernel before/after the collective. Correct.
+- `shard_batch_rows`: pre-rounds B to `16*world` (wgmma B%16==0 precondition + balanced shards), even_partition over the rounded extent. Deterministic. Correct.
+- Step [3] state round-trip: `ctx.state` is `[3, shard_numel]`; `ctx.state[:, ss:se].reshape(-1).contiguous()` yields `[m[ss:se]|v[ss:se]|extra[ss:se]]` (the kernel's shard-local plane layout), writeback `.view(3, se-ss)` de-interleaves correctly. For the elementwise-only path (the ONLY supported path — per-tensor cells loudly rejected) there is exactly ONE owned slice spanning the whole shard, so ss=0,se=shard_numel and the [m|v|extra] mapping is exact. Correct.
+- world=1 + decompose_at_world1=False short-circuits to the plain fused_train_step (zero overhead, §6.2 "single-GPU path literally unchanged"). decompose_at_world1=True forces decomposition for the §7.1 identity gate.
+- INVARIANT documented + correct: the sharded apply starts from params-BEFORE-step (the store, gathered before [1], untouched by the kernel); the in-kernel P3's p.data mutation is discarded by the [4] overwrite. The redundant-P3 inefficiency is honestly documented (removed by the §2.2 early-exit at the 8x window) and is correctness-identical.
+- API verified: `dispatch._opt_scalars_from(optimizer, step)` exists (:1028); `fused_train_step(..., return_grad=True)` exists (:1512/:2005). **No bug.** Severity: n/a (clean).
+
+### F8 — pipeline.py — REVIEWED CLEAN (1F1B math verified)
+`grokking_optimizers/parallel/pipeline.py` (368 lines). All PP math correct:
+- `stage_tensor_ownership("decoder", P)`: prefix=2 (tok,pos), per_layer=12 (in_w,in_b,out_w,out_b,n1w,n1b,n2w,n2b,ff0w,ff0b,ff2w,ff2b), n_layers=2, suffix=4 (norm.w,norm.b,out.weight,out.bias) → total=30. VERIFIED against the tp_layer.cuh shard table indices (L0=2..13, L1=14..25, norm=26,27, head=28,29). Stage owns `[prefix+12*llo, prefix+12*lhi)` + prefix(first) + suffix(last). Built-in partition assertion (disjoint+complete over [0,30)). Correct.
+- `build_1f1b_schedule`: warmup=min(P-1-s,M), steady=M-warmup (fwd,bwd) pairs, cooldown drains remaining bwds — standard non-interleaved Megatron 1F1B; each stage runs M fwds + M bwds, each mb once per direction. Correct.
+- `validate_1f1b_schedule`: real dependency event-loop sim — fwd(s,mb) needs fwd(s-1,mb); bwd(s,mb) needs fwd(s,mb)+bwd(s+1,mb); deadlock detection + inflight-peak<=min(P-s,M) liveness bound check. The inflight bound is correct (peak = warmup+1 = min(P-s,M+1) capped by M at the first steady fwd). Correct.
+- `run_1f1b`: driver event-loop mirrors the validator's dependency model; act/dh tagged handoffs via LoopbackP2P; recv-before-send raises (surfaces schedule bugs that would deadlock real P2P); end-of-run drain check. Correct.
+- `handoff_plan`: fwd payload bf16 [T_mb,d] (2*n bytes), bwd payload fp32 [T_mb,d] (4*n bytes) — matches §4.1 (fp32 dh = bit-preserving carrier). Correct.
+**No bug.** Severity: n/a (clean).
+
+### F9 — CPU gates RE-RUN GREEN (this box, 2026-06-16)
+`tests/test_pipeline_schedule.py` + `tests/test_zero3_plan.py`: **55 passed in 1.54s** (CPU-only, no CUDA touched — safe to run, does not collide with #11's GPU work). Matches the RUNBOOK's documented "55 passed". py_compile clean on all 4 parallel modules. (ruff binary not present in this venv — substituted py_compile + the test suite.) Confirms the shard-map / zero3-plan / pipeline-schedule math holds against its own test suite, independent of the GPU.
