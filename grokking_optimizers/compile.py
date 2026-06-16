@@ -6049,7 +6049,14 @@ class BayesianEarlyStopper:
         # over the trailing ``patience`` window. ei_floor <= 0 disables the
         # criterion (user can opt out while keeping other stoppers active).
         if self.ei_floor > 0 and len(self._improvement_window) >= self.patience:
-            recent = list(self._improvement_window)[-self.patience:]
+            # Trailing ``patience`` window. ``_improvement_window`` is an
+            # unbounded deque, so the old ``list(deque)[-patience:]`` copied
+            # the entire (growing) history each poll; ``islice(reversed())``
+            # touches only the last ``patience`` items. Same elements, same
+            # order (re-reversed below ⇒ identical sum), so bit-identical.
+            recent = list(itertools.islice(
+                reversed(self._improvement_window), self.patience))
+            recent.reverse()
             rolling_mean = sum(recent) / max(1, len(recent))
             self._last_ei_estimate = rolling_mean
             if rolling_mean < self.ei_floor:
@@ -14259,9 +14266,10 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 report.write(f"    [pallas time error {ckey}: {exc}]\n")
                 result = None
             elapsed = time.monotonic() - progress_state["last_start"]
+            # window is a deque(maxlen=20): append auto-discards the oldest
+            # (was a manual list + O(n) pop(0) trim; deque keeps the same
+            # most-recent-20 telemetry in O(1)).
             progress_state["window"].append(elapsed)
-            if len(progress_state["window"]) > 20:
-                progress_state["window"].pop(0)
             return result
 
         return pallas_closure
@@ -15026,9 +15034,10 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     python_package=spec.python_package)
 
         elapsed = time.monotonic() - progress_state["last_start"]
+        # window is a deque(maxlen=20): append auto-discards the oldest
+        # (was a manual list + O(n) pop(0) trim; deque keeps the same
+        # most-recent-20 telemetry in O(1)).
         progress_state["window"].append(elapsed)
-        if len(progress_state["window"]) > 20:
-            progress_state["window"].pop(0)
 
         # ── Numerical validation pass (Fix-#2 §3 rewrite) ──────────────
         # Uses an explicit _dump_variant_output call (fresh subprocess,
@@ -15440,7 +15449,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
             report.write("  [worker] persistent timing worker is up.\n")
             worker = single
 
-    progress_state = {"last_start": time.monotonic(), "window": []}
+    progress_state = {"last_start": time.monotonic(),
+                      "window": collections.deque(maxlen=20)}
     # Stream C — shared mutable state for the learned cost model.
     # Always constructed (cheap dict) but only populated / consulted
     # when spec.enable_cost_model is True; the timer's rejection gate
@@ -16102,7 +16112,9 @@ def _pallas_autotune(spec: BuildSpec, sources: List[Path],
     report.write(f"  [pallas-autotune] candidates: {len(configs)}\n")
 
     # Build the per-trial timer.
-    progress_state: Dict[str, Any] = {"last_start": time.monotonic(), "window": []}
+    progress_state: Dict[str, Any] = {
+        "last_start": time.monotonic(),
+        "window": collections.deque(maxlen=20)}
     timer = _make_variant_timer(
         spec, sources, [], [], [], [], cache, None, report, progress_state)
 
