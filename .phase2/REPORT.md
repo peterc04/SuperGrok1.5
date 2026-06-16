@@ -137,3 +137,92 @@ mechanical at the 4 marked points); (3) real scaling measurements (DP 1→8,
 ZeRO-3 OOM threshold, PP bubble/microbatch sweeps); (4) cross-rank graph
 capture with collectives; (5) PP real P2P transport swap; (6) vit/mamba twins
 (1-GPU follow-up, not 8×-bound).
+
+---
+
+# Phase-2 REVIEW pass — CPU-only agent, 2026-06-16 (Opus 4.8 1M)
+
+**Mission:** independent rigorous static review of the dormant Phase-2 shard
+math + advance any CPU-authorable gaps. GPU device owned by another agent (#11,
+actively timing the d=2048 decoder bench during this pass) — NOTHING was run on
+the GPU, no nvcc contended with #11's builds. Full per-finding log:
+`.phase2/PHASE2_REVIEW_FINDINGS.md`.
+
+## What I reviewed (line-by-line, against the design's shard-math invariants)
+All 13 dormant files: `parallel_config.cuh`, `sharded_optimizer_kernel.cuh`,
+`tp_transport.cuh`, `tp_layer.cuh`, `sharded_optimizer_binding.cu`,
+`pp_stage_decoder_tc.cuh`, `parallel/{shard_map,zero3,distributed_step,pipeline}.py`,
+and the GPU tests `test_sharded_optimizer.py`, `test_dp2_loopback_determinism.py`,
+`tp_loopback_binding.cu` (+ cross-read of test_tp_loopback / test_pp2 / test_zero3
+/ test_distributed_step). Audited against ABI §0.2, taxonomy §0.4, decomposition
+§2.1-2.7, partition §3.4, TP geometry §5.1-5.2, cross-rank A/A/A §6.4.
+
+## VERDICT: the multi-GPU shard MATH is CORRECT; scaffolding is COMPLETE
+The prior Lane-C pass (commits 26517ac + ef433ac + ab8c313) authored a more
+complete surface than this review's brief anticipated. After the audit:
+- **ZeRO-3 partition/gather/reduce-scatter offsets & shard ranges: correct.**
+  `even_partition` is byte-for-byte identical to `distributed.py::_even_partition`
+  (verified). FlatShardPlan prefix-sum flat offsets, `owned()` shard coords,
+  and the padded `all_gather_into_tensor` stitch convention all match
+  distributed.py. No off-by-one.
+- **parallel_config DP×TP×PP arithmetic: correct** (derived gates;
+  SingleGPU=<1,1,1,1,Z0> byte-identity contract; SP==1 static_assert).
+- **TP all-reduce/all-gather seams: correct.** Fixed-order ascending-pe fp32
+  reduce with `#pragma unroll 1` (the §5.2 A/A/A non-negotiable). Symmetric-heap
+  addressing identical loopback↔NVSHMEM. Megatron col/row/ColQKV geometry +
+  head-aligned QKV 3-block shard + dW exact-slice all match §5.1.
+- **PP: correct.** `PPStageSpec::owns_tensor` (kernel) is **VERIFIED bit-for-bit
+  equal** to `pipeline.py::stage_tensor_ownership` (the cross-check the GPU test
+  asserts). 1F1B warmup/steady/cooldown + the inflight-liveness bound are correct.
+- **dtype/alignment/sync/rank↔offset: correct** (fp32 blobs, int64 indexing,
+  B%16 wgmma alignment, fp32 dh PP carrier, cuda.synchronize fences collectives).
+- **CPU gates re-run GREEN this box:** `tests/test_pipeline_schedule.py` +
+  `tests/test_zero3_plan.py` → **55 passed** (matches the prior run; CPU-only,
+  no GPU touched). py_compile clean on all parallel modules.
+
+## Bugs found + fixed (file:line + severity)
+- **F6a [MINOR, doc-only] — `csrc/fused/sm_90/tp_layer.cuh:56-70`** (the §5.2
+  TP-insertion map for the 8× builder): the cited production-header line numbers
+  had drifted stale (the decoder header grew 1100→1946 lines via the kernel
+  track's split-K/GEMM-interleave edits), so they pointed *inside a GEMM helper*
+  instead of the call sites. **FIXED** (commit `2ff75a5`): refreshed to the
+  current lines (① out_proj ~1085, ② ff2 ~1116, ①' in_proj dX ~1421, ②' ff0 dX
+  ~1392) and re-anchored them to the **stable call-site comment text** so future
+  drift self-corrects. Comment-only: `git diff` shows **0 non-comment lines
+  changed** — no math, no production-TU edit. This is builder guidance, not a
+  correctness bug in any code path.
+- **No other bugs.** No off-by-ones, dtype, sync, or rank-mapping errors in any
+  shard-math path. Honest outcome per the brief: the scaffolding was already
+  complete & correct, so there was no CPU-authorable functional gap to fill and
+  no busywork was invented. The brief's "write DP=2 loopback test / complete
+  test_sharded_optimizer.py" items were already satisfied by committed prior
+  work (verified correct, not stubs).
+
+## PENDING-GPU-VERIFICATION (for the 1×H100 bring-up phase, when #11 frees the device)
+Run in the RUNBOOK's order (all CUDA-skip-guarded; none can run on this CPU box).
+Each first invocation pays a one-time JIT build (~2-4 min):
+1. `tests/hw/test_sharded_optimizer.py` — DELIVERABLE-1 DP=1 sharded-opt ==
+   in-kernel-P3 bit-parity, 9 cells {adamw,lion,grokfast}×{decoder,vit,mamba}.
+   Build `sharded_optimizer_binding` (own JIT dir, NOT `_ops`). Expect maxd=0.
+2. `tests/hw/test_dp2_loopback_determinism.py` — DP=2 loopback (NCCL_HOSTID trick,
+   both ranks cuda:0): (a) cross-rank param identity, (b) A/A/A ×3 bitwise,
+   (c) vs-unsharded within 3e-5. The cross-rank fixed-order-reduce gate (§6.4).
+3. `tests/hw/test_tp_loopback.py` — TP∈{2,4} loopback: cross-rank identity,
+   A/A/A, transport-neutrality bit-exact, dW slice-exactness bit-exact, vs-unsharded
+   < 3e-5. (Builds `tp_loopback_binding`.)
+4. `tests/hw/test_pp2_loopback_determinism.py` — **first** `git apply
+   .phase2/patches/0001-dectc-layer-range-pp.patch`, then PP=2 stage composition
+   == single fused step bitwise + the kernel↔python ownership cross-check.
+   (SKIPS loudly without the patch.)
+5. `tests/hw/test_zero3_roundtrip.py` — virtual world=2 ZeRO-3 gather/release +
+   checkpoint save-resume bit-exact + loud-guard raises.
+6. `tests/hw/test_distributed_step.py` — §6.2 world=1 forced-decompose identity +
+   world=2 torchrun loopback through the module.
+7. Regression echo: `wiring_check.py --require-all` (33/33 L3-TC — phase-2 files
+   do not touch `_ops`, so any regression is NOT from this lane).
+
+## Genuinely-needs-8× / FOLLOW-UP (unchanged from the Lane-C residual above)
+NVSHMEM-TP validation + §5.4 go/no-go; TP insertion into the production kernel
+body (the 4 points whose CURRENT lines F6a now records correctly); real 1→8
+scaling + ZeRO-3 OOM threshold + PP bubble sweeps; cross-rank graph capture;
+PP real P2P swap; vit/mamba PP/TP twins (1-GPU follow-up).
