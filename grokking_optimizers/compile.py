@@ -5842,8 +5842,12 @@ def _multi_fidelity_prune_decision(
     if hasattr(measured_ms, "__len__") and len(measured_ms) < 8:
         return False, None
     try:
-        finite = [float(m) for m in measured_ms
-                  if isinstance(m, (int, float)) and math.isfinite(float(m))]
+        # ``float(m)`` was computed twice per element (once in the
+        # ``isfinite`` guard, once for the kept value); the walrus binds it
+        # once. Identical values, identical filtering ⇒ bit-identical list.
+        finite = [fm for m in measured_ms
+                  if isinstance(m, (int, float))
+                  and math.isfinite(fm := float(m))]
     except TypeError:
         return False, None
     # Need a non-trivial empirical distribution before a quantile means
@@ -6881,6 +6885,104 @@ def _read_trial_log_records(sidecar_path: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _trial_eligible_ms(trial: Dict[str, Any]) -> Optional[float]:
+    """Eligible timing of one trial for the ``best_timing_ms`` summary.
+
+    Mirrors EXACTLY the per-trial predicate in ``_read_trial_log_summary``
+    (status in (None, "ok"); ms = value_ms or timing_ms; float-coercible),
+    so the incremental and full-scan summaries are bit-identical. Returns
+    ``None`` when the trial does not contribute a timing.
+    """
+    if trial.get("status") not in (None, "ok"):
+        return None
+    ms = trial.get("value_ms") or trial.get("timing_ms")
+    if ms is None:
+        return None
+    try:
+        return float(ms)
+    except (TypeError, ValueError):
+        return None
+
+
+# Per-process, per-sidecar accumulator: {resolved_path -> (byte_size,
+# n_trials, best_ms)} captured at the last summary computation. Lets
+# ``record_trial`` roll the summary forward in O(1) instead of re-scanning
+# the whole (monotonically-appended) .jsonl on every trial — collapsing the
+# old O(n^2) sidecar I/O to O(n). Falls back to a full re-scan whenever the
+# observed file size doesn't match "previous size + just-appended bytes"
+# (first touch, restart, or any external/concurrent write), so the result is
+# provably identical to a full ``_read_trial_log_summary`` in every case.
+_SIDECAR_SUMMARY_ACCUM: Dict[str, Tuple[int, int, Optional[float]]] = {}
+
+
+def _roll_trial_log_summary(sidecar_path: Path,
+                            new_trial: Dict[str, Any],
+                            appended_bytes: int,
+                            stop_reason: Optional[str] = None
+                            ) -> Dict[str, Any]:
+    """Roll ``trial_log_summary`` forward by one appended trial in O(1).
+
+    Bit-identical to ``_read_trial_log_summary`` (the full re-scan): on the
+    common monotonic-append path it adds ``new_trial`` to a cached
+    ``(n_trials, best_ms)`` accumulator; on ANY size mismatch it falls back
+    to a full re-scan and reseeds. ``appended_bytes`` is the byte length the
+    new trial added to the file (the JSON line + newline).
+    """
+    key = str(sidecar_path)
+    try:
+        cur_size = Path(sidecar_path).stat().st_size
+    except OSError:
+        cur_size = -1
+    prev = _SIDECAR_SUMMARY_ACCUM.get(key)
+    # Fast path: the file grew by exactly our appended bytes since the last
+    # summary, so the only new content is ``new_trial`` — update in O(1).
+    if (prev is not None and cur_size >= 0 and appended_bytes >= 0
+            and prev[0] + appended_bytes == cur_size):
+        n_trials = prev[1] + 1
+        best = prev[2]
+        ems = _trial_eligible_ms(new_trial)
+        if ems is not None:
+            best = ems if best is None else min(best, ems)
+    else:
+        # Cold/changed: full re-scan (identical to the legacy behaviour).
+        n_trials = 0
+        best: Optional[float] = None
+        try:
+            with Path(sidecar_path).open("r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        trial = json.loads(ln)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(trial, dict):
+                        continue
+                    n_trials += 1
+                    ems = _trial_eligible_ms(trial)
+                    if ems is not None:
+                        best = ems if best is None else min(best, ems)
+        except OSError:
+            # Match _read_trial_log_summary: unreadable ⇒ empty summary,
+            # and don't poison the accumulator.
+            _SIDECAR_SUMMARY_ACCUM.pop(key, None)
+            return {
+                "n_trials":          0,
+                "best_timing_ms":    None,
+                "stop_reason":       stop_reason,
+                "last_updated_unix": time.time(),
+            }
+    if cur_size >= 0:
+        _SIDECAR_SUMMARY_ACCUM[key] = (cur_size, n_trials, best)
+    return {
+        "n_trials":          n_trials,
+        "best_timing_ms":    best,
+        "stop_reason":       stop_reason,
+        "last_updated_unix": time.time(),
+    }
+
+
 class _DebugTee:
     """File-like wrapper that mirrors every write to a secondary stream.
 
@@ -7460,8 +7562,10 @@ class CompileCache:
                 sidecar = cache_dir / sidecar_name
                 try:
                     cache_dir.mkdir(parents=True, exist_ok=True)
+                    line = json.dumps(trial, default=str) + "\n"
+                    appended_bytes = len(line.encode("utf-8"))
                     with sidecar.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(trial, default=str) + "\n")
+                        f.write(line)
                         f.flush()
                         try:
                             os.fsync(f.fileno())
@@ -7475,12 +7579,15 @@ class CompileCache:
                     # against self.path.parent).
                     if not e.get("trial_log_path"):
                         e["trial_log_path"] = sidecar_name
-                    # Roll the summary forward — recomputing from the
-                    # sidecar is robust to mid-process restarts.
+                    # Roll the summary forward in O(1) (was a full sidecar
+                    # re-scan every trial ⇒ O(n^2) over a sweep). Bit-identical
+                    # to the full scan: falls back to a re-scan on any file-size
+                    # mismatch, so it stays robust to mid-process restarts.
                     stop_reason = (
                         e.get("early_stop_info") or {}).get("stop_reason")
-                    e["trial_log_summary"] = _read_trial_log_summary(
-                        sidecar, stop_reason=stop_reason)
+                    e["trial_log_summary"] = _roll_trial_log_summary(
+                        sidecar, trial, appended_bytes,
+                        stop_reason=stop_reason)
                 except OSError as exc:
                     sys.stderr.write(
                         f"[cache] WARN trial sidecar write failed: "
