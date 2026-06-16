@@ -54,15 +54,23 @@
 //  test asserts this slice-exactness bitwise.
 //
 //  WHERE THE REDUCES SIT IN THE FUSED STEP (the §5.2 insertion map for the
-//  megakernel builder; the two marked points in dectc_forward_tile):
-//    ① model_stage_decoder_tc.cuh:766-768  — after `a = X_ctx @ out_w^T` (the
-//      out_proj GEMM writes sc.work): publish the [nrows,d] partial to the TP
-//      slot, rendezvous, fixed-order-reduce into sc.work, rendezvous; THEN the
-//      r1 residual+bias fold proceeds unchanged on the reduced value.
-//    ② model_stage_decoder_tc.cuh:797-799  — after `ff2 = X_gact @ ff2_w^T`:
+//  megakernel builder; the two marked points in dectc_forward_tile).
+//  NB: line numbers below are ANCHORED TO THE CALL-SITE COMMENT TEXT (stable),
+//  not absolute lines — the production header grows as the kernel track edits
+//  it (was ~1100 lines at the Lane-C authoring, 1946 as of 2026-06-16). Grep the
+//  quoted comment if a number has drifted. Lines verified current 2026-06-16:
+//    ① model_stage_decoder_tc.cuh ~1085-1087 — the `a = X_ctx @ out_w^T (+ out_b)`
+//      out_proj GEMM into sc.work (the `// a = X_ctx @ out_w^T` comment), residual
+//      fold at ~1093: publish the [nrows,d] partial to the TP slot, rendezvous,
+//      fixed-order-reduce into sc.work, rendezvous; THEN the r1 residual+bias fold
+//      proceeds unchanged on the reduced value.
+//    ② model_stage_decoder_tc.cuh ~1116-1118 — the `ff2 = X_gact @ ff2_w^T (+ ff2_b)`
+//      GEMM into sc.work (the `// ff2 = X_gact @ ff2_w^T` comment), r2 fold at ~1124:
 //      same publish/reduce on the [nrows,d] partial before the r2 fold.
-//    ①' / ②' mirror in dectc_backward_tile at :1104 (in_proj dX) and :1075
-//      (ff0 dX). NOTE the rendezvous is GRID-WIDE: with TP inside the
+//    ①' / ②' mirror in dectc_backward_tile: ①' at ~1421-1423 (the in_proj dX
+//      `dx_in_attn = dqkv @ in_w` GEMM, residual fold `sc.dh += sc.work` at ~1427)
+//      and ②' at ~1392-1395 (the ff0 dX `dx1 += dff0 @ ff0_w` GEMM).
+//      NOTE the rendezvous is GRID-WIDE: with TP inside the
 //      persistent kernel every CTA participates (the GridBarrier IS the
 //      rendezvous fabric, design §5.2) — i.e. P1's "barrier-free within a
 //      tile" relaxes to "barrier at the 4 reduce points" on the TP>1 path
