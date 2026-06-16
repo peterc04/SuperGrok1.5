@@ -247,7 +247,7 @@ Gate per candidate: self-test stays **236/6** (CPU-only) AND, for build-cost can
 build that imports + dlopens + a spot gate passes + a MEASURED build-time delta. Self-test held
 236/6 (identical drift-guard set) at every step of every round below.
 
-**BROAD round 1 — `compile-01-singlecell-source-scoping` (rank-1 flagship): KEEP** — commit `<r1>`.
+**BROAD round 1 — `compile-01-singlecell-source-scoping` (rank-1 flagship): KEEP** — commit `62a9128`.
 The incremental-variant-build feature (`--incremental-variant-build`, the documented build-throughput
 lever) was **completely non-functional** — every incremental attempt fell back to a full build — for
 TWO latent bugs that single-cell scoping uncovered, plus it didn't scope across models at all. Fixed
@@ -282,6 +282,50 @@ all three in `_plan_incremental_build` + two new mtime-memoized helpers:
     fallback-to-full-build path is intact (coverage/correctness never at risk; verified it correctly
     falls back on a stale/mismatched AOT dir during diagnosis). Flag is opt-in (off by default), so
     the shipped `_ops`/`setup.py` build is byte-unchanged.
+
+**BROAD round 2 — `compile-10-host-side-hoisting-caching` (rank-9): KEEP** — commit `9a0645c`.
+`_resolve_sources` (called per-variant inside the incremental-build planner) ran
+`_owns_extension_module_tu` over every fused-cell `.cu` in `csrc/fused/<arch>/`, and that helper
+`read_text()`'d each of ~30 files on every call. mtime-keyed memoization (`_OWNS_EXT_MODULE_CACHE`,
+mirroring `_INCLUDE_WALK_CACHE`) cut `_resolve_sources` from **~29.3 ms → ~2.6 ms (~11×)**, result
+verified byte-identical across decoder/vit/mamba specs. Directly synergizes with the compile-01
+planner path. (The candidate's other legs — caching `sorted(fused_dir.iterdir())` and batching report
+writes — were left: the `_owns_extension_module_tu` `read_text` WAS the ~16 ms bottleneck; the residual
+iterdir/glob is ~2.6 ms and caching the file LIST adds more correctness surface for a smaller gain.)
+Self-test 236/6 held.
+
+**BROAD round 3 onward — remaining 7 candidates: 2 DEFER + 5 neutral/SKIP → STOP (criterion b).**
+Verdicts (each assessed against the owner gate — measurable positive AND unattended-safe AND
+correctness-preserving; "no measurable improvement COUNTS as not-positive"):
+
+| candidate | verdict | reason |
+|---|---|---|
+| `compile-06` build-pool variant compilation | **DEFER** | The candidate's OWN TODO (compile.py ~14383) forbids half-wiring: ninja-dir isolation + cache-write races + the TimingWorker handshake must be solved together. A naive pool also races on the SHARED `spec._incremental_plan` (set/cleared per-build) — which the just-landed compile-01 relies on — and K parallel CUTLASS builds risk the documented cc1plus/cicc OOM under MAX_JOBS fan-out. Cannot be implemented cleanly AND fully validated unattended overnight; per the SAFETY RAILS, NOT touched (never half-wired). **not-positive #1.** |
+| `compile-04` cost-model feature expansion | **neutral** | Positive = 15-25% lower cost-model MAE, which needs a corpus of hundreds of (config, measured_ms) trials to measure. Available historical sidecars hold **1-3 trials**; generating hundreds on the single GPU (~3-7 min/variant) is infeasible overnight. Adding features is unmeasurable here AND risks the `FEATURE_DIM` self-test invariant. **not-positive #2.** |
+| `compile-05` prefilter rule ordering | **neutral** | Measured: the prefilter runs at **2.29 µs/config**; a 100k-config Cartesian is **~229 ms total = 0.14% of ONE ~160 s variant build**. A 5-10% reorder win saves ~11-23 ms across an hours-long, build-dominated sweep — **sub-noise**. The byte-identical-survivor gate is satisfiable (AND is commutative; reorder only the in-memory eval list, never the YAML — `hash_space` serializes rule order so reordering it would bust AOT keys), but the positive is not measurable. **not-positive #3 → STOP.** |
+| `compile-07` cache-key collision avoidance | **SKIP** | False premise: variant artifacts live under `variant_artifacts[config_key]` gated by `build_sig` (which folds every `SG_TUNED_*` macro, l.15099); the AOT artifact is the SEPARATE `primary_artifact` key. The two namespaces are disjoint and the `build_sig` check is macro-complete, so a tuned-macro `.so` CANNOT alias the no-macro AOT `.so`. No bug, no perf change. |
+| `compile-02` nvcc device-pass caching | **DEFER** | The gate it requires — "device `.o` binary equivalence under full rebuild" — cannot be proven: ptxas output is not guaranteed bit-reproducible across the flag/version matrix (the candidate's own soundness caveat). An unsound device cache silently links a wrong `.o` → a correctness hazard unacceptable unattended. sccache already wraps the host pass, so the marginal target is only the (non-reproducible) device pass. |
+| `compile-03` TPE prior biasing | **neutral** | Positive = faster TPE convergence (time-to-top-K), measurable only over long Bayesian sweeps (50-100+ trials). Infeasible to measure overnight on one GPU; the cost-model leg also needs `enable_cost_model` + a warm model (cold-start floor disables pruning until N measured trials). Unmeasurable positive. |
+| `compile-08` sidecar feature-cache batching | **neutral** | Positive = 20-40% faster cost-model retrain on a LONG trial history (feature recompute is ~30% of train time). With 1-3 historical trials there is nothing to amortize; synergistic only with compile-04 (also unmeasurable here). Unmeasurable positive. |
+
+### Loop termination — compile.py BROAD track
+
+**STOP REASON: criterion (b) — 3 consecutive not-positive** (`compile-06` DEFER → `compile-04` neutral
+→ `compile-05` neutral), AND criterion (a) holds for the remainder: no further compile.py candidate has a
+**measurable, landable, unattended-safe** positive in this environment. A re-discovery pass over the
+per-variant host path found the remaining costs already optimized — `_hash_sources` (99 ms) is hoisted
+once-per-sweep (`_base_sources_hash`, narrow-loop KEEP), `resolve_macros` is ~17 µs, and the dominant
+`_owns_extension_module_tu` read was just fixed (compile-10). The two genuinely-new broad wins this
+campaign were latent BUGS uncovered while landing compile-01 (the `.cuda.o` object-suffix the incremental
+planner never matched, and the reused-`bindings.o` `PyInit_` mismatch) — both fixed, turning a
+completely-non-functional incremental-variant-build feature into a working 2.55× build-throughput lever.
+
+**BROAD compile.py cumulative: 2 KEEP (compile-01 `62a9128`, compile-10 `9a0645c`), 2 DEFER
+(compile-06, compile-02), 5 neutral/SKIP (compile-04/05/07/03/08), 0 REVERT.** Self-test held at
+**236 passed / 6 failed** (identical pre-existing #10-aftermath drift-guard set) at every step;
+compile.py stayed AST-parseable + importable after every edit. The two KEPT edits are gated behind the
+opt-in `--incremental-variant-build` flag and host-side memoization respectively — the shipped
+`setup.py`/`_ops` build is byte-unchanged.
 
 ---
 
