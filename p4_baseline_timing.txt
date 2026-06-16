@@ -1,0 +1,13 @@
+BASELINE mamba (current binary = baseline mamba; 0003 touched only vit) — 01:00:09Z
+TIMING {"model": "mamba", "opt": "adamw", "seed": 42, "median_ms": 24.7908837890625, "min_ms": 24.7404345703125, "walls_ms": [24.7404, 24.7909, 24.8733, 24.8216, 24.748]}
+TIMING {"model": "mamba", "opt": "lion", "seed": 42, "median_ms": 25.048720703125, "min_ms": 25.0069287109375, "walls_ms": [25.0246, 25.0069, 25.0487, 25.0695, 25.0757]}
+TIMING {"model": "mamba", "opt": "grokfast", "seed": 42, "median_ms": 25.04621826171875, "min_ms": 24.92742919921875, "walls_ms": [25.0483, 24.9472, 25.0462, 25.0521, 24.9274]}
+TIMING {"model": "mamba", "opt": "looksam", "seed": 42, "median_ms": 51.319326171875, "min_ms": 51.219384765625, "walls_ms": [51.2194, 51.3599, 51.4288, 51.3193, 51.2829]}
+TIMING {"model": "mamba", "opt": "adamw", "seed": 7, "median_ms": 24.85587646484375, "min_ms": 24.84267822265625, "walls_ms": [24.8559, 24.9544, 24.9086, 24.8427, 24.8461]}
+TIMING {"model": "mamba", "opt": "lion", "seed": 7, "median_ms": 24.977783203125, "min_ms": 24.941884765625, "walls_ms": [25.0092, 24.9778, 24.976, 24.9419, 24.9853]}
+TIMING {"model": "mamba", "opt": "grokfast", "seed": 7, "median_ms": 25.00861572265625, "min_ms": 25.00409423828125, "walls_ms": [25.0196, 25.0089, 25.0086, 25.0054, 25.0041]}
+TIMING {"model": "mamba", "opt": "looksam", "seed": 7, "median_ms": 51.1621142578125, "min_ms": 51.1088623046875, "walls_ms": [51.2374, 51.1361, 51.2029, 51.1621, 51.1089]}
+TIMING {"model": "mamba", "opt": "adamw", "seed": 123, "median_ms": 24.77732666015625, "min_ms": 24.7418603515625, "walls_ms": [24.7787, 24.7419, 24.7773, 24.811, 24.7699]}
+TIMING {"model": "mamba", "opt": "lion", "seed": 123, "median_ms": 24.93340087890625, "min_ms": 24.8941455078125, "walls_ms": [24.9086, 24.9748, 24.958, 24.9334, 24.8941]}
+TIMING {"model": "mamba", "opt": "grokfast", "seed": 123, "median_ms": 24.94725341796875, "min_ms": 24.85326171875, "walls_ms": [24.9548, 24.8533, 24.9176, 24.9473, 24.9708]}
+TIMING {"model": "mamba", "opt": "looksam", "seed": 123, "median_ms": 51.20900390625, "min_ms": 51.1743798828125, "walls_ms": [51.1744, 51.2613, 51.204, 51.209, 51.2628]}

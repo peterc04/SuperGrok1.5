@@ -648,7 +648,7 @@ __device__ __forceinline__ MbPartial mb_partial_bind(float* base) {
 // __noinline__ (mirrors mbtc_backward_tile): one shared out-of-line frame for the
 // 2nd-pass cells that call the forward twice, bounding the megakernel's register
 // footprint so the wgmma accumulator stays register-resident (A/A/A determinism).
-__device__ __noinline__ float mbtc_forward_tile(
+__device__ float mbtc_forward_tile(
         const MambaWeights& w, int g0, int nrows, const MbActs& acts,
         const MbTileScratch& sc, const int* __restrict__ tok_ids,
         const int* __restrict__ tgt_ids,
@@ -858,7 +858,7 @@ __device__ __noinline__ float mbtc_forward_tile(
 // in. The math is unchanged (same code, just not inlined). Warpgroup-uniform call:
 // the whole CTA enters/exits together, so the wgmma fence/commit/wait choreography
 // inside is well-formed across the call boundary.
-__device__ __noinline__ void mbtc_backward_tile(
+__device__ void mbtc_backward_tile(
         const MambaWeights& w, int g0, int nrows, int B, const MbActs& acts,
         const MbTileScratch& sc, const MbPartial& part,
         const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,
@@ -1115,6 +1115,36 @@ __device__ __noinline__ void mbtc_backward_tile(
         acts.dh0[(int64_t)g0 * mb::kD + idx] = __float2bfloat16(sc.work_d[idx]);
     __syncthreads();
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  SAM-cell-scoped OUT-OF-LINE tile shims (reg-pressure campaign C2). The
+//  unconditional __noinline__ on mbtc_forward_tile/mbtc_backward_tile (the
+//  original LookSAM accumulator-spill fix) taxed EVERY cell with the ABI
+//  out-of-line frame: the single-pass cells carried ~5.7-5.8 KB of callee
+//  spill traffic that the fully-inline allocation does not have (the original
+//  fix note itself records that the single-pass cells stayed under the spill
+//  threshold when inline). SCOPING the outline to the SAM-coupled cells
+//  (LookSAM/SG11/SG15/SG2 -- the ones that genuinely instantiate the tile body
+//  TWICE) keeps their one-shared-frame fix AND returns the single-pass cells
+//  to the cleaner inline allocation. Math identical; warpgroup-uniform call.
+// ════════════════════════════════════════════════════════════════════════
+__device__ __noinline__ float mbtc_forward_tile_outlined(
+        const MambaWeights& w, int g0, int nrows, const MbActs& acts,
+        const MbTileScratch& sc, const int* __restrict__ tok_ids,
+        const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+    return mbtc_forward_tile(w, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red);
+}
+__device__ __noinline__ void mbtc_backward_tile_outlined(
+        const MambaWeights& w, int g0, int nrows, int B, const MbActs& acts,
+        const MbTileScratch& sc, const MbPartial& part,
+        const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        float* dBmat_s, float* dCmat_s) {
+    mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok_ids, tgt_ids, sA, sB, red,
+                       dBmat_s, dCmat_s);
+}
+
 
 // ════════════════════════════════════════════════════════════════════════
 //  P2 — OUTPUT-STATIONARY dW (the 4 projections × kLayers = 8 weight matrices,

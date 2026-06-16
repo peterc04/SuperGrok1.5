@@ -529,6 +529,12 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
                           float lr, int step, FusedOptState st) {
     __shared__ MbTcSmem sm;
     GridBarrier bar = ctx.barrier();
+    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); ONLY they route
+    // through the out-of-line shims (one shared frame). Single-pass cells now
+    // use the inline bodies (the original noinline was unconditional and taxed
+    // them ~5.7 KB of callee spill; campaign C2 scopes it).
+    constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
+                                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
     const int cta = blockIdx.x;
     const int nCTA = (int)ctx.n_ctas;
     const int B = tok.B;
@@ -609,12 +615,21 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         const int g0 = ti * nrows_tile;
         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
         SG_MBTC_PROF_TIC(_pt);
-        float nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                            sm.sA, sm.sB, sm.red);
+        float nll;
+        if constexpr (kSamCoupled)
+            nll = mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
+                                                   tok.targets, sm.sA, sm.sB, sm.red);
+        else
+            nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+                                          sm.sA, sm.sB, sm.red);
         SG_MBTC_PROF_ACC(0, _pt);
         SG_MBTC_PROF_TIC(_pt);
-        mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
-                                 sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+        if constexpr (kSamCoupled)
+            mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
+                                              tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+        else
+            mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
+                                     sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
         SG_MBTC_PROF_ACC(1, _pt);
         if (threadIdx.x == 0) nll_acc += nll;
         __syncthreads();
@@ -775,10 +790,10 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
             for (int ti = cta; ti < n_tiles; ti += nCTA) {
                 const int g0 = ti * nrows_tile;
                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
-                mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                        sm.sA, sm.sB, sm.red);
-                mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
-                                         sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+                mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
+                                                 tok.targets, sm.sA, sm.sB, sm.red);
+                mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
+                                                  tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
                 __syncthreads();
             }
             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY + dh0) + partials complete

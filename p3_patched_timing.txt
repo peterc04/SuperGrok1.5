@@ -1,0 +1,10 @@
+PATCHED (0003 applied) vit SAM cells — 00:55:00Z
+TIMING {"model": "vit", "opt": "looksam", "seed": 42, "median_ms": 121.63119140625, "min_ms": 121.48884765625, "walls_ms": [121.4888, 121.696, 121.5678, 121.7259, 121.6312]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 42, "median_ms": 122.144111328125, "min_ms": 122.09017578125, "walls_ms": [122.1644, 122.0902, 122.3212, 122.1154, 122.1441]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 42, "median_ms": 122.1621875, "min_ms": 122.084697265625, "walls_ms": [122.225, 122.2492, 122.0847, 122.1166, 122.1622]}
+TIMING {"model": "vit", "opt": "looksam", "seed": 7, "median_ms": 121.8380078125, "min_ms": 121.683212890625, "walls_ms": [121.6832, 121.857, 121.838, 121.7234, 121.846]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 7, "median_ms": 122.1216796875, "min_ms": 122.088310546875, "walls_ms": [122.0883, 122.2742, 122.1217, 122.1561, 122.0989]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 7, "median_ms": 122.1237890625, "min_ms": 121.9744140625, "walls_ms": [121.9744, 122.0376, 122.213, 122.1238, 122.2341]}
+TIMING {"model": "vit", "opt": "looksam", "seed": 123, "median_ms": 121.598505859375, "min_ms": 121.4701953125, "walls_ms": [121.6599, 121.5883, 121.6173, 121.4702, 121.5985]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 123, "median_ms": 122.000322265625, "min_ms": 121.9393359375, "walls_ms": [121.9393, 121.9923, 122.0059, 122.1103, 122.0003]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 123, "median_ms": 122.05365234375, "min_ms": 121.781416015625, "walls_ms": [122.1328, 121.7814, 122.0151, 122.0537, 122.1211]}

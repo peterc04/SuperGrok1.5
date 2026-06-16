@@ -1,0 +1,13 @@
+BASELINE (ce5ab33 = #10 + 0002) vit SAM-coupled cells — 00:42:44Z
+TIMING {"model": "vit", "opt": "looksam", "seed": 42, "median_ms": 115.58896484375, "min_ms": 115.50693359375, "walls_ms": [115.7303, 115.5165, 115.589, 115.868, 115.5069]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 42, "median_ms": 116.196962890625, "min_ms": 115.947001953125, "walls_ms": [116.2848, 115.947, 116.197, 116.2004, 115.9703]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 42, "median_ms": 115.930517578125, "min_ms": 115.78068359375, "walls_ms": [115.7807, 116.0815, 115.9305, 115.805, 116.2434]}
+TIMING_ERROR supergrok2/vit seed=42: TypeError: 'NoneType' object is not callable
+TIMING {"model": "vit", "opt": "looksam", "seed": 7, "median_ms": 115.622421875, "min_ms": 115.44564453125, "walls_ms": [115.5463, 115.6485, 115.4456, 115.6224, 115.7427]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 7, "median_ms": 115.98619140625, "min_ms": 115.91708984375, "walls_ms": [116.1972, 115.9862, 116.2289, 115.9743, 115.9171]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 7, "median_ms": 116.274267578125, "min_ms": 116.048505859375, "walls_ms": [116.4796, 116.0485, 116.1842, 116.2743, 116.3601]}
+TIMING_ERROR supergrok2/vit seed=7: TypeError: 'NoneType' object is not callable
+TIMING {"model": "vit", "opt": "looksam", "seed": 123, "median_ms": 115.9466796875, "min_ms": 115.90880859375, "walls_ms": [115.9088, 116.0145, 116.4714, 115.9203, 115.9467]}
+TIMING {"model": "vit", "opt": "supergrok11", "seed": 123, "median_ms": 116.379619140625, "min_ms": 116.18255859375, "walls_ms": [116.3796, 116.4008, 116.4117, 116.21, 116.1826]}
+TIMING {"model": "vit", "opt": "supergrok15", "seed": 123, "median_ms": 116.371162109375, "min_ms": 116.009130859375, "walls_ms": [116.2851, 116.0091, 116.5769, 116.466, 116.3712]}
+TIMING_ERROR supergrok2/vit seed=123: TypeError: 'NoneType' object is not callable
