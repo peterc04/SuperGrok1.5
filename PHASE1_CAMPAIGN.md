@@ -396,8 +396,54 @@ decoder 515.4 ms, vit 5759 ms, mamba 221.6 ms (all d/B above, seeds {42,7,123}).
 | # | candidate (track) | lever | bench result (3-seed median) | verdict |
 |---|---|---|---|---|
 | 1 | PERF-004 decoder DW split-K (model, rank-1 flagship) | `SG_TUNED_DEC_DW_SPLITK` 4→8 | **529.0 ms vs 515.4 (+2.6%, slower on all 3 seeds)** | **SKIP** (not-positive #1). The "fill idle SMs" hypothesis loses at d=2048/B=4096: at this width the dW tiles already fill the grid, so 2× split-K just doubles the partial-reduce + workspace traffic. Workspace headroom was fine (+1.6 GB). Bench-first avoided a wasted production build+gate. |
-| 1b | (data-driven counter-probe to #1) | `SG_TUNED_DEC_DW_SPLITK` 4→**2** | **502.6 ms vs 515.4 (−2.5%, all 3 seeds)** | **WIN-candidate.** Since G=8 was slower, probed FEWER split-K — G=2 beats the G=4 default (the default over-splits at this width). A real win the list didn't propose. Combine-tested with PERF-005. |
-| 2 | PERF-005 decoder M-atom interleave (model, rank-2) | `SG_TUNED_DEC_GEMM_INTERLEAVE` 2→4 | **467.7 ms vs 515.4 (−9.3%, all 3 seeds), 21.2 TF/s** | **WIN-candidate.** No catastrophic register spill (built clean + faster). Full IL=4 (all orientations) is bit-faithful per kernel comment (ascending-k per atom). The biggest decoder lever found. |
+| 1b | decoder DW split-K 4→2 (data-driven; the surviving win) | `SG_TUNED_DEC_DW_SPLITK` 4→**2** | **502.6 ms vs 515.4 (−2.5%, all 3 seeds)** | **KEEP** (commit 36bc1e5). Probed FEWER split-K after G=8 lost — G=2 beats the G=4 default (over-split at this width). Production build green; A/A/A spot-gate (10 decoder + adamw/vit/mamba) = **14/14 pass** (the deterministic ascending-chunk reduce IS order-stable for any G, unlike IL=4); full-33 @ seed42 confirming. The first KEPT kernel win this cycle. |
+| 2 | PERF-005 decoder M-atom interleave (model, rank-2) | `SG_TUNED_DEC_GEMM_INTERLEAVE` 2→4 | bench −9.3% (467.7 ms, 21.2 TF/s) BUT **A/A/A determinism FAIL** | **REJECT** (not-positive #2). Fastest bench lever found, but the production gate REJECTED it: gate (1) fp64 parity passed yet gate (2) A/A/A determinism FAILED on all 10 decoder cells (grad/param not bit-equal run-to-run; loss identical). IL=4 makes the dW M-atom GROUPS 4-wide, and at the toy d=128 the RAGGED atom counts (qkv 6→4+2, ff 8→4+4) make the 4-wide dW group/reduce non-deterministic. (Ran fine at d=2048 where atoms divide evenly → bench missed it; the gate caught it. The candidate's note flagged full-IL=4 as risky vs the dW-only "BEHAVIOR-003" vehicle — the break is exactly in the dW orientation.) Reverted; IL stays 2. KEY LESSON: bench-first is necessary, NOT sufficient — every winner must clear the full A/A/A gate. |
+
+**RESUME-2 (2026-06-16, after 2nd socket death) — production-gate the 2 decoder wins.** On resume,
+the working tree held an UNCOMMITTED in-flight state from the dead prev agent: a CONCURRENT rogue
+`./build.sh` (a "BISECT build: split-K=2 ALONE, IL reverted to 2 — is split-K=2 determinism-safe?")
+was still running and had reverted IL 4→2 in the tree mid-build. Killed it + the torn `_ops`.
+**Why the prev agent was bisecting:** its mid-validation gate logs show grokadamw/decoder PASS at
+seed 42 (state m=8.8e-8, ema=0) + seed 123 (m=8.4e-8, ema=0) but **FAIL at seed 7** (state
+m=4.9e-2, **ema=7.3e-2** — clip ENGAGED; params OK 1.2e-5; A/A/A deterministic OK). Pattern: the
+grokadamw GLOBAL grad-norm clip is INERT at 42/123 (‖g‖₂<grad_clip ⇒ ema=0) but FIRES at seed 7,
+and the kernel-vs-fp64-reference STATE then diverges — a clip-firing-path REFERENCE mismatch, not a
+split-K/interleave numeric drift (those touch only the dW GEMM tiling → ~bf16 rounding, can't make
+a 0.05 state error; and adamw/decoder PASSES at seed 7). Investigating whether this seed-7 grokadamw
+FAIL is PRE-EXISTING on committed HEAD (DW_SPLITK=4/IL=2; `ce5ab33` claimed 33/33×{42,7,123}) →
+clean baseline build + seed-7 gate in progress.
+
+**RESUME-3 (2026-06-16) — IL=4 verdict + split-K=2 bisect.** Production-gated the 2 bench-winners
+(IL=4 + split-K=2 combined) at seed 42: gate (1) fp64 parity PASSED (rel 1.4e-7) but **gate (2)
+A/A/A determinism FAILED on all 10 decoder cells** (loss bit-identical across the 3 runs, but
+grad/param NOT bit-equal run-to-run). Diagnosis: `SG_TUNED_DEC_GEMM_INTERLEAVE=4` changes `kDecDwIL`
+→ the dW M-atom GROUPS become 4-wide; at the toy d=128 the decoder weights have RAGGED atom counts
+(qkv 6 atoms → a 4+2 split; ff 8 → 4+4) and the 4-wide dW group/reduce introduces a run-to-run
+non-deterministic accumulation → A/A/A breaks. (It ran FASTER + clean at d=2048 where atoms divide
+evenly, so the bench missed it — the gate caught it. The candidate's own note flagged full-IL=4 as
+risky vs the "BEHAVIOR-003 per-orientation dW-only" vehicle; the determinism break is exactly in the
+dW orientation.) **VERDICT: IL=4 (PERF-005) = REVERT (A/A/A-unsafe at d=128, the gate config) —
+not-positive #2.** `SG_TUNED_DEC_GEMM_INTERLEAVE` stays 2. Now bisecting **split-K=2 ALONE** (IL=2):
+the deterministic ascending-chunk reduce is order-stable for any G, so it SHOULD stay A/A/A-clean —
+production build + decoder A/A/A gate in progress. KEY LESSON: bench-first timing is necessary but
+NOT sufficient — a candidate can be faster at the d=2048 roofline yet break A/A/A determinism at the
+d=128 gate config (ragged-shape races). EVERY winner must clear the full gate, never bench alone.
+
+**RESUME-2 INFRA BLOCKER (root-caused + resolved) — orphaned detached build tasks.** The dead prev
+agent had launched a STAGGERED SERIES of `run_in_background` Bash tasks (the "sk-series":
+`build_sk2`→`sk2b`→`sk2c`→`sk2d`, retries with decreasing `MAX_JOBS` 16→8→2 to dodge a feared
+cc1plus OOM, plus a `sleep 2700` heartbeat and header-edit tasks). The harness keeps detached tasks
+alive across the parent's death, so they kept firing `./build.sh` ONE AT A TIME from the backlog —
+each racing the single `grokking_optimizers/_ops.so` and re-applying the bisect header (DW_SPLITK=2/
+IL=2) under my feet. This invalidated ~3 of my build+gate attempts (a sibling build raced the `.so`
+mid-compile). Memory was never the issue (1.58 TB / 188 GB cgroup; the prev "OOM" was a `free -g`
+GB-rounding misread). RESOLUTION: traced every build to its detached-task wrapper (PPID=1578 via
+shell-snapshot eval), killed the whole sk-series tree + drained the backlog to ZERO build-task
+wrappers + 0 compiler procs; confirmed NO cron/hook/loop/routine generator (finite manual retries,
+now exhausted). Verified clean: header reset to committed 4/2, GPU 0 MiB. KEY LESSON for the next
+agent: before ANY build, `ps -eo comm | grep -E '^(ninja|nvcc|cicc)$'` must be 0 AND no
+`build_sk*`/`timeout * ./build.sh` wrapper under the claude PID — else a sibling detached task is
+racing your `_ops` and every gate result is void.
 
 ---
 
