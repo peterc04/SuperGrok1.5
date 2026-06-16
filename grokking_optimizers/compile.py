@@ -6648,29 +6648,62 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
 # Persistent cache (in-memory dict, JSON on disk, atomic save) — v3 schema
 # ---------------------------------------------------------------------------
 
+# Process-invariant half of the host-identity record. All of these
+# (platform string, interpreter version, torch/cuda/hip/jax versions, ncpus)
+# are fixed for the life of the process; only ``recorded_at`` changes per call.
+# The probe is surprisingly expensive (~100 us/call — the ``import jax`` +
+# ``jax.__version__`` resolution dominates at ~60 us), and ``_current_host``
+# is called per-trial in ``_run_exhaustive`` / ``_pallas_autotune`` (and ~12
+# other sites), so we compute the invariant fields ONCE and merge a fresh
+# timestamp each call. The returned dict is byte-identical to the old
+# per-call probe (same version strings, fresh ``recorded_at``).
+_HOST_IDENTITY_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _host_identity() -> Dict[str, Any]:
+    global _HOST_IDENTITY_CACHE
+    if _HOST_IDENTITY_CACHE is None:
+        try:
+            import torch
+            torch_v = getattr(torch, "__version__", None)
+            cuda_v = getattr(torch.version, "cuda", None)
+            hip_v = getattr(torch.version, "hip", None)
+        except ImportError:
+            torch_v = cuda_v = hip_v = None
+        try:
+            import jax
+            jax_v = getattr(jax, "__version__", None)
+        except ImportError:
+            jax_v = None
+        _HOST_IDENTITY_CACHE = {
+            "platform": platform.platform(),
+            "python":   sys.version.split()[0],
+            "torch":    torch_v,
+            "cuda":     cuda_v,
+            "hip":      hip_v,
+            "jax":      jax_v,
+            "ncpus":    NCPUS,
+        }
+    return _HOST_IDENTITY_CACHE
+
+
 def _current_host() -> dict:
-    """Capture host identity for the cache provenance trail."""
-    try:
-        import torch
-        torch_v = getattr(torch, "__version__", None)
-        cuda_v = getattr(torch.version, "cuda", None)
-        hip_v = getattr(torch.version, "hip", None)
-    except ImportError:
-        torch_v = cuda_v = hip_v = None
-    try:
-        import jax
-        jax_v = getattr(jax, "__version__", None)
-    except ImportError:
-        jax_v = None
+    """Capture host identity for the cache provenance trail.
+
+    The invariant identity fields are memoized in ``_HOST_IDENTITY_CACHE``
+    (computed once per process); ``recorded_at`` is freshly stamped on each
+    call so the record's shape/values are byte-identical to the legacy probe.
+    """
+    ident = _host_identity()
     return {
         "recorded_at": datetime.datetime.now().isoformat(),
-        "platform":    platform.platform(),
-        "python":      sys.version.split()[0],
-        "torch":       torch_v,
-        "cuda":        cuda_v,
-        "hip":         hip_v,
-        "jax":         jax_v,
-        "ncpus":       NCPUS,
+        "platform":    ident["platform"],
+        "python":      ident["python"],
+        "torch":       ident["torch"],
+        "cuda":        ident["cuda"],
+        "hip":         ident["hip"],
+        "jax":         ident["jax"],
+        "ncpus":       ident["ncpus"],
     }
 
 
