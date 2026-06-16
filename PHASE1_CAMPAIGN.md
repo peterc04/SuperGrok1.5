@@ -386,7 +386,18 @@ bottleneck is structural (scale-invariant), so the candidate levers bite proport
 exactly the non-GEMM head-CE/LN/attn surface VIT_TC_001/002 target → large headroom). (b) Per-seed
 spread is <1% (tight, reproducible) — a real ≥1% delta is cleanly resolvable.
 
-**Ratchet ledger (model_track → optimizer_track → re-discover incl. mamba):** _filling as the loop runs…_
+**Ratchet ledger (model_track → optimizer_track → re-discover incl. mamba).** Method:
+*bench-first* — each candidate is first TIMED at d=2048 via a `-D` override variant (cheap, no
+production rebuild); only a candidate that is faster on all 3 seeds advances to the production
+`./build.sh` + fp64 gate (decoder/vit/mamba cells + spot) + full-33-gate-before-commit. A
+not-faster candidate is SKIPPED (counts toward the 3-consecutive-not-positive STOP). Baselines:
+decoder 515.4 ms, vit 5759 ms, mamba 221.6 ms (all d/B above, seeds {42,7,123}).
+
+| # | candidate (track) | lever | bench result (3-seed median) | verdict |
+|---|---|---|---|---|
+| 1 | PERF-004 decoder DW split-K (model, rank-1 flagship) | `SG_TUNED_DEC_DW_SPLITK` 4→8 | **529.0 ms vs 515.4 (+2.6%, slower on all 3 seeds)** | **SKIP** (not-positive #1). The "fill idle SMs" hypothesis loses at d=2048/B=4096: at this width the dW tiles already fill the grid, so 2× split-K just doubles the partial-reduce + workspace traffic. Workspace headroom was fine (+1.6 GB). Bench-first avoided a wasted production build+gate. |
+| 1b | (data-driven counter-probe to #1) | `SG_TUNED_DEC_DW_SPLITK` 4→**2** | **502.6 ms vs 515.4 (−2.5%, all 3 seeds)** | **WIN-candidate.** Since G=8 was slower, probed FEWER split-K — G=2 beats the G=4 default (the default over-splits at this width). A real win the list didn't propose. Combine-tested with PERF-005. |
+| 2 | PERF-005 decoder M-atom interleave (model, rank-2) | `SG_TUNED_DEC_GEMM_INTERLEAVE` 2→4 | **467.7 ms vs 515.4 (−9.3%, all 3 seeds), 21.2 TF/s** | **WIN-candidate.** No catastrophic register spill (built clean + faster). Full IL=4 (all orientations) is bit-faithful per kernel comment (ascending-k per atom). The biggest decoder lever found. |
 
 ---
 
