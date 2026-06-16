@@ -395,6 +395,23 @@ __host__ __device__ __forceinline__ int64_t vit_tc_acts_floats(int T, int B) {
 __host__ __device__ __forceinline__ int64_t vit_tc_dw_part_floats() {
     return vittc::vit_dw_part_floats(vittc::kVitDwSplitK);
 }
+// The d-scaled BENCH layout (SG_VIT_BENCH_LAYOUT=1) is adamw-ONLY (vit_bench.py /
+// scripts/roofline_bench.py drive OptId::AdamW exclusively — none of the four staged
+// optimizers ever runs in the bench TU), so carving them there is pure dead weight.
+// At bench width the SG2 region in particular is pathological: vit_sg2_ws_stride_floats()
+// is O(Nmax·d_model) PER CTA and Nmax=4d²·… grows with d ⇒ ~565 GB over 132 CTAs at
+// d=2048, OOMing the 80 GB H100 (the SAME deep limit the decoder twin documents at
+// dec_tc_sg2_floats — SG2's per-CTA workspace DESIGN doesn't scale; a chunked/streamed
+// restructure is the documented deep item, out of scope here). So we GATE the four
+// regions OFF at bench width: honest scoping (the bench never touches them), NOT
+// correctness suppression. PRODUCTION is byte-identical — kVitStagedOptScratch is true
+// there, so every gated helper folds back to its original value (constexpr bool, -O3
+// inline). This mirrors the decoder's kDecStagedOptScratch (fused_decoder_megakernel.cuh).
+#if SG_VIT_BENCH_LAYOUT
+constexpr bool kVitStagedOptScratch = false;   // bench: adamw-only → elide the 4 staged-opt carves
+#else
+constexpr bool kVitStagedOptScratch = true;    // production: carve all 4 (opt-agnostic launcher)
+#endif
 // STAGED-optimizer cross-CTA reduction scratch (Prodigy d-estimate). The Prodigy
 // stage publishes per-CTA (r,s) slots (2*nCTA) + a reduced-d slot (1) — an owner-
 // computes tree (opt_stages_precompute.cuh), NO float atomic. Sized for the LARGEST
@@ -402,6 +419,7 @@ __host__ __device__ __forceinline__ int64_t vit_tc_dw_part_floats() {
 // the opt-agnostic launcher allocates one workspace fitting every OptId. Unused by
 // AdamW/Lion/… (their P3 never touches it) → those cells stay byte-identical.
 __host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA) {
+    if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): Prodigy never runs
     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
 }
 // ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. The NS chain
@@ -416,6 +434,7 @@ __host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA) {
 static constexpr int kVitMuonMaxNumel = vit::kDff * vit::kD;     // 512*128 = 65536 (ff0/ff2)
 static constexpr int kVitMuonMaxRows  = vit::kDff;               // 512 (ff0 rows)
 __host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
+    if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): Muon never runs
     // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
     return (int64_t)4 * kVitMuonMaxNumel
          + (int64_t)kVitMuonMaxRows * kVitMuonMaxRows
@@ -434,6 +453,7 @@ __host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
 //    out → byte-identical). The ‖g‖ reduction reuses the loss workspace (sq_part/ron_bc,
 //    as GrokAdamW's P2.5 / the decoder twin do), so no extra here. ──
 __host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats() {
+    if (!kVitStagedOptScratch) return 0;      // bench (adamw-only): LookSAM never runs
     return (int64_t)2 * kVitTotalElems;       // [sam_backup | sam_grad]
 }
 // ── SuperGrok2 — the ViT twin of dec_tc_sg2_floats. Weights from HBM; the only SG2
@@ -449,6 +469,8 @@ __host__ __device__ __forceinline__ int64_t vit_sg2_ws_stride_floats() {
          + sg2_ws_stride<VitSG2Dims>((int64_t)kVitSG2Nmax);
 }
 __host__ __device__ __forceinline__ int64_t vit_tc_sg2_floats(int nCTA) {
+    if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): SG2 never runs — and
+        // its honestly-derived per-CTA stride (O(Nmax·d_model)) would OOM at large d.
     // +1 for the 8-byte realignment slack of sg2_ws_base (kVitTotalElems is odd).
     return (int64_t)nCTA * vit_sg2_ws_stride_floats() + 1;
 }

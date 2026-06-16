@@ -576,7 +576,7 @@ _DEC_DFF = 4 * _DEC_D
 # constants, byte-identical default). So the committed header carries both, the
 # production _ops always sees d=128, and the variant build flips ONE flag. The
 # proven end-to-end d (task #13 context: parity 2.4e-07, A/A/A) is 1024.
-_DEC_BENCH_D = 1024
+_DEC_BENCH_D = 2048
 
 
 def _decoder_param_sizes(d: int = _DEC_D) -> List[int]:
@@ -779,7 +779,7 @@ _VIT_DFF = 4 * _VIT_D
 # the compile flag SG_VIT_BENCH_LAYOUT (set ONLY by the bench TU / the _ops_bench
 # variant; UNSET → the production d=128 constants, byte-identical default). This
 # mirrors the decoder's SG_DEC_BENCH_LAYOUT dual-branch (commit 79d3840).
-_VIT_BENCH_D = 1024
+_VIT_BENCH_D = 2048
 
 
 def _vit_heads(d: int) -> int:

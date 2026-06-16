@@ -234,6 +234,28 @@ MODEL_SCALES = {
     "large":  {"dim_model": 512, "num_heads": 8, "num_layers": 6},   # ~20M params
 }
 
+# Canonical-published FLAGSHIP tier (owner-locked, PHASE1_CAMPAIGN.md §1). Unlike the
+# tiny tiers above, each trained model is registered at its OWN recognized published
+# size (different param counts is honest + normal — peer-review credibility), so this
+# entry is keyed BY model_type (the shared dim_model/num_heads/num_layers differ per
+# model). run_pipeline resolves the per-model sub-dict by base["model_type"] below.
+# The trained reference models use a 4*d MLP (DecoderBlock/EncoderBlock hardcode it),
+# matching the d-scaled kernel bench layouts (DFF=4*d); mamba uses an explicit SwiGLU
+# d_ff via mamba_mlp_ratio. These are the roofline/scaling config from the SAME
+# portable code; the grokking-science RACE stays at the toy d=128 tiers.
+#   decoder = GPT-2 XL  (d=1600, L=48, h=25)            ~1.5 B
+#   vit     = ViT-G/14  (d=1664, L=48, h=16, MLP=4*d)   ~1.8 B
+#   mamba   = Mamba-3   (d=2048, L=24, state=128, head_dim=64, d_ff=4096 [mlp_ratio=2])  ~1.5 B
+MODEL_SCALES_BY_MODEL = {
+    "flagship": {
+        "decoder": {"dim_model": 1600, "num_heads": 25, "num_layers": 48},
+        "vit":     {"dim_model": 1664, "num_heads": 16, "num_layers": 48},
+        "mamba":   {"dim_model": 2048, "num_heads": 32, "num_layers": 24,
+                    "mamba_state_dim": 128, "mamba_head_dim": 64,
+                    "mamba_expand": 2, "mamba_mlp_ratio": 2},
+    },
+}
+
 DEFAULT_CONFIG: Dict = {
     "p": 97, "operation": "x/y", "frac_train": 0.5, "val_ratio": 0.10,
     "num_layers": 2, "dim_model": 128, "num_heads": 4, "num_tokens": 99,
@@ -1806,6 +1828,15 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
     base["use_amp"]=use_amp
     if model_scale is not None and model_scale in MODEL_SCALES:
         base.update(MODEL_SCALES[model_scale])
+    elif model_scale is not None and model_scale in MODEL_SCALES_BY_MODEL:
+        # Per-model-type tier (e.g. "flagship"): each model has its OWN canonical
+        # published dims, so select the sub-dict by the resolved model_type.
+        _mt = base.get("model_type", "decoder")
+        _tier = MODEL_SCALES_BY_MODEL[model_scale]
+        if _mt not in _tier:
+            raise ValueError(f"model_scale={model_scale!r} has no config for "
+                             f"model_type={_mt!r} (have {sorted(_tier)})")
+        base.update(_tier[_mt])
     cl=base.get("chain_length",3); base["seq_len"]=2*cl+2
 
     # ── Device selection ──────────────────────────────────────────────

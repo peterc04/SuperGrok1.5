@@ -31,7 +31,7 @@
 // Two layouts coexist under the single include guard. SG_VIT_BENCH_LAYOUT is
 // UNSET on the production _ops build (→ the d=128 branch, byte-identical to
 // the historical header), and set to 1 ONLY by the d-scaled benchmark TU / the
-// _ops_bench variant extension (→ the d=1024 branch, HEADS=16
+// _ops_bench variant extension (→ the d=2048 branch, HEADS=32
 // via the d/64 head-dim rule). The branches are mutually exclusive at preprocess
 // time, so a TU compiles exactly one consistent (constants, __constant__ table,
 // static-assert) set; production never sees the bench numbers. Mirrors the
@@ -47,40 +47,40 @@
 namespace sg { namespace fused { namespace sm90 {
 
 #if SG_VIT_BENCH_LAYOUT
-// ── d-SCALED BENCH VARIANT (d=1024): the ViT-megakernel roofline build.
+// ── d-SCALED BENCH VARIANT (d=2048): the ViT-megakernel roofline build.
 //    NOT on the production path; selected ONLY by -DSG_VIT_BENCH_LAYOUT=1. ──
 constexpr int SG_VIT_VOCAB  = 97;          // p (head Linear(d, p))
-constexpr int SG_VIT_D      = 1024;
-constexpr int SG_VIT_HEADS  = 16;
+constexpr int SG_VIT_D      = 2048;
+constexpr int SG_VIT_HEADS  = 32;
 constexpr int SG_VIT_LAYERS = 2;
 constexpr int SG_VIT_PATCH  = 49;          // patch pixel count (7×7)
 constexpr int SG_VIT_NPATCH = 16;          // image patches
 constexpr int SG_VIT_SEQ    = SG_VIT_NPATCH + 1;  // 17 (CLS + 16 patches)
-constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // 4096
+constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // 8192
 
 constexpr int     kVitNumTensors = 32;
-constexpr int64_t kVitTotalElems = 25363553;
+constexpr int64_t kVitTotalElems = 101058657;
 
 // Per-tensor element offsets into the flat param blob, named_parameters() order.
 __device__ __constant__ int kVitOffsets[kVitNumTensors] = {
-    0, 1024, 51200, 52224, 69632, 3215360, 3218432, 4267008, 4268032, 4269056,
-    4270080, 4271104, 4272128, 8466432, 8470528, 12664832, 12665856, 15811584, 15814656, 16863232,
-    16864256, 16865280, 16866304, 16867328, 16868352, 21062656, 21066752, 25261056, 25262080, 25263104,
-    25264128, 25363456
+    0, 2048, 102400, 104448, 139264, 12722176, 12728320, 16922624, 16924672, 16926720,
+    16928768, 16930816, 16932864, 33710080, 33718272, 50495488, 50497536, 63080448, 63086592, 67280896,
+    67282944, 67284992, 67287040, 67289088, 67291136, 84068352, 84076544, 100853760, 100855808, 100857856,
+    100859904, 101058560
 };
 
 // Per-tensor element sizes (numel), same order.
 __device__ __constant__ int kVitSizes[kVitNumTensors] = {
-    1024, 50176, 1024, 17408, 3145728, 3072, 1048576, 1024, 1024, 1024,
-    1024, 1024, 4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024,
-    1024, 1024, 1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024,
-    99328, 97
+    2048, 100352, 2048, 34816, 12582912, 6144, 4194304, 2048, 2048, 2048,
+    2048, 2048, 16777216, 8192, 16777216, 2048, 12582912, 6144, 4194304, 2048,
+    2048, 2048, 2048, 2048, 16777216, 8192, 16777216, 2048, 2048, 2048,
+    198656, 97
 };
 
 static_assert(kVitNumTensors == 32,
               "vit_layout: tensor count drifted. Regenerate from "
               "vit_oracle.py::vit_param_layout() (codegen adoption: --vit-layout).");
-static_assert(kVitTotalElems == 25363553,
+static_assert(kVitTotalElems == 101058657,
               "vit_layout: total param count drifted. Regenerate.");
 
 // Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
@@ -88,16 +88,16 @@ static_assert(kVitTotalElems == 25363553,
 // offsets/sizes/total agree.
 namespace vit_layout_check {
 constexpr int kSizes[kVitNumTensors] = {
-    1024, 50176, 1024, 17408, 3145728, 3072, 1048576, 1024, 1024, 1024,
-    1024, 1024, 4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024,
-    1024, 1024, 1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024,
-    99328, 97
+    2048, 100352, 2048, 34816, 12582912, 6144, 4194304, 2048, 2048, 2048,
+    2048, 2048, 16777216, 8192, 16777216, 2048, 12582912, 6144, 4194304, 2048,
+    2048, 2048, 2048, 2048, 16777216, 8192, 16777216, 2048, 2048, 2048,
+    198656, 97
 };
 constexpr int kOffsets[kVitNumTensors] = {
-    0, 1024, 51200, 52224, 69632, 3215360, 3218432, 4267008, 4268032, 4269056,
-    4270080, 4271104, 4272128, 8466432, 8470528, 12664832, 12665856, 15811584, 15814656, 16863232,
-    16864256, 16865280, 16866304, 16867328, 16868352, 21062656, 21066752, 25261056, 25262080, 25263104,
-    25264128, 25363456
+    0, 2048, 102400, 104448, 139264, 12722176, 12728320, 16922624, 16924672, 16926720,
+    16928768, 16930816, 16932864, 33710080, 33718272, 50495488, 50497536, 63080448, 63086592, 67280896,
+    67282944, 67284992, 67287040, 67289088, 67291136, 84068352, 84076544, 100853760, 100855808, 100857856,
+    100859904, 101058560
 };
 constexpr int64_t sum_sizes() {
     int64_t s = 0;
@@ -127,39 +127,39 @@ static_assert(offsets_consistent(),
               "vit_layout: kVitOffsets[i] != sum(kVitSizes[0..i)). Regenerate.");
 
 // ── Per-CTA dynamic-smem budget (d-SCALED BENCH). The ViT per-sample working set
-//    (VitSampleSmem, model_stage_vit.cuh) is ≈ 1434384 bytes (1400.77 KB) at
-//    seq=17, D=1024, HEADS=16 — over the sm_90 227 KB per-block dynamic cap, so
+//    (VitSampleSmem, model_stage_vit.cuh) is ≈ 2864016 bytes (2796.89 KB) at
+//    seq=17, D=2048, HEADS=32 — over the sm_90 227 KB per-block dynamic cap, so
 //    the SCALAR ViT megakernel (the ONLY VitSampleSmem consumer) cannot launch at
 //    this width and is compiled OUT on the bench TU (SG_VIT_SCALAR_MEGAKERNEL=0),
 //    exactly as the decoder bench gates its scalar megakernel. The TC engine the
 //    bench drives uses the small, d-independent static VitTcSmem and DOES fit, so
 //    the `< 227 KB` cap assert below is intentionally NOT emitted in this branch.
 //    Computed from the field list (all float, 4 B, no padding):
-//      patch 16*49 + layer_in 2*17*1024 + final_in 17*1024 + qkv 17*3072
-//      + ctx 17*1024 + x1 17*1024 + ff0 17*4096 + gact 17*4096 + attn 16*17*17
-//      + n1_xhat 17*1024 + n1_inv 17 + n2_xhat 17*1024 + n2_inv 17
-//      + fn_xhat 17*1024 + fn_inv 17 + dh 17*1024 + logits 97 + dsc 16*17*17
-//      + red 256  = 358596 floats = 1434384 bytes. ─
+//      patch 16*49 + layer_in 2*17*2048 + final_in 17*2048 + qkv 17*6144
+//      + ctx 17*2048 + x1 17*2048 + ff0 17*8192 + gact 17*8192 + attn 32*17*17
+//      + n1_xhat 17*2048 + n1_inv 17 + n2_xhat 17*2048 + n2_inv 17
+//      + fn_xhat 17*2048 + fn_inv 17 + dh 17*2048 + logits 97 + dsc 32*17*17
+//      + red 256  = 716004 floats = 2864016 bytes. ─
 constexpr int kVitSampleSmemFloats =
     16 * 49
-  + 2 * 17 * 1024
-  + 17 * 1024
-  + 17 * 3072
-  + 17 * 1024
-  + 17 * 1024
-  + 17 * 4096
-  + 17 * 4096
-  + 16 * 17 * 17
-  + 17 * 1024 + 17
-  + 17 * 1024 + 17
-  + 17 * 1024 + 17
-  + 17 * 1024
+  + 2 * 17 * 2048
+  + 17 * 2048
+  + 17 * 6144
+  + 17 * 2048
+  + 17 * 2048
+  + 17 * 8192
+  + 17 * 8192
+  + 32 * 17 * 17
+  + 17 * 2048 + 17
+  + 17 * 2048 + 17
+  + 17 * 2048 + 17
+  + 17 * 2048
   + 97
-  + 16 * 17 * 17
+  + 32 * 17 * 17
   + 256;
 constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
-static_assert(kVitSampleSmemBytes == 1434384,
-              "vit_layout: VitSampleSmem byte budget drifted from 1434384.");
+static_assert(kVitSampleSmemBytes == 2864016,
+              "vit_layout: VitSampleSmem byte budget drifted from 2864016.");
 }  // namespace vit_layout_check
 
 // Largest per-tensor numel, hoisted to namespace scope. vit_tc_sg2_floats /

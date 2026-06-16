@@ -327,6 +327,67 @@ compile.py stayed AST-parseable + importable after every edit. The two KEPT edit
 opt-in `--incremental-variant-build` flag and host-side memoization respectively — the shipped
 `setup.py`/`_ops` build is byte-unchanged.
 
+### KERNEL track (model + optimizer) — roofline cycling @ d=2048 (overnight 2026-06-16)
+
+**Setup (committed before the ratchet):**
+- **Flagship MODEL_SCALES tier registered** (`grokking_race_v2.py`): `MODEL_SCALES_BY_MODEL["flagship"]`,
+  keyed by model_type (each model at its OWN canonical published size; resolved in run_pipeline
+  by base["model_type"]). decoder GPT-2 XL d1600/L48/h25 → 1.476B; vit ViT-G/14 d1664/L48/h16 →
+  1.596B; mamba Mamba-3 d2048/L24/state128/head_dim64/d_ff4096 → 1.265B. (Param counts reflect the
+  codebase's 4*d MLP + toy vocab=99; honest + expected.) The toy d=128 tiers (small/medium/large)
+  are untouched — the grokking-science RACE stays there.
+- **Roofline benchmark width = d=2048** (owner's named roofline scale). The d-scaled bench-variant
+  layout branches (`SG_{DEC,VIT,MB}_BENCH_LAYOUT`, codegen `_*_BENCH_D`) bumped 1024→2048 via
+  `megakernel_codegen.py`; the production **d=128 `#else` branch stays byte-identical** (verified by
+  diff after regen — the safety guardrail). Bench builds are coexisting standalone-JIT TUs
+  (`tuning/{decoder,vit,mamba}_bench.py`, own module + build dir + sccache) — they NEVER touch the
+  production `_ops.so` or the 33/33 gate. 3-seed timing harness: `scripts/roofline_bench.py`
+  (wraps the bench `build_variant`, times seeds {42,7,123}).
+
+**WHICH CELLS FIT at d=2048 (step 2):**
+- **decoder — FITS.** Builds (137s) + launches; d=2048/B=16384 = 1976 ms/step, 20.0 TF/s,
+  **2.03% of the 989 TF/s bf16 roofline** (101M params). (Same ~2% as d=1024 → the structural
+  bottleneck is scale-invariant; levers bite proportionally at both widths.)
+- **vit — FITS after a bench-workspace fix.** The ViT bench TU `vit_tc_workspace_floats`
+  UNCONDITIONALLY carved the opt-agnostic staged-opt scratch (Prodigy|Muon|LookSAM|**SG2**); the
+  SG2 per-CTA stride is O(Nmax·d_model) and at d=2048 (Nmax=16.7M) it demanded ~565 GB over 132
+  CTAs → CUDA OOM (806 GiB) at ANY B. ROOT CAUSE: the decoder twin gates these to 0 at bench width
+  (`kDecStagedOptScratch`, adamw-only bench) but the ViT twin never got that gating. FIX: added the
+  identical `kVitStagedOptScratch` (`#if SG_VIT_BENCH_LAYOUT` → false; **production true →
+  byte-identical**) gating all four `vit_tc_{opt_reduce,muon,looksam,sg2}_floats` to 0 at bench.
+  This is a bench-only latent-bug fix, NOT an opt candidate. [vit d=2048 timing: see baseline table.]
+- **mamba — DOES NOT FIT at the roofline scale (smem-bound).** The Mamba-3 mixer is scan-dominated;
+  the TC megakernel (`fused_mamba_megakernel_tc`) allocates the per-sample `MambaSampleSmem` as
+  DYNAMIC smem (`cudaFuncSetAttribute(MaxDynamicSharedMemorySize, kMambaSmemBytes)`), and that struct
+  scales with d_inner/d_ff/n_heads. At d=128 it is 215,844 B (211 KB) — already near the H100 227 KB
+  opt-in cap. The smem formula (megakernel_codegen `_mamba_param_sizes`) crosses 227 KB at **~d=142**
+  (d=142 → 226.66 KB fits; d=143 → 227.85 KB exceeds); at d=1024 it needs ~1.26 MB and at d=2048 far
+  more — `cudaFuncSetAttribute` REFUSES it (the kernel's own comment, fused_mamba_megakernel.cuh:116).
+  So **mamba's roofline stays at its production d=128** (the only validated mamba TC width); the
+  decoder/vit-style wgmma width-scaling does not apply (Mamba-3 is a scalar batch-parallel scan, not
+  a tiled GEMM). NOT a blocker for the workstream — proceeding with decoder+vit at d=2048 + mamba@d128
+  per the owner directive ("do NOT block the whole workstream on mamba").
+
+**Roofline BASELINE (baseline-before-mods, 3-seed median step-ms; the fp64-gate-validated
+production `_ops` is the parity anchor at d=128).** Ratchet timing config (apples-to-apples
+before/after): decoder d=2048/B=4096, vit d=2048/B=1024, mamba d=128/B=4096 — all seeds {42,7,123},
+the adamw cell (the only standalone bench TU; the P3 optimizer tail it runs is the shared
+`apply_optimizer<AdamW>`). The d=2048 headline at B=16384 (decoder) = 1976 ms, 20.0 TF/s.
+
+| cell | d | B | seed42 | seed7 | seed123 | **median ms** | TF/s | % roofline |
+|------|---|---|--------|-------|---------|---------------|------|-----------|
+| adamw/decoder | 2048 | 4096 | 514.2 | 515.4 | 517.2 | **515.4** | 19.2 | 1.94% |
+| adamw/vit     | 2048 | 1024 | 5805.8 | 5737.6 | 5759.2 | **5759.2** | 1.83 | 0.185% |
+| adamw/mamba   | 128  | 4096 | 221.4 | 221.6 | 221.7 | **221.6** | 0.30 | 0.03% |
+
+Notes: (a) decoder & vit are at the SAME ~2% / 0.19% roofline as their d=1024 predecessors → the
+bottleneck is structural (scale-invariant), so the candidate levers bite proportionally; vit is
+~11× slower than decoder per step (the seq=17, TILE_M=1088 GEMM is pathologically under-utilized —
+exactly the non-GEMM head-CE/LN/attn surface VIT_TC_001/002 target → large headroom). (b) Per-seed
+spread is <1% (tight, reproducible) — a real ≥1% delta is cleanly resolvable.
+
+**Ratchet ledger (model_track → optimizer_track → re-discover incl. mamba):** _filling as the loop runs…_
+
 ---
 
 ## 4. Autotuner (compile.py) — status

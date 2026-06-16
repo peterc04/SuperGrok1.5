@@ -19,7 +19,7 @@
 // Two layouts coexist under the single include guard. SG_DEC_BENCH_LAYOUT is
 // UNSET on the production _ops build (→ the d=128 branch, byte-identical to
 // the historical header), and set to 1 ONLY by the d-scaled benchmark TU / the
-// _ops_bench variant extension (→ the d=1024 branch). The branches are
+// _ops_bench variant extension (→ the d=2048 branch). The branches are
 // mutually exclusive at preprocess time, so a TU compiles exactly one consistent
 // (constants, __constant__ table, static-assert) set; production never sees the
 // bench numbers. This is the loop infra for task #13 — see /workspace/.hillclimb_loop.md.
@@ -34,36 +34,36 @@
 namespace sg { namespace fused { namespace sm90 {
 
 #if SG_DEC_BENCH_LAYOUT
-// ── d-SCALED BENCH VARIANT (d=1024): the persistent-megakernel roofline
+// ── d-SCALED BENCH VARIANT (d=2048): the persistent-megakernel roofline
 //    build. NOT on the production path; selected ONLY by -DSG_DEC_BENCH_LAYOUT=1. ──
 constexpr int SG_DEC_VOCAB  = 99;
-constexpr int SG_DEC_D      = 1024;
+constexpr int SG_DEC_D      = 2048;
 constexpr int SG_DEC_HEADS  = 4;
 constexpr int SG_DEC_LAYERS = 2;
 constexpr int SG_DEC_SEQ    = 4;
-constexpr int SG_DEC_DFF    = 4 * SG_DEC_D;   // 4096
+constexpr int SG_DEC_DFF    = 4 * SG_DEC_D;   // 8192
 
 constexpr int     kDecNumTensors = 30;
-constexpr int64_t kDecTotalElems = 25401443;
+constexpr int64_t kDecTotalElems = 101134435;
 
 // Per-tensor element offsets into the flat param blob, named_parameters() order.
 __device__ __constant__ int kDecOffsets[kDecNumTensors] = {
-    0, 101376, 105472, 3251200, 3254272, 4302848, 4303872, 4304896, 4305920, 4306944,
-    4307968, 8502272, 8506368, 12700672, 12701696, 15847424, 15850496, 16899072, 16900096, 16901120,
-    16902144, 16903168, 16904192, 21098496, 21102592, 25296896, 25297920, 25298944, 25299968, 25401344
+    0, 202752, 210944, 12793856, 12800000, 16994304, 16996352, 16998400, 17000448, 17002496,
+    17004544, 33781760, 33789952, 50567168, 50569216, 63152128, 63158272, 67352576, 67354624, 67356672,
+    67358720, 67360768, 67362816, 84140032, 84148224, 100925440, 100927488, 100929536, 100931584, 101134336
 };
 
 // Per-tensor element sizes (numel), same order.
 __device__ __constant__ int kDecSizes[kDecNumTensors] = {
-    101376, 4096, 3145728, 3072, 1048576, 1024, 1024, 1024, 1024, 1024,
-    4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024, 1024, 1024,
-    1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024, 101376, 99
+    202752, 8192, 12582912, 6144, 4194304, 2048, 2048, 2048, 2048, 2048,
+    16777216, 8192, 16777216, 2048, 12582912, 6144, 4194304, 2048, 2048, 2048,
+    2048, 2048, 16777216, 8192, 16777216, 2048, 2048, 2048, 202752, 99
 };
 
 static_assert(kDecNumTensors == 30,
               "decoder_layout: tensor count drifted. Regenerate via "
               "megakernel_codegen.py --decoder-layout.");
-static_assert(kDecTotalElems == 25401443,
+static_assert(kDecTotalElems == 101134435,
               "decoder_layout: total param count drifted. Regenerate.");
 
 // Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
@@ -71,14 +71,14 @@ static_assert(kDecTotalElems == 25401443,
 // offsets/sizes/total agree.
 namespace dec_layout_check {
 constexpr int kSizes[kDecNumTensors] = {
-    101376, 4096, 3145728, 3072, 1048576, 1024, 1024, 1024, 1024, 1024,
-    4194304, 4096, 4194304, 1024, 3145728, 3072, 1048576, 1024, 1024, 1024,
-    1024, 1024, 4194304, 4096, 4194304, 1024, 1024, 1024, 101376, 99
+    202752, 8192, 12582912, 6144, 4194304, 2048, 2048, 2048, 2048, 2048,
+    16777216, 8192, 16777216, 2048, 12582912, 6144, 4194304, 2048, 2048, 2048,
+    2048, 2048, 16777216, 8192, 16777216, 2048, 2048, 2048, 202752, 99
 };
 constexpr int kOffsets[kDecNumTensors] = {
-    0, 101376, 105472, 3251200, 3254272, 4302848, 4303872, 4304896, 4305920, 4306944,
-    4307968, 8502272, 8506368, 12700672, 12701696, 15847424, 15850496, 16899072, 16900096, 16901120,
-    16902144, 16903168, 16904192, 21098496, 21102592, 25296896, 25297920, 25298944, 25299968, 25401344
+    0, 202752, 210944, 12793856, 12800000, 16994304, 16996352, 16998400, 17000448, 17002496,
+    17004544, 33781760, 33789952, 50567168, 50569216, 63152128, 63158272, 67352576, 67354624, 67356672,
+    67358720, 67360768, 67362816, 84140032, 84148224, 100925440, 100927488, 100929536, 100931584, 101134336
 };
 constexpr int64_t sum_sizes() {
     int64_t s = 0;
