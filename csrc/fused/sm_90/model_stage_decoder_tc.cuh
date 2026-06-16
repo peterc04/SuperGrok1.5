@@ -91,7 +91,11 @@ namespace wgs = ::sg::sm90::wgs;
 #define SG_TUNED_DEC_GEMM_STAGES 2
 #endif
 #ifndef SG_TUNED_DEC_DW_SPLITK
-#define SG_TUNED_DEC_DW_SPLITK 4
+// Roofline ratchet (2026-06-16, d=2048/B=4096): G=2 beats the prior G=4 default by −2.5% on
+// 3 seeds (G=8 was +2.6% SLOWER — at d=2048 the dW tiles already fill the grid, so MORE split-K
+// only adds partial-reduce + workspace traffic). The deterministic ascending-chunk reduce is
+// order-stable for any G, so parity + A/A/A determinism hold. G==1 = single-CTA path.
+#define SG_TUNED_DEC_DW_SPLITK 2
 #endif
 
 // ── M-atom INTERLEAVE width cap (task #13 hill-climb win). The GEMM microkernel
