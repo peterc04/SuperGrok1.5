@@ -70,14 +70,23 @@ Phases (CHECKPOINT before the megakernel — expensive/irreversible):
 
 ---
 
-## 3. Optimization LOOP (compile.py first, then kernels)  — compile.py track ✅ DONE (dry-well), kernel track PENDING
+## 3. Optimization CYCLING — BROAD & truly-exhaustive, 3 file-classes (owner clarified 2026-06-16)
 
-**compile.py track COMPLETE (2026-06-16):** looped rounds 1-5 → terminated on **DRY WELL**.
-Cumulative **9 KEEP / 0 REVERT / 20 SKIP**, self-test held 236/6 throughout (commits e3b9b71,
-8e25a11, c8ee2e5, 311e0eb, ledger 19912db). Top wins: O(n²)→O(n) trial-sidecar summary roll;
-~85× host-identity-probe memoization (both differential-tested bit-identical). All bit-neutral
-host-side hoists — zero kernel/cache-key/trajectory change. **Kernel track** runs after Mamba-3
-lands (d=2048, fp64 parity + 3-seed timing).
+**Criterion (corrected):** keep cycling {discover exhaustive list → ratchet each → re-discover}
+until (a) genuinely **cannot think of any more implementations**, or (b) **3 in a row are
+neutral-or-negative** (neutral = no measurable improvement COUNTS, not just reverts). Scope is
+**BROAD** — features + behavior changes + perf, not just bit-neutral micro-opts. Three tracks:
+**compile.py**, **model files** (decoder/vit/mamba kernels), **optimizer files** (11 optimizers).
+
+**compile.py — NARROW micro-opt sub-loop ✅ DONE (dry-well, 2026-06-16):** rounds 1-5,
+**9 KEEP / 0 REVERT / 20 SKIP**, self-test held 236/6 (commits e3b9b71, 8e25a11, c8ee2e5, 311e0eb,
+ledger 19912db). Top: O(n²)→O(n) trial-sidecar roll; ~85× host-identity memoize.
+**compile.py — BROAD cycle STILL PENDING:** single-cell build (`_resolve_sources` builds all 4
+megakernels; scope to the tuned cell + reuse other AOT .o → ~5-8min→~1-2min), fuller nvcc
+device-compile caching, search-quality. Gate = self-test + measured build/tune-time.
+**model + optimizer tracks PENDING:** run at d=2048 (fp64 parity + 3-seed timing) after Mamba-3
+lands. Broad discovery for compile.py-broad + decoder/vit + optimizer stages: workflow
+`opt-discovery-broad` (mamba excluded — being rewritten). Verdict ledgers appended as the cycle runs.
 
 The optimization process is **LOOPED**, not one-shot (owner 2026-06-16). Per track:
 
