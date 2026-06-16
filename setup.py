@@ -913,24 +913,59 @@ class TunedBuildExtension(BuildExtension):
             _torch_cpp_ext._write_ninja_file = orig_writer
 
 
+def _scan_csrc_ifndef_macros():
+    """Collect every ``SG_TUNED_*`` macro guarded by an ``#ifndef`` in the
+    committed device tree (csrc/). Returns the set of guarded macro names.
+
+    Programmatic scan (no single hard-coded header): the eager per-op headers
+    that used to carry the guards (grokking_optimizers/kernels/sm_90/*_sm90.cuh)
+    were deleted in the L3-TC-only cut, so a single-file check
+    silently early-returns and the drift guard never fires. Walking csrc/ for
+    ``#ifndef SG_TUNED_<NAME>`` tracks the real guard set wherever it lives
+    (megakernel_common.cuh, the *_tc.cuh substrates, tile_pipeline.cuh, ...).
+    """
+    pat = re.compile(r"#ifndef\s+(SG_TUNED_[A-Z0-9_]+)")
+    exts = (".cu", ".cuh", ".h", ".hpp", ".hip", ".cpp", ".cc", ".cxx")
+    found = set()
+    csrc_root = os.path.join(_REPO_ROOT, "csrc")
+    for dirpath, _dirs, files in os.walk(csrc_root):
+        for fn in files:
+            if not fn.endswith(exts):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), "r",
+                          errors="ignore") as fh:
+                    found.update(pat.findall(fh.read()))
+            except OSError:
+                continue
+    return found
+
+
 def _verify_macro_names(inject):
-    """Best-effort drift check: the macro names we emit are guarded by the
-    kernel header. Loud warning on mismatch; never fatal (design 1c)."""
+    """Best-effort drift check: every macro name the injector is about to emit
+    is guarded by an ``#ifndef SG_TUNED_*`` in some committed kernel. Loud
+    warning on mismatch; never fatal (design 1c).
+
+    Replaces the prior single-file check against the (now-deleted)
+    kernels/sm_90/adamw_sm90.cuh — that path no longer exists, so the old guard
+    early-returned and could never catch the case it was meant to (an injected
+    macro that no kernel reads, i.e. a dead ``-D``). A programmatic scan of
+    csrc/ for the ``#ifndef`` guards is robust to where the guards live.
+    """
     try:
-        header = os.path.join(_REPO_ROOT, "grokking_optimizers", "kernels",
-                              "sm_90", "adamw_sm90.cuh")
-        if not os.path.isfile(header):
+        guarded = _scan_csrc_ifndef_macros()
+        if not guarded:
+            # No csrc/ visible (e.g. an installed wheel without sources) —
+            # nothing to compare against; skip silently.
             return
-        with open(header, "r", encoding="utf-8") as fh:
-            text = fh.read()
-        missing = [name for name in inject.header_default_macros()
-                   if name not in text]
+        missing = sorted(name for name in inject.header_default_macros()
+                         if name not in guarded)
         if missing:
             print("  [tuned-inject] WARNING: macro name(s) in the injector "
-                  f"source-of-truth are NOT guarded by {os.path.basename(header)}: "
-                  f"{missing}. Emitting them anyway, but they may be silent "
-                  "no-ops — reconcile _tuned_inject.MACROS with the header "
-                  "(#ifndef SG_TUNED_*).")
+                  "source-of-truth (_tuned_inject.MACROS) are NOT guarded by "
+                  f"any '#ifndef SG_TUNED_*' in csrc/: {missing}. Emitting them "
+                  "anyway, but they may be silent no-ops — reconcile "
+                  "_tuned_inject.MACROS with the committed kernels.")
     except Exception:  # noqa: BLE001 — diagnostic only.
         pass
 

@@ -1,0 +1,41 @@
+# examples/toy_tune_project/toy_search_space.yaml
+# ===========================================================================
+# The minimal autotune search space for the toy SAXPY project: ONE tunable
+# dimension, the CUDA launch block size, declared as a -D macro that the
+# kernel reads (#ifndef TOY_TUNED_BLOCK ... in toy_kernel.cu).
+#
+# compile.py loads this via --search-space <path> -> get_search_space() ->
+# load_yaml(), which validates this exact shape:
+#   * top-level dict keyed by ARCH name (must match --arch, e.g. sm_90a)
+#   * each arch block -> { dims: [ ... ], prefilter: {optional} }
+#   * each dim -> name, type (int|bool|enum|tuple), values (non-empty list),
+#                 macro, applies_to (subset of {host, device})
+#
+# For a "macro"-kind dim (the default), compile.py's resolve_macros() emits
+#   -D<macro>=<value>
+# onto the nvcc command line for each candidate. So a dim with
+#   macro: TOY_TUNED_BLOCK,  values: [128, 256, 512, 1024]
+# makes the autotuner build four variants:
+#   -DTOY_TUNED_BLOCK=128 / =256 / =512 / =1024
+# and time each via the tune_hook. The kernel's static_assert rejects any
+# illegal value (>1024), which the autotuner treats as an infeasible config.
+#
+# VERIFIED: this file parses cleanly through grokking_optimizers.compile.
+# load_yaml() (see the README's validation command).
+# ===========================================================================
+
+sm_90a:
+  dims:
+    - name: block
+      type: int
+      values: [128, 256, 512, 1024]
+      # The macro token compile.py emits as -D<macro>=<value>. This is the
+      # tuned-macro the kernel reads; the TOY_TUNED_ prefix mirrors grokking's
+      # SG_TUNED_ convention but is entirely project-chosen.
+      macro: TOY_TUNED_BLOCK
+      # Affects both the host launch config and (via the macro) device codegen.
+      applies_to: [host, device]
+  # No prefilter rules needed — all four block sizes are individually legal
+  # (the kernel's static_assert guards the <=1024 bound at compile time).
+  prefilter:
+    rules: []

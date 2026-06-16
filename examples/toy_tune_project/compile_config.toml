@@ -1,0 +1,133 @@
+# examples/toy_tune_project/compile_config.toml
+# ===========================================================================
+# Project config that points grokking_optimizers/compile.py at the TOY SAXPY
+# project with ZERO grokking assumptions. The key names here match EXACTLY
+# what compile.py's loader reads:
+#   - load_config()        merges this over _DEFAULT_PROJECT_CONFIG
+#   - apply_to_buildspec() copies [project]/[sources]/... onto the BuildSpec
+#   - _resolve_sources()   uses [sources].cuda_root (+ Tier-1 auto-glob)
+#   - the search space below declares the ONE tunable dim TOY_TUNED_BLOCK
+#     (--search-space toy_search_space.yaml supplies it; see that file)
+#
+# Verified against compile.py @ _DEFAULT_PROJECT_CONFIG (~line 29168) and
+# apply_to_buildspec (~line 29356). Every key below is read by the loader.
+# ===========================================================================
+
+[project]
+name    = "toy_tune_project"
+version = "0.1.0"
+
+# Macro namespace for the -D gating flags compile.py's _build_macros emits
+# (e.g. -DTOY_OPTIMIZER_<NAME>, -DTOY_ARCH_SM_90A). MUST end with '_' or the
+# loader warns (apply_to_buildspec, Group A.11). Keeps the toy build's macros
+# out of the SG_BUILD_ namespace, proving macro_prefix is honored.
+macro_prefix = "TOY_"
+
+# PORTABLE tune-hook — the schema-agnostic autotune seam. compile.py's
+# _hook_capture resolves this as "pkg.module:fn" (rsplit on ':'), imports it,
+# and calls fn(*, so_path, model, optimizer, arch, regime, seed) ->
+# {"output": np.ndarray, "elapsed_ms": float} in a FRESH subprocess (cwd =
+# repo root). Two forms work:
+#   - "tune_hook:run"  -> resolvable when the subprocess cwd / sys.path
+#     includes THIS directory (e.g. you run compile.py from here AND this dir
+#     is on PYTHONPATH).
+#   - "examples.toy_tune_project.tune_hook:run" -> repo-root-relative, always
+#     importable because compile.py runs the hook subprocess with cwd = the
+#     SuperGrok1.5 repo root (PYTHONPATH=repo root). This is the robust form
+#     and the one verified end-to-end against _hook_capture's protocol.
+tune_hook = "examples.toy_tune_project.tune_hook:run"
+
+# This project has NO Python package to import an optimizer class from. The
+# tune_hook is the entire numerical+timing seam, so python_package is only a
+# fallback that the (non-portable) torch.op timing path would use — see the
+# README's "Portability gaps" section for why that path is the blocker.
+python_package = "examples.toy_tune_project"
+
+# No C++ namespace in the toy kernel (it uses an anonymous namespace), so the
+# project_namespace stays empty — templates that reference it are not used.
+namespace = ""
+
+[sources]
+# Point the CUDA source root at THIS project directory. _resolve_sources()
+# looks for the historical csrc layout (launch_*.cu + models/*.cu) under the
+# arch subdir first; toy_kernel.cu matches NONE of those globs, so those
+# lists are empty and compile.py's Tier-1 zero-config fallback
+# (_auto_discover_sources) is meant to glob this dir for *.cu and find
+# toy_kernel.cu.
+#
+# Relative paths are resolved against the SuperGrok1.5 repo root.
+cuda_root = "examples/toy_tune_project"
+
+# Re-point bindings_dir + algorithms_dir at THIS directory (which has no .cpp /
+# no algorithm headers) so the structured bindings/launchers/models lists are
+# all empty. Without this they DEEP-MERGE-INHERIT grokking's defaults
+# ("csrc/bindings" / "csrc/algorithms"), and csrc/bindings/*.cpp would leak
+# into the toy build AND keep the structured list non-empty (suppressing the
+# Tier-1 auto-glob). VERIFIED: with these overrides the bindings/launchers/
+# models lists are empty.
+#
+# *** PORTABILITY GAP (Phase 2) ***: even with these overrides, _resolve_sources
+# ALSO unconditionally globs `REPO_ROOT/csrc/fused/<arch_subdir>/*.cu` (compile.
+# py line ~9237), which is HARDCODED — there is NO [sources] key for it. On
+# sm_90a (arch subdir sm_90) csrc/fused/sm_90/*.cu EXISTS (grokking's L3
+# megakernel TUs), so `structured` stays NON-empty, the Tier-1 auto-glob never
+# fires, toy_kernel.cu is NOT discovered, and grokking's fused TUs leak in.
+# See README "Portability gaps" #2 — Phase 2 must make the fused-dir root
+# config-driven (or skip it when source_roots is overridden) to close this.
+bindings_dir    = "examples/toy_tune_project"
+algorithms_dir  = "examples/toy_tune_project"
+
+# No extra include dirs needed (torch/extension.h + CUDA come from the toolchain).
+[sources.include_paths]
+extra = []
+
+# Restrict the CLI's --optimizer / --model choices to toy-specific names so
+# the argument parser accepts them (the choices= lists are built from these).
+# NOTE: these names are placeholders required only to satisfy the CLI parser;
+# the toy project has no real optimizers/models. With the tune_hook seam fully
+# wired (Phase 2), the (optimizer, model) pair is passed THROUGH to the hook,
+# which ignores them. See the README's portability-gaps note.
+[optimizers]
+enabled = ["toy_saxpy"]
+
+[models]
+enabled = ["toy"]
+
+[archs]
+# Default to Hopper; the CLI --arch sm_90a overrides/confirms this.
+default = "sm_90a"
+allowed = ["sm_90a"]
+
+# ---------------------------------------------------------------------------
+# Numerical validation regimes. The toy SAXPY is exactly linear, so it is
+# correct under every magnitude regime; we keep the full adversarial sweep so
+# the portability proof exercises compile.py's multi-regime oracle machinery.
+# (Omitting this section would default to the full _INPUT_REGIMES set anyway.)
+# ---------------------------------------------------------------------------
+[numerics]
+regimes = ["normal", "large", "small", "adversarial"]
+
+# ---------------------------------------------------------------------------
+# Every heavy / grokking-specific codegen layer OFF. The toy proof only needs
+# the bare -DTOY_TUNED_BLOCK macro sweep + the tune_hook; the Jinja2 emitter,
+# OpGraph synth, polyhedral search, learned cost model, and device PGO all
+# assume grokking's kernel/template structure, so we disable them explicitly.
+# (These already default OFF in _DEFAULT_PROJECT_CONFIG; set here for clarity.)
+# ---------------------------------------------------------------------------
+[codegen]
+enable_emitter = false
+
+[synth_codegen]
+enable = false
+
+[polyhedral]
+enable = false
+
+[cost_model]
+enable = false
+
+[device_pgo]
+enable = false
+
+[runtime_specialization]
+enable = false

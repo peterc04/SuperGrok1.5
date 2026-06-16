@@ -30,20 +30,34 @@ it never triggers ``grokking_optimizers/__init__.py`` (which does
 ``import torch`` + ``get_ops()`` and would probe CUDA). Do NOT add any
 ``grokking_optimizers``-relative imports or third-party imports here.
 
-SCOPE — the five canonical SAFE per-TU dims (block / vec / unroll /
-async_depth as ``-DSG_TUNED_*`` macros + maxrregcount as a real
-``--maxrregcount=N`` ptxas flag) are hardcoded in :data:`MACROS` as the
+SCOPE — the SAFE per-TU floor (the megakernel / L3-TC launch dims the
+committed sm_90 kernels actually read via ``#ifndef SG_TUNED_*`` — mega_block,
+tile_m/tile_n, the per-model dW split-K factors, and the warp-group register
+caps prod_regs/cons_regs — as ``-DSG_TUNED_*`` macros + maxrregcount as a real
+``--maxrregcount=N`` ptxas flag) is hardcoded in :data:`MACROS` as the
 always-known floor. Review fix P0.2: the exporter ALSO persists EVERY OTHER
-winner dim that carries a macro in the live search space (cluster_shape, and
-any feature macro a kernel begins consuming), together with the dim→macro map
-the producer derived. The consumer (:func:`source_extra_nvcc_flags`) reads that
-persisted ``_macros`` map so it can emit ``-D<macro>=<v>`` for dims it has no
-hardcoded entry for — WITHOUT importing compile.py (this module stays pure
-stdlib). Tuple dims (cluster_shape) emit nvcc-safe per-axis scalar macros
-``<MACRO>_0/_1/_2`` plus ``<MACRO>_VOLUME`` exactly as compile.py's
-``resolve_macros`` does (a single ``-Dfoo=2,1,1`` is rejected by the -D lexer).
-An unknown macro (no map entry, not in MACROS) is IGNORED with a one-line
-warning so a stale setup.py degrades gracefully (task P0.2).
+winner dim that carries a macro in the live search space, together with the
+dim→macro map the producer derived. The consumer
+(:func:`source_extra_nvcc_flags`) reads that persisted ``_macros`` map so it can
+emit ``-D<macro>=<v>`` for dims it has no hardcoded entry for — WITHOUT
+importing compile.py (this module stays pure stdlib). Tuple dims (cluster_shape)
+emit nvcc-safe per-axis scalar macros ``<MACRO>_0/_1/_2`` plus
+``<MACRO>_VOLUME`` exactly as compile.py's ``resolve_macros`` does (a single
+``-Dfoo=2,1,1`` is rejected by the -D lexer). An unknown macro (no map entry,
+not in MACROS) is IGNORED with a one-line warning so a stale setup.py degrades
+gracefully (task P0.2).
+
+LIVE-MACRO AUDIT (2026-06 re-derivation) — the previous :data:`MACROS` table
+listed SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL / ASYNC_DEPTH, which were the
+guards in the DELETED eager per-op headers ``grokking_optimizers/kernels/sm_90/
+*_sm90.cuh``. A grep of the committed device tree
+(``grep -rnE 'SG_TUNED_[A-Z0-9_]+' csrc``) shows NO current kernel ``#ifndef``s
+or reads any of those four — so every tuned build emitted four dead ``-D``
+flags while the macros the kernels DO read got nothing. The macros with a live
+``#ifndef`` guard AND a matching autotuner tuning dim (compile.py ``_dim(...)``
+with a ``macro=``) are exactly the floor below; their in-source ``#ifndef``
+defaults are recorded so a no-JSON build is byte-identical and the drift guard
+(:func:`header_default_macros`) can flag future divergence.
 """
 
 from __future__ import annotations
@@ -86,39 +100,70 @@ def canonical_arch_key(arch: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# SOURCE OF TRUTH — the five SAFE per-TU dims.
+# SOURCE OF TRUTH — the SAFE per-TU floor (LIVE sm_90 macros only).
 #
-# Each entry maps a winner-combo key (the search-space dim name used by
-# compile.py, e.g. "block") to how it is emitted on the compiler command
-# line. There are two kinds:
+# Each entry maps a winner-combo key (the search-space dim NAME used by
+# compile.py's ``_dim(...)``, e.g. "mega_block") to how it is emitted on the
+# compiler command line. There are two kinds:
 #   kind="macro": emitted as ``-D<macro>=<value>`` (an nvcc preprocessor
 #                 define). The macro name MUST match the ``#ifndef`` guard
-#                 in the kernel header so the override actually takes — see
-#                 grokking_optimizers/kernels/sm_90/adamw_sm90.cuh lines
-#                 31-41 (SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL /
-#                 ASYNC_DEPTH; the other per-opt headers inline the same
-#                 four guards).
+#                 in a committed kernel so the override actually takes.
 #   kind="flag": emitted as a real ptxas/codegen flag, NOT a -D macro.
 #                ``maxrregcount`` -> ``--maxrregcount=<n>`` (CUDA). A value
 #                of 0 means "unset" and emits NOTHING (the historical
 #                default — nvcc's own register allocator decides).
 #
-# ``defaults`` records the in-header #ifndef default for the macro dims, so a
-# CPU-only unit test can assert "no drift" between this table and the header
-# without a GPU. Keep this dict in lockstep with adamw_sm90.cuh:31-41.
+# Every macro dim here is BOTH (a) read by a committed sm_90 kernel via a live
+# ``#ifndef SG_TUNED_*`` guard AND (b) produced by an autotuner tuning dim
+# (compile.py ``_dim(name, ..., macro=...)``), so a winner combo can actually
+# carry it. dim name → macro → consumer file:line → in-source #ifndef default:
+#   mega_block      SG_TUNED_MEGA_BLOCK     csrc/fused/megakernel_common.cuh:50  256
+#                     (also opt_stage_supergrok2.cuh:1262; launch_bounds of every
+#                      sm_90 fused megakernel — decoder/vit/mamba/SG2)
+#   tile_m          SG_TUNED_TILE_M         csrc/backends/cuda/sm_90/wgmma.cuh:136 128
+#                     (also model_stage_decoder_tc.cuh:75 =128 / _mamba_tc.cuh:78 =64)
+#   tile_n          SG_TUNED_TILE_N         csrc/backends/cuda/sm_90/wgmma.cuh:133 128
+#                     (shared by decoder/vit/mamba TC substrates)
+#   dec_dw_splitk   SG_TUNED_DEC_DW_SPLITK  csrc/fused/sm_90/model_stage_decoder_tc.cuh:93 4
+#   vit_dw_splitk   SG_TUNED_VIT_DW_SPLITK  csrc/fused/sm_90/model_stage_vit_tc.cuh:105 4
+#   mb_dw_splitk    SG_TUNED_MB_DW_SPLITK   csrc/fused/sm_90/model_stage_mamba_tc.cuh:181 4
+#   prod_regs       SG_TUNED_PROD_REGS      csrc/backends/cuda/sm_90/tile_pipeline.cuh:92 40
+#   cons_regs       SG_TUNED_CONS_REGS      csrc/backends/cuda/sm_90/tile_pipeline.cuh:95 232
+#   maxrregcount    (ptxas flag)            --maxrregcount=N (no -D macro)          0 (unset)
+#
+# ``default`` records the in-source #ifndef default for the macro dims (the
+# wgmma.cuh substrate value where a macro is multiply-#ifndef'd — that header
+# is included first, so its default wins), so a CPU-only unit test can assert
+# "no drift" between this table and the headers without a GPU, AND so a no-JSON
+# build is byte-identical (no -D emitted at all when there is no winner).
+#
+# NB: SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL / ASYNC_DEPTH were the guards in
+# the DELETED eager headers (grokking_optimizers/kernels/sm_90/*_sm90.cuh); NO
+# committed kernel reads them, so they were dropped from this floor (they only
+# emitted dead -D flags). SG_TUNED_MIN_BLOCKS / CLUSTER_SHAPE are likewise NOT
+# guarded by any committed kernel (only mentioned in a comment), so they are
+# not in the floor either; the GEMM-stage / interleave / pipe-depth / gemm-impl
+# macros ARE #ifndef'd but have no autotuner tuning dim, so no winner carries
+# them.
 # --------------------------------------------------------------------------
 MACROS: Dict[str, Dict[str, Any]] = {
-    "block":       {"kind": "macro", "macro": "SG_TUNED_BLOCK_SIZE", "default": 256},
-    "vec":         {"kind": "macro", "macro": "SG_TUNED_VEC_WIDTH",  "default": 4},
-    "unroll":      {"kind": "macro", "macro": "SG_TUNED_UNROLL",     "default": 1},
-    "async_depth": {"kind": "macro", "macro": "SG_TUNED_ASYNC_DEPTH", "default": 2},
+    "mega_block":    {"kind": "macro", "macro": "SG_TUNED_MEGA_BLOCK",    "default": 256},
+    "tile_m":        {"kind": "macro", "macro": "SG_TUNED_TILE_M",        "default": 128},
+    "tile_n":        {"kind": "macro", "macro": "SG_TUNED_TILE_N",        "default": 128},
+    "dec_dw_splitk": {"kind": "macro", "macro": "SG_TUNED_DEC_DW_SPLITK", "default": 4},
+    "vit_dw_splitk": {"kind": "macro", "macro": "SG_TUNED_VIT_DW_SPLITK", "default": 4},
+    "mb_dw_splitk":  {"kind": "macro", "macro": "SG_TUNED_MB_DW_SPLITK",  "default": 4},
+    "prod_regs":     {"kind": "macro", "macro": "SG_TUNED_PROD_REGS",     "default": 40},
+    "cons_regs":     {"kind": "macro", "macro": "SG_TUNED_CONS_REGS",     "default": 232},
     # Real ptxas flag (no preprocessor macro). 0 == unset == emit nothing.
-    "maxrregcount": {"kind": "flag", "flag": "--maxrregcount", "default": 0},
+    "maxrregcount":  {"kind": "flag", "flag": "--maxrregcount", "default": 0},
 }
 
 # Order in which to emit flags for a TU (stable output → deterministic
 # build.ninja diffs and a predictable unit-test expectation).
-_EMIT_ORDER = ["block", "vec", "unroll", "async_depth", "maxrregcount"]
+_EMIT_ORDER = ["mega_block", "tile_m", "tile_n",
+               "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+               "prod_regs", "cons_regs", "maxrregcount"]
 
 # The canonical optimizer tokens (mirrors
 # grokking_optimizers.dispatch.OPTIMIZERS). Used to validate filename→opt
@@ -150,12 +195,13 @@ _MODEL_TOKEN_TO_SHORT: Dict[str, str] = {
 # best-effort build-time check) compares them to the committed header.
 # --------------------------------------------------------------------------
 def header_default_macros() -> Dict[str, int]:
-    """The macro→default mapping this module asserts the headers ship.
+    """The macro→default mapping this module asserts the committed kernels ship.
 
-    A drift between this and the actual ``#ifndef`` guard in
-    ``adamw_sm90.cuh`` would mean we emit a ``-D`` for a macro the kernel no
-    longer reads (silent no-op) or miss one it added. The unit test compares
-    this against a parse of the real header.
+    A drift between this and the actual ``#ifndef`` guard in the committed
+    device tree (csrc/) would mean we emit a ``-D`` for a macro no kernel reads
+    (silent no-op) or miss one a kernel added. setup.py's
+    :func:`_verify_macro_names` scans csrc/ for ``#ifndef SG_TUNED_*`` and warns
+    on any macro here that no kernel guards (drift detection, non-fatal).
     """
     return {spec["macro"]: spec["default"]
             for spec in MACROS.values() if spec["kind"] == "macro"}
@@ -335,7 +381,7 @@ def source_extra_nvcc_flags(optimizer: Optional[str],
     ``{arch: {optimizer: ...}}`` schema is still read (``model`` ignored) so a
     pre-#12 JSON keeps working unchanged. See :func:`_lookup_combo`.
 
-    Deterministic order: the five hardcoded SAFE dims first (``_EMIT_ORDER``),
+    Deterministic order: the hardcoded SAFE floor dims first (``_EMIT_ORDER``),
     then any EXTRA persisted macro dims (P0.2) in sorted order. Scalar macro
     dims become ``-D<macro>=<v>``; tuple dims (cluster_shape) become per-axis
     ``-D<macro>_0/_1/_2`` + ``-D<macro>_VOLUME`` (nvcc rejects ``-Dfoo=2,1,1``);
@@ -491,13 +537,14 @@ def load_tuned(path: Optional[str] = None) -> Optional[Dict[str, Any]]:
 # --------------------------------------------------------------------------
 # JSON export (producer side — compile.py build_jit).
 # --------------------------------------------------------------------------
-# The five SAFE per-TU dims are ALWAYS persisted (the MACROS floor). Review fix
+# The SAFE per-TU floor dims are ALWAYS persisted (the MACROS floor). Review fix
 # P0.2: EVERY other winner dim that carries a macro in the live search space is
 # persisted too (so a winning cluster_shape / feature-macro value actually
 # reaches the product build instead of being silently dropped). Bookkeeping keys
 # (timing_ms, config_key, stage_won, fast-math markers, ...) are still dropped —
 # the JSON is a STABLE handoff contract, not a dump of the trial record.
-_PERSIST_KEYS = tuple(MACROS.keys())  # block, vec, unroll, async_depth, maxrregcount
+_PERSIST_KEYS = tuple(MACROS.keys())  # mega_block, tile_m/n, *_dw_splitk,
+                                      # prod_regs, cons_regs, maxrregcount
 
 # Combo keys that are autotuner bookkeeping, never a tunable macro dim — always
 # dropped from the persisted payload regardless of the macro map.
@@ -521,7 +568,7 @@ def _winner_payload(combo: Dict[str, Any],
                     ) -> Dict[str, Any]:
     """Project a winner combo down to the persisted dims.
 
-    P0.2: persists (a) the five hardcoded SAFE dims (always), and (b) EVERY
+    P0.2: persists (a) the hardcoded SAFE floor dims (always), and (b) EVERY
     extra combo key present in ``macro_map`` (the producer-derived dim→macro
     map from the live search space). Scalars persist as-is; tuple/list dims
     (cluster_shape) persist as a list so the consumer can emit per-axis macros.
@@ -592,7 +639,7 @@ def export_winner(optimizer: str,
     block under ``_macros`` so the stdlib-only consumer
     (:func:`source_extra_nvcc_flags`) can emit ``-D<macro>=<v>`` for them
     WITHOUT importing compile.py. When ``None`` (legacy callers), behaviour is
-    the old SAFE-5-only export.
+    the SAFE-floor-only export (the hardcoded MACROS dims).
 
     Returns ``True`` on success, ``False`` on any failure. This function
     MUST NEVER raise into the caller — a failed persist is a loud warning,

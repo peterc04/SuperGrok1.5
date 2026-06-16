@@ -7437,6 +7437,20 @@ class BuildSpec:
     macro_prefix: str = "SG_BUILD_"
     fused_op_template: str = (
         "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
+    # PORTABLE tune-hook (Stream A, the schema-agnostic seam). A project may
+    # declare ``[project] tune_hook = "pkg.module:fn"`` in its compile_config.toml.
+    # When set, the autotuner does NOT discover a torch.op or synthesize args from a
+    # schema; instead it invokes this callable (in a fresh subprocess per built .so)
+    # with the contract:
+    #     fn(*, so_path, model, optimizer, arch, regime, seed)
+    #         -> {"output": np.ndarray (float), "elapsed_ms": float}
+    # compile.py compares ``output`` (variant build vs strict-math reference build)
+    # for numerical correctness and uses ``elapsed_ms`` for the timing objective —
+    # knowing nothing about the op. This is how a project with a complex / non-
+    # torch.ops entry point (e.g. a persistent megakernel reached via a pybind
+    # ``fused_step``) plugs into the generic autotuner. None ⇒ fall back to the
+    # historical torch.op-template / discovery numerical path.
+    tune_hook: Optional[str] = None
     python_package: str = "grokking_optimizers"
     project_namespace: str = ""
     tuned_header_path: str = "csrc/algorithms/tuned_configs.h"
@@ -12742,6 +12756,53 @@ def _render_arg_construction(entry: Optional["DiscoveredEntry"],
     return "\n        ".join(lines)
 
 
+def _hook_capture(tune_hook: str, so_path: str, spec, *, regime: str,
+                  seed: int, out_npy, report=None,
+                  timeout: int = 900) -> Tuple[Path, float]:
+    """PORTABLE numerical+timing capture via a project-supplied tune_hook.
+
+    compile.py stays schema-agnostic: it knows only that ``tune_hook`` is a
+    ``"pkg.module:fn"`` callable obeying the contract
+        fn(*, so_path, model, optimizer, arch, regime, seed)
+            -> {"output": np.ndarray, "elapsed_ms": float}
+    The hook is invoked in a FRESH subprocess (each built .so must load in its own
+    process to avoid extension-module / `_ops` aliasing collisions). The returned
+    ``output`` array is saved to ``out_npy`` (so the caller can compare a variant
+    build's output against the strict-math reference build's output) and the
+    ``elapsed_ms`` is returned for the timing objective. Raises RuntimeError on any
+    failure — no silent skip (a broken hook must fail the trial loudly)."""
+    out_npy = Path(out_npy)
+    out_npy.parent.mkdir(parents=True, exist_ok=True)
+    script = textwrap.dedent("""
+        import sys, json, importlib
+        import numpy as np
+        _hk = {hook!r}
+        _mod, _fn = (_hk.rsplit(":", 1) if ":" in _hk else _hk.rsplit(".", 1))
+        _f = getattr(importlib.import_module(_mod), _fn)
+        _res = _f(so_path={so!r}, model={model!r}, optimizer={opt!r},
+                  arch={arch!r}, regime={regime!r}, seed={seed})
+        _arr = np.asarray(_res["output"], dtype=np.float32)
+        np.save({out!r}, _arr)
+        sys.stdout.write("HOOK_OK " + json.dumps(
+            {{"elapsed_ms": float(_res["elapsed_ms"]), "n": int(_arr.size)}}) + "\\n")
+    """).format(hook=tune_hook, so=str(so_path), model=spec.model,
+                opt=spec.optimizer, arch=spec.arch, regime=regime,
+                seed=int(seed), out=str(out_npy))
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                       text=True, timeout=timeout, cwd=str(REPO_ROOT))
+    if r.returncode != 0 or not out_npy.exists():
+        raise RuntimeError(
+            f"tune_hook {tune_hook!r} failed (rc={r.returncode}) for "
+            f"{so_path}: stderr={r.stderr[-600:]}")
+    oks = [ln for ln in r.stdout.splitlines() if ln.startswith("HOOK_OK ")]
+    if not oks:
+        raise RuntimeError(
+            f"tune_hook {tune_hook!r} produced no HOOK_OK marker for {so_path}: "
+            f"stdout={r.stdout[-300:]} stderr={r.stderr[-300:]}")
+    ms = float(json.loads(oks[-1][len("HOOK_OK "):])["elapsed_ms"])
+    return out_npy, ms
+
+
 def _capture_reference_output(aot_so_path: Path, opt_class: str,
                               size: int, dtype: str,
                               out_dir: Path,
@@ -13465,6 +13526,24 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             return cached
         if ref_state["oracle_unavailable"]:
             return None
+        # PORTABLE tune_hook reference: when a project supplies a tune_hook, the
+        # ground-truth oracle is the hook's output on the STRICT-math AOT .so (no
+        # torch.op discovery / arg-synthesis). Cached per (regime, seed) like the
+        # template path; a hook failure disables validation loudly for the sweep.
+        if getattr(spec, "tune_hook", None):
+            try:
+                _rp = spec.out_dir / ("ref_hook_%s_%s_%s_s%d.npy"
+                                      % (spec.optimizer, spec.model, regime, seed))
+                _p, _ = _hook_capture(spec.tune_hook, str(aot_so), spec,
+                                      regime=regime, seed=seed, out_npy=_rp,
+                                      report=report)
+                ref_state["paths"][rk] = _p
+                return _p
+            except Exception as _exc:
+                report.write("  [numerical] tune_hook reference capture failed "
+                             "(%s); validation disabled for this sweep.\n" % _exc)
+                ref_state["oracle_unavailable"] = True
+                return None
         # Mandate #9 — the oracle must be a fast-math-OFF strict build. The
         # AOT .so is the reference source; post-#6 the base is strict-math, so
         # the oracle is uncontaminated. Fix-#2 re-audit — actively GUARD that:
@@ -13793,26 +13872,45 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # for non-megakernel/optimizer-only configs or if the TC JIT build is
         # unavailable, so elementwise dims keep their correct (and far cheaper)
         # opt.step() timing.
-        if _config_touches_gemm_tile_dim(config, dims) and \
-                _canonical_tc_model(spec.model) is not None:
-            result = _time_megakernel_tc_step(
-                spec.model, device_extra, spec.out_dir, report=report)
-            if result is not None:
-                report.write(
-                    f"    [megakernel-tc] {ckey[:24]}: real TC step "
-                    f"{result['timing_ms']:.4f} ms "
-                    f"(B={result.get('tc_batch')}, n={result['n']}) — tile dims "
-                    f"are LIVE in this measurement.\n")
-        if result is None and worker is not None and worker.alive():
-            result = worker.time(variant_so)
+        # PORTABLE tune_hook timing + candidate capture: when a project supplies a
+        # tune_hook, run it on the variant .so for BOTH the timing objective and the
+        # candidate output (compared against the strict reference in the validation
+        # pass below). Bypasses the OptCls.step() worker / one-shot timers (removed
+        # with the eager path) and the torch.op-schema dump entirely.
+        hook_cand_npy = None
+        if getattr(spec, "tune_hook", None):
+            try:
+                hook_cand_npy, _hook_ms = _hook_capture(
+                    spec.tune_hook, str(variant_so), spec,
+                    regime="normal", seed=0,
+                    out_npy=variant_dump_dir / ("cand_%s.npy" % _short_key(ckey)),
+                    report=report)
+                result = {"timing_ms": _hook_ms}
+            except Exception as _hexc:
+                report.write("    [tune_hook] timing/capture failed for %s: %s\n"
+                             % (ckey, _hexc))
+                result = None
+        else:
+            if _config_touches_gemm_tile_dim(config, dims) and \
+                    _canonical_tc_model(spec.model) is not None:
+                result = _time_megakernel_tc_step(
+                    spec.model, device_extra, spec.out_dir, report=report)
+                if result is not None:
+                    report.write(
+                        f"    [megakernel-tc] {ckey[:24]}: real TC step "
+                        f"{result['timing_ms']:.4f} ms "
+                        f"(B={result.get('tc_batch')}, n={result['n']}) — tile dims "
+                        f"are LIVE in this measurement.\n")
+            if result is None and worker is not None and worker.alive():
+                result = worker.time(variant_so)
+                if result is None:
+                    report.write(f"    [worker time failed for {ckey}; "
+                                 "restart + fallback]\n")
+                    worker.restart()
             if result is None:
-                report.write(f"    [worker time failed for {ckey}; "
-                             "restart + fallback]\n")
-                worker.restart()
-        if result is None:
-            result = _time_variant_oneshot(
-                variant_so, OPT_CLASS[spec.optimizer], report=report,
-                python_package=spec.python_package)
+                result = _time_variant_oneshot(
+                    variant_so, OPT_CLASS[spec.optimizer], report=report,
+                    python_package=spec.python_package)
 
         elapsed = time.monotonic() - progress_state["last_start"]
         progress_state["window"].append(elapsed)
@@ -13859,13 +13957,21 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # draw).
                     ref_path = _resolve_ref("normal", 0)
                     if ref_path is not None:
-                        num_status = _validate_against_regimes(
-                            variant_so, OPT_CLASS[spec.optimizer], ref_state,
-                            _resolve_ref, _validation_regimes(spec),
-                            variant_dump_dir, ckey, report,
-                            fused_op_template=getattr(
-                                spec, "fused_op_template", None),
-                            label="variant")
+                        if getattr(spec, "tune_hook", None) and \
+                                hook_cand_npy is not None:
+                            # hook numerical check: variant hook-output vs the
+                            # strict-build hook reference (schema-agnostic compare).
+                            _st, _rel = _compare_outputs(
+                                ref_path, hook_cand_npy, ref_state["dtype"])
+                            num_status = _st
+                        else:
+                            num_status = _validate_against_regimes(
+                                variant_so, OPT_CLASS[spec.optimizer], ref_state,
+                                _resolve_ref, _validation_regimes(spec),
+                                variant_dump_dir, ckey, report,
+                                fused_op_template=getattr(
+                                    spec, "fused_op_template", None),
+                                label="variant")
                 progress_state.setdefault("_val_cache", {})[ckey] = \
                     num_status
                 if (num_status not in ("numerical_fail",)
@@ -29113,6 +29219,16 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         #   {opt_lower}  — .lower() of {opt}
         #   {opt_upper}  — .upper() of {opt}
         "fused_op_template": "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step",
+        # PORTABLE tune-hook (schema-agnostic autotune seam). A project supplies a
+        # callable ``pkg.module:fn`` with the contract
+        #   fn(*, so_path, model, optimizer, arch, regime, seed)
+        #       -> {"output": np.ndarray, "elapsed_ms": float}
+        # and the autotuner uses it for BOTH reference capture and variant
+        # run+time+validate, bypassing torch.op discovery / arg-synthesis entirely.
+        # The SuperGrok default points at the L3-TC megakernel driver; a foreign
+        # project overrides this in its own compile_config.toml. Empty/None ⇒ the
+        # historical torch.op-template numerical path.
+        "tune_hook": "grokking_optimizers.tune_hook:run",
         # Python package imported by the worker / timing / pgo
         # subprocesses to resolve the optimizer class
         # (e.g. `from <python_package> import Lion`).
@@ -29476,6 +29592,13 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
                          or src.get("fused_op_template"))
     if fused_op_template:
         spec.fused_op_template = str(fused_op_template)
+    # PORTABLE tune-hook: ``[project] tune_hook = "pkg.module:fn"``. Empty string
+    # in a project config explicitly disables the hook (falls back to the torch.op
+    # numerical path); a missing key leaves the BuildSpec/_DEFAULT_PROJECT_CONFIG
+    # value untouched.
+    if "tune_hook" in proj:
+        th = proj.get("tune_hook")
+        spec.tune_hook = str(th) if th else None
     if proj.get("python_package"):
         spec.python_package = str(proj["python_package"])
     # ``namespace`` defaults to "" — we still copy that through so a
