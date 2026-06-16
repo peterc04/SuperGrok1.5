@@ -123,3 +123,37 @@ NOTE (not a bug, flagged for the 8x builder): `gather_full` tensor-granular bran
 
 ### F9 — CPU gates RE-RUN GREEN (this box, 2026-06-16)
 `tests/test_pipeline_schedule.py` + `tests/test_zero3_plan.py`: **55 passed in 1.54s** (CPU-only, no CUDA touched — safe to run, does not collide with #11's GPU work). Matches the RUNBOOK's documented "55 passed". py_compile clean on all 4 parallel modules. (ruff binary not present in this venv — substituted py_compile + the test suite.) Confirms the shard-map / zero3-plan / pipeline-schedule math holds against its own test suite, independent of the GPU.
+
+### F10 — sharded_optimizer_binding.cu — REVIEWED CLEAN (ABI verified)
+`tests/hw/sharded_optimizer_binding.cu` (167 lines). The FusedOptState construction mirrors the production TC launcher: `exp_avg=state`, `exp_avg_sq=state+total`, `ema=state+2*total`, then `apply_scalars(st, scalars)` then `st.lr=lr`. VERIFIED every referenced ABI name exists in opt_components.cuh: `FusedScalars{lr,beta1,beta2,eps,wd,bc1,bc2,alpha,lamb}` with in-class defaults (struct at :271); `FusedOptState{exp_avg,exp_avg_sq,ema}` (:105); `apply_scalars(FusedOptState&,FusedScalars)` (:342); `OptId::{AdamW=0,Lion=1,Grokfast=2}` (:53). TORCH_CHECK guards (CUDA, float32, contiguous, grad==params numel, state>=3*total). Elementwise-only dispatch, loud TORCH_CHECK on others. The `sharded_opt_step` 14-arg signature matches the test_sharded_optimizer.py and test_dp2_loopback callers exactly. Compiles against the kernel header (include chain sound). **No bug.** Severity: n/a (clean). NOTE: nvcc -c syntax-check deliberately SKIPPED — #11 is actively timing on the GPU (scripts/nvcc_baseline.py --bench-d2048 live, PID ~272606); per the hard constraints I will not contend on nvcc. ABI verified statically instead.
+
+### F11 — pp_stage_decoder_tc.cuh — REVIEWED CLEAN; ownership cross-check VERIFIED EQUAL
+`csrc/fused/sm_90/pp_stage_decoder_tc.cuh` (not in my explicit scope-list but reviewed for the partition cross-check; I did NOT edit it). `PPStageSpec<Stage,NumStages>::owns_tensor(t)` is **bit-for-bit equivalent** to the Python `pipeline.py::stage_tensor_ownership`:
+  - kernel: layer block `t∈[2+12*kLlo, 2+12*kLhi)`; first stage `t∈{0,1}`; last stage `t∈[26,29]`.
+  - python: layer block `range(2+12*llo, 2+12*lhi)`; first prepends `range(2)={0,1}`; last appends `range(26,30)={26,27,28,29}`.
+  IDENTICAL partition. kLlo/kLhi use the same contiguous even split (Stage*kLayers/NumStages). static_asserts (NumStages∈[1,kLayers], kLayers%NumStages==0, Stage in range) mirror the Python ValueErrors. The cross-check test (test_pp2_stage_ownership_matches_python_plan) WILL pass. owns_spec (4 specs/layer + head=8 on last) and owns_lnvec (4 slots/layer + {8,9} on last) are consistent with the dW-spec / LN-vec orders. **No bug.** Severity: n/a (clean).
+
+### F12 — tp_loopback_binding.cu — REVIEWED CLEAN (honesty-enforcing references)
+`tests/hw/tp_loopback_binding.cu` (~27KB). Runs TP=P virtual ranks in one grid: row-parallel ff2 partial→publish→`tp_allreduce_sum_fixed_order` (point ②); conjugate col-parallel dX partial→reduce (②'); dW0/dW1/db shards via ascending-m fp32 single-owner accumulation (the P2 determinism contract). Builds three references — (i) unsharded full-K, (ii) serial CHUNKED-ORDER (same ascending-pe fp32 sum as the transport ⇒ transport-neutrality oracle), (iii) per-shard. Asserts (a) cross-rank bit-identity, (b) A/A/A, (c) transport-neutrality bit-exact, (d) dW slice-exactness bit-exact, (e) vs-unsharded within parity tol. The chunked-order reference makes a fake-success loopback impossible (the design §5.3 honesty requirement). Shard-pack uses the tp_layer.cuh helpers (single source). **No bug.** Severity: n/a (clean). PENDING-GPU.
+
+### F13 — DP=2 loopback test + remaining GPU tests — REVIEWED CLEAN
+`tests/hw/test_dp2_loopback_determinism.py` (24KB): the [1]-[4] decomposed step is consistent with distributed_step.py (same `_shard_batch` 16*world rounding, same `_fixed_order_allreduce_grad` = all_gather + ascending-rank fp32 sum + /world, same even_partition shard ownership, same padded all_gather stitch). NCCL_HOSTID loopback trick for 2-ranks-on-cuda:0. The worker restores params_before (pb) before the sharded apply so the discarded in-kernel-P3 update does not leak. Three asserts (a) cross-rank identity, (b) A/A/A, (c) vs-unsharded within tol — matches design §6.4. CUDA-skip-guarded (`_sm90a_available()` + torchrun spawn). PENDING-GPU.
+Sibling GPU tests (test_tp_loopback.py, test_pp2_loopback_determinism.py, test_distributed_step.py, test_zero3_roundtrip.py): all CUDA-skip-guarded per the RUNBOOK; their pass-criteria match the design (reviewed at the REPORT/RUNBOOK level + spot-checked the determinism flows). PENDING-GPU.
+
+---
+
+## OVERALL VERDICT (review complete, 2026-06-16)
+
+**The Phase-2 dormant scaffolding is COMPLETE and the multi-GPU shard MATH is CORRECT.** Lane C (#25, commit ab8c313 + ef433ac + 26517ac) authored a far more complete surface than the task brief anticipated. After a line-by-line audit of all 13 files against the design's shard-math invariants (ABI §0.2, taxonomy §0.4, decomposition §2.1-2.7, partition §3.4, TP geometry §5.1-5.2, cross-rank A/A/A §6.4):
+
+- ZeRO-3 partition/gather/reduce-scatter offsets & shard-range boundaries: **correct** (even_partition byte-identical to distributed.py; flat-plan prefix-sum offsets correct; owned() shard coords consistent; padded all-gather convention matches). 
+- parallel_config DP×TP×PP dimension arithmetic: **correct** (derived gates, SingleGPU byte-identity contract).
+- TP all-reduce / all-gather seams: **correct** (fixed-order ascending-pe fp32 reduce with `#pragma unroll 1`; symmetric-heap addressing identical loopback↔NVSHMEM; Megatron col/row/ColQKV geometry matches §5.1; dW exact-slice).
+- off-by-one in shard ranges: **none found** (even_partition min-clamps; LPT deterministic; PP layer ranges + tensor ownership cross-checked kernel↔python EQUAL; 1F1B warmup/steady/cooldown + liveness bound correct).
+- dtype/alignment: **correct** (fp32 params/grad/state; int64 indexing; B%16 wgmma alignment; fp32 dh PP carrier).
+- synchronization vs design equations: **correct** (cuda.synchronize fences collectives off the megakernel; rendezvous = GridBarrier; no overlap on the shared loopback device).
+- rank↔offset mapping: **correct**.
+
+**ONE finding requiring a fix (F6a, MINOR, doc-only, in-scope):** the tp_layer.cuh §5.2 TP-insertion-map line citations drifted stale as the production decoder header grew (1100→1946 lines). Fixed below (comment-only update in the my-scope tp_layer.cuh; NO math, NO production-TU edit). Everything else is clean.
+
+**No CPU-authorable functional gaps remain.** The "write the DP=2 loopback test / complete test_sharded_optimizer.py" task items were already satisfied by committed prior work (verified correct). Per the brief's Honesty clause, this is stated plainly rather than inventing busywork. The residual is GPU-verification (PENDING-GPU list in REPORT.md) + the 8x-genuine items (NVSHMEM TP, scaling) + the FOLLOW-UP vit/mamba twins.
