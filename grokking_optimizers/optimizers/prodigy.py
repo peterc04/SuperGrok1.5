@@ -138,103 +138,21 @@ class Prodigy(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimisation step.
+        """Eager optimiser step — REMOVED (pure L3-TC).
 
-        Args:
-            closure: A closure that re-evaluates the model and returns the loss
-                (optional).
-
-        Returns:
-            The loss value if *closure* is provided, otherwise ``None``.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        if self._use_grad_hooks:
-            return loss
-
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind("prodigy_fused_step")
-
-        for group in self.param_groups:
-            (params_list, exp_avg_list, exp_avg_sq_list, s_list,
-             param_init_list, states) = self._group_cache(group)
-
-            if len(params_list) == 0:
-                continue
-
-            grads_list = [_validate_grad(p) for p in params_list]
-            step_list = []
-            for state in states:
-                state["step"] += 1
-                step_list.append(state["step"])
-
-            beta1, beta2 = group["betas"]
-            # beta3 governs the persistent-EMA decay of the D-estimate's
-            # numerator/denominator (canonical Prodigy uses sqrt(beta2)).
-            beta3 = math.sqrt(beta2)
-            # The kernel decays the persistent (r_ema, s_ema) by beta3, adds
-            # this step's reduction, updates d = max(d_prev, d_coef·r_ema/|s_ema|),
-            # applies, and returns the new (d_lr, r_ema, s_ema).
-            self._d_lr, self._r_ema, self._s_ema = fused_step(
-                params_list,
-                grads_list,
-                exp_avg_list,
-                exp_avg_sq_list,
-                s_list,
-                param_init_list,
-                step_list,
-                self._d_lr,
-                self._r_ema,
-                self._s_ema,
-                beta1,
-                beta2,
-                beta3,
-                group["lr"],
-                group["weight_decay"],
-                group["eps"],
-                group["d0"],
-                group["d_coef"],
-            )
-
-        return loss
+        On the L3-TC path the staged global-d estimate (cross-all-tensors (r,s)
+        reduction → beta3-EMA → d) and the prodigy apply run IN the megakernel; the
+        eager kernel dispatch here is gone. ``d_lr`` + ``state_dict`` are kept as
+        host-side helpers."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path.
-
-        KNOWN LIMITATION: the persistent-EMA D-estimate decays (r_ema, s_ema) by
-        beta3 ONCE PER fused_step CALL. On this per-parameter hook path that is
-        once per param per optimizer step, so a model with K parameters over-
-        decays the shared EMA by beta3**K each step (vs the intended beta3). The
-        D-estimate trajectory therefore differs from the standard (use_grad_hooks
-        =False) path. The grokking race uses use_grad_hooks=False, so this does
-        not affect it; fixing the hook path would require a per-step (not
-        per-param) decay barrier and is left out of scope.
-        """
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["step"] = 0
-            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-            state["s"] = torch.zeros_like(param, dtype=torch.float32)
-            state["param_init"] = param.data.clone().float()
-        state["step"] += 1
-        beta1, beta2 = group["betas"]
-        beta3 = math.sqrt(beta2)
-        self._d_lr, self._r_ema, self._s_ema = _ops.prodigy_fused_step(
-            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
-            [state["s"]], [state["param_init"]], [state["step"]],
-            getattr(self, '_d_lr', group["d0"]),
-            getattr(self, '_r_ema', 0.0), getattr(self, '_s_ema', 0.0),
-            beta1, beta2, beta3, group["lr"],
-            group["weight_decay"], group["eps"],
-            group["d0"], group["d_coef"],
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     @property
     def d_lr(self) -> float:

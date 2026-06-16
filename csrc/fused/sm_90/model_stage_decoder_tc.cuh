@@ -56,7 +56,7 @@
 
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/decoder_layout.cuh"
-#include "csrc/fused/sm_90/model_stages_decoder.cuh"   // reuse DecWeights/DecGrad/bind + fp32 helpers
+#include "csrc/fused/sm_90/dec_weights.cuh"   // reuse DecWeights/DecGrad/bind + fp32 helpers
 #include "csrc/backends/cuda/sm_90/wgmma.cuh"
 #include "csrc/backends/cuda/sm_90/tile_pipeline.cuh"
 

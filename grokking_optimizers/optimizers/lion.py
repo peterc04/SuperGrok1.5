@@ -115,59 +115,16 @@ class Lion(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimisation step.
-
-        Args:
-            closure: A closure that re-evaluates the model and returns the loss
-                (optional).
-
-        Returns:
-            The loss value if *closure* is provided, otherwise ``None``.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        if self._use_grad_hooks:
-            return loss
-
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind("lion_fused_step")
-
-        for group in self.param_groups:
-            params_list, exp_avg_list = self._group_cache(group)
-
-            if len(params_list) == 0:
-                continue
-
-            grads_list = [_validate_grad(p) for p in params_list]
-
-            fused_step(
-                params_list,
-                grads_list,
-                exp_avg_list,
-                group["lr"],
-                group["betas"][0],
-                group["betas"][1],
-                group["weight_decay"],
-            )
-
-        return loss
+        """Eager optimiser step — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-        _ops.lion_fused_step(
-            [param], [grad], [state["exp_avg"]],
-            group["lr"], group["betas"][0], group["betas"][1],
-            group["weight_decay"],
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

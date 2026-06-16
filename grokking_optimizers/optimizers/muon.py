@@ -152,32 +152,14 @@ class Muon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimisation step.
+        """Eager optimiser step — REMOVED (pure L3-TC).
 
-        Args:
-            closure: A closure that re-evaluates the model and returns the loss
-                (optional).
-
-        Returns:
-            The loss value if *closure* is provided, otherwise ``None``.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        if self._use_grad_hooks:
-            return loss
-
-        for group in self.param_groups:
-            group_type = group.get("group_type", "muon")
-
-            if group_type == "muon":
-                self._step_muon(group)
-            else:
-                self._step_adamw(group)
-
-        return loss
+        On the L3-TC path the staged grid-cooperative Newton-Schulz (2D weights)
+        and the AdamW aux tail (1D weights) run IN the megakernel; the eager
+        per-group dispatch here is gone."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _muon_cache(self, group: dict):
         """Cached (params, momentum_buffers) for a Muon group, keyed on the
@@ -229,75 +211,22 @@ class Muon(Optimizer):
         return entry
 
     def _step_muon(self, group: dict) -> None:
-        """Apply Muon (momentum + Newton-Schulz orthogonalisation) to 2D params."""
-        params_list, momentum_buf_list = self._muon_cache(group)
-
-        if len(params_list) == 0:
-            return
-
-        grads_list = [_validate_grad(p) for p in params_list]
-
-        fused_step = self._muon_fused_step
-        if fused_step is None:
-            fused_step = self._muon_fused_step = _ops.bind("muon_fused_step")
-        fused_step(
-            params_list,
-            grads_list,
-            momentum_buf_list,
-            group["momentum"],
-            group["lr"],
-            group["weight_decay"],
-            group["ns_steps"],
-        )
+        """Eager Muon (NS-orth) kernel dispatch — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _step_adamw(self, group: dict) -> None:
-        """Apply standard AdamW to non-2D params."""
-        params_list, exp_avg_list, exp_avg_sq_list, states = \
-            self._adamw_cache(group)
-
-        if len(params_list) == 0:
-            return
-
-        grads_list = [_validate_grad(p) for p in params_list]
-        step_list = []
-        for state in states:
-            state["step"] += 1
-            step_list.append(state["step"])
-
-        betas = group.get("betas", (0.9, 0.98))
-        eps = group.get("eps", 1e-8)
-
-        fused_step = self._adamw_fused_step
-        if fused_step is None:
-            fused_step = self._adamw_fused_step = _ops.bind(
-                "fused_adamw_simple_step")
-        fused_step(
-            params_list,
-            grads_list,
-            exp_avg_list,
-            exp_avg_sq_list,
-            step_list,
-            betas[0],
-            betas[1],
-            group["lr"],
-            group["weight_decay"],
-            eps,
-        )
+        """Eager AdamW-aux kernel dispatch — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["momentum_buffer"] = torch.zeros_like(param, dtype=torch.float32)
-        _ops.muon_fused_step(
-            [param], [grad], [state["momentum_buffer"]],
-            group.get("momentum", 0.95),
-            group["lr"],
-            group["weight_decay"],
-            group.get("ns_steps", 5),
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

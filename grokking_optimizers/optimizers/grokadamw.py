@@ -330,156 +330,19 @@ class GrokAdamW(Optimizer):
         Returns:
             The loss value if *closure* is provided, otherwise ``None``.
         """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        # Grokking-signal → live α_t (reference: alpha = alpha_init *
-        # exp(-grokking_signal_decay_rate * signal), applied per group in
-        # _alpha_for_group). Only recomputes when BOTH losses are supplied;
-        # otherwise the last signal carries over (and α stays at alpha_init until
-        # the first pair arrives).
-        if train_loss is not None and val_loss is not None:
-            self._grok_signal = self._grokking_signal(train_loss, val_loss)
-            self._signal_active = True
-
-        if self._use_grad_hooks:
-            return loss
-
-        # Bind the resolved kernel callable once on the instance, then reuse it
-        # across steps instead of going through the _LazyOps proxy each step.
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind("grokadamw_fused_step")
-
-        for group in self.param_groups:
-            grads_by_id = {
-                id(p): _validate_grad(p)
-                for p in group["params"] if p.grad is not None
-            }
-            params_list, exp_avg_list, exp_avg_sq_list, ema_list, states = \
-                self._group_cache(group, grads_by_id)
-
-            if len(params_list) == 0:
-                continue
-
-            grads_list = [grads_by_id[id(p)] for p in params_list]
-            step_list = []
-            for state in states:
-                state["step"] += 1
-                step_list.append(state["step"])
-
-            # Live α_t (group alpha_init if no signal yet) — a SCALAR the kernel
-            # accepts as-is. β1 is PER-TENSOR (layer-wise decay), so it must vary
-            # per param: β1_i = β1*(1-gamma)**layer_index.
-            alpha_t = self._alpha_for_group(group)
-            beta1s = [self._layer_beta1(p) for p in params_list]
-
-            self._dispatch_grokadamw(
-                fused_step, params_list, grads_list, exp_avg_list,
-                exp_avg_sq_list, ema_list, step_list, alpha_t, beta1s, group)
-
-        return loss
-
-    # Has the rebuilt extension grown the vector-β1 ABI? None = unprobed;
-    # True/False latched after the first attempt so we don't re-raise/re-catch
-    # the TypeError every step. Class-level so all instances share the verdict.
-    _vector_beta1_abi: Optional[bool] = None
-
-    def _dispatch_grokadamw(self, fused_step, params_list, grads_list,
-                            exp_avg_list, exp_avg_sq_list, ema_list, step_list,
-                            alpha_t, beta1s, group):
-        """Drive the fused GrokAdamW kernel with a live scalar α_t and a
-        PER-TENSOR β1 vector (layer-wise decay).
-
-        Two paths, selected by an ABI probe (stale-ABI latch):
-          • VECTOR ABI (post-rebuild): the C++ ``grokadamw_fused_step`` accepts a
-            ``layer_beta1s`` vector after ``steps`` — ONE multi-tensor launch
-            passes the whole β1 vector + scalar α_t. Faithful and fastest.
-          • INTERIM (no rebuild): the shipped binding takes a SCALAR β1, so we
-            PARTITION the params by their β1_i value and issue one fused call per
-            distinct β1 (each its own scalar β1 + the live α_t). Correctness over
-            launch count until the ABI lands. With gamma=0 every β1_i is equal ⇒
-            exactly one call (no regression vs the old single-call path)."""
-        cls = type(self)
-        if cls._vector_beta1_abi is not False:
-            # Try the new signature: layer_beta1s inserted right after steps.
-            try:
-                fused_step(
-                    params_list, grads_list, exp_avg_list, exp_avg_sq_list,
-                    ema_list, step_list, beta1s,
-                    alpha_t, group["lamb"], group["betas"][0],
-                    group["betas"][1], group["lr"], group["weight_decay"],
-                    group["eps"], group["grad_clip"],
-                )
-                if cls._vector_beta1_abi is None:
-                    cls._vector_beta1_abi = True
-                return
-            except TypeError:
-                if cls._vector_beta1_abi is None:
-                    cls._vector_beta1_abi = False
-                    warnings.warn(
-                        "GrokAdamW: the compiled extension does not yet expose "
-                        "the vector-β1 grokadamw_fused_step ABI; using the "
-                        "interim per-β1 partitioned launch (correct, slightly "
-                        "more launches). Rebuild (`pip install -e .`) to get the "
-                        "single-call vector path.", RuntimeWarning, stacklevel=2)
-                # fall through to the interim partitioned path
-        self._dispatch_partitioned(
-            fused_step, params_list, grads_list, exp_avg_list, exp_avg_sq_list,
-            ema_list, step_list, alpha_t, beta1s, group)
-
-    @staticmethod
-    def _dispatch_partitioned(fused_step, params_list, grads_list, exp_avg_list,
-                              exp_avg_sq_list, ema_list, step_list, alpha_t,
-                              beta1s, group):
-        """Interim path: group tensors by identical β1_i and issue one scalar-β1
-        fused call per group (each passing the live scalar α_t)."""
-        # Bucket indices by their β1 value (preserve first-seen order).
-        buckets: dict = {}
-        order = []
-        for i, b1 in enumerate(beta1s):
-            if b1 not in buckets:
-                buckets[b1] = []
-                order.append(b1)
-            buckets[b1].append(i)
-        for b1 in order:
-            idxs = buckets[b1]
-            fused_step(
-                [params_list[i] for i in idxs],
-                [grads_list[i] for i in idxs],
-                [exp_avg_list[i] for i in idxs],
-                [exp_avg_sq_list[i] for i in idxs],
-                [ema_list[i] for i in idxs],
-                [step_list[i] for i in idxs],
-                alpha_t, group["lamb"], b1, group["betas"][1],
-                group["lr"], group["weight_decay"], group["eps"],
-                group["grad_clip"],
-            )
+        # PURE L3-TC: eager .step() execution is REMOVED. The L3-TC production path
+        # (grokking_race_v2.train_grokadamw) sets opt._grok_signal / _signal_active
+        # HOST-SIDE before the fused launch; _alpha_for_group + _layer_beta1 stay as
+        # host-side helpers _opt_scalars_from reads. The eager kernel dispatch is gone.
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path.
-
-        Uses this param's LAYER-WISE β1 and the live α_t (updated by step() from
-        the grokking signal). Routed through the SAME ABI-probed dispatcher as
-        the batched path so it is correct both pre- and post-rebuild."""
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["step"] = 0
-            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-            state["ema"] = grad.detach().to(torch.float32).clone()
-        state["step"] += 1
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind("grokadamw_fused_step")
-        self._dispatch_grokadamw(
-            fused_step, [param], [grad], [state["exp_avg"]],
-            [state["exp_avg_sq"]], [state["ema"]], [state["step"]],
-            self._alpha_for_group(group), [self._layer_beta1(param)], group)
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

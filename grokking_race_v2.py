@@ -736,51 +736,35 @@ OPT_KEY_BY_NAME = {
 }
 
 def _record_train_path(r):
-    """Compose r.train_path from the per-run path signals (task 2 WIRING GUARD).
+    """Stamp r.train_path from the L3-TC engine that ACTUALLY ran this step.
 
-    Reads the module globals LAST_L3_ENGINE (set by _try_fused_train_step on a
-    successful L3 step → carries the ACTUAL engine) and LAST_L1_FIRED (set by
-    _try_fused_step). Composes the human label the directive lists: "L3-TC bf16" /
-    "L3-scalar fp32" / "L1+eager" / "eager".
+    Reads the module global LAST_L3_ENGINE (set by _try_fused_train_step on a
+    successful L3-TC step → carries the ACTUAL engine). Composes the human label
+    ("L3-TC bf16").
 
-    LOUD-DEGRADE: for an L3-REAL-CAPABLE cell+precision (decoder/vit×adamw at bf16,
-    any ×adamw at fp32) that EXPECTED L3 but did not fire it, mark the path DEGRADED
-    and emit a one-time stderr banner — UNLESS the stale-ABI latch tripped (a
-    legitimate rebuild-pending soft-degrade, labelled as such, not a failure). The
-    sweep CONTINUES (a hard raise would forfeit the roofline deliverable); the smoke
-    gate asserts engine separately where "TC must fire" is load-bearing.
+    PURE L3-TC (owner directive: NO silent downgrade, ever). The eager / L1-tail /
+    scalar paths were REMOVED, so the ONLY way a train_* loop reaches here is via a
+    successful L3-TC step (LAST_L3_ENGINE set). If an L3-CAPABLE cell somehow
+    reached completion WITHOUT firing L3-TC, that is a silent-gate regression —
+    HARD RAISE (the old code soft-degraded to a DEGRADED/ABI-stale label; that
+    fallback is gone). A genuinely non-L3 cell can never get here: it raises inside
+    _try_fused_train_step before training completes.
     """
     if LAST_L3_ENGINE is not None:
         r.train_path = LAST_L3_ENGINE["path"]
         return
-    base = "L1+eager" if LAST_L1_FIRED else "eager"
-    # Whether THIS cell could even take an L3-REAL path (the 3 adamw cells on sm_90).
-    # has_l3_real is the decisive gate — without it, gemm_impl_for_cell's "scalar"
-    # default would flag every non-adamw cell (muon/prodigy/…), which CORRECTLY run
-    # eager. opt_key maps the display name → optimizer key for has_l3_real.
+    # No engine recorded: an L3-capable cell finished a run without firing L3-TC.
+    # There is no eager/L1/scalar path to attribute it to — this is a wiring
+    # regression, not a degrade. HARD-FAIL (no silent downgrade).
     opt_key = OPT_KEY_BY_NAME.get(r.name)
     l3_capable = opt_key is not None and has_l3_real(r.model_type, opt_key)
-    expected_engine = (gemm_impl_for_cell(r.model_type, opt_key, r.matmul_precision)
-                       if l3_capable else None)
-    # DEGRADED fires ONLY for a genuine silent gate regression: an L3-capable cell,
-    # fusion requested, not AMP, a wired precision (expected_engine set), that
-    # declined L3 anyway AND is NOT the legitimate stale-ABI soft-degrade. Anything
-    # else (non-L3 cell, use_fused off — e.g. the FLOP pass, AMP, tf32/fp16) is an
-    # honest eager run, not a degrade.
-    degraded = (l3_capable and r.use_fused_requested and not r.use_amp
-                and expected_engine is not None and not _FUSED_ABI_STALE)
-    if l3_capable and r.use_fused_requested and not r.use_amp \
-            and expected_engine is not None and _FUSED_ABI_STALE:
-        r.train_path = f"{base}(ABI-stale, rebuild pending)"
-    elif degraded:
-        want = _l3_path_label(expected_engine, r.matmul_precision)
-        r.train_path = f"{base}(DEGRADED: expected {want})"
-        msg = (f"[WIRING-GUARD] {r.name}/{r.model_type} @ {r.matmul_precision}: "
-               f"expected {want} but ran {base} — L3-REAL path did NOT fire "
-               f"(not ABI-stale). Roofline/race row is degraded; investigate.")
-        print(msg, file=sys.stderr, flush=True)
-    else:
-        r.train_path = base
+    raise RuntimeError(
+        f"L3-TC unavailable; refusing to silently downgrade: {r.name}/"
+        f"{r.model_type} @ {r.matmul_precision} completed without firing the "
+        f"L3-TC megakernel (LAST_L3_ENGINE is None; l3_capable={l3_capable}, "
+        f"use_fused_requested={r.use_fused_requested}, use_amp={r.use_amp}). "
+        f"The eager/L1/scalar fallback paths were removed — this is a wiring "
+        f"regression, investigate the gate (has_l3_real / gemm_impl_for_cell).")
 
 
 def _fin(r, st, step, t0, m, tex, tey, p=97):
@@ -830,11 +814,11 @@ def _tr(name, c):
     # [A4-M4] capture the per-run resolved matmul precision + AMP flag so
     # save_json can record what precision actually ran (config c is not in
     # save_json's scope; the TrainResult carries it).
-    # WIRING GUARD (task 2): reset the per-run path signals at run start so _fin
-    # composes train_path from THIS run only (globals resolved at call-time, so the
-    # forward reference to LAST_L3_ENGINE/LAST_L1_FIRED defined below is fine).
-    global LAST_L3_ENGINE, LAST_L1_FIRED
-    LAST_L3_ENGINE = None; LAST_L1_FIRED = False
+    # WIRING GUARD (task 2): reset the per-run path signal at run start so _fin
+    # composes train_path from THIS run only (the global is resolved at call-time,
+    # so the forward reference to LAST_L3_ENGINE defined below is fine).
+    global LAST_L3_ENGINE
+    LAST_L3_ENGINE = None
     r = TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5),
                     c.get("val_ratio",0.10), matmul_precision=_resolve_matmul_precision(c),
                     use_amp=bool(c.get("use_amp", False)))
@@ -847,162 +831,88 @@ from grokking_optimizers import (
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
 )
 from grokking_optimizers.dispatch import (
-    detect_arch, has_fused, dispatch_fused, fused_optimizer_step,
+    detect_arch,
     announce_fused_readiness, has_l3_real, fused_train_step,
     gemm_impl_for_cell, canonicalize_model,
 )
 
 # ── WIRING GUARD (owner directive task 2): the engine that ACTUALLY executed the
-# last L3-REAL fused train step, set by _try_fused_train_step on every successful
-# L3 step. None when the last step took the eager/L1 path. The roofline harness
-# reads this (via the dispatch wrapper) to label the row with the REAL path
-# (L3-TC bf16 / L3-scalar fp32) and pick the matching ceiling — never inferred from
-# the requested precision. Format: dict(engine="wgmma"|"scalar", model=<canon>,
-# precision=<str>, path=<human label>) or None. Module-global is safe: each train_*
-# runs in one process, one model at a time.
+# last L3-TC fused train step, set by _try_fused_train_step on every successful L3
+# step. PURE L3-TC: never None when a train_* loop completes (a non-L3 step RAISES
+# inside _try_fused_train_step — there is no eager/L1 path left). The roofline
+# harness reads this (via the dispatch wrapper) to label the row with the REAL path
+# (L3-TC bf16) and pick the matching ceiling — never inferred from the requested
+# precision. Format: dict(engine="wgmma", model=<canon>, precision=<str>,
+# path=<human label>) or None. Module-global is safe: each train_* runs in one
+# process, one model at a time.
 LAST_L3_ENGINE = None
-# Companion flag (task 2): True once the L1 fused optimizer-tail fired this run
-# (whitelisted cell: eager fwd+bwd + fused tail). Lets _fin compose the path label
-# without hand-editing every train_* loop. Reset at run start by _tr; the stale-ABI
-# soft-degrade reason is tracked separately so the guard does not fire spuriously.
-LAST_L1_FIRED = False
 
 
 def _l3_path_label(engine, precision):
-    """Human path label for TrainResult/run-JSON/roofline rows (task 2)."""
+    """Human path label for TrainResult/run-JSON/roofline rows (task 2).
+
+    PURE L3-TC: production only ever passes engine="wgmma". The legacy "scalar" /
+    "L1+eager" labels are kept as inert defaults (those paths were removed)."""
     if engine == "wgmma":
         return f"L3-TC {precision}"
     if engine == "scalar":
-        return f"L3-scalar {precision}"
-    return "L1+eager"
+        return f"L3-scalar {precision}"  # legacy/inert: scalar path removed
+    return "L1+eager"                      # legacy/inert: eager/L1 path removed
 
 def _maybe_wrap_cuda_graph(opt, c):
     """No-op shim. CUDA Graph wrapping was removed in the post-refactor
     cleanup; the race is single-node and does not need graph capture."""
     return opt
 
-# Process-wide stale-ABI latch for the fused optimizer path: set on the first
-# pybind TypeError (extension predates the widened fused_step signature) so
-# every subsequent step takes the eager path without re-attempting.
-_FUSED_ABI_STALE = False
-
-def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c):
-    """Run the L1 fused optimizer-tail megakernel for a whitelisted cell.
-
-    CONTRACT CHANGE (lever (a)): this is now a post-backward OPTIMIZER STEP, not a
-    fwd+bwd+opt launch. The caller MUST have already run the real forward +
-    ``loss.backward()`` so every parameter carries its real ``p.grad``; this
-    applies the canonical optimizer update in-place via ``ops.fused_step``
-    (``opt_only=True`` → the L1 real-grad tail). Returns True if the fused step
-    ran (the caller must then SKIP its own ``optimizer.step()`` / ``scaler.step``);
-    False if the cell is not on the readiness whitelist (caller runs eager).
-
-    Why not L3 (fwd+bwd+opt in one launch): the L3 megakernel runs an element-
-    local SURROGATE model over the flat param blob (csrc/.../model_stages.cuh),
-    NOT the real Transformer/ViT/Mamba graph, so its loss cannot match eager. The
-    L1 tail consumes the real gradient and IS the eager optimizer step. See
-    BUILD_AND_VALIDATE.md.
-
-    State ownership: ``optimizer.step()`` is replaced, so the torch optimizer's
-    own ``.state`` never fills. We keep a persistent per-parameter ``[m|v|extra]``
-    buffer in a cache attached to the optimizer instance (allocated once per
-    param) plus a step counter — reallocating per step would reset momentum and
-    the run would never grok.
-    """
-    global _FUSED_ABI_STALE
-    if _FUSED_ABI_STALE or not c.get("use_fused", True):
-        return False
-    try:
-        # has_fused() is the readiness gate: True ONLY for whitelisted cells on a
-        # GPU arch with a compiled fused TU. Keep it inside the guard so the fused
-        # path always degrades to eager rather than crashing the run.
-        if not has_fused(model_name, opt_name):
-            return False
-        announce_fused_readiness()  # one-time loud run-start banner (idempotent)
-        # Persistent per-parameter state + step counter live on the optimizer
-        # instance so they survive across iterations (the cache key is id(param)).
-        cache = getattr(optimizer, "_fused_state_cache", None)
-        if cache is None:
-            cache = {}
-            optimizer._fused_state_cache = cache
-        step = getattr(optimizer, "_fused_step_counter", 0) + 1
-        optimizer._fused_step_counter = step
-        fused_optimizer_step(model_name, opt_name, model, optimizer,
-                             state_cache=cache, step=step)
-        global LAST_L1_FIRED
-        LAST_L1_FIRED = True  # task 2: L1 fused tail fired this run (for _fin's path)
-        return True
-    except TypeError as e:
-        # STALE-ABI GUARD: a pybind TypeError here means the compiled _ops
-        # extension predates the widened fused_step signature (rebuild
-        # pending). Without this catch the error escaped and CRASHED runs —
-        # poisoning tuner trials with crash scores. Degrade LOUDLY ONCE per
-        # process to the validated eager path; never retry (per-step retries
-        # would spam and re-fail identically).
-        if not _FUSED_ABI_STALE:
-            _FUSED_ABI_STALE = True
-            warnings.warn(
-                "fused_step ABI mismatch (stale _ops build predates the widened "
-                f"signature) — eager optimizer steps until rebuild: {e}")
-        return False
-    except (KeyError, NotImplementedError, ValueError, RuntimeError):
-        # Any assembly/ABI problem (unbuilt extension, unsupported dtype/layout,
-        # non-whitelisted cell) degrades to the eager path — never crash the run.
-        return False
-
 def _try_fused_train_step(model_name, opt_name, model, optimizer, x_batch,
                           y_batch, c):
-    """PHASE 1+2 — run the TRUE L3 fused TRAIN step (real fwd+bwd+opt in ONE
-    persistent megakernel) for an L3-REAL cell. Model-GENERIC: fires for whichever
-    of (transformer_decoder|vit|mamba × adamw) has a compiled real fwd+bwd+opt
-    kernel on this arch (has_l3_real gates it; PHASE 1 decoder, PHASE 2 vit+mamba).
-    x_batch is the per-model input the cell expects — int token ids [B,seq] for
-    decoder/mamba, float patches [B,16,49] for vit — and flows unchanged into
-    fused_train_step, which packs it per model (see dispatch.py).
+    """Run the TRUE L3-TC fused TRAIN step (real fwd+bwd+opt in ONE persistent
+    wgmma megakernel) for an L3-REAL cell. Model-GENERIC: fires for whichever of
+    (transformer_decoder|vit|mamba × <wgmma-wired optimizer>) is registered on this
+    arch (has_l3_real gates it). x_batch is the per-model input the cell expects —
+    int token ids [B,seq] for decoder/mamba, float patches [B,16,49] for vit — and
+    flows unchanged into fused_train_step, which packs it per model (see
+    dispatch.py).
 
-    Unlike ``_try_fused_step`` (the L1 post-backward optimizer tail, which needs
-    the caller to have already run fwd+bwd), this REPLACES the eager forward +
-    backward + optimizer.step() entirely: ONE persistent kernel runs the real
-    model forward+backward AND AdamW — real model math, real optimizer math,
-    ZERO intermediate launches (the owner rejected CUDA graphs; this is the path).
+    This REPLACES the eager forward + backward + optimizer.step() entirely: ONE
+    persistent wgmma kernel runs the real model forward+backward AND the optimizer
+    update — real model math, real optimizer math, ZERO intermediate launches.
 
-    Returns the training LOSS (a float, mean cross-entropy) if the fused train step
-    ran — the caller then SKIPS its own fwd/bwd/step and logs THIS loss — or
-    ``None`` if the L3-REAL path is NOT APPLICABLE for this cell/precision (caller
-    falls back to eager + the L1 fused optimizer step). A None return is the honest
-    eager path, NOT a degrade.
-
-    WIRING GUARD (task 2): once the path-matched gate has SELECTED an engine for an
-    L3-REAL cell, a launch failure RAISES (loud) rather than returning None — a
-    silent degrade to eager here would let a roofline/race run secretly measure the
-    wrong path. The ONLY soft-degrade is a stale-ABI TypeError (compiled _ops
-    predates the widened fused_step signature → rebuild pending), which warns once
-    and falls back process-wide. On every success this sets the module-global
-    LAST_L3_ENGINE to the engine that ACTUALLY ran (dispatch.cpp has no silent
-    fallback: a wgmma request runs wgmma or throws), so the path report is the real
-    executed path, not the requested one.
+    PURE L3-TC (owner directive: NO silent downgrade, ever — hard-fail otherwise).
+    There is NO eager fallback left. ALWAYS returns the training LOSS (a float,
+    mean cross-entropy) on success; on ANY condition that the old code would have
+    declined to eager for (fusion off, not an L3-REAL cell, AMP on, unwired
+    precision, stale ABI) it RAISES RuntimeError rather than silently downgrading.
+    On success it sets the module-global LAST_L3_ENGINE to the engine that ACTUALLY
+    ran (dispatch.cpp has no silent fallback: a wgmma request runs wgmma or throws),
+    so the path report is the real executed path, not the requested one.
     """
-    global _FUSED_ABI_STALE, LAST_L3_ENGINE
-    LAST_L3_ENGINE = None  # default: this step did NOT take L3 (set on success below)
-    if _FUSED_ABI_STALE or not c.get("use_fused", True):
-        return None
-    # AVAILABILITY (legit-eager, not a degrade): not an L3-REAL cell on this arch.
+    global LAST_L3_ENGINE
+    LAST_L3_ENGINE = None  # default: set on success below (a failure RAISES, never returns)
+    if not c.get("use_fused", True):
+        raise RuntimeError(
+            "L3-TC unavailable; refusing to silently downgrade: fusion is "
+            "disabled (use_fused=False), but the eager path was removed")
     if not has_l3_real(model_name, opt_name):
-        return None
-    # PATH-MATCHED PRECISION GATE (owner directive task 1 — replaces the fp32-only
-    # gate). The engine map picks the ACTUAL in-kernel GEMM engine for the run's
-    # resolved precision: fp32 → scalar (all cells); bf16 → wgmma (decoder/vit TC
-    # cells) / scalar (mamba carve-out). Fairness is preserved because the engine
-    # MATCHES the run precision — a bf16 race runs the bf16 TC kernel (not fp32
-    # in-kernel while competitors run bf16-eager, the old confound). fp16-AMP and
-    # tf32 have no in-kernel carrier here → engine None → decline to eager (honest).
+        raise RuntimeError(
+            f"L3-TC unavailable; refusing to silently downgrade: ({model_name}, "
+            f"{opt_name}) is not an L3-REAL cell on this arch (has_l3_real=False)")
+    # PURE L3-TC: the wgmma tensor-core megakernel is the ONLY engine. AMP has no
+    # in-kernel carrier (the megakernel reads raw fp32 params), so it is a hard
+    # failure, not an eager fallback.
     if c.get("use_amp", False):
-        return None
+        raise RuntimeError(
+            "L3-TC unavailable; refusing to silently downgrade: AMP is enabled "
+            "(use_amp=True), but the L3-TC megakernel reads raw fp32 params and "
+            "there is no eager/AMP fallback. Disable AMP for the L3-TC path")
     precision = _resolve_matmul_precision(c)
     gemm_impl = gemm_impl_for_cell(model_name, opt_name, precision)
     if gemm_impl is None:
-        return None  # unwired precision (fp16/tf32) — eager is the honest path
-    # COMMITTED to the L3 path with a selected engine. From here a failure is LOUD.
+        raise RuntimeError(
+            f"L3-TC unavailable; refusing to silently downgrade: no wgmma engine "
+            f"for ({model_name}, {opt_name}) at precision {precision!r} "
+            f"(gemm_impl_for_cell returned None) and there is no scalar/eager "
+            f"fallback")
     announce_fused_readiness()  # one-time loud run-start banner (idempotent)
     # Persistent flat-param + [m|v|extra]+loss state on the optimizer instance
     # (keyed by canonical model name), surviving across iterations — the megakernel
@@ -1019,15 +929,13 @@ def _try_fused_train_step(model_name, opt_name, model, optimizer, x_batch,
                                 x_batch, y_batch, state_cache=cache, step=step,
                                 gemm_impl=gemm_impl)
     except TypeError as e:
-        # STALE-ABI guard ONLY (compiled _ops predates the widened/gemm_impl
-        # signature). This is the one legitimate soft-degrade: rebuild pending.
-        # Degrade LOUDLY ONCE to eager process-wide; never retry.
-        if not _FUSED_ABI_STALE:
-            _FUSED_ABI_STALE = True
-            warnings.warn(
-                "fused_step ABI mismatch (stale _ops build predates the widened "
-                f"signature) — eager train steps until rebuild: {e}")
-        return None
+        # A pybind TypeError means the compiled _ops extension predates the widened
+        # fused_step signature (rebuild pending). PURE L3-TC: this is NOT a soft-
+        # degrade — there is no eager path to fall back to. HARD-FAIL.
+        raise RuntimeError(
+            "L3-TC unavailable; refusing to silently downgrade: stale-ABI "
+            f"(compiled _ops predates the widened fused_step signature — rebuild "
+            f"the extension): {e}") from e
     # Success → record the ACTUAL executed engine for the wiring guard / roofline.
     LAST_L3_ENGINE = dict(
         engine=gemm_impl, model=canonicalize_model(model_name),
@@ -1050,23 +958,10 @@ def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # the params in place). eval below stays eager/unchanged. Falls back to the
         # eager fwd+bwd + L1 fused tail when the L3-REAL kernel is unavailable
         # (non-decoder, AMP on, unbuilt TU, non-sm_90).
-        l3_loss=_try_fused_train_step(mtype, "adamw", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)  # for _eval_log's .item()-style logging
-        else:
-            # Real forward + backward (the megakernel L1 path is an OPTIMIZER step
-            # on the real grad — NOT a fused fwd/bwd; see _try_fused_step).
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward()
-            # Whitelisted cell (decoder/vit/mamba × adamw): the L1 fused tail
-            # applies the AdamW update in-place. On the fused path skip
-            # scaler.step(opt) (the update already happened); still call
-            # scaler.update() to advance the AMP scale.
-            if _try_fused_step(mtype, "adamw", m, opt, tx, ty, c):
-                scaler.update()
-            else:
-                scaler.step(opt); scaler.update()
+        # PURE L3-TC: the megakernel runs the REAL fwd+bwd+AdamW in ONE wgmma
+        # kernel and returns the loss; if L3-TC is unavailable it RAISES (no eager
+        # fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "adamw", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1133,26 +1028,15 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # post-unscale isfinite skip train_supergrok uses before this call.
         _component_guard(r, "amplifier_step", step, c, opt.train_amplifier_step,
                          m, vax, vay, crit_ng, aopt)
-        # PHASE 1 — TRUE L3 fused path for (model × neuralgrok): ONE persistent
-        # bf16 wgmma megakernel runs the REAL fwd+bwd AND the amplified-AdamW tail
-        # (apply_optimizer<NeuralGrok>: g_amp=(psi*alpha+beta)*g over the TC-reduced
-        # grad). The amplifier's lookahead autograd CANNOT run in-kernel, so it is
-        # trained HOST-SIDE just above — the eager fwd+bwd we already ran seeds
-        # p.grad (the |g| featurization the amplifier needs), and fused_train_step
-        # re-extracts the freshly-trained psi_pack() into the kernel's `extra` state
-        # slice BEFORE this launch (so the kernel evaluates the amplifier we just
-        # trained THIS step). On the L3 path the host grad is amplifier-featurization
-        # ONLY: the kernel computes its own deterministically-reduced grad and owns
-        # the in-place weight + m/v update, so we SKIP scaler.step(opt) — identical to
-        # train_adamw's L3 branch. Falls back to the eager loss-fed step below when
-        # L3-REAL is unavailable (AMP on / non-sm_90 / unwired precision); since
-        # _try_fused_train_step declines under AMP, l3_loss!=None ⇒ scaler was disabled
-        # ⇒ the unscale_ above was a no-op (no stranded pending-unscale state).
-        l3_loss=_try_fused_train_step(mtype, "neuralgrok", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)  # for _eval_log's .item()-style logging
-        else:
-            scaler.step(opt); scaler.update()
+        # PURE L3-TC: ONE persistent bf16 wgmma megakernel runs the REAL fwd+bwd AND
+        # the amplified-AdamW tail (apply_optimizer<NeuralGrok>: g_amp=(psi*alpha+
+        # beta)*g over the TC-reduced grad) and returns the loss. The amplifier's
+        # lookahead autograd CANNOT run in-kernel, so it is trained HOST-SIDE just
+        # above; fused_train_step re-extracts the freshly-trained psi_pack() into the
+        # kernel's `extra` state slice BEFORE this launch (so the kernel evaluates the
+        # amplifier we just trained THIS step). If L3-TC is unavailable it RAISES (no
+        # eager fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "neuralgrok", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1206,19 +1090,11 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # the eager fwd/bwd/step (the kernel updated params in place); the signal
         # was already set above so α adapts on this path too. Falls back to eager
         # + the loss-fed step() when L3-REAL is unavailable (AMP on / non-sm_90).
-        l3_loss=_try_fused_train_step(mtype, "grokadamw", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward()
-            # scaler.step doesn't forward kwargs, so unscale + step directly (same
-            # as the SuperGrok loops). Fall back to a plain step on a stale opt.
-            scaler.unscale_(opt)
-            try: opt.step(**kw)
-            except TypeError: opt.step()
-            scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd+GrokAdamW (all 3
+        # mechanisms: per-tensor layer-wise β1, global grad-norm clip, and the LIVE
+        # α_t set via opt._grok_signal above which _opt_scalars_from forwards) and
+        # returns the loss. If L3-TC is unavailable it RAISES (no eager fallback).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "grokadamw", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1297,43 +1173,13 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
                     _component_guard(r, "meta_step", step, c, opt.meta_step, m, vax, vay, crit_sg, mopt, tx, ty)
                 if sam_due:
                     _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_sg)
-        l3_loss=_try_fused_train_step(mtype, "supergrok11", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-            if step%eval_every==0 or step==1:
-                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
-                if done: break
-            continue
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            logits=m(tx); loss=F.cross_entropy(logits,ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        if c.get("use_amp", False):
-            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-            if _has_inf:
-                scaler.update(); continue
-        if step%muf==0:
-            _component_guard(r, "meta_step", step, c, opt.meta_step, m, vax, vay, crit_sg, mopt, tx, ty)
-        sam_freq = max(1, muf * 2)
-        if hasattr(opt, 'sam_step') and step % sam_freq == 0 and opt._get_effective_sam_freq() < 999999:
-            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_sg)
-        alpha_freq=c.get("supergrok_alpha_update_freq",50)
-        kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
-        if needs_metrics:
-            with torch.no_grad():
-                train_loss_val=loss.item()
-                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
-            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
-            if step%alpha_freq==0:
-                with torch.no_grad():
-                    vl_sg=F.cross_entropy(m(vax),vay).item()
-                kw["val_loss"]=vl_sg
-        try: opt.step(**kw)
-        except TypeError: opt.step()
-        scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd + the model-coupled
+        # SAM 2nd backward + the per-tensor meta-net mu/gate precompute + the SG11
+        # apply, ALL in-kernel, and returns the loss. The bilevel meta_step/sam_step
+        # were trained HOST-SIDE above (the kernel cannot run that autograd); fused_
+        # train_step re-extracts the fresh phi pack. If L3-TC is unavailable it
+        # RAISES (no eager fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "supergrok11", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1420,43 +1266,13 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
                     _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s15)
                 if bilevel_due:
                     _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s15, mopt)
-        l3_loss=_try_fused_train_step(mtype, "supergrok15", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-            if step%eval_every==0 or step==1:
-                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
-                if done: break
-            continue
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            logits=m(tx); loss=F.cross_entropy(logits,ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        if c.get("use_amp", False):
-            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-            if _has_inf:
-                scaler.update(); continue
-        sam_freq_eff=opt._get_effective_sam_freq()
-        if sam_freq_eff < 999999 and step%sam_freq_eff==0:
-            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s15)
-        bilevel_freq_eff=opt._get_effective_bilevel_freq()
-        if step%bilevel_freq_eff==0:
-            _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s15, mopt)
-        kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
-        if needs_metrics:
-            with torch.no_grad():
-                train_loss_val=loss.item()
-                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
-            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
-            if step%alpha_freq==0:
-                with torch.no_grad():
-                    vl_s15=F.cross_entropy(m(vax),vay).item()
-                kw["val_loss"]=vl_s15
-        try: opt.step(**kw)
-        except TypeError: opt.step()
-        scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd + the model-coupled
+        # SAM 2nd backward + the per-tensor meta-net mu precompute + the SG15 apply,
+        # ALL in-kernel, and returns the loss. The sam_step/bilevel_step were trained
+        # HOST-SIDE above (the kernel cannot run that autograd); fused_train_step re-
+        # extracts the fresh phi pack. If L3-TC is unavailable it RAISES (no eager
+        # fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "supergrok15", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1515,43 +1331,14 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # separate result. Falls back to eager (AMP on / non-sm_90 / fp32 / mamba —
         # mamba×SG2 is BLOCKED: the SAM double-forward + segmented sort re-trip the shared
         # mamba-forward A/A/A race, and the mamba kernel/launcher carry no SG2 case).
-        l3_loss=_try_fused_train_step(mtype, "supergrok2", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-            if step%eval_every==0 or step==1:
-                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
-                if done: break
-            continue
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            logits=m(tx); loss=F.cross_entropy(logits,ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        if c.get("use_amp", False):
-            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-            if _has_inf:
-                scaler.update(); continue
-        sam_freq_eff=opt._get_effective_sam_freq()
-        if sam_freq_eff < 999999 and step%sam_freq_eff==0:
-            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s2)
-        bilevel_freq_eff=opt._get_effective_bilevel_freq()
-        if step%bilevel_freq_eff==0:
-            _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s2, mopt)
-        kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
-        if needs_metrics:
-            with torch.no_grad():
-                train_loss_val=loss.item()
-                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
-            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
-            if step%alpha_freq==0:
-                with torch.no_grad():
-                    vl_s2=F.cross_entropy(m(vax),vay).item()
-                kw["val_loss"]=vl_s2
-        try: opt.step(**kw)
-        except TypeError: opt.step()
-        scaler.update()
+        # PURE L3-TC: the DEDICATED wgmma megakernel runs the REAL fwd+bwd + the FULL
+        # CSA/HCA/PEER/GRU meta-net AS the optimizer phase (in-kernel segmented sort +
+        # SAM 2nd backward + sg2_meta_stages) in ONE persistent launch, and returns
+        # the loss. If L3-TC is unavailable it RAISES (no eager fallback — owner
+        # directive: no silent downgrade, ever). HONEST CAVEAT (per .sg2_spec.md): SG2
+        # reaches L3-TC + single-step parity but WON'T GROK (the in-kernel CSA fidelity
+        # gap) — a documented separate result.
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "supergrok2", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1580,13 +1367,11 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # tail, so the eager optimizer.step runs the fused per-op kernel).
         # [A4-M5] L1 fused tail integration requires the adamw/lion post-backward
         # structure — do not re-add the pre-forward continue pattern.
-        l3_loss=_try_fused_train_step(mtype, "grokfast", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # PURE L3-TC: the bf16 wgmma megakernel runs the REAL fwd+bwd AND the Grokfast
+        # tail (EMA-amplify + Adam on g_amp) in ONE persistent kernel and returns the
+        # loss. If L3-TC is unavailable it RAISES (no eager fallback — no silent
+        # downgrade).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "grokfast", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1615,13 +1400,11 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # The momentum buffer is carried in the driver-owned m-slice; _opt_scalars_from
         # forwards muon's lr/momentum(β1)/wd from opt.param_groups. (Same hook the other
         # L3-TC loops use.)
-        l3_loss=_try_fused_train_step(mtype, "muon", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd + the staged grid-
+        # cooperative Newton-Schulz (2D weights) + the muon apply (1D weights on the
+        # AdamW tail) in ONE persistent kernel and returns the loss. If L3-TC is
+        # unavailable it RAISES (no eager fallback — no silent downgrade).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "muon", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1645,17 +1428,10 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # returns the loss and we SKIP the eager fwd/bwd/step. Otherwise: eager
         # fwd+bwd + the whitelisted L1 fused tail (lion uses only the m=exp_avg
         # slice of [m|v|extra]).
-        l3_loss=_try_fused_train_step(mtype, "lion", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward()
-            if _try_fused_step(mtype, "lion", m, opt, tx, ty, c):
-                scaler.update()           # fused path: skip scaler.step(opt)
-            else:
-                scaler.step(opt); scaler.update()
+        # PURE L3-TC: the bf16 wgmma megakernel runs the REAL fwd+bwd AND the Lion
+        # tail (apply_optimizer<Lion>) in ONE persistent kernel and returns the loss.
+        # If L3-TC is unavailable it RAISES (no eager fallback — no silent downgrade).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "lion", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1685,24 +1461,11 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # phase. If it ran we SKIP the eager fwd/bwd/sam_step/step (params updated in place);
         # else fall back to eager (AMP on / non-sm_90 / fp32 / unregistered cell). (Same hook
         # the adamw/prodigy loops use.)
-        l3_loss=_try_fused_train_step(mtype, "looksam", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            # [A4-M5] L1 fused tail integration for this optimizer requires the
-            # adamw/lion post-backward structure (see train_adamw) — do not re-add
-            # the pre-forward continue pattern (it skips side-steps and eval).
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-            if c.get("use_amp", False):
-                _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-                if _has_inf:
-                    scaler.update(); continue
-            if opt.should_sam_step():
-                opt.sam_step(m, tx, ty, crit_ls)
-            opt.step()
-            scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd + the model-coupled
+        # SAM 2nd backward (the every-k cadence rides FusedScalars.looksam_sam) + the
+        # LookSAM apply, ALL in-kernel, and returns the loss. If L3-TC is unavailable
+        # it RAISES (no eager fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "looksam", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1727,13 +1490,11 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # anchor param_init + the persisted estimator scalars are carried in the
         # driver-owned state buffer (4*total+4); _opt_scalars_from forwards d0/d_coef/
         # beta3 from opt.param_groups. (Same hook the adamw/grokadamw loops use.)
-        l3_loss=_try_fused_train_step(mtype, "prodigy", m, opt, tx, ty, c)
-        if l3_loss is not None:
-            loss=torch.as_tensor(l3_loss)
-        else:
-            with _autocast(c):
-                loss=F.cross_entropy(m(tx),ty)
-            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # PURE L3-TC: the wgmma megakernel runs the REAL fwd+bwd + the staged global-d
+        # estimate (cross-all-tensors (r,s) reduction → beta3-EMA → d) + the prodigy
+        # apply, ALL in-kernel, and returns the loss. If L3-TC is unavailable it
+        # RAISES (no eager fallback — owner directive: no silent downgrade, ever).
+        loss=torch.as_tensor(_try_fused_train_step(mtype, "prodigy", m, opt, tx, ty, c))
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break

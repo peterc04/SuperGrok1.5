@@ -234,78 +234,16 @@ class SuperGrok11(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        """Eager optimiser step — REMOVED (pure L3-TC).
 
-        if self._use_grad_hooks:
-            self._global_step += 1
-            return loss
-
-        self._ensure_state()
-        self._global_step += 1
-
-        if train_acc is not None:
-            self._cached_train_acc = train_acc
-
-        if self._global_step % self.alpha_update_freq == 0 or self._global_step == 1:
-            self._update_alpha(train_loss, val_loss, train_acc)
-
-        base_alpha = self._cached_alpha
-        ramp = self._get_ramp_factor()
-        layer_alphas = [max(0.0, min(1.0, base_alpha * f)) for f in self._flat_layer_alphas]
-
-        # Own the step counter in Python. The fused binding receives `steps` BY
-        # VALUE (pybind copies the list[int]), so its internal `steps[i] += 1`
-        # never persists back to this list. Without owning it here, _flat_steps
-        # stays frozen at 0 -> bc1/bc2 are pinned at t=1 -> the Adam denominator
-        # stays ~50x inflated forever and the model can never memorize. Mirrors
-        # adamw.py / grokadamw.py, which advance the counter in Python.
-        for i, p in enumerate(self._flat_params):
-            if p.grad is not None and p.grad.numel() > 0:
-                self._flat_steps[i] += 1
-
-        if self._weights_dirty:
-            self._cached_weights = self.meta_net.get_weights()
-            self._weights_dirty = False
-        W1, b1, W2, b2, rescale = self._cached_weights
-
-        ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
-        # ONE fused call PER PARAM GROUP so per-group lr/betas/eps/wd are
-        # honored (torch.optim contract). The original single call fed every
-        # group's params with group 0's scalars — silently wrong for the
-        # classic no-decay-bias-group pattern. Single-group models take one
-        # call exactly as before (the slices are the full lists). Global
-        # layer indices (layerwise beta1/alpha schedules) are preserved —
-        # they were assigned at __init__ across groups.
-        flat_idx = 0
-        for group in self.param_groups:
-            n_g = len(group["params"])
-            if n_g == 0:
-                continue
-            sl = slice(flat_idx, flat_idx + n_g)
-            flat_idx += n_g
-            grads_g = [p.grad.data if p.grad is not None else torch.Tensor()
-                       for p in self._flat_params[sl]]
-            ops_impl.supergrok11_fused_step(
-                self._flat_param_data[sl],
-                grads_g,
-                self._flat_exp_avgs[sl],
-                self._flat_exp_avg_sqs[sl],
-                self._flat_mus[sl],
-                self._flat_sharpness[sl],
-                self._flat_steps[sl],
-                layer_alphas[sl],
-                self._flat_layer_beta1s[sl],
-                W1, b1, W2, b2, rescale, self.meta_hidden_dim,
-                group["betas"][1], group["lr"], group["weight_decay"],
-                group["eps"],
-                self.lamb, ramp, self.gate_temperature,
-                self.gradient_clipping,
-            )
-
-        return loss
+        On the L3-TC path the SAM 2nd backward + per-tensor meta-net mu/gate
+        precompute + the SG11 apply run IN the megakernel; the meta-net is trained
+        host-side via ``meta_step``/``sam_step`` (pure-PyTorch autograd, kept) and
+        fused_train_step re-extracts its phi pack. The eager kernel dispatch here is
+        gone (``_update_alpha`` / ``_get_gate_signal`` stay as host-side helpers)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def sam_step(self, model, train_x, train_y, criterion):
         """SAM ascent step → per-parameter sharpness |g(w+e) − g(w)|.
@@ -462,39 +400,10 @@ class SuperGrok11(Optimizer):
         return val_loss.item()
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
-        if param.grad is None:
-            return
-        self._ensure_state()
-        pidx = self._param_to_idx.get(id(param))
-        if pidx is None:
-            return
-        self._flat_steps[pidx] += 1
-        base_alpha = self._cached_alpha
-        ramp = self._get_ramp_factor()
-        layer_alpha = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
-
-        if self._weights_dirty:
-            self._cached_weights = self.meta_net.get_weights()
-            self._weights_dirty = False
-        W1, b1, W2, b2, rescale = self._cached_weights
-
-        ops_impl = _ops if param.is_cuda else _ops_cpu
-        ops_impl.supergrok11_fused_step(
-            [param.data],
-            [param.grad.data],
-            [self._flat_exp_avgs[pidx]],
-            [self._flat_exp_avg_sqs[pidx]],
-            [self._flat_mus[pidx]],
-            [self._flat_sharpness[pidx]],
-            [self._flat_steps[pidx]],
-            [layer_alpha],
-            [self._flat_layer_beta1s[pidx]],
-            W1, b1, W2, b2, rescale, self.meta_hidden_dim,
-            group["betas"][1], group["lr"], group["weight_decay"], group["eps"],
-            self.lamb, ramp, self.gate_temperature,
-            self.gradient_clipping,
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def get_global_step(self):
         return self._global_step

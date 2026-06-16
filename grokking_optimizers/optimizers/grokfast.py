@@ -155,77 +155,16 @@ class Grokfast(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimisation step.
-
-        Args:
-            closure: A closure that re-evaluates the model and returns the loss
-                (optional).
-
-        Returns:
-            The loss value if *closure* is provided, otherwise ``None``.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        if self._use_grad_hooks:
-            return loss
-
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind(
-                "grokfast_fused_ema_adam_step")
-
-        for group in self.param_groups:
-            # Validate grads up front; this also provides the first-gradient
-            # seed for any params whose EMA state is initialised on this step.
-            grads_by_id = {
-                id(p): _validate_grad(p)
-                for p in group["params"] if p.grad is not None
-            }
-            params_list, ema_list, exp_avg_list, exp_avg_sq_list, states = \
-                self._group_cache(group, grads_by_id)
-
-            if len(params_list) == 0:
-                continue
-
-            grads_list = [grads_by_id[id(p)] for p in params_list]
-            step_list = []
-            for state in states:
-                state["step"] += 1
-                step_list.append(state["step"])
-
-            # Fused EMA + amplification + Adam in a single CUDA pass
-            fused_step(
-                params_list, grads_list, ema_list,
-                exp_avg_list, exp_avg_sq_list, step_list,
-                group["grokfast_alpha"], group["grokfast_lamb"],
-                group["betas"][0], group["betas"][1],
-                group["lr"], group["weight_decay"], group["eps"],
-            )
-
-        return loss
+        """Eager optimiser step — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["step"] = 0
-            state["ema"] = grad.detach().to(torch.float32).clone()
-            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-        state["step"] += 1
-        # Fused EMA + amplification + Adam in a single CUDA pass
-        _ops.grokfast_fused_ema_adam_step(
-            [param], [grad], [state["ema"]],
-            [state["exp_avg"]], [state["exp_avg_sq"]], [state["step"]],
-            group["grokfast_alpha"], group["grokfast_lamb"],
-            group["betas"][0], group["betas"][1],
-            group["lr"], group["weight_decay"], group["eps"],
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

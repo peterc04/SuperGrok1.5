@@ -44,7 +44,7 @@
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/opt_components.cuh"
 #include "csrc/fused/sm_90/decoder_layout.cuh"
-#include "csrc/fused/sm_90/model_stages_decoder.cuh"
+#include "csrc/fused/sm_90/dec_weights.cuh"
 #include "csrc/backends/cuda/sm_90/warp_specialize.cuh"
 
 #include <cuda_runtime.h>

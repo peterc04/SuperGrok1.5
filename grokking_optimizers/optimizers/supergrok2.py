@@ -1593,158 +1593,18 @@ class SuperGrok2(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        """Eager optimiser step — REMOVED (pure L3-TC).
 
-        if self._use_grad_hooks:
-            self._global_step += 1
-            return loss
-
-        self._ensure_state()
-        self._global_step += 1
-
-        if train_acc is not None:
-            self._cached_train_acc = train_acc
-
-        if self._global_step % self.alpha_update_freq == 0 or self._global_step == 1:
-            self._update_alpha(train_loss, val_loss, train_acc)
-        elif train_acc is not None and train_acc >= self.zero_acc_threshold:
-            self._update_alpha(train_loss, val_loss, train_acc)
-        elif train_loss is not None and train_loss < self.zero_loss_threshold:
-            self._update_alpha(train_loss, val_loss, train_acc)
-
-        base_alpha = self._cached_alpha
-        ramp = self._get_ramp_factor()
-        gate_signal = self._get_gate_signal()
-
-        group = self.param_groups[0]
-        lr = group["lr"]
-        beta2 = group["betas"][1]
-        eps = group["eps"]
-        wd_eff = self._get_effective_wd(group["weight_decay"])
-
-        # Collect active parameters (those with gradients)
-        lamb_eff = self.lamb * ramp * gate_signal
-        active_indices = []
-
-        for i, p in enumerate(self._flat_params):
-            if p.grad is None:
-                continue
-
-            self._flat_steps[i] += 1
-
-            # CSA/HCA attention is stateless — no per-parameter scan state.
-            active_indices.append(i)
-
-        if not active_indices:
-            return loss
-
-        # Check if we can use CUDA batched path
-        use_cuda = _HAS_CUDA and self._flat_params[active_indices[0]].is_cuda
-
-        if use_cuda:
-            # Ensure weights are extracted and cached
-            if self._weights_dirty:
-                # Emit weights at the configured precision (bf16 by default).
-                # _emitted_weights holds the chosen-precision tensors (the
-                # reachable bf16/fp8 path); _cached_weights is the FP32 view the
-                # current kernel ABI consumes (see _kernel_abi_view).
-                self._emitted_weights = self.meta_net.get_weights(
-                    self.precision_config)
-                w = self._kernel_abi_view(self._emitted_weights)
-                def _to_f32_contig(t):
-                    t = t if t.dtype == torch.float32 else t.float()
-                    return t if t.is_contiguous() else t.contiguous()
-                self._cached_peer_query_Ws = torch.stack(
-                    [_to_f32_contig(q.weight.data) for q in self.meta_net.peer_queries])
-                self._cached_prod_keys_A = torch.stack(
-                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_A])
-                self._cached_prod_keys_B = torch.stack(
-                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_B])
-                self._cached_weights = w
-                self._weights_dirty = False
-            w = self._cached_weights
-
-            # ONE C++ call: fused grad prep (clip, finite, bias corrections) + batched step.
-            # CSA/HCA weight bundle (spec §4/§7) replaces the old mamba bundle.
-            # No per-parameter scan states (attention is stateless); GRU state stays.
-            active_grads = [self._flat_params[i].grad.data for i in active_indices]
-            sharpness_list = [
-                self._flat_sharpness[i].to(active_grads[k].dtype)
-                for k, i in enumerate(active_indices)
-            ]
-            # supergrok2_prepare_and_batched_step keeps its name (spec §5).
-            prepare_step = _ops.supergrok2_prepare_and_batched_step
-            prepare_step(
-                [self._flat_params[i].data for i in active_indices],
-                active_grads,
-                [self._flat_exp_avgs[i] for i in active_indices],
-                [self._flat_exp_avg_sqs[i] for i in active_indices],
-                [self._flat_gru_states[i] for i in active_indices],
-                [self._flat_mus[i] for i in active_indices],
-                # slows mirror mus (restored grokfast slow-grad EMA); position
-                # matches supergrok2_prepare_and_batched_step's `slows` param.
-                [self._flat_slows[i] for i in active_indices],
-                sharpness_list,
-                [int(self._flat_steps[i]) for i in active_indices],
-                [float(self._flat_layer_alphas[i]) for i in active_indices],
-                [float(self._flat_layer_beta1s[i]) for i in active_indices],
-                float(base_alpha), float(self.gradient_clipping),
-                float(beta2), float(lr), float(eps), float(wd_eff),
-                float(self.lamb), float(ramp), float(gate_signal),
-                # ── shared input projection ──
-                w['input_proj_W'], w['input_proj_b'],
-                # ── CSA layer (produces csa_ctx) ──
-                w['csa_q_W'], w['csa_k_W'], w['csa_v_W'],
-                w['csa_compress_w'],
-                w['csa_idx_DQ'], w['csa_idx_UQ'], w['csa_idx_K'],
-                w['csa_out_W'],
-                # ── HCA layer (produces hca_ctx) ──
-                w['hca_q_W'], w['hca_k_W'], w['hca_v_W'], w['hca_out_W'],
-                # ── GRU ──
-                w['gru_W_z'], w['gru_W_r'], w['gru_W_h'],
-                w['gru_b_z'], w['gru_b_r'], w['gru_b_h'],
-                # ── PEER routing + experts ──
-                self._cached_peer_query_Ws,
-                self._cached_prod_keys_A,
-                self._cached_prod_keys_B,
-                w['expert_W1'].reshape(self.num_experts, -1),
-                w['expert_b1'],
-                w['expert_W2'].reshape(self.num_experts, -1),
-                w['expert_b2'].reshape(-1),
-                # ── config ints ──
-                self.meta_net.d_model,
-                self.meta_net.gru_hidden,
-                self.meta_net.n_heads,
-                self.meta_net.pk_dim,
-                self.meta_net.expert_hidden,
-                self.meta_net.num_experts,
-                self.meta_net.csa_compress, self.meta_net.csa_window,
-                self.meta_net.csa_topk, self.meta_net.hca_compress,
-                self.meta_net.indexer_rank,
-                self.meta_net.expert_counts,
-                # ── configurable PEER top-k (Phase 8; trailing arg, default 4) ──
-                self.meta_net.peer_topk,
-            )
-            # Expert recycling: increment step counter and periodically recycle
-            self._step_counter += 1
-            if (self.meta_net.recycle_interval > 0 and
-                    self._step_counter % self.meta_net.recycle_interval == 0):
-                if self.expert_allreduce_before_recycle:
-                    self._allreduce_expert_counts()
-                self.meta_net._recycle_dead_experts()
-        else:
-            raise RuntimeError(
-                "SuperGrok2.step() requires a CUDA/HIP GPU and the compiled "
-                "C++ kernel extension. There is NO pure-PyTorch / CPU fallback "
-                "(check grokking_optimizers.has_kernels() before stepping; "
-                "build with `pip install -e .`). For per-parameter execution "
-                "(e.g. gradient hooks), use `use_grad_hooks=True` which routes "
-                "through `_single_param_step`.")
-
-        return loss
+        On the L3-TC path SuperGrok2's DEDICATED megakernel runs the REAL fwd+bwd
+        + the FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase (in-kernel
+        segmented sort + SAM 2nd backward + sg2_meta_stages) in ONE persistent
+        launch; the meta-net is trained host-side via ``sam_step``/``bilevel_step``
+        (pure-PyTorch autograd, kept) and the dedicated entry scatters its weights.
+        The eager kernel dispatch here (the use_cuda batched path) is gone.
+        """
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def sam_step(self, model, train_x, train_y, criterion):
         """SAM ascent step → per-parameter sharpness |g(w+e) − g(w)|.
@@ -1806,16 +1666,14 @@ class SuperGrok2(Optimizer):
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training with C++ backward (primary) or autograd (fallback).
+        """Bilevel meta-net training (pure-PyTorch autograd path).
 
-        When the C++ bilevel backward is available (``mn.has_cuda_bilevel``),
-        runs the forward under ``no_grad`` saving intermediates, computes
-        validation gradients, then calls the hand-written C++ VJP
-        (``supergrok2_bilevel_backward``) to compute meta-net weight grads
-        without building an autograd graph — lower peak memory and faster.
-
-        Falls back to ``torch.autograd.backward`` when the C++ extension is
-        not available (CPU-only, or extension not built with bilevel support).
+        PURE L3-TC (owner directive): the C++ hand-written VJP backward
+        (``_bilevel_step_cuda`` → ``_ops.supergrok2_bilevel_backward``) was DROPPED;
+        this host-side meta-net training now ALWAYS uses the ``torch.autograd``
+        path (``_bilevel_step_autograd``). The meta-net it trains is then evaluated
+        IN the megakernel (fused_train_step scatters its weights). The model
+        forward/backward + optimizer update never run eager here.
         """
         self._ensure_state()
         named_params = list(model.named_parameters())
@@ -1859,16 +1717,11 @@ class SuperGrok2(Optimizer):
                 dev = torch.device('cpu')
             return torch.zeros((), device=dev)
 
-        use_cuda_bwd = mn.has_cuda_bilevel
-
-        if use_cuda_bwd:
-            return self._bilevel_step_cuda(
-                model, val_x, val_y, criterion, meta_optimizer,
-                named_params, saved_grads, param_info, mn)
-        else:
-            return self._bilevel_step_autograd(
-                model, val_x, val_y, criterion, meta_optimizer,
-                named_params, saved_grads, param_info, mn)
+        # PURE L3-TC: the C++ bilevel backward (_bilevel_step_cuda) is DROPPED;
+        # always use the autograd path. (mn.has_cuda_bilevel is no longer consulted.)
+        return self._bilevel_step_autograd(
+            model, val_x, val_y, criterion, meta_optimizer,
+            named_params, saved_grads, param_info, mn)
 
     def _bilevel_step_autograd(self, model, val_x, val_y, criterion,
                                meta_optimizer, named_params, saved_grads,
@@ -1930,179 +1783,16 @@ class SuperGrok2(Optimizer):
     def _bilevel_step_cuda(self, model, val_x, val_y, criterion,
                            meta_optimizer, named_params, saved_grads,
                            param_info, mn):
-        """C++ hand-written backward path — no autograd graph."""
-        meta_optimizer.zero_grad()
-        smart_grads = {}
-        new_gru_states = {}
-        per_param_saved = {}
+        """C++ hand-written bilevel backward — DROPPED (pure L3-TC).
 
-        with torch.no_grad():
-            for (name, p, pidx, grad_flat, sharp_flat) in param_info:
-                gru_state = self._flat_gru_states[pidx].float()
-                smart_grad, new_gru, saved = mn.forward_for_bilevel_cuda(
-                    grad_flat, sharp_flat, gru_state)
-                smart_grads[name] = smart_grad
-                new_gru_states[pidx] = new_gru
-                per_param_saved[name] = (grad_flat, sharp_flat, saved)
-
-        model.zero_grad()
-        with torch.enable_grad():
-            val_loss = criterion(model(val_x), val_y)
-            val_loss.backward()
-
-        w = mn.get_weights()
-        d = w['d_model']
-        gru_hid = w['gru_hidden']
-        nheads = w['num_heads']
-        pkd = w['pk_dim']
-        ehid = w['expert_hidden']
-        n_exp = w['num_experts']
-        topk = w['topk']
-        gru_in_dim = 2 + 2 * d
-        peer_in_dim = gru_hid + 2 * d + 2
-        fopt = dict(device=w['input_proj_W'].device, dtype=torch.float32)
-
-        d_ip_W = torch.zeros_like(w['input_proj_W'])
-        d_ip_b = torch.zeros(d, **fopt)
-        d_csa_q = torch.zeros_like(w['csa_q_W'])
-        d_csa_k = torch.zeros_like(w['csa_k_W'])
-        d_csa_v = torch.zeros_like(w['csa_v_W'])
-        d_csa_cw = torch.zeros_like(w['csa_compress_w'])
-        d_csa_dq = torch.zeros_like(w['csa_idx_DQ'])
-        d_csa_uq = torch.zeros_like(w['csa_idx_UQ'])
-        d_csa_ik = torch.zeros_like(w['csa_idx_K'])
-        d_csa_out = torch.zeros_like(w['csa_out_W'])
-        d_hca_q = torch.zeros_like(w['hca_q_W'])
-        d_hca_k = torch.zeros_like(w['hca_k_W'])
-        d_hca_v = torch.zeros_like(w['hca_v_W'])
-        d_hca_out = torch.zeros_like(w['hca_out_W'])
-        d_gru_Wz = torch.zeros_like(w['gru_W_z'])
-        d_gru_bz = torch.zeros(gru_hid, **fopt)
-        d_gru_Wr = torch.zeros_like(w['gru_W_r'])
-        d_gru_br = torch.zeros(gru_hid, **fopt)
-        d_gru_Wh = torch.zeros_like(w['gru_W_h'])
-        d_gru_bh = torch.zeros(gru_hid, **fopt)
-        nph = w['num_peer_heads']
-        d_peer_Ws = torch.zeros(nph, d, peer_in_dim, **fopt)
-        d_pka = torch.zeros(nph, pkd, d // 2, **fopt)
-        d_pkb = torch.zeros(nph, pkd, d // 2, **fopt)
-        d_eW1 = torch.zeros_like(w['expert_W1'])
-        d_eb1 = torch.zeros_like(w['expert_b1'])
-        d_eW2 = torch.zeros_like(w['expert_W2'])
-        d_eb2 = torch.zeros_like(w['expert_b2'])
-
-        peer_Ws = torch.stack([q.detach().float().contiguous()
-                               for q in w['peer_queries']])
-        pka = torch.stack([k.detach().float().contiguous()
-                           for k in w['product_keys_A']])
-        pkb = torch.stack([k.detach().float().contiguous()
-                           for k in w['product_keys_B']])
-        empty_t = torch.empty(0, **fopt)
-
-        for (name, p, pidx, grad_flat, sharp_flat) in param_info:
-            if p.grad is None:
-                continue
-            # Sanitize on-device (see _allreduce_meta_grads): zero NaN/Inf
-            # entries rather than skipping the whole param via an
-            # ``isfinite(vg).all()`` host reduction. A fully non-finite grad
-            # becomes all-zeros -> vg_norm == 0 -> vg_unit stays zero, so the
-            # bilevel backward receives a zero d_smart (no contribution),
-            # matching the old skip in that case.
-            vg = torch.nan_to_num(
-                p.grad.detach().reshape(-1).float(),
-                nan=0.0, posinf=0.0, neginf=0.0)
-            vg_norm = vg.norm()
-            vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
-            d_smart = -vg_unit
-
-            g_f, s_f, sv = per_param_saved[name]
-            _ops.supergrok2_bilevel_backward(
-                d_smart, g_f, s_f, float(w['rescale']),
-                sv['sort_indices'], sv['x_sorted'],
-                sv['csa_ctx'], sv['hca_ctx'],
-                empty_t, empty_t, empty_t,
-                empty_t, empty_t,
-                sv['gru_input'], sv['gru_h_old'],
-                sv['gru_z'], sv['gru_r'], sv['gru_h_tilde'],
-                sv['peer_input'], empty_t, empty_t, empty_t,
-                empty_t, empty_t, empty_t, empty_t, empty_t, empty_t,
-                w['csa_q_W'], w['csa_k_W'], w['csa_v_W'],
-                w['csa_compress_w'],
-                w['csa_idx_DQ'], w['csa_idx_UQ'], w['csa_idx_K'],
-                w['csa_out_W'],
-                w['hca_q_W'], w['hca_k_W'], w['hca_v_W'],
-                w['hca_out_W'],
-                w['gru_W_z'], w['gru_W_r'], w['gru_W_h'],
-                peer_Ws, pka, pkb,
-                w['expert_W1'], w['expert_W2'],
-                w['expert_b1'], w['expert_b2'],
-                w['input_proj_W'],
-                d_csa_q, d_csa_k, d_csa_v, d_csa_cw,
-                d_csa_dq, d_csa_uq, d_csa_ik, d_csa_out,
-                d_hca_q, d_hca_k, d_hca_v, d_hca_out,
-                d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br,
-                d_gru_Wh, d_gru_bh,
-                d_peer_Ws, d_pka, d_pkb,
-                d_eW1, d_eb1, d_eW2, d_eb2,
-                d_ip_W, d_ip_b,
-                d, gru_hid, gru_in_dim,
-                nheads, topk, pkd,
-                ehid, peer_in_dim, n_exp,
-                mn.csa_compress, mn.csa_window, mn.csa_topk,
-                mn.hca_compress, mn.indexer_rank,
-                32)
-
-        grad_map = {
-            'input_proj.weight': d_ip_W,
-            'input_proj.bias': d_ip_b,
-            'csa_layer.q_W.weight': d_csa_q,
-            'csa_layer.k_W.weight': d_csa_k,
-            'csa_layer.v_W.weight': d_csa_v,
-            'csa_layer.compress_w': d_csa_cw,
-            'csa_layer.idx_DQ': d_csa_dq,
-            'csa_layer.idx_UQ': d_csa_uq,
-            'csa_layer.idx_K': d_csa_ik,
-            'csa_layer.out_W.weight': d_csa_out,
-            'hca_layer.q_W.weight': d_hca_q,
-            'hca_layer.k_W.weight': d_hca_k,
-            'hca_layer.v_W.weight': d_hca_v,
-            'hca_layer.out_W.weight': d_hca_out,
-            'gru.W_z.weight': d_gru_Wz,
-            'gru.W_z.bias': d_gru_bz,
-            'gru.W_r.weight': d_gru_Wr,
-            'gru.W_r.bias': d_gru_br,
-            'gru.W_h.weight': d_gru_Wh,
-            'gru.W_h.bias': d_gru_bh,
-            'expert_W1': d_eW1,
-            'expert_b1': d_eb1,
-            'expert_W2': d_eW2,
-            'expert_b2': d_eb2,
-        }
-        for h in range(nph):
-            grad_map[f'peer_queries.{h}.weight'] = d_peer_Ws[h]
-            grad_map[f'product_keys_A.{h}'] = d_pka[h]
-            grad_map[f'product_keys_B.{h}'] = d_pkb[h]
-
-        for pname, param in mn.named_parameters():
-            if pname in grad_map:
-                g = grad_map[pname]
-                if g.shape != param.shape:
-                    g = g.reshape(param.shape)
-                param.grad = g.to(param.dtype)
-
-        if self.bilevel_allreduce_meta_grads:
-            self._allreduce_meta_grads()
-
-        meta_optimizer.step()
-        self._weights_dirty = True
-
-        for pidx, ng in new_gru_states.items():
-            self._flat_gru_states[pidx] = ng
-
-        for name, p in named_params:
-            p.grad = saved_grads.get(name)
-
-        return val_loss.detach()
+        The eager VJP kernel (``_ops.supergrok2_bilevel_backward``) is removed;
+        ``bilevel_step`` now always routes to ``_bilevel_step_autograd``. This
+        method is retained only so an explicit call fails loudly rather than
+        silently running a removed eager path.
+        """
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def bilevel_step_distributed(self, model, train_x, train_y, val_x, val_y,
                                   criterion, meta_optimizer, process_group=None):
@@ -2193,374 +1883,29 @@ class SuperGrok2(Optimizer):
 
     @torch.no_grad()
     def step_compiled(self, train_loss=None, val_loss=None, train_acc=None):
-        """Graph-capturable optimizer step with no dynamic Python control flow.
-
-        This is a simplified version of ``step()`` designed for CUDA graph
-        capture and ``torch.compile``. It:
-          - Uses pre-built static tensor lists (from ``_prepare_for_compile()``)
-          - Avoids dynamic ``active_indices`` construction
-          - Assumes all parameters have gradients (copies into static buffers)
-          - Uses fixed scalar hyperparameters (no per-step adaptive scheduling)
-          - Skips expert recycling (must be done separately in eager mode)
-
-        Call ``_prepare_for_compile()`` first. Then use this method inside a
-        CUDA graph capture or ``torch.compile`` region.
-        """
-        if not getattr(self, '_compile_prepared', False):
-            raise RuntimeError(
-                "Call _prepare_for_compile() before step_compiled()")
-
-        self._global_step += 1
-
-        if train_acc is not None:
-            self._cached_train_acc = train_acc
-
-        # Copy gradients into static buffers (avoids dynamic None checks)
-        for i, p in enumerate(self._flat_params):
-            if p.grad is not None:
-                g = p.grad.data.reshape(-1).float()
-                gn = g.norm()
-                if gn > self.gradient_clipping:
-                    g = g * (self.gradient_clipping / (gn + 1e-12))
-                self._static_grads[i].copy_(g)
-                self._flat_steps[i] += 1
-            else:
-                self._static_grads[i].zero_()
-
-        if not _HAS_CUDA or not self._flat_params[0].is_cuda:
-            return
-
-        w = self._cached_weights
-        group = self.param_groups[0]
-        ramp = self._get_ramp_factor()
-        gate_signal = self._get_gate_signal()
-        lamb_eff = self.lamb * ramp * gate_signal
-        wd_eff = self._get_effective_wd(group["weight_decay"])
-        beta2 = self._static_beta2
-        lr = self._static_lr
-        eps = self._static_eps
-
-        # Build per-parameter scalars
-        alpha_mus = []
-        lamb_effs = []
-        beta1s = []
-        bc1s = []
-        bc2s = []
-        active_grads = []
-        active_sharpness = []
-        active_params = []
-        active_exp_avgs = []
-        active_exp_avg_sqs = []
-        active_mus = []
-        active_slows = []
-        active_gru_states = []
-
-        base_alpha = self._cached_alpha
-        for i in range(self._num_params):
-            step_i = self._flat_steps[i]
-            if step_i == 0:
-                continue
-            alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
-            beta1_i = self._flat_layer_beta1s[i]
-            bc1 = 1.0 - beta1_i ** step_i
-            bc2 = 1.0 - beta2 ** step_i
-
-            active_params.append(self._flat_params[i].data)
-            active_grads.append(self._static_grads[i])
-            active_sharpness.append(self._flat_sharpness[i])
-            active_exp_avgs.append(self._flat_exp_avgs[i])
-            active_exp_avg_sqs.append(self._flat_exp_avg_sqs[i])
-            active_mus.append(self._flat_mus[i])
-            active_slows.append(self._flat_slows[i])
-            active_gru_states.append(self._flat_gru_states[i])
-            alpha_mus.append(float(alpha_i))
-            lamb_effs.append(float(lamb_eff))
-            beta1s.append(float(beta1_i))
-            bc1s.append(float(bc1))
-            bc2s.append(float(bc2))
-
-        if not active_params:
-            return
-
-        # Prefer the new CSA/HCA batched name; fall back to the old mamba alias.
-        batched_step = _ops_fn(
-            'supergrok2_batched_step', 'supergrok2_mamba_peer_batched_step')
-        batched_step(
-            active_params, active_grads, active_sharpness,
-            active_exp_avgs, active_exp_avg_sqs, active_mus,
-            # slows mirror mus (restored grokfast slow-grad EMA); position
-            # matches supergrok2_batched_step's `slows` param (after mus).
-            active_slows,
-            active_gru_states,
-            # ── shared input projection ──
-            w['input_proj_W'], w['input_proj_b'],
-            # ── CSA layer (produces csa_ctx) ──
-            w['csa_q_W'], w['csa_k_W'], w['csa_v_W'],
-            w['csa_compress_w'],
-            w['csa_idx_DQ'], w['csa_idx_UQ'], w['csa_idx_K'],
-            w['csa_out_W'],
-            # ── HCA layer (produces hca_ctx) ──
-            w['hca_q_W'], w['hca_k_W'], w['hca_v_W'], w['hca_out_W'],
-            # ── GRU ──
-            w['gru_W_z'], w['gru_b_z'],
-            w['gru_W_r'], w['gru_b_r'],
-            w['gru_W_h'], w['gru_b_h'],
-            # ── PEER routing + experts ──
-            self._cached_peer_query_Ws,
-            self._cached_prod_keys_A,
-            self._cached_prod_keys_B,
-            w['expert_W1'].reshape(self.num_experts, -1),
-            w['expert_b1'],
-            w['expert_W2'].reshape(self.num_experts, -1),
-            w['expert_b2'].reshape(-1),
-            # ── per-tensor scalar vectors ──
-            alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
-            # ── shared scalars ──
-            float(self.meta_net.rescale),
-            float(beta2), float(lr), float(wd_eff), float(eps),
-            # ── config ints ──
-            self.meta_net.d_model,
-            self.meta_net.gru_hidden, self.meta_net.n_heads,
-            self.meta_net.pk_dim, self.meta_net.expert_hidden,
-            self.meta_net.num_experts,
-            self.meta_net.csa_compress, self.meta_net.csa_window,
-            self.meta_net.csa_topk, self.meta_net.hca_compress,
-            self.meta_net.indexer_rank,
-            self.meta_net.expert_counts,
-            # ── configurable PEER top-k (Phase 8; trailing arg, default 4) ──
-            self.meta_net.peer_topk,
-        )
-
-        self._step_counter += 1
+        """Graph-capturable eager step — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     @torch.no_grad()
     def sg2_step_megakernel(self, params, grads, sharpness_list, states, meta,
                             scalars):
-        """ONE persistent-kernel SG2 optimizer step over ALL param tensors.
+        """SG2 eager optimizer-phase megakernel driver — REMOVED (pure L3-TC).
 
-        The launch-elimination driver for csrc/fused/sm_90/
-        opt_stage_supergrok2.cuh (INTEGRATION-NOTES.md §2): replaces the per-op
-        ``supergrok2_batched_step``'s ~15-20 launches/tensor with ONE batched
-        argsort prep + ONE persistent megakernel (CSA/HCA/GRU/PEER/apply for all
-        tensors via the task queue). Mutates ``params`` and the carried state in
-        ``states`` IN PLACE; returns None.
-
-        Args (all explicit — no optimizer-internal scheduling is read, so the
-        scalars cannot desync from a caller that also drives the oracle):
-          params:        list[Tensor]  param tensors (mutated in place)
-          grads:         list[Tensor]  reduced gradients (same order)
-          sharpness_list:list[Tensor]  per-element sharpness (same order)
-          states:        dict of lists-per-tensor with keys
-                         'exp_avg','exp_avg_sq','mu','slow','gru_state'
-                         (gru_state[t] is [n_t, gru_hidden]); all mutated in place
-          meta:          dict — the meta weight bundle (any dtype; upcast to fp32
-                         here once). Keys: input_proj_W/b, csa_{q,k,v,out}_W,
-                         csa_compress_w, csa_idx_{DQ,K}, hca_{q,k,v,out}_W,
-                         gru_{Wz,bz,Wr,br,Wh,bh}, peer_query_Ws,
-                         prod_keys_A/B, expert_{W1,b1,W2,b2}.
-          scalars:       dict — per-tensor arrays 'alpha','gru_decay','lamb_eff',
-                         'beta1','bc1','bc2' (length P) + shared floats 'rescale',
-                         'beta2','lr','wd','eps'.
+        The production L3-TC path runs SG2 via dispatch.fused_train_step (ops.
+        sg2_fused_step), which fuses the REAL model fwd+bwd with this optimizer
+        phase in ONE launch. This standalone eager optimizer-only driver is gone.
         """
-        if not params:
-            return
-        dev = params[0].device
-        GH = self.meta_net.gru_hidden
-
-        # 1) PACK all tensors back-to-back (one contiguous fp32 buffer each). The
-        #    kernel addresses tensor t at row_off[t] .. row_off[t]+n[t].
-        P = len(params)
-        n = torch.tensor([p.numel() for p in params], dtype=torch.int32,
-                         device=dev)
-        row_off = torch.zeros(P, dtype=torch.int64, device=dev)
-        row_off[1:] = torch.cumsum(n.to(torch.int64), 0)[:-1]
-        total = int(n.sum())
-        row_off_cpu = row_off.cpu().tolist()
-        n_cpu = n.cpu().tolist()
-
-        def pack(lst, width=1):
-            out = torch.empty(total * width, dtype=torch.float32, device=dev)
-            for t, x in enumerate(lst):
-                o = row_off_cpu[t] * width
-                out[o:o + x.numel()] = x.reshape(-1).float()
-            return out
-
-        params_packed = pack([p.data for p in params])
-        grads_packed = pack(grads)
-        sharp_packed = pack(sharpness_list)
-        exp_avg_packed = pack(states['exp_avg'])
-        exp_avg_sq_packed = pack(states['exp_avg_sq'])
-        mu_packed = pack(states['mu'])
-        slow_packed = pack(states['slow'])
-        gru_state_packed = pack(states['gru_state'], width=GH)  # [total*GH] row-major
-
-        # 2) THE ONE EXPLICIT PRE-KERNEL SORT (honesty rail #5). Per tensor,
-        #    argsort |grad| ASCENDING reproducing csa_hca_step_one's
-        #    `sort_keys.sort(0, descending=false)` (plain torch.sort, NOT stable
-        #    on CUDA). perm/unsort are PACKED with indices LOCAL to each tensor.
-        perm_packed = torch.empty(total, dtype=torch.int32, device=dev)
-        unsort_packed = torch.empty(total, dtype=torch.int32, device=dev)
-        for t, gt in enumerate(grads):
-            o, m = row_off_cpu[t], n_cpu[t]
-            # STRATEGY A (index tie-break), LOCK-STEP with the per-op oracle's stable
-            # sort (supergrok2_sm90.cuh) AND the L3-TC fused kernel's in-kernel
-            # segmented sort: stable=True breaks |grad| ties by ascending original
-            # index (the (|grad|, idx) total order), so the standalone megakernel's
-            # host-precomputed perm is byte-faithful to both. A plain unstable sort
-            # would drift the persisted gru_state on ties (bf16 grads collide).
-            _, perm = gt.reshape(-1).abs().sort(dim=0, descending=False, stable=True)  # [m]
-            # unsort is the inverse permutation; build it by scatter (perm is a
-            # permutation, so argsort(stable) is exact and tie-free here).
-            unsort = perm.argsort(stable=True)                            # inverse perm
-            perm_packed[o:o + m] = perm.to(torch.int32)
-            unsort_packed[o:o + m] = unsort.to(torch.int32)
-
-        # 3) Per-CTA workspace. ws_stride = the AUTHORITATIVE C++ binding (so the
-        #    host stride can never drift from the kernel carve). n_ctas == #SMs.
-        Nmax = int(n.max())
-        ws_stride = int(_ops.sg2_ws_stride(Nmax))
-        n_ctas = torch.cuda.get_device_properties(dev).multi_processor_count
-        workspace = torch.empty(n_ctas * ws_stride, dtype=torch.float32,
-                                device=dev)
-
-        # 4) Persistent-context scratch (zero-init; the launcher re-zeros each call).
-        g_next_task = torch.zeros(1, dtype=torch.int32, device=dev)
-        g_arrived = torch.zeros(1, dtype=torch.int32, device=dev)
-        g_generation = torch.zeros(1, dtype=torch.int32, device=dev)
-
-        # 5) Meta bundle as fp32 (upcast ONCE here — the kernel is fp32-compute).
-        def f32(x):
-            x = x if x.dtype == torch.float32 else x.float()
-            return x.contiguous()
-        ne = self.meta_net.num_experts
-
-        # 6) Per-tensor scalar arrays (length P).
-        def sc_arr(key):
-            return torch.as_tensor(scalars[key], dtype=torch.float32,
-                                   device=dev).contiguous()
-        alpha = sc_arr('alpha')
-        gru_decay = sc_arr('gru_decay')
-        lamb_eff = sc_arr('lamb_eff')
-        beta1 = sc_arr('beta1')
-        bc1 = sc_arr('bc1')
-        bc2 = sc_arr('bc2')
-
-        _ops.sg2_meta_optimizer_tail(
-            params_packed, grads_packed, sharp_packed,
-            exp_avg_packed, exp_avg_sq_packed, mu_packed, slow_packed,
-            gru_state_packed, perm_packed, unsort_packed, n, row_off,
-            workspace, ws_stride,
-            f32(meta['input_proj_W']), f32(meta['input_proj_b']),
-            f32(meta['csa_q_W']), f32(meta['csa_k_W']), f32(meta['csa_v_W']),
-            f32(meta['csa_out_W']),
-            f32(meta['csa_compress_w']), f32(meta['csa_idx_DQ']),
-            f32(meta['csa_idx_K']),
-            f32(meta['hca_q_W']), f32(meta['hca_k_W']), f32(meta['hca_v_W']),
-            f32(meta['hca_out_W']),
-            f32(meta['gru_Wz']), f32(meta['gru_bz']), f32(meta['gru_Wr']),
-            f32(meta['gru_br']), f32(meta['gru_Wh']), f32(meta['gru_bh']),
-            f32(meta['peer_query_Ws']), f32(meta['prod_keys_A']),
-            f32(meta['prod_keys_B']),
-            f32(meta['expert_W1']).reshape(ne, -1), f32(meta['expert_b1']),
-            f32(meta['expert_W2']).reshape(ne, -1),
-            f32(meta['expert_b2']).reshape(-1),
-            alpha, gru_decay, lamb_eff, beta1, bc1, bc2,
-            float(scalars['rescale']), float(scalars['beta2']),
-            float(scalars['lr']), float(scalars['wd']), float(scalars['eps']),
-            g_next_task, g_arrived, g_generation)
-
-        # 7) UNPACK results back into the per-tensor buffers (params + state).
-        for t, p in enumerate(params):
-            o, m = row_off_cpu[t], n_cpu[t]
-            p.data.copy_(params_packed[o:o + m].reshape(p.shape))
-            states['exp_avg'][t].copy_(exp_avg_packed[o:o + m].reshape(-1))
-            states['exp_avg_sq'][t].copy_(exp_avg_sq_packed[o:o + m].reshape(-1))
-            states['mu'][t].copy_(mu_packed[o:o + m].reshape(-1))
-            states['slow'][t].copy_(slow_packed[o:o + m].reshape(-1))
-            states['gru_state'][t].copy_(
-                gru_state_packed[o * GH:(o + m) * GH].reshape(m, GH))
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by `use_grad_hooks=True`.
-
-        Per-parameter meta-net forward + AdamW. Called from a post-accumulate
-        gradient hook for each parameter individually.
-        """
-        if param.grad is None:
-            return
-        self._ensure_state()
-        pidx = self._param_to_idx.get(id(param))
-        if pidx is None:
-            return
-
-        self._flat_steps[pidx] += 1
-
-        # CSA/HCA attention is stateless — no per-parameter scan state to init.
-
-        base_alpha = self._cached_alpha
-        ramp = self._get_ramp_factor()
-        gate_signal = self._get_gate_signal()
-        lamb_eff = self.lamb * ramp * gate_signal
-        beta2 = group["betas"][1]
-        lr = group["lr"]
-        eps = group["eps"]
-        wd_eff = self._get_effective_wd(group["weight_decay"])
-
-        grad = param.grad.data
-        # Gradient clipping + NaN guard, both done on-device without a host
-        # sync. The scale is 1.0 when ||g|| <= clip (matching the original
-        # ``if gn > clip`` branch exactly) and clip/(||g||+eps) otherwise,
-        # selected with a device-side ``where``. The non-finite guard then
-        # zeroes any NaN/Inf unconditionally (nan_to_num is a no-op on
-        # already-finite gradients), replacing the previous
-        # ``isfinite(grad).all()`` reduction-to-host on every step.
-        gn = grad.norm()
-        scale = torch.where(
-            gn > self.gradient_clipping,
-            self.gradient_clipping / (gn + 1e-12),
-            torch.ones_like(gn),
-        )
-        grad = grad * scale
-        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
-
-        alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
-        beta1_i = self._flat_layer_beta1s[pidx]
-        step_i = self._flat_steps[pidx]
-        bc1 = 1.0 - beta1_i ** step_i
-        bc2 = 1.0 - beta2 ** step_i
-
-        flat_grad = grad.reshape(-1)
-        flat_sharp = self._flat_sharpness[pidx].reshape(-1)
-
-        smart_grad, new_gru, _f, _b = self.meta_net(
-            flat_grad, flat_sharp,
-            self._flat_gru_states[pidx])
-        self._flat_gru_states[pidx] = new_gru.detach()
-        # Attention is stateless: no scan state to persist.
-
-        # Restored grokfast amplification. Use the dedicated slow-gradient EMA
-        # buffer (_flat_slows) here, NOT _flat_mus: the kernel paths (step /
-        # step_compiled) reserve _flat_mus for sg2_apply_step's expert-output
-        # EMA (mu_new = gru_decay*mu + (1-gru_decay)*expert_out) and carry the
-        # slow-grad EMA in _flat_slows. The eager meta_net already folds the
-        # expert output into `smart_grad`, so this path only needs the slow EMA:
-        #   slow = alpha*slow + (1-alpha)*g ; eff = smart_grad + lamb_eff*slow
-        # which mirrors sg2_apply_step's `slow_new` term (alpha == alpha_i is
-        # both the mixing coeff and the slow-EMA decay). Converging the buffer
-        # convention keeps _flat_mus consistent across every code path.
-        slow = self._flat_slows[pidx]
-        slow.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
-        effective_grad = smart_grad.reshape(-1) + lamb_eff * slow
-
-        fg = effective_grad.reshape(-1).float()
-        ea = self._flat_exp_avgs[pidx]
-        easq = self._flat_exp_avg_sqs[pidx]
-        ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-        easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
-        step_size = lr / bc1
-        denom = (easq / bc2).sqrt().add_(eps)
-        param.data.mul_(1 - lr * wd_eff)
-        param.data.addcdiv_(ea.reshape(param.data.shape), denom.reshape(param.data.shape), value=-step_size)
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def get_global_step(self):
         return self._global_step
@@ -2748,47 +2093,10 @@ class CompiledSuperGrok2:
         self._static_grad_buffers: Dict[int, torch.Tensor] = {}
 
     def step(self, **kwargs):
-        """Execute optimizer step with automatic warmup/capture/replay.
-
-        During warmup (first ``warmup_steps`` calls), runs in eager mode.
-        After warmup, captures a CUDA graph and replays it for subsequent
-        calls. Falls back to eager mode if capture fails.
-
-        Args:
-            **kwargs: Passed to ``optimizer.step()`` during eager mode.
-                During graph replay, kwargs are ignored (hyperparameters
-                are frozen at capture time).
-        """
-        self._step_count += 1
-
-        # Eager mode during warmup
-        if self._step_count <= self.warmup_steps:
-            return self.optimizer.step(**kwargs)
-
-        # Periodic eager step for expert recycling
-        if (self.recycle_in_eager and
-                self.optimizer.meta_net.recycle_interval > 0 and
-                self._step_count % self.optimizer.meta_net.recycle_interval == 0):
-            self._graph_valid = False
-            result = self.optimizer.step(**kwargs)
-            # Re-capture on next step
-            return result
-
-        # Eager path when kwargs are provided (CUDA-graph capture requires fixed args)
-        if kwargs:
-            return self.optimizer.step(**kwargs)
-
-        # First time after warmup: prepare and capture
-        if not self._graph_valid:
-            self._capture_graph()
-
-        if self._graph is not None and self._graph_valid:
-            self._copy_grads_to_static()
-            self._graph.replay()
-            self.optimizer._step_counter += 1
-        else:
-            # Graph capture failed — use eager mode
-            self.optimizer.step()
+        """Compiled-wrapper eager step — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _capture_graph(self):
         """Capture the optimizer step as a CUDA graph."""
@@ -2936,32 +2244,10 @@ class MoEAwareSuperGrok2(SuperGrok2):
     def step(self, closure=None, active_expert_indices=None,
              gate_logits=None, param_to_expert=None, expert_active=None,
              threshold=0.0, **kwargs):
-        """Optimizer step with optional MoE-aware compaction.
-
-        Args:
-            active_expert_indices: Tensor of active expert indices, or None.
-            gate_logits: [N, num_experts] gate logits for load balancing.
-            param_to_expert: [total_params] maps each param to its expert.
-            expert_active: [num_experts] binary mask of active experts.
-            threshold: Gate logit threshold for expert activation counting.
-            **kwargs: Forwarded to SuperGrok2.step().
-        """
-        if getattr(self, "_use_grad_hooks", False):
-            return super().step(closure=closure, **kwargs)
-
-        if (active_expert_indices is not None and
-                _HAS_CUDA and
-                hasattr(_ops, 'moe_filter_active_params')):
-            return self._moe_step(
-                active_expert_indices=active_expert_indices,
-                gate_logits=gate_logits,
-                param_to_expert=param_to_expert,
-                expert_active=expert_active,
-                threshold=threshold,
-                closure=closure,
-                **kwargs,
-            )
-        return super().step(closure=closure, **kwargs)
+        """MoE-aware eager step — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def _moe_step(self, active_expert_indices, gate_logits=None,
                   param_to_expert=None, expert_active=None,

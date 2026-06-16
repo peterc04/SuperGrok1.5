@@ -237,56 +237,17 @@ struct FusedScalars {
 };
 } // namespace sm90
 } // namespace fused
-// Phase 3 Stage 5: all 33 sm_90 cells are real component compositions
-// (csrc/fused/sm_90/mega_<model>_<opt>.cu → fused_megakernel.cuh →
-// opt_components.cuh/model_stages.cuh). This generated table declares every
-// cell launcher and routes (model, optimizer) → the real symbol. It replaces
-// the 3 hard-coded demo routes (the toy megakernel_demo.cu was deleted).
-#include "csrc/fused/sm_90/fused_dispatch_table.inc"
+// PURE L3-TC: the generic surrogate dispatch table (fused_dispatch_table.inc,
+// which declared the 33 sm_90 mega_<model>_<opt> surrogate cells + the
+// dispatch_sm90_cell router) is removed along with fused_megakernel.cuh — the
+// only sm_90 path is the real bf16 tensor-core launcher block below.
 
-// PHASE 1 — extern decl of the TRUE L3 fused decoder launcher. Its DEFINITION
-// lives in the nvcc-compiled csrc/fused/sm_90/mega_decoder_real_adamw.cu (which
-// owns all the <<<>>> / __global__ / device-intrinsic code — dispatch.cpp is
-// HOST-compiled and cannot host any of it). The boundary signature is decomposed
-// to plain pointers/ints + the FusedScalars mirror (NO header-only types like
-// DecoderTokenCtx/FusedOptState), and uses the same sg::fused::PersistentContext
-// + sg::fused::sm90::FusedScalars mirror types the 33 surrogate cells already use
-// — so the FQN/layout/mangling match the .cu definition (the existing cell cheat).
-// kDecTotalElems / kDecNumTensors are NOT visible here (they live in the device
-// header); fused_step's decoder branch passes the element count it already knows.
-namespace fused { namespace sm90 {
-cudaError_t mega_decoder_real_adamw(
-    ::sg::fused::PersistentContext ctx, float* params,
-    const int* tokens, const int* targets, int B,
-    float* state, float* grad, float* workspace, float* loss_out,
-    const int* sizes, const int* offsets,
-    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
-}}  // namespace fused::sm90
+// PURE L3-TC: the scalar (fp32 owner-computes) real launchers
+// mega_{decoder,vit,mamba}_real_adamw — defined in
+// csrc/fused/sm_90/mega_{decoder,vit,mamba}_real_adamw.cu — are removed. Only the
+// bf16 tensor-core (wgmma) launchers below remain.
 
-// PHASE 2 — extern decls of the TRUE L3 fused ViT + Mamba launchers. Definitions
-// live in the nvcc-compiled csrc/fused/sm_90/mega_{vit,mamba}_real_adamw.cu (which
-// own all the <<<>>> / __global__ / device-intrinsic code). Boundary signatures
-// are plain pointers/ints + the FusedScalars mirror (NO header-only ViTInputCtx /
-// MambaTokenCtx / FusedOptState), using the same sg::fused::PersistentContext +
-// sg::fused::sm90::FusedScalars mirror types the cells already use — so FQN /
-// layout / mangling match the .cu definitions. UNLIKE the decoder launcher these
-// take NO sizes/offsets (the kernels read kVitSizes/kMambaSizes __constant__
-// tables directly), matching the .cu definitions exactly — a mismatch is a loud
-// link error, not silent. kVitTotalElems / kMambaTotalElems are NOT visible here
-// (they live in the device headers); the branches below pass the element count
-// they already know. ViT takes FLOAT patches; Mamba takes int tokens (the .cu
-// signatures differ in the first input-pointer type).
 namespace fused { namespace sm90 {
-cudaError_t mega_vit_real_adamw(
-    ::sg::fused::PersistentContext ctx, float* params,
-    const float* patches, const int* targets, int B,
-    float* state, float* grad, float* workspace, float* loss_out,
-    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
-cudaError_t mega_mamba_real_adamw(
-    ::sg::fused::PersistentContext ctx, float* params,
-    const int* tokens, const int* targets, int B,
-    float* state, float* grad, float* workspace, float* loss_out,
-    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
 
 // R2.4 — extern decls of the WIRED tensor-core (bf16 wgmma) launchers. Their
 // definitions live in csrc/fused/sm_90/mega_{decoder,vit}_real_adamw_tc_launcher.cu
@@ -770,13 +731,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // Trailing defaulted arg (back-compat); inert default 1.0 for every non-SG11 cell.
  float gate_temp) {
  int arch = detect_arch();
- // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
- // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
- // run scalar under a TC-requested run and corrupt the roofline fractions.
- const bool want_wgmma = (gemm_impl == "wgmma");
- TORCH_CHECK(gemm_impl == "scalar" || gemm_impl == "wgmma",
- "fused_step: unknown gemm_impl '", gemm_impl,
- "' (expected 'scalar' or 'wgmma').");
+ // PURE L3-TC: the scalar / eager / surrogate / fallback paths are removed. The
+ // only supported GEMM engine is the bf16 tensor-core (wgmma) launcher; any other
+ // token (including the old "scalar" default) is a HARD reject — no silent scalar
+ // run under a TC-requested race (the owner no-suppression rule).
+ TORCH_CHECK(gemm_impl == "wgmma",
+ "L3-TC wgmma only; no scalar/eager path (got gemm_impl '", gemm_impl, "').");
+ const bool want_wgmma = true;
  std::string arch_str = (arch == 90) ? "sm_90"
  : (arch == 942) ? "gfx942" : "tpu_v6e";
  // `gamma` is NOW LIVE for the decoder L3-TC GrokAdamW cell: it is the
@@ -789,15 +750,12 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // Both flow to the kernel via the FusedScalars POD below → apply_scalars.
 
  const std::string cell = wired_fused_cell(model, optimizer, arch);
- if (cell.empty()) {
- // §1.12 fall-through: no fused TU for this cell. The caller uses the
- // existing per-op dispatch (the per-optimizer *_fused_step bindings),
- // which is untouched. We surface a clear, non-silent signal.
- throw std::runtime_error(
- "no fused TU for (" + model + ", " + optimizer + ", " + arch_str +
- "); use the per-op path. Wired L3 cells: (mamba3,adamw), "
- "(transformer_decoder,lion), (vit,supergrok15).");
- }
+ // PURE L3-TC: there is no per-op / eager fall-through anymore. A cell with no
+ // wired fused TU is a HARD failure (was: throw → caller degraded to the per-op
+ // path, which is deleted).
+ TORCH_CHECK(!cell.empty(),
+ "no fused TU for (", model, ", ", optimizer, ", ", arch_str,
+ "); the eager/per-op path has been removed (pure L3-TC).");
 
 #if defined(WITH_CUDA) && !defined(WITH_HIP)
  // ── PHASE 1: the TRUE L3 fused decoder megakernel (real fwd+bwd+adamw). ──
@@ -813,12 +771,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // (kSeq/kVocab/kD); B is derived from input.numel(). This leaves the 33
  // generated surrogate cells untouched (their surrogate-L3 path is now
  // unreachable dead code; see BUILD_AND_VALIDATE.md PHASE-1).
- // OPTID-GENERIC GATE (owner baseline directive — all 33 cells on L3-TC): the
- // decoder real fwd+bwd+opt megakernel fires for adamw (scalar OR wgmma) AND, on
- // the wgmma path only, for the single-launch optimizer tails (lion/grokfast/
- // grokadamw/neuralgrok). The scalar real decoder kernel exists ONLY for adamw, so
- // a non-adamw scalar request is rejected inside (no silent adamw fallback). The
- // STAGED/coupled optimizers never reach here (wgmma_tail_opt_id < 0 → eager).
+ // OPTID-GENERIC GATE (owner baseline directive — pure L3-TC, wgmma only): the
+ // decoder real fwd+bwd+opt TC megakernel fires for the single-launch optimizer
+ // tails (adamw/lion/grokfast/grokadamw/neuralgrok — wgmma_tail_opt_id >= 0). The
+ // STAGED/coupled optimizers (wgmma_tail_opt_id < 0) and SuperGrok2 do not reach
+ // here. (want_wgmma is always true now — the scalar path is removed.)
  const int dec_opt_id = wgmma_tail_opt_id(optimizer);
  // SuperGrok2 routes through the DEDICATED ops.sg2_fused_step entry (it needs the
  // meta-net weight bundle + per-tensor scalar arrays this generic block cannot carry),
@@ -905,22 +862,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // Lock-step with the vit decoder-twin POD below.
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- // GEMM-engine branch (owner directive task 1). want_wgmma → the bf16 tensor-core
- // launcher (mega_decoder_real_adamw_tc_launcher.cu: HGMMA in SASS, its own
- // TC-sized workspace, so we pass nullptr for the scalar `workspace`); else the
- // shipped fp32 scalar launcher (mega_decoder_real_adamw.cu, scalar dsc.workspace).
- // Both run the REAL decoder fwd+bwd+AdamW as ONE persistent kernel. NO silent
- // fallback: a wgmma request runs wgmma or the launcher returns a cuda error that
- // throws below (the no-suppression rule — a TC-requested run never secretly runs
- // scalar). All <<<>>>/__global__/device code lives in the launcher TUs; this host
- // TU passes only plain pointers + the FusedScalars POD.
- cudaError_t err;
- if (want_wgmma) {
- // opt_id selects the in-kernel tail (apply_optimizer<Opt>); the fwd+bwd is
- // optimizer-independent. dec_opt_id is >=0 here (the gate required it on the
- // wgmma path), so adamw/lion/grokfast/grokadamw/neuralgrok route to their own
- // tail instantiation; an unsupported id returns cudaErrorInvalidValue → throw.
- err = fused::sm90::mega_decoder_real_adamw_tc(
+ // PURE L3-TC: the bf16 tensor-core launcher is the ONLY path (the scalar
+ // mega_decoder_real_adamw TU is removed). HGMMA in SASS, its own TC-sized
+ // workspace (so we pass nullptr for `workspace`). opt_id selects the in-kernel
+ // tail (apply_optimizer<Opt>); the fwd+bwd is optimizer-independent. dec_opt_id
+ // is >=0 here (the gate required it), so adamw/lion/grokfast/grokadamw/neuralgrok
+ // route to their own tail; an unsupported id returns cudaErrorInvalidValue →
+ // throw below. All <<<>>>/__global__/device code lives in the launcher TU; this
+ // host TU passes only plain pointers + the FusedScalars POD.
+ cudaError_t err = fused::sm90::mega_decoder_real_adamw_tc(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
  input.data_ptr<int>() + (int64_t)B * kDecoderSeq,   // targets
@@ -928,26 +878,9 @@ void fused_step(const std::string& model, const std::string& optimizer,
  /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
  /*sizes=*/nullptr, /*offsets=*/nullptr,
  lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, dec_opt_id);
- } else {
- // The SCALAR real decoder kernel exists only for adamw. A non-adamw scalar
- // request has no real fwd+bwd+opt scalar TU → FAIL LOUD (no adamw fallback).
- TORCH_CHECK(optimizer == "adamw",
- "fused decoder megakernel: the scalar (fp32) real fwd+bwd+opt path is "
- "wired for adamw only; optimizer '", optimizer, "' has a real L3-TC path "
- "via gemm_impl='wgmma' (single-launch tail) but no scalar one. Use bf16.");
- err = fused::sm90::mega_decoder_real_adamw(
- ctx, params.data_ptr<float>(),
- input.data_ptr<int>(),                              // tokens
- input.data_ptr<int>() + (int64_t)B * kDecoderSeq,   // targets
- B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
- dsc.workspace.data_ptr<float>(), loss_slot,
- /*sizes=*/nullptr, /*offsets=*/nullptr,
- lr, static_cast<int>(step), scalars, stream);
- }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string(want_wgmma ? "fused decoder TC (wgmma) megakernel launch failed: "
- : "fused decoder megakernel launch failed: ") +
+ std::string("fused decoder TC (wgmma) megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }
@@ -966,9 +899,10 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // [3*total + 1] ([m|v|extra] + a trailing loss slot the kernel writes the mean
  // loss into). The workspace is device scratch (never crosses the ABI). Placed
  // BEFORE the surrogate route so the real path wins.
- // OPTID-GENERIC GATE (owner baseline directive — twin of the decoder gate): the
- // vit real fwd+bwd+opt megakernel fires for adamw (scalar OR wgmma) AND, on the
- // wgmma path only, for the single-launch tails (lion/grokfast/grokadamw/neuralgrok).
+ // OPTID-GENERIC GATE (owner baseline directive — twin of the decoder gate, pure
+ // L3-TC wgmma only): the vit real fwd+bwd+opt TC megakernel fires for the
+ // single-launch tails (adamw/lion/grokfast/grokadamw/neuralgrok). SuperGrok2 is
+ // excluded (dedicated entry). (want_wgmma is always true now.)
  const int vit_opt_id = wgmma_tail_opt_id(optimizer);
  // SuperGrok2 routes through the DEDICATED ops.sg2_fused_step entry (see the decoder
  // block) — EXCLUDE it from the generic vit block.
@@ -1036,42 +970,25 @@ void fused_step(const std::string& model, const std::string& optimizer,
  gate_temp};           // SuperGrok11 cosine-gate temperature (sigmoid(gate_temp·cos))
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
- // (mega_vit_real_adamw_tc_launcher.cu, its own TC-sized scratch → nullptr
- // workspace); else the fp32 scalar launcher. ViT input is FLOAT patches with the
- // int targets bit-reinterpreted out of the trailing float slots (same pointer
- // arithmetic both ways). NO silent fallback (no-suppression rule).
+ // PURE L3-TC: the bf16 tensor-core launcher is the ONLY path (the scalar
+ // mega_vit_real_adamw TU is removed). Its own TC-sized scratch → nullptr
+ // workspace. ViT input is FLOAT patches with the int targets bit-reinterpreted
+ // out of the trailing float slots. opt_id selects the in-kernel tail; vit_opt_id
+ // is >=0 here (the gate required it). adamw/lion/grokfast/grokadamw/neuralgrok
+ // route to their own tail; an unsupported id returns cudaErrorInvalidValue →
+ // throw below.
  const float* vit_patches = input.data_ptr<float>();
  const int* vit_targets = reinterpret_cast<const int*>(
  input.data_ptr<float>() + (int64_t)B * kVitPatchElems);
- cudaError_t err;
- if (want_wgmma) {
- // opt_id selects the in-kernel tail; vit_opt_id is >=0 here (the gate required
- // it on the wgmma path). adamw/lion/grokfast/grokadamw/neuralgrok route to their
- // own tail; an unsupported id returns cudaErrorInvalidValue → throw below.
- err = fused::sm90::mega_vit_real_adamw_tc(
+ cudaError_t err = fused::sm90::mega_vit_real_adamw_tc(
  ctx, params.data_ptr<float>(),
  vit_patches, vit_targets,
  B, m, grad.data_ptr<float>(),
  /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
  lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, vit_opt_id);
- } else {
- // The SCALAR real vit kernel exists only for adamw — fail loud otherwise.
- TORCH_CHECK(optimizer == "adamw",
- "fused ViT megakernel: the scalar (fp32) real fwd+bwd+opt path is wired "
- "for adamw only; optimizer '", optimizer, "' has a real L3-TC path via "
- "gemm_impl='wgmma' (single-launch tail) but no scalar one. Use bf16.");
- err = fused::sm90::mega_vit_real_adamw(
- ctx, params.data_ptr<float>(),
- vit_patches, vit_targets,
- B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
- vsc.workspace.data_ptr<float>(), loss_slot,
- lr, static_cast<int>(step), scalars, stream);
- }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string(want_wgmma ? "fused ViT TC (wgmma) megakernel launch failed: "
- : "fused ViT megakernel launch failed: ") +
+ std::string("fused ViT TC (wgmma) megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }
@@ -1136,15 +1053,12 @@ void fused_step(const std::string& model, const std::string& optimizer,
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
- // A wgmma request for a NON-TC-tail mamba optimizer (the SAM/SG2 set) is a loud
- // error rather than a silent scalar run under a wgmma label (no-suppression). The
- // scalar real kernel covers only adamw, so a non-adamw scalar request is also
- // rejected (no silent adamw fallback).
- TORCH_CHECK(want_wgmma || optimizer == "adamw",
- "fused_step: mamba3 scalar L3 path exists ONLY for adamw (got '", optimizer,
- "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
- TORCH_CHECK(!want_wgmma || mb_tc_tail,
- "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
+ // PURE L3-TC: wgmma is the only engine. The optimizer must be in the mamba TC
+ // launcher's single-launch tail set (a non-TC-tail mamba optimizer — the SG2 set
+ // — is a loud error, no silent run; SG2 routes via the DEDICATED sg2_fused_step
+ // entry). The deleted scalar mega_mamba_real_adamw is no longer a target.
+ TORCH_CHECK(mb_tc_tail,
+ "fused_step: mamba3 with optimizer '", optimizer,
  "', but the mamba TC launcher generic single-launch tail production-routes "
  "{adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam,supergrok11,supergrok15} "
  "(opt_id 0/1/2/3/6/7/5/4/8/9). SuperGrok2 routes via the DEDICATED sg2_fused_step entry "
@@ -1218,138 +1132,32 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // Lock-step with the decoder/vit PODs above.
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- // GEMM-engine branch (mirrors the decoder/vit). want_wgmma → the bf16 tensor-core
- // launcher (mega_mamba_real_adamw_tc_launcher.cu: HGMMA in SASS for the 4 projection
- // GEMMs, scan/conv scalar by design; owns its own TC-sized workspace, so we pass
- // nullptr for the scalar `workspace`); else the shipped fp32 scalar launcher
- // (mega_mamba_real_adamw.cu, scalar msc.workspace). Both run the REAL mamba fwd+bwd
- // +opt as ONE persistent kernel. NO silent fallback: a wgmma request runs wgmma or
- // the launcher returns a cuda error that throws below (the no-suppression rule).
- cudaError_t err;
- if (want_wgmma) {
- // opt_id (mb_opt_id ∈ {0,1,2} — the gate required it on the wgmma path) selects the
- // in-kernel tail (apply_optimizer<Opt>); the fwd+bwd is optimizer-independent.
- err = fused::sm90::mega_mamba_real_adamw_tc(
+ // PURE L3-TC: the bf16 tensor-core launcher is the ONLY path (the scalar
+ // mega_mamba_real_adamw TU is removed). HGMMA in SASS for the 4 projection GEMMs,
+ // scan/conv scalar by design; owns its own TC-sized workspace, so we pass nullptr
+ // for `workspace`. opt_id (mb_opt_id — the gate required it in the TC-tail set)
+ // selects the in-kernel tail (apply_optimizer<Opt>); the fwd+bwd is
+ // optimizer-independent.
+ cudaError_t err = fused::sm90::mega_mamba_real_adamw_tc(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
  input.data_ptr<int>() + (int64_t)B * kMambaSeq,     // targets
  B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
  /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
  lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, mb_opt_id);
- } else {
- err = fused::sm90::mega_mamba_real_adamw(
- ctx, params.data_ptr<float>(),
- input.data_ptr<int>(),                              // tokens
- input.data_ptr<int>() + (int64_t)B * kMambaSeq,     // targets
- B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
- msc.workspace.data_ptr<float>(), loss_slot,
- lr, static_cast<int>(step), scalars, stream);
- }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string(want_wgmma ? "fused Mamba TC (wgmma) megakernel launch failed: "
- : "fused Mamba megakernel launch failed: ") +
+ std::string("fused Mamba TC (wgmma) megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }
 
- if (arch == 90) {
- // Prepare the megakernel inputs from the tensors. The persistent scratch
- // (task counter + barrier state) is device-allocated and zero-initialized
- // here; the host launcher pins one CTA per SM. `state` carries the
- // optimizer state slices (m, v) concatenated; sizes/offsets describe the
- // per-parameter-tensor layout (here the single flattened tensor).
- //
- // Keep the element count in int64 at this boundary: a large flat param
- // ( > 2^31-1 elements ) truncated to `int` would wrap negative, making
- // the `3*n` state-size check pass spuriously and the `m + n` / `m + 2*n`
- // pointer offsets index out of bounds (silent OOB corruption). The
- // numel-derived state check and pointer math below all use this int64 n.
- const int64_t n = params.numel();
-
- // Reusable per-(device,n) scratch: counters/acts reset, sizes/offsets fixed.
- FusedScratch& sc = fused_scratch_for(params, n);
-
- // acts proxy + the m/v halves of state.
- auto p = params.data_ptr<float>();
- auto in = input.numel() ? input.data_ptr<float>() : p;
- auto gr = grad.numel() ? grad.data_ptr<float>() : sc.acts.data_ptr<float>();
- // state holds [m | v | extra]; split it. `extra` is the per-optimizer third
- // per-element buffer (ema/sam_dir/s_track/mu/orth/smart_grad); each cell binds
- // it to its FusedOptState field (adamw/lion/neuralgrok ignore it). Sized 3n.
- // An undersized state tensor was previously silently replaced by a fresh
- // zero buffer that was DISCARDED after the call (the optimizer state never
- // persisted) and reallocated every step — a latent correctness bug plus a
- // hot-path realloc. Surface it instead of silently corrupting state.
- if (state.numel() < 3 * n) {
- throw std::runtime_error(
- "fused_step: state tensor for (" + model + ", " + optimizer +
- ") has " + std::to_string(state.numel()) + " elements but needs at "
- "least 3*n = " + std::to_string(3 * n) +
- " (m|v|extra). Pass a persistent, correctly-sized state tensor.");
- }
- float* m = state.data_ptr<float>();
- float* v = m + n;
- float* extra = m + 2 * n;
-
- // The megakernel ABI (PersistentContext.n_tasks, the int32 sizes/offsets
- // tensors) is 32-bit per the layout-identical mirror struct and the
- // generated launchers. The fused indices are being widened by the fused
- // agent; until the device-side N is int64, fail loudly rather than feed a
- // truncated count into the kernel (which would silently process the wrong
- // task range). This gate fires only for params with > 2^31-1 elements.
- TORCH_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
- "fused_step: param has ", n, " elements, exceeding the int32 "
- "megakernel ABI (PersistentContext.n_tasks / sizes / offsets). "
- "Use the per-op path for params with > 2^31-1 elements.");
-
- fused::PersistentContext ctx{
- sc.g_next.data_ptr<int>(),
- reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
- reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
- // n_tasks = number of work tasks = #entries in sizes/offsets (one slab per
- // parameter tensor; a single flat tensor here → 1). It is NOT the element
- // count: the megakernel loops `t < n_tasks` reading sizes[t]/offsets[t], so
- // n_tasks=n would index both 1-element arrays ~n entries out of bounds and
- // feed garbage offsets into params[] (a multi-GB OOB read). n_ctas (0 here)
- // is overwritten by the launcher with one persistent CTA per SM.
- static_cast<int>(sc.sizes.numel()), 0u};
-
- // Use the current CUDA stream so the megakernel orders against the rest of
- // the model's work and is capturable in a CUDA graph (the legacy default
- // stream 0 serialized against all work and blocked graph capture).
- cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-
- // Pack the FULL scalar set for this cell. apply_optimizer<> reads every one
- // (the C2-gap fix); the cell's apply_scalars() copies them into FusedOptState.
- // Field order MUST match fused::sm90::FusedScalars (lr, beta1, beta2, eps, wd,
- // bc1, bc2, alpha, beta, lamb, alpha_max, gate, d_factor, neg_lr_scale,
- // decay_factor). bc1/bc2 are un-inverted (= 1 - beta^step) — ONE pair per call
- // is correct because the megakernel processes the flat param as a single task
- // and all race params share `step`.
- fused::sm90::FusedScalars scalars{
- lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
- d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
-
- // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
- // is set false only if no cell matches (then we fall through to the honest
- // not-compiled signal below). `opt_only` selects L1 (faithful real-grad tail)
- // vs L3 (surrogate-model fwd+bwd+opt).
- bool found = false;
- cudaError_t err = fused::sm90::dispatch_sm90_cell(
- model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
- sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr,
- static_cast<int>(step), scalars, opt_only, stream, &found);
-
- if (found) {
- if (err != cudaSuccess)
- throw std::runtime_error(
- std::string("fused megakernel launch failed for ") + cell + ": " +
- cudaGetErrorString(err));
- return;
- }
- }
+ // PURE L3-TC: the generic sm_90 surrogate route (dispatch_sm90_cell over the 33
+ // mega_<model>_<opt> cells, with the FusedScratch/acts proxy + opt_only L1/L3
+ // tier select) is removed. The only sm_90 paths are the three real bf16
+ // tensor-core megakernel blocks above (decoder/vit/mamba) + the dedicated
+ // sg2_fused_step entry. A (model, optimizer) that reaches here unhandled falls to
+ // the hard not-compiled TORCH_CHECK at the end.
 #endif
 
 #if defined(WITH_HIP)

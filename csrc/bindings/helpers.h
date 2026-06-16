@@ -42,13 +42,17 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 float d_factor = 1.0f, float bc1 = 1.0f, float bc2 = 1.0f,
                 float neg_lr_scale = 0.0f, float decay_factor = 1.0f,
                 float beta = 0.0f, float alpha_max = 1.0f,
-                int64_t step = 1, bool opt_only = true,
-                // GEMM-engine selector for the L3-REAL path (task 1): "scalar"
-                // (default; the shipped fp32 megakernel) or "wgmma" (the bf16
-                // tensor-core launcher). Default keeps old call shapes valid. Keep
-                // in sync with the definition in dispatch.cpp (which, per the C++
-                // rule, omits the default — it lives only on this declaration).
-                const std::string& gemm_impl = "scalar",
+                // opt_only is a dead ABI slot: the L1 real-grad optimizer TAIL was
+                // removed (task #10 — pure L3-TC or hard-fail). Default false ⇒ the
+                // L3-REAL (!opt_only) path, the only one that survives in dispatch.cpp.
+                // Kept in the signature for pybind ABI stability (stale-ABI latch).
+                int64_t step = 1, bool opt_only = false,
+                // GEMM-engine selector: "wgmma" is the ONLY supported engine (task
+                // #10 removed the scalar fp32 megakernel). The top gate in dispatch.cpp
+                // hard-CHECKs gemm_impl=="wgmma"; the default makes a bare call shape
+                // valid. Keep in sync with the definition in dispatch.cpp (which, per
+                // the C++ rule, omits the default — it lives only on this declaration).
+                const std::string& gemm_impl = "wgmma",
                 // GrokAdamW GLOBAL grad-norm clip threshold (decoder L3-TC,
                 // mechanism (ii)). Trailing defaulted arg (≤0 ⇒ no clip = inert for
                 // every non-GrokAdamW cell). Keep in sync with the definition in

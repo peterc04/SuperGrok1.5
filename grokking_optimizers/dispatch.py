@@ -564,50 +564,22 @@ def has_kernels() -> bool:
 
 
 # ----------------------------------------------------------------------
-# Fused (model, optimizer, arch) kernel registry + L1 megakernel readiness.
+# L3-TC fused (model, optimizer) megakernel — the ONLY production path.
 #
-# THE LIVE FUSED PATH (lever (a)). ``register_fused`` populates ``_FUSED_REGISTRY``
-# for the cells on the READINESS whitelist (``_FUSED_READY``). For a whitelisted
-# (model, optimizer) cell, ``has_fused(...)`` returns True and ``dispatch_fused``
-# runs the L1 fused optimizer-tail megakernel via ``ops.fused_step`` —
-# numerically the canonical optimizer update over the REAL gradient the framework
-# already computed (the C++ ``opt_only=True`` path; dispatch.cpp/opt_components).
+# PURE L3-TC (owner directive: no silent downgrade, hard-fail otherwise). Every
+# production cell runs the TRUE L3 fused megakernel: ONE persistent wgmma kernel
+# runs the REAL model fwd+bwd + the optimizer update, no surrogate, no
+# intermediate launches (model_stages_<model>.cuh + fused_<model>_megakernel.cuh +
+# mega_<model>_real_adamw_tc_launcher.cu, transcribed from the verified per-model
+# oracle). Its loss matches eager to fp64-anchored tolerance.
 #
-# L1 vs L3 (the tier landscape after PHASE 1):
-#   * L1 (this whitelist, {adamw,lion}×3 models): the fused optimizer TAIL only —
-#     consumes the real ``p.grad`` the framework computed and applies the
-#     canonical update. Faithful + validatable; the cell stays model-agnostic.
-#   * L3-SURROGATE (the 33 generated cells' opt_only=False path): an element-local
-#     SURROGATE model (csrc/fused/sm_90/model_stages.cuh: acts=GELU(param+input),
-#     grad=acts*GELU'(param)) over the flat param blob — NOT the real graph; its
-#     loss cannot match eager, so it is NOT used by the race. Still compiled
-#     (perf-placement coverage) but unreachable on the race path.
-#   * L3-REAL (PHASE 1; ONLY (transformer_decoder, adamw) on sm_90): the TRUE
-#     fused megakernel — ONE persistent kernel runs the REAL decoder fwd+bwd +
-#     AdamW, no surrogate, no intermediate launches (model_stages_decoder.cuh +
-#     fused_decoder_megakernel.cuh + mega_decoder_real_adamw.cu, transcribed from
-#     the verified oracle). Its loss DOES match eager (validated to 1e-5).
-#     Reached via ``fused_train_step`` / ``has_l3_real`` (the L3-REAL tier marker
-#     ``_FUSED_L3_REAL``), which REPLACES the eager fwd+bwd+opt for that one cell.
-# So "L3 can't match eager" is true for the SURROGATE L3 cells but FALSE for the
-# L3-REAL decoder×adamw cell. See BUILD_AND_VALIDATE.md §PHASE-1.
-#
-# WHY THIS WHITELIST (adamw, lion). The L1 tail's only non-pointer inputs are the
-# scalars (lr/betas/eps/wd/bc1/bc2) and the persistent m|v state — all directly
-# computable from the live optimizer + a step counter, with NO separate per-step
-# precompute. The other 9 optimizers need a precomputed per-step quantity the L1
-# tail reads but does not itself produce — prodigy's adaptive ``d``, grokfast/
-# grokadamw's slow-grad EMA seeding, looksam's SAM direction, muon's NS-orth
-# direction, SG11/15's reduced gate + mu, SG2's meta-net smart-grad. Those are
-# honest-staged behind the readiness gate (a loud one-time TODO at run start)
-# rather than wired with placeholder scalars (which would silently degrade the
-# math — the exact suppression the owner forbids). ``register_fused`` is the seam
-# to add them once their precompute is plumbed + validated.
-#
-# NOTE (L1 is model-agnostic): the L1 tail (fused_optimizer_stage<Opt>) never
-# touches the model stages, so a cell's result depends only on the optimizer, not
-# the model. All 3 models × {adamw, lion} are therefore equivalent on L1 and all
-# are whitelisted; the parity test needs only ONE model per optimizer.
+# The eager path, the per-op (opt_only=False L3-SURROGATE) path, the scalar fp32
+# owner-computes megakernel, AND the L1 fused-optimizer-tail path were ALL REMOVED
+# from production. ``has_l3_real`` (the L3-REAL tier marker ``_FUSED_L3_REAL``)
+# and ``gemm_impl_for_cell`` (the ``_L3_WGMMA_CELLS`` wgmma gate) are the only
+# gates; ``fused_train_step`` REPLACES fwd+bwd+opt for every L3-REAL cell. Any
+# cell or precision the wgmma megakernel does not cover HARD-FAILS at the caller
+# (RuntimeError) — it never silently routes to a non-existent fallback.
 # ----------------------------------------------------------------------
 
 MODELS = ("transformer_decoder", "vit", "mamba3")
@@ -628,16 +600,6 @@ OPT_CLASS = {
     "supergrok2":  "SuperGrok2",
 }
 
-# READINESS whitelist: (canonical_model, optimizer) cells cleared for the L1
-# megakernel path this pass. Everything else uses the existing per-op/eager path.
-# Kept as the SINGLE source of truth for "which cell may take the megakernel"; the
-# validation script (tests/hw/test_megakernel_vs_eager.py) asserts each of these
-# matches its eager reference before it is trusted on hardware.
-_FUSED_READY_OPTIMIZERS = ("adamw", "lion")
-_FUSED_READY = frozenset(
-    (m, o) for m in MODELS for o in _FUSED_READY_OPTIMIZERS
-)
-
 # PHASE 1+2 — L3-REAL tier marker. These (canonical_model, optimizer) cells have a
 # TRUE L3 fused megakernel: ONE persistent kernel runs the REAL model fwd+bwd +
 # AdamW (no surrogate, no intermediate launches), transcribed from the verified
@@ -652,9 +614,9 @@ _FUSED_READY = frozenset(
 # "mamba3"; the C++ dispatch + wired-cell table also use "mamba3"). These are the
 # ONLY L3-REAL cells — every other cell's L3 path is still the element-local
 # SURROGATE (loud honesty: do NOT use opt_only=False for them). The race reaches
-# these cells via fused_train_step() (NOT the L1 per-tensor fused_optimizer_step).
-# Kept as a SET so the tier semantics are a single source of truth the race + the
-# parity tests both read.
+# these cells via fused_train_step() — the ONLY production path. Kept as a SET so
+# the tier semantics are a single source of truth the race + the parity tests both
+# read.
 # OWNER BASELINE DIRECTIVE (all 33 cells on L3-TC): the decoder/vit wgmma fwd+bwd is
 # optimizer-independent, so the SINGLE-LAUNCH optimizer tails (lion/grokfast/grokadamw
 # /neuralgrok) compose into the SAME TC driver via apply_optimizer<Opt> (the 14/0-
@@ -998,18 +960,6 @@ _FUSED_L3_REAL = frozenset({
     ("mamba3", "supergrok2"),
 })
 
-_FUSED_REGISTRY = {}
-
-
-def fused_ready_cells():
-    """The (canonical_model, optimizer) pairs cleared for the L1 megakernel path.
-
-    Single source of truth for the readiness whitelist; the race and the
-    validation script both read it so they cannot disagree on which cell is live.
-    """
-    return frozenset(_FUSED_READY)
-
-
 def fused_l3_real_cells():
     """The (canonical_model, optimizer) pairs with a TRUE L3 fused megakernel
     (real fwd+bwd+opt in one persistent kernel). Currently only
@@ -1037,65 +987,8 @@ def has_l3_real(model, optimizer, arch=None) -> bool:
     return (model, optimizer) in _FUSED_L3_REAL
 
 
-def register_fused(model, optimizer, arch):
-    """Register a fused (model, optimizer, arch) kernel callable.
-
-    Used to populate ``_FUSED_REGISTRY`` for the readiness-whitelisted cells (see
-    ``_register_ready_cells`` below). The registered callable takes the same
-    ``(params, inputs, grads, state, lr)`` shape ``dispatch_fused`` forwards.
-    """
-    def decorator(fn):
-        _FUSED_REGISTRY[(canonicalize_model(model), optimizer, arch)] = fn
-        return fn
-    return decorator
-
-
-def has_fused(model, optimizer, arch=None):
-    """Whether the L1 megakernel path is available for (model, optimizer, arch).
-
-    True iff the cell is on the readiness whitelist (``_FUSED_READY``) for the
-    detected arch. The arch must be a real GPU arch with a compiled fused TU
-    (sm_90 / gfx942); on any other arch (CPU host, TPU) this returns False so the
-    caller uses the eager path. Tolerant of an unknown model name (returns False).
-    """
-    if arch is None:
-        try:
-            arch = detect_arch()
-        except UnsupportedArchError:
-            return False
-    try:
-        model = canonicalize_model(model)
-    except ValueError:
-        return False
-    # The compiled fused TU exists only for the GPU impl families (sm_90/gfx942).
-    impl = normalize_arch(arch) if not isinstance(arch, int) else arch
-    if impl not in (90, 942):
-        return False
-    return (model, optimizer) in _FUSED_READY
-
-
-def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None):
-    """Dispatch to a registered fused kernel, or raise KeyError if none.
-
-    The whitelisted cells register a callable here via ``register_fused``; the
-    race reaches the megakernel through the higher-level
-    :func:`fused_optimizer_step` (which assembles persistent state + live
-    scalars), so this remains the low-level registry shim.
-    """
-    if arch is None:
-        arch = detect_arch()
-    model = canonicalize_model(model)
-    key = (model, optimizer, arch)
-    if key not in _FUSED_REGISTRY:
-        raise KeyError(
-            f"No fused kernel for {key}. "
-            f"Available: {list(_FUSED_REGISTRY.keys())}"
-        )
-    return _FUSED_REGISTRY[key](params, inputs, grads, state, lr)
-
-
 # ----------------------------------------------------------------------
-# L1 megakernel optimizer-step driver (the live race path for whitelisted cells).
+# L3-TC megakernel run-start announcement (the ONLY production path).
 # ----------------------------------------------------------------------
 
 # One-time run-start announcement guard (so the readiness summary prints ONCE per
@@ -1106,39 +999,30 @@ _FUSED_ANNOUNCED = False
 def announce_fused_readiness(force: bool = False) -> None:
     """Print, ONCE per process, the PRODUCTION execution path.
 
-    Loud + honest at run start: all whitelisted (model, optimizer) cells run the
-    real fwd+bwd+optimizer in ONE persistent L3-TC wgmma megakernel; the eager/
-    per-op and scalar kernels are NOT on the race path (on-decline fallback +
-    dev/gate oracles only). Idempotent (guarded by ``_FUSED_ANNOUNCED``).
+    Loud + honest at run start: ALL L3-REAL (model, optimizer) cells run the real
+    fwd+bwd+optimizer in ONE persistent L3-TC wgmma megakernel — the ONLY
+    production path. The eager, per-op, scalar, and L1-tail paths were REMOVED:
+    there is NO silent downgrade. Any cell/precision the wgmma megakernel does not
+    cover HARD-FAILS at the caller (RuntimeError), it never falls back. Idempotent
+    (guarded by ``_FUSED_ANNOUNCED``).
     """
     global _FUSED_ANNOUNCED
     if _FUSED_ANNOUNCED and not force:
         return
     _FUSED_ANNOUNCED = True
-    ready = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_READY)
     l3_real = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_L3_REAL)
     msg = (
-        f"[fused] PRODUCTION path = L3-TC persistent megakernel (real fwd+bwd+"
-        f"optimizer in ONE wgmma kernel) for all {len(l3_real)} (model, optimizer) "
-        f"cell(s): {', '.join(l3_real)}. Eager/per-op + scalar kernels are NOT on "
-        f"the race path -- they run only as the on-decline fallback (AMP / non-sm_90 "
-        f"/ stale-ABI, loudly flagged DEGRADED) and as dev/gate oracles. "
-        f"(L1 fused-optimizer-tail available for {len(ready)} cell(s) as a legacy "
-        f"sub-tier, superseded by L3-TC where both apply.)")
+        f"[fused] PRODUCTION path = L3-TC persistent wgmma megakernel (real fwd+"
+        f"bwd+optimizer in ONE kernel) for all {len(l3_real)} (model, optimizer) "
+        f"cell(s): {', '.join(l3_real)}. This is the ONLY path: the eager / per-op "
+        f"/ scalar / L1-tail paths were REMOVED -- there is NO silent downgrade. "
+        f"Any cell or precision the wgmma megakernel does not cover HARD-FAILS "
+        f"(RuntimeError) at the caller; it never falls back.")
     # Print to stderr so the run-start banner is ALWAYS visible (the module
     # logger has a NullHandler by default, so logger.warning would be silent
     # unless GROK_LOG_LEVEL is set). Also log it for structured-log consumers.
     print(msg, file=sys.stderr, flush=True)
     logger.warning(msg)
-
-
-# Per-optimizer extra-state requirement for the L1 tail's `extra` (3rd n-slice).
-# Only the whitelisted optimizers are listed; adamw/lion need no extra slice (it
-# is allocated and zeroed but never read — rebase_state<Opt> guards it out).
-_OPT_USES_EXTRA = {
-    "adamw": False,
-    "lion":  False,
-}
 
 
 def _opt_scalars_from(optimizer, step):
@@ -1382,89 +1266,6 @@ def _opt_scalars_from(optimizer, step):
     return out
 
 
-def fused_optimizer_step(model_name, opt_name, torch_module, optimizer, *,
-                         state_cache, step):
-    """Run ONE L1 fused optimizer-tail step over the live model's parameters.
-
-    This is the live race path for a readiness-whitelisted cell. The caller has
-    ALREADY run the real forward + backward, so every trainable parameter carries
-    its real ``p.grad``; this applies the canonical optimizer update to each
-    parameter in-place via the fused megakernel (``ops.fused_step`` with
-    ``opt_only=True`` → the L1 real-grad tail).
-
-    State ownership (critical): because the fused path REPLACES ``optimizer.step()``
-    the torch optimizer's own ``.state`` never fills, so we keep our OWN persistent
-    per-parameter ``[m|v|extra]`` (one contiguous 3n fp32 buffer) in
-    ``state_cache`` (a dict the caller threads across steps). Reallocating it per
-    step would reset momentum every step (the optimizer would never grok); we
-    allocate once per parameter and reuse.
-
-    Args:
-        model_name: user/canonical model name (canonicalized internally).
-        opt_name: optimizer key (must be on the readiness whitelist).
-        torch_module: the ``nn.Module`` being trained (provides named params+grads).
-        optimizer: the live torch optimizer (source of lr/betas/eps/wd).
-        state_cache: dict persisted across steps: id(param) -> 3n fp32 state tensor.
-        step: 1-based step counter (drives bias correction).
-
-    Returns True on success. Raises if the cell is not whitelisted or a param is
-    in an unsupported layout (no silent corruption).
-    """
-    model_c = canonicalize_model(model_name)
-    if (model_c, opt_name) not in _FUSED_READY:
-        raise KeyError(
-            f"fused_optimizer_step: cell ({model_c}, {opt_name}) is not on the "
-            f"L1 readiness whitelist {sorted(_FUSED_READY)}")
-    ops = get_ops()
-    if not hasattr(ops, "fused_step"):
-        raise RuntimeError("ops.fused_step unavailable; build the extension.")
-
-    scalars = _opt_scalars_from(optimizer, step)
-
-    for _, p in torch_module.named_parameters():
-        if not p.requires_grad:
-            continue
-        g = p.grad
-        if g is None:
-            # No grad for this param this step (e.g. an unused head). Skip it
-            # rather than feed a stale/zero buffer — the eager step would also be
-            # a no-op for a None grad.
-            continue
-        # The L1 tail indexes raw dense float memory; a non-contiguous param/grad
-        # or a non-fp32 dtype would silently address the wrong elements. fused_step
-        # does NOT run check_param_grad (that guard is on the per-op path), so we
-        # enforce it here. amp is off by default in the race (fp32 params).
-        if p.dtype != torch.float32 or g.dtype != torch.float32:
-            raise RuntimeError(
-                f"fused_optimizer_step requires fp32 params AND grads (got "
-                f"param {p.dtype}, grad {g.dtype}); the L1 megakernel tail reads "
-                f"raw float memory. Disable AMP for the fused path.")
-        if g.is_sparse:
-            raise RuntimeError("fused_optimizer_step does not support sparse grads")
-        param = p.data if p.data.is_contiguous() else p.data.contiguous()
-        grad = g if g.is_contiguous() else g.contiguous()
-        n = param.numel()
-        key = id(p)
-        st = state_cache.get(key)
-        if st is None or st.numel() != 3 * n:
-            # Persistent [m|v|extra] state, zero-init ONCE per parameter.
-            st = torch.zeros(3 * n, dtype=torch.float32, device=param.device)
-            state_cache[key] = st
-        # input is unused on the L1 tail (auto in = input.numel()? : p); pass the
-        # param as a harmless non-empty placeholder so the C++ side does not fall
-        # back to the acts buffer. grad is the REAL gradient just computed.
-        ops.fused_step(model_c, opt_name, param.view(-1), param.view(-1),
-                       grad.view(-1), st, scalars["lr"],
-                       beta1=scalars["beta1"], beta2=scalars["beta2"],
-                       eps=scalars["eps"], weight_decay=scalars["weight_decay"],
-                       bc1=scalars["bc1"], bc2=scalars["bc2"],
-                       step=scalars["step"], opt_only=True)
-        # If .contiguous() copied, write the update back into the param storage.
-        if param.data_ptr() != p.data.data_ptr():
-            p.data.copy_(param.view_as(p.data))
-    return True
-
-
 # Per-model flat-buffer element counts. Each MUST equal the C++/CUDA total the
 # corresponding .cu static-asserts (kDecTotalElems / kVitTotalElems /
 # kMambaTotalElems). The Python wrapper builds the flat param/state buffers to
@@ -1494,14 +1295,17 @@ _L3_REAL_SPEC = {
 }
 
 
-# Per-(canonical_model, gemm_engine) READINESS for the L3-REAL train path. The
-# GEMM engine is the owner directive's GEMM_IMPL axis (task 1): "wgmma" runs the
-# bf16 tensor-core launcher (mega_{decoder,vit}_real_adamw_tc_launcher.cu, wired
-# into _ops), "scalar" runs the shipped fp32 megakernel. Mamba has NO wgmma
-# launcher (the measured scalar-wins carve-out, 905a4bb 0.46×), so requesting
-# wgmma for it is unsupported and FAILS LOUD (dispatch.cpp TORCH_CHECK) — never a
-# silent scalar run under a wgmma label. Single source of truth the race + tests
-# read so the path map cannot drift.
+# Per-(canonical_model, optimizer) PRODUCTION cells on the bf16 tensor-core wgmma
+# megakernel — the ONLY production GEMM engine (scalar fp32 + eager were removed).
+# Membership here is what makes ``gemm_impl_for_cell`` return "wgmma"; any cell NOT
+# in this set returns None, which HARD-FAILS at the caller (no silent fallback to a
+# non-existent scalar/eager path). The wgmma launchers are
+# mega_{decoder,vit,mamba}_real_adamw_tc_launcher.cu, wired into _ops; dispatch.cpp
+# has no silent fallback (an unsupported wgmma request throws TORCH_CHECK). Single
+# source of truth the race + tests read so the path map cannot drift.
+# (Historical note: the inline per-cell comments below that say "gemm_impl_for_cell
+# returns 'scalar' WITHOUT this entry" predate the pure-L3-TC cut — it now returns
+# None and the caller hard-fails; membership still routes the cell to "wgmma".)
 _L3_WGMMA_CELLS = frozenset({
     ("transformer_decoder", "adamw"),
     ("vit", "adamw"),
@@ -1687,42 +1491,26 @@ _L3_WGMMA_CELLS = frozenset({
 
 
 def gemm_impl_for_cell(model_name, opt_name, precision):
-    """The GEMM engine token ("wgmma" | "scalar") for an L3-REAL cell at `precision`.
+    """The GEMM engine token ("wgmma") for an L3-TC cell, else None.
 
-    Path-matched semantics (replaces the old fp32-only gate, owner directive task 1):
-      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit/mamba ×
-                               {adamw, lion, grokfast} as wired in _L3_WGMMA_CELLS),
-                               "scalar" otherwise. mamba is NOW a wgmma cell (cycle-2
-                               directive (c)) — the 0.46× scalar-wins is a perf fact the
-                               roofline reports, not a correctness carve-out.
-      * precision == "fp32"  → "scalar" for ADAMW cells (the fp32 owner-computes
-                               megakernel exists only for adamw, all 3 models); None for
-                               the non-adamw single-launch tails (lion/grokfast) — they
-                               have NO scalar real fwd+bwd+opt kernel, only the wgmma one,
-                               so at fp32 the caller declines to eager (the honest path).
-                               Returning "scalar" for them would route to the SURROGATE
-                               cell (wired_fused_cell) → a dtype throw on the token input,
-                               a loud-but-wrong fallthrough; None avoids it cleanly.
-    Any other precision returns None → the caller declines the L3 path entirely
-    (fp16-AMP / tf32 have no in-kernel carrier here; eager is the honest path).
+    PURE L3-TC (owner directive): the ONLY production GEMM engine is the bf16
+    tensor-core ``wgmma`` launcher. The scalar fp32 owner-computes megakernel and
+    every eager path were REMOVED — there is no silent downgrade. A cell wired in
+    ``_L3_WGMMA_CELLS`` returns "wgmma" regardless of the resolved precision; any
+    other (model, optimizer) returns None so the caller HARD-FAILS (it must not
+    silently route to a non-existent scalar/eager path).
 
     The engine returned is the ACTUAL engine dispatch.cpp will run (it has no silent
     fallback: an unsupported wgmma request throws), so a successful fused_train_step
     with this token PROVES that engine executed — the basis of the path report.
     """
     model_c = canonicalize_model(model_name)
-    if precision == "fp32":
-        # Only adamw has a scalar real fwd+bwd+opt megakernel. Non-adamw L3-REAL cells
-        # (lion) are wgmma-only → decline at fp32 (eager), never the surrogate.
-        return "scalar" if opt_name == "adamw" else None
-    if precision == "bf16":
-        return "wgmma" if (model_c, opt_name) in _L3_WGMMA_CELLS else "scalar"
-    return None
+    return "wgmma" if (model_c, opt_name) in _L3_WGMMA_CELLS else None
 
 
 def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
                      targets, *, state_cache, step, return_grad=False,
-                     gemm_impl="scalar",
+                     gemm_impl="wgmma",
                      lr=None, betas=None, weight_decay=None, eps=None):
     """Run ONE TRUE L3 fused TRAIN step (real fwd+bwd+opt) for an L3-REAL cell.
 
@@ -2222,29 +2010,3 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
     return loss
 
 
-def _register_ready_cells():
-    """Populate ``_FUSED_REGISTRY`` for every readiness-whitelisted cell.
-
-    The registered callable is a thin shim so ``dispatch_fused`` / ``has_fused``
-    see a real entry; the live race uses :func:`fused_optimizer_step` directly
-    (it owns the persistent state + per-step scalars the low-level registry shim
-    cannot carry). Registering for the detected GPU arch only (the compiled TU).
-    """
-    try:
-        arch = detect_arch()
-    except UnsupportedArchError:
-        return
-    impl = normalize_arch(arch) if not isinstance(arch, int) else arch
-    if impl not in (90, 942):
-        return
-    for (m, o) in _FUSED_READY:
-        def _shim(params, inputs, grads, state, lr, _m=m, _o=o):
-            ops = get_ops()
-            ops.fused_step(_m, _o, params, inputs, grads, state, float(lr),
-                           opt_only=True)
-            return params
-        register_fused(m, o, arch)(_shim)
-
-
-# Populate the registry at import (no-op / silent on CPU + non-GPU arches).
-_register_ready_cells()

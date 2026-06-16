@@ -1,10 +1,28 @@
-#ifndef SG_FUSED_SM90_MODEL_STAGES_DECODER_CUH_
-#define SG_FUSED_SM90_MODEL_STAGES_DECODER_CUH_
+#ifndef SG_FUSED_SM90_DEC_WEIGHTS_CUH_
+#define SG_FUSED_SM90_DEC_WEIGHTS_CUH_
 // ============================================================================
-// csrc/fused/sm_90/model_stages_decoder.cuh — PHASE 1 of the TRUE L3 fused
-// megakernel: the REAL transformer-decoder forward + backward as in-kernel
-// stages of the persistent megakernel (replaces the element-local SURROGATE in
-// model_stages.cuh for the (transformer_decoder × adamw) cell).
+// csrc/fused/sm_90/dec_weights.cuh — REAL transformer-decoder weight binding +
+// fp32 in-kernel forward/backward stage substrate, SALVAGED VERBATIM from the
+// former csrc/fused/sm_90/model_stages_decoder.cuh during the eager/scalar/
+// surrogate removal (task #10). The eager element-local SURROGATE substrate
+// (model_stages.cuh / fused_megakernel.cuh) and the 33 surrogate mega_*.cu
+// cells were deleted; this file is the genuine decoder substrate that the KEPT
+// L3-TC path still depends on and was kept (not deleted) for that reason.
+//
+// KEPT CONSUMERS (why every symbol below is still live):
+//   * model_stage_decoder_tc.cuh — reuses dec::* shape constants, dec::attn_scale,
+//     dec::kLnEps, DecWeights/DecWeights::Layer, DecGrad, dec_gelu/dec_gelu_grad,
+//     dec_block_sum/dec_block_max (the TC engine's own fwd/bwd reuse these prims).
+//   * fused_decoder_megakernel.cuh — its TC driver uses dec::* shape constants;
+//     and its fp32 scalar megakernel (the `#if SG_DEC_SCALAR_MEGAKERNEL` block,
+//     DEFAULT ON) uses DecSampleSmem + dec_bind/dec_bind_grad + dec_forward_sample
+//     + dec_backward_sample. So the full fwd/bwd stages below are NOT dead while
+//     that block compiles — they are part of the kept include graph.
+//   * pp_stage_decoder_tc.cuh, decoder_tc_selftest.cu, tp_layer.cuh reach these
+//     symbols transitively through the two headers above.
+// NOTE: this is the genuine eager-architecture decoder (the REAL math), NOT a
+// surrogate — there is no GELU(param+input) element-local surrogate in this file
+// to drop; that surrogate lived only in the deleted model_stages.cuh.
 //
 // HONESTY: this is the genuine eager architecture (grokking_race_v2.py
 // _raw_model → Transformer), transcribed LINE-FOR-LINE from the verified
@@ -1002,4 +1020,4 @@ __device__ inline void dec_backward_sample(const DecWeights& w, const DecGrad& g
 
 }}} // namespace sg::fused::sm90
 
-#endif  // SG_FUSED_SM90_MODEL_STAGES_DECODER_CUH_
+#endif  // SG_FUSED_SM90_DEC_WEIGHTS_CUH_

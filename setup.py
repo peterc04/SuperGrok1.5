@@ -208,6 +208,51 @@ else:
     print("  Compiler launcher: none (ccache/sccache not found)")
 
 
+def _resolve_real_nvcc():
+    """The nvcc BINARY torch's cpp_extension would invoke ($CUDA_HOME/bin/
+    nvcc), for wrapping in a compiler cache. Mirrors compile.py::
+    _resolve_real_nvcc. Falls back to PATH-spelled "nvcc" only when torch/
+    CUDA_HOME cannot name a real file."""
+    try:
+        cuda_home = getattr(_torch_cpp_ext, "CUDA_HOME", None)
+        if cuda_home:
+            cand = os.path.join(cuda_home, "bin", "nvcc")
+            if os.path.isfile(cand):
+                return cand
+    except Exception:  # noqa: BLE001 — fall back to PATH form.
+        pass
+    return "nvcc"
+
+
+def _sccache_nvcc_env():
+    """Fold sccache into the _ops build by wrapping nvcc via torch's
+    SUPPORTED PYTORCH_NVCC knob — mirrors compile.py::_sccache_env so that
+    repeated `pip install -e .` / `setup.py build_ext` runs hit the same
+    on-disk CUDA object cache the autotuner populates. Returns a dict of env
+    vars to set (empty when sccache is not on PATH).
+
+    PYTORCH_NVCC (not CUDA_NVCC_EXECUTABLE, a CMake var cpp_extension ignores)
+    is the knob torch writes verbatim into build.ninja. We wrap the REAL nvcc
+    binary ($CUDA_HOME/bin/nvcc), NOT PATH-spelled "nvcc": on pods where the
+    first nvcc on PATH is itself a caching wrapper SCRIPT, sccache would be
+    asked to treat a bash script as the compiler and die with "Compiler not
+    supported" (observed 2026-06-12). On hosts whose PATH nvcc IS the real
+    binary this resolves to the same compiler. Host CC/CXX are left to the
+    launcher-on-PATH masquerade above; this targets the .cu TUs only."""
+    out = {}
+    sccache = shutil.which("sccache")
+    if not sccache:
+        return out
+    sc_dir = os.environ.get("SCCACHE_DIR")
+    if sc_dir:
+        out.setdefault("SCCACHE_DIR", sc_dir)
+    out["PYTORCH_NVCC"] = f"{sccache} {_resolve_real_nvcc()}"
+    for k in ("SCCACHE_REDIS_ENDPOINT", "SCCACHE_REDIS", "SCCACHE_S3_BUCKET"):
+        if k in os.environ:
+            out[k] = os.environ[k]
+    return out
+
+
 # ----------------------------------------------------------------------
 # Multi-arch targets. The kernel source is single-per-vendor (one CUDA
 # tree, one HIP tree) and portable: the arch-specific paths (CUTLASS Sm90,
@@ -787,6 +832,24 @@ class TunedBuildExtension(BuildExtension):
     def build_extensions(self):
         import shlex as _shlex
 
+        # sccache fold-in (guarded): wrap nvcc via PYTORCH_NVCC so _ops
+        # rebuilds hit the same CUDA object cache compile.py's autotuner
+        # populates. Set into the live env here (BEFORE super() writes
+        # build.ninja, which reads PYTORCH_NVCC). No-op when sccache is not
+        # on PATH; never raised — diagnostic only. Runs on every build path,
+        # ahead of the tuned-inject early-returns below.
+        try:
+            _sc_env = _sccache_nvcc_env()
+            if _sc_env:
+                for _k, _v in _sc_env.items():
+                    os.environ.setdefault(_k, _v)
+                print(f"  [sccache] nvcc wrapped via PYTORCH_NVCC = "
+                      f"{os.environ.get('PYTORCH_NVCC')!r} (cached _ops "
+                      "rebuilds).")
+        except Exception as _scexc:  # noqa: BLE001 — never break the build.
+            print(f"  [sccache] fold-in skipped ({_scexc}); building with "
+                  "the unwrapped toolchain.")
+
         inject = _TUNED_INJECT
         tuned = inject.load_tuned() if inject is not None else None
 
@@ -900,7 +963,13 @@ setup(
     # live under an importable package.
     package_data={
         "grokking_optimizers": [
-            "kernels/sm_90/*.cuh",
+            # NOTE: kernels/sm_90/*.cuh removed — the eager per-op/model sm_90
+            # device headers (adamw_sm90.cuh … transformer_decoder_sm90.cuh,
+            # common_sm90.cuh) were deleted in the L3-TC-only cut; the sm_90
+            # device path now lives under csrc/fused/sm_90/ (megakernel +
+            # _tc model/opt stages), which is not an importable package dir
+            # and is shipped via MANIFEST.in (sdist). kernels/sm_90/ retains
+            # only __init__.py, so this glob matched nothing post-cut.
             "kernels/gfx942/*.hip.hpp",
             "kernels/gfx942/*.cuh",
             # Lever (b): ship the canonical autotuner winners when a wheel is

@@ -1,10 +1,16 @@
 """tests/hw/test_l3tc_tail_gate.py — per-cell L3-TC conversion gate (owner baseline).
 
 The owner baseline directive's per-cell gates for a newly-converted L3-TC cell:
-  (1) megakernel-vs-eager single-step  — the in-kernel optimizer TAIL must match a
+  (1) megakernel-vs-fp64 single-step   — the in-kernel optimizer TAIL must match a
       reference apply of the SAME canonical update on the SAME TC-reduced grad.
   (2) A/A/A determinism                — the production L3-TC step is bit-identical
       across 3 runs from the same init (fixed tile ownership + ascending-k/t reduce).
+
+RE-ANCHOR (task #10): the eager per-op CUDA kernels are being DELETED, so (1) no longer
+runs a fresh eager optimizer + opt.step(); the reference is now the PURE-fp64 canonical
+transcription (ref_<opt>_step in tests/hw/test_reference_parity.py) applied PER TENSOR on
+the kernel's captured grad + zero-init state. bf16 STAYS the compute precision (the kernel
+is unchanged); fp64 is only the ground-truth yardstick.
 
 WHY THIS SHAPE (not a full loss-trajectory-vs-eager oracle): the bf16 wgmma fwd+bwd
 and the deterministic grad reduction are SHARED with the already-gated adamw TC cell
@@ -15,9 +21,11 @@ the right gate is "did the kernel's tail apply the canonical update to the reduc
 grad correctly" — which is (1). The grad itself is validated by the adamw gates +
 the determinism check (2) proves no race was introduced by the tail swap.
 
-The reference apply is the canonical CPU math (transcribed from csrc/algorithms/<opt>.h
-— the SAME single source the kernel's apply_optimizer<Opt> calls), run on the grad the
-kernel returns (fused_train_step(return_grad=True)). fp32 both sides → tight tol.
+The reference apply is the canonical fp64 math (transcribed from csrc/algorithms/<opt>.h
+— the SAME single source the kernel's apply_optimizer<Opt> compiles from), run on the grad
+the kernel returns (fused_train_step(return_grad=True)). bf16-TC kernel vs fp64 reference →
+fp32-reorder tol (1e-4); the SAM 2nd-backward surfaces (sharpness/sam_dir) carry the bf16-
+TC-vs-fp64 floor tol (3e-2 / 2.5e-2).
 
 Run:
   PYTHONPATH=. python -m tests.hw.test_l3tc_tail_gate                 # all converted
@@ -62,12 +70,15 @@ def _g():
     return g
 
 
-# Cell spec: model, race optimizer key, and a factory that builds the REAL eager
-# optimizer with the EXACT production hyperparameters (the SAME ones train_<opt> uses).
-# The gate references this LIVE optimizer (not a header re-transcription), so it catches
-# any mechanism the real optimizer has that apply_optimizer<Opt> drops (grad_clip,
-# per-layer schedules, adaptive alpha) — the "megakernel-vs-REAL-eager" the directive
-# means. State layout in fused_train_step is [m|v|extra].
+# Cell spec: model, race optimizer key, and a factory that builds the live optimizer
+# with the EXACT production hyperparameters (the SAME ones train_<opt> uses). The factory
+# is STILL the production driver — it supplies the kernel's scalars via _opt_scalars_from
+# inside fused_train_step (lr/betas/wd/alpha/gamma/rho/grad_clip/…), so the kernel runs the
+# real mechanism. The (1a/1b) REFERENCE, however, is now the PURE-fp64 canonical transcription
+# (ref_<opt>_step), fed those SAME live scalars + the kernel's captured grad (RE-ANCHOR task
+# #10: the eager per-op kernels are deleted). A mechanism the kernel's tail drops (grad_clip,
+# per-layer β1, the SAM blend) shows up as a param/state mismatch because the references carry
+# it explicitly. State layout in fused_train_step is [m|v|extra].
 def _adamw_factory(g, params, c):
     # train_adamw: torch.optim.AdamW(lr, betas=(beta1,beta2), weight_decay, fused=True)
     import torch
@@ -182,45 +193,35 @@ def _supergrok15_factory(g, params, c):
     return opt
 
 
-def _neuralgrok_canonical_mv(grad, opt_obj, step):
-    """The (m, v) the NeuralGrok tail MUST produce, by the canonical header math.
+def _neuralgrok_canonical_mv(grad, opt_obj, step, p_before=None):
+    """The (m, v, p_after) the NeuralGrok tail MUST produce, by the canonical header math.
 
     Transcribes csrc/algorithms/neuralgrok.h (the SINGLE source the kernel's
-    apply_optimizer<NeuralGrok> AND the eager per-op kernel both call) — the gate's
-    docstring already defines its reference as exactly this header math:
+    apply_optimizer<NeuralGrok> calls) — the gate's docstring defines its reference as
+    exactly this header math:
         psi   = sum_j psi_W2[j] * relu(psi_W1[j]*|g| + psi_b1[j]) + psi_b2   (kPsiHidden=16)
         g_amp = (psi*alpha + beta) * g
         m     = beta1*m_prev + (1-beta1)*g_amp        (m_prev = 0 at step 1, zero-init cache)
         v     = beta2*v_prev + (1-beta2)*g_amp^2
-    computed in fp32 on the SAME captured TC-reduced grad and the SAME psi weights the
-    kernel read (opt_obj.psi_pack). Returns flat fp32 (m, v) for the whole param vector.
+        update= (m/bc1) / (sqrt(v/bc2) + eps);  p_after = p - lr*(update + wd*p)   (AdamW tail)
+    computed in fp64 on the SAME captured TC-reduced grad and the SAME psi weights the
+    kernel read (opt_obj.psi_pack). Returns flat fp32 (m, v, p_after) for the whole param
+    vector; p_after is None when p_before is None (the (1b)-only call shape).
 
-    WHY THIS IS THE (1b) REFERENCE FOR NEURALGROK (not the live eager .state): the eager
-    per-op neuralgrok_fused_step CUDA kernel has a CROSS-CELL CONTAMINATION bug — when it
-    runs AFTER another decoder/vit cell in the SAME process (the suite runs 11 cells in
-    one process), its psi-weight staging into __constant__/shared memory is perturbed by
-    the prior L3 launch's raw-cudaMalloc scratch teardown, so its g_amp magnitude drifts
-    (observed: eager-m vs this canonical-m rel ~1.7e-2 contaminated, but 2.7e-7 in a fresh
-    process — verified by running neuralgrok/decoder in isolation: kernel == live-eager
-    BIT-EXACT, m=v=0.0). The drift cancels in the step-1 param update (m/sqrt(v) ≈
-    sign(g_amp) is scale-invariant), so (1a) params still match the eager to <1e-6 — only
-    the RAW m/v state exposes it. The L3-TC kernel under gate is PROVABLY correct: it
-    matches THIS canonical math to ~2.7e-7 whether run fresh or after any cell. Anchoring
-    (1b) to the header math therefore validates the kernel against the real algorithm (its
-    documented contract), not a self-serving re-transcription — and (1a)'s live-eager
-    param check + the isolation-bit-exactness keep it tied to the actual optimizer. The
-    eager-kernel contamination is a SEPARATE pre-existing finding (it could corrupt an
-    fp32-fallback neuralgrok run sharing a process); it is in the CUDA kernel, out of this
-    task's edit scope (neuralgrok.py + dispatch.py neuralgrok entries + this gate).
+    RE-ANCHOR (task #10): the eager per-op neuralgrok_fused_step CUDA kernel is being
+    DELETED, so BOTH (1a) params and (1b) m/v are now anchored to THIS ground-truth fp64
+    transcription of neuralgrok.h — the same single source the kernel's apply_optimizer<
+    NeuralGrok> compiles from. The kernel matches this canonical math to ~2.7e-7. (1a) used
+    to compare the live eager opt.step(); with the eager path gone, the AdamW tail here IS
+    the (1a) reference. bf16 stays the compute precision; fp64 is the yardstick.
     """
     dev = grad.device
     g64 = grad.double()
-    # GLOBAL grad-norm clip — eager neuralgrok clips the reduced grad IN-PLACE (via
-    # clip_grad_norms_device_side) BEFORE psi+amp, and the L3-TC kernel now matches it
-    # (P2.5, extended to NeuralGrok). Apply the SAME clip to the reference so (1b) tracks
-    # the kernel when the clip FIRES (global grad-norm > grad_clip, e.g. seed 7); inert
-    # (coef=1) when norm<=clip. total_norm = sqrt(Σ g²) over the reduced grad == both the
-    # kernel's P2.5 norm and eager's clip_grad_norms_device_side norm.
+    # GLOBAL grad-norm clip — neuralgrok.h's tail clips the reduced grad (kernel P2.5,
+    # st.clip_coef) BEFORE psi+amp. Apply the SAME clip to the reference so it tracks the
+    # kernel when the clip FIRES (global grad-norm > grad_clip, e.g. seed 7); inert
+    # (coef=1) when norm<=clip. total_norm = sqrt(Σ g²) over the reduced grad == the
+    # kernel's P2.5 norm.
     _gclip = float(opt_obj.param_groups[0].get("grad_clip", 0.0))
     if _gclip > 0.0:
         _tn = g64.norm().item()
@@ -240,7 +241,16 @@ def _neuralgrok_canonical_mv(grad, opt_obj, step):
     # step 1 from zero-init moments (the kernel's state cache zero-inits [m|v|extra]).
     m = (1.0 - beta1) * g_amp
     v = (1.0 - beta2) * g_amp * g_amp
-    return m.float(), v.float()
+    p_after = None
+    if p_before is not None:
+        # AdamW tail (the (1a) reference). bc1=1-β1, bc2=1-β2 at t=1.
+        lr = float(grp.get("lr", 1e-3)); eps = float(grp.get("eps", 1e-8))
+        wd = float(grp.get("weight_decay", 0.0))
+        bc1 = 1.0 - beta1; bc2 = 1.0 - beta2
+        pb = p_before.double().to(dev)
+        update = (m / bc1) / (torch.sqrt(v / bc2) + eps)
+        p_after = (pb - lr * (update + wd * pb)).float()
+    return m.float(), v.float(), p_after
 
 
 def _neuralgrok_factory(g, params, c):
@@ -250,9 +260,9 @@ def _neuralgrok_factory(g, params, c):
     # PARITY PINS (the kernel's compile-time psi contract — OPTIMIZER_CONFIGS sets
     # these too): num_layers=2 and hidden_dim=16 == kPsiHidden, so the trained MLP IS
     # the deployed MLP (psi_pack maps it 1:1 into the kernel's `extra` slice). grad_clip
-    # is forwarded from the config (default 1.0, == train_neuralgrok); the gate asserts
-    # it is INERT at the gated step (global grad-norm <= grad_clip) so the eager
-    # reference's clip never silently diverges from the clip-free kernel tail.
+    # is forwarded from the config (default 1.0, == train_neuralgrok); the kernel's P2.5
+    # clip applies it, and the canonical fp64 reference (_neuralgrok_canonical_mv) applies
+    # the SAME clip — so the parity is real at any seed (inert when ‖g‖₂≤grad_clip).
     params = list(params)
     opt = g.NeuralGrok(params, lr=c["lr"], betas=(c["beta1"], c["beta2"]),
                        weight_decay=c["weight_decay"],
@@ -263,9 +273,9 @@ def _neuralgrok_factory(g, params, c):
                        grad_clip=c.get("neural_grad_clip", 1.0))
     # The amplifier is constructed on CPU in __init__; the race moves it to the
     # param device (grokking_race_v2.py:1094 opt.amplifier=opt.amplifier.to(dev)).
-    # Mirror that — without it get_weights()/psi_pack() return CPU tensors copied per
-    # step by the eager neuralgrok_fused_step, and (observed) the eager reference's
-    # state diverges. This is the production device placement, not a test crutch.
+    # Mirror that — without it get_weights()/psi_pack() return CPU tensors, and the
+    # kernel reads the psi `extra` slice from the wrong device. This is the production
+    # device placement, not a test crutch.
     if params:
         opt.amplifier = opt.amplifier.to(params[0].device)
     return opt
@@ -304,13 +314,12 @@ _CELLS = {
     # neuralgrok (decoder + vit): CONVERTED. The amplifier psi-net MLP is in the TC
     # driver (apply_optimizer<NeuralGrok>); the host fills the psi `extra` slice via
     # NeuralGrok.psi_pack() inside fused_train_step, and alpha/beta are forwarded by
-    # _opt_scalars_from. The gate handles two neuralgrok-specific facts (see
-    # run_cell_gate): (i) the eager reference's amplifier must hold the SAME psi
-    # weights the kernel read, so we copy opt_obj's amplifier into opt_ref before the
-    # reference step; (ii) the eager binding's GLOBAL grad-norm clip (grad_clip=1.0)
-    # is NOT in the kernel's neuralgrok.h tail, so the gate ASSERTS it is inert
-    # (global grad-norm <= grad_clip) at the gated step — a real parity, not a hollow
-    # pass. mamba×neuralgrok is NOT here (no mamba TC neuralgrok tail).
+    # _opt_scalars_from. RE-ANCHOR (task #10): BOTH (1a) params and (1b) m/v are now vs the
+    # CANONICAL fp64 transcription of neuralgrok.h (_neuralgrok_canonical_mv, extended to
+    # also return the AdamW-tail p_after) — fed the kernel's OWN psi_pack weights + reduced
+    # grad, including the GLOBAL grad-norm clip (kernel P2.5; inert at the default step,
+    # fires at e.g. GATE_SEED=7). The eager per-op kernel reference is deleted. mamba×
+    # neuralgrok is NOT here (no mamba TC neuralgrok tail).
     "neuralgrok/decoder": dict(model="decoder", opt="neuralgrok",
                                factory=_neuralgrok_factory),
     "neuralgrok/vit":     dict(model="vit", opt="neuralgrok",
@@ -355,9 +364,9 @@ _CELLS = {
     # prodigy (decoder): CONVERTED (wave-2 decoder lane). STAGED global-d, computed
     # IN-KERNEL (P2.6 phase, between the grad reduction B2 and the optimizer tail P3)
     # — still a SINGLE persistent wgmma launch. The single-step state gate checks the
-    # kernel's [m|v|s_track] against the REAL eager Prodigy's exp_avg/exp_avg_sq/s
-    # (run_cell_gate has a prodigy branch: the third buffer is `s`, not `ema`). At
-    # step 1 param_init==params ⇒ r=0 ⇒ d stays at d0=1e-6 (matching eager _d_lr=d0),
+    # kernel's [m|v|s_track] against the canonical fp64 ref_prodigy_apply_step's
+    # m/v/s_track (run_cell_gate's prodigy branch: the third buffer is `s`, not `ema`,
+    # d=d0=1e-6 at step 1). At step 1 param_init==params ⇒ r=0 ⇒ d stays at d0=1e-6,
     # so the single-step state gate is NECESSARY but NOT SUFFICIENT — it is BLIND to
     # the d-adaptation (which fires at step≥2). Honest registration rests on the
     # MULTI-STEP parity (_prodigy_multistep_parity: the kernel's d tracks eager; a
@@ -416,67 +425,68 @@ _CELLS = {
     # SAM steps (every k) it perturbs p'=p+(rho/‖g‖)·g, runs a FULL SECOND in-kernel
     # fwd+bwd at p' → g_sam, writes sam_dir=g_sam−g (persisted in the `extra` slice), and
     # restores p; the apply tail blends g_adj=(1−α)g+α·sam_dir → AdamW. The gate runs at
-    # step 1 (a SAM step), so the 2nd backward fires. run_cell_gate has a looksam branch:
-    #   (1a) params — copy the kernel's OWN sam_dir into opt_ref's sam_direction, inject
-    #        the kernel grad g, then opt_ref.step() blends the SAME direction and runs
-    #        AdamW: tight (1e-4) APPLY-TAIL parity (the 14/0 apply math on the kernel's
+    # step 1 (a SAM step), so the 2nd backward fires. run_cell_gate has a looksam branch
+    # (RE-ANCHORED task #10 — the eager per-op path is deleted):
+    #   (1a)+(1b) params + m/v — ref_looksam_apply_step fed the kernel's OWN sam_dir
+    #        (k_sam) blends the SAME direction the kernel used, then runs the canonical
+    #        fp64 AdamW: tight (1e-4) APPLY-TAIL parity (the 14/0 apply math on the kernel's
     #        reduced grad + sam_dir). param_tol stays tight — the apply has no NS-style
-    #        fp32 accumulation, so a dropped blend / wrong AdamW shows immediately.
-    #   (1b) STATE — m/v from the blended grad (tight 1e-4); the `extra` slice (== the
-    #        kernel's sam_dir) is checked against an INDEPENDENT bf16-floor reference: the
-    #        eager LookSAM.sam_step's 2nd backward (fp32 autograd through the reference
-    #        model at the SAME perturbed weights) → sam_dir_eager = g_sam_eager − g. The
-    #        kernel's bf16-TC 2nd backward vs the fp32 eager 2nd backward differ only by
-    #        the bf16 floor (the SAME DESIGN ≤2e-2 the first-grad adamw gate calibrates),
-    #        so sam_dir is checked at 2e-2 — a REAL parity against a real 2nd backward, not
-    #        a self-referential pass. A kernel that SKIPPED the SAM phase (sam_dir≈0) FAILS
-    #        this (g_sam_eager−g is O(rho)≫0). The 2nd backward's exact correctness is
-    #        inherited from the shared adamw grad gate (same fwd/bwd/assembly code), and
-    #        (2) A/A/A proves the 2nd pass introduced no race.
+    #        accumulation, so a dropped blend / wrong AdamW shows immediately.
+    #   (1b-sam) the `extra` slice (== the kernel's sam_dir) is checked against the PURE-fp64
+    #        oracle's OWN 2nd backward (the model's fp64 fwd+bwd at the SAME perturbed weights)
+    #        → sam_dir_fp = g_sam_fp − g_fp. The kernel's bf16-TC 2nd backward vs this ground-
+    #        truth fp64 2nd backward differ only by the bf16-TC floor — the kernel measured
+    #        ~1.87e-2 to fp64, so sam_dir is checked at 2.5e-2 (was 2e-2 vs the bf16-faithful
+    #        oracle). A REAL parity against ground-truth math, not a self-referential pass; a
+    #        kernel that SKIPPED the SAM phase (sam_dir≈0) FAILS this (g_sam_fp−g is O(rho)≫0).
+    #        The 2nd backward's correctness is inherited from the shared grad gate, and (2)
+    #        A/A/A proves the 2nd pass introduced no race.
     "looksam/decoder": dict(model="decoder", opt="looksam", factory=_looksam_factory,
-                            sam_dir_tol=2e-2),
+                            sam_dir_tol=2.5e-2),
     # looksam (vit — SAM-tier lane): CONVERTED. The IDENTICAL in-kernel P2.4 SAM 2nd
     # backward ported onto the ViT TC kernel (fused_vit_megakernel.cuh): on the step-1
     # SAM step it perturbs p'=p+(rho/‖g‖)·g, runs a FULL SECOND ViT fwd+bwd at p' →
     # g_sam (via vittc_forward_tile/vittc_backward_tile + vittc_dw_*/clspos/lnvec into a
     # SEPARATE sam_grad buffer), writes sam_dir=g_sam−g (persisted in `extra`), restores
-    # p. (1a/1b) parity + the sam_dir oracle use the ViT bf16-faithful oracle (gate (A),
-    # vit branch above); (2) A/A/A proves the 2nd pass introduced no race (vit's forward
-    # is deterministic — vit Prodigy/Muon are A/A/A-green, same fixed reductions).
+    # p. (1a/1b) parity uses the canonical fp64 ref_looksam_apply_step + the sam_dir oracle
+    # uses the ViT PURE-fp64 oracle (RE-ANCHOR task #10, vit branch in run_cell_gate); (2)
+    # A/A/A proves the 2nd pass introduced no race (vit's forward is deterministic — vit
+    # Prodigy/Muon are A/A/A-green, same fixed reductions).
     "looksam/vit": dict(model="vit", opt="looksam", factory=_looksam_factory,
-                        sam_dir_tol=2e-2),
+                        sam_dir_tol=2.5e-2),
     # supergrok11 (decoder/vit — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
     # (P2.4, sharpness=(g_sam−g)²) + the per-TENSOR meta-net mu/gate precompute (P2.45,
     # mu=rescale·phi(g,sharpness), gate=sigmoid(gate_temp·cos(g,mu))) are IN-KERNEL phases; the apply
     # tail (sg11_sweep_b_step: smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. The gate
     # (factory: warmup_steps=0 ⇒ ramp=1, rescale=0.1 ⇒ mu!=0) validates FOUR surfaces vs the
     # canonical fp64 math (run_cell_gate's opt=="supergrok11"/"supergrok15" branch):
-    #   (A) sharpness — vs the bf16-faithful 2nd backward (g_sam−g)² (the SAME oracle the
-    #       looksam sam_dir check uses, squared); a SKIPPED SAM phase (sharpness≈0) fails it.
+    #   (A) sharpness — vs the PURE-fp64 2nd backward (g_sam−g)² (the SAME ground-truth oracle
+    #       the looksam sam_dir check uses, squared); a SKIPPED SAM phase (sharpness≈0) fails it.
     #   (B) mu — vs rescale·phi(g, sharpness) (canonical sg11_phi_forward / ref_sg_phi_forward),
     #       on the SAME captured grad + the kernel's OWN sharpness (so the meta-net forward is
-    #       validated independent of the bf16 2nd-backward floor).
+    #       validated independent of the 2nd-backward floor).
     #   (1a) params + (1b) m/v — vs ref_sg11_step (smart_grad=g+(1−gate)·alpha·mu, AdamW) with
     #       the kernel's grad/mu/gate, tight 1e-4 (the apply tail math).
     # mamba×supergrok11 is BLOCKED (shared mamba-forward A/A/A race; code-absent in the mamba
-    # kernel/launcher). sharpness_tol=2e-2 (the bf16-TC vs bf16-faithful 2nd-backward floor,
-    # the SAME design floor as looksam's sam_dir); mu_tol=3e-3 (fp32 phi reorder, SG-family).
+    # kernel/launcher). sharpness_tol=3e-2 (RE-ANCHORED task #10: bf16-TC vs PURE-fp64 ground-
+    # truth — the kernel measured 2-3× closer to fp64 than the deleted bf16-faithful oracle was,
+    # floor ~2.2e-2; was 2e-2 vs bf16-faithful); mu_tol=3e-3 (fp32 phi reorder, SG-family).
     "supergrok11/decoder": dict(model="decoder", opt="supergrok11",
                                 factory=_supergrok11_factory,
-                                sharpness_tol=2e-2, mu_tol=3e-3),
+                                sharpness_tol=3e-2, mu_tol=3e-3),
     "supergrok11/vit": dict(model="vit", opt="supergrok11",
                             factory=_supergrok11_factory,
-                            sharpness_tol=2e-2, mu_tol=3e-3),
+                            sharpness_tol=3e-2, mu_tol=3e-3),
     # supergrok15 (decoder/vit — SAM-tier lane): CONVERTED. SAME SAM 2nd backward + mu precompute
     # as SG11, but SIMPLER tail: the gate is a HOST SCALAR (sigmoid(accuracy)), NO per-tensor
     # cosine — so the precompute is just mu=rescale·phi(g,sharpness); the apply (sg15_sweep_b_step)
     # does the per-coord alpha clip + smart_grad=g+gate·a·mu + AdamW. Validated vs ref_sg15_step.
     "supergrok15/decoder": dict(model="decoder", opt="supergrok15",
                                 factory=_supergrok15_factory,
-                                sharpness_tol=2e-2, mu_tol=3e-3),
+                                sharpness_tol=3e-2, mu_tol=3e-3),
     "supergrok15/vit": dict(model="vit", opt="supergrok15",
                             factory=_supergrok15_factory,
-                            sharpness_tol=2e-2, mu_tol=3e-3),
+                            sharpness_tol=3e-2, mu_tol=3e-3),
     # looksam (mamba): CONVERTED — the A/A/A race is FIXED (same root cause + fix as
     # prodigy/mamba above: a register-pressure wgmma-accumulator spill in the mamba TC
     # backward, exposed harder here because the SAM block inlines the heavy fwd+bwd a SECOND
@@ -488,7 +498,7 @@ _CELLS = {
     # a SAM step (sam_dir = g_sam−g recomputed bit-stable) and a SAM-off step. decoder/vit
     # looksam were already A/A/A-clean; mamba now joins them.
     "looksam/mamba": dict(model="mamba", opt="looksam", factory=_looksam_factory,
-                          sam_dir_tol=2e-2),
+                          sam_dir_tol=2.5e-2),
     # supergrok11/15 (mamba — wave-4 mamba SG lane): CONVERTED via the FEATURE PORT (the
     # decoder/vit twins ported onto fused_mamba_megakernel.cuh + mega_mamba_real_adamw_tc_
     # launcher.cu): the P2.4 SAM 2nd backward extends to SG (sharpness=(g_sam−g)²) + the
@@ -497,21 +507,22 @@ _CELLS = {
     # mamba-forward A/A/A race is FIXED (commit 0b57f7e — the LookSAM mamba instantiation
     # proved the SAM double-forward is race-free), so the (2) A/A/A determinism check below
     # VERIFIES SG11/15 are bit-exact too. Same 4-surface validation as decoder/vit (sharpness
-    # vs the bf16-faithful 2nd backward, mu vs the canonical phi, 1a/1b apply tail). HONEST
+    # vs the PURE-fp64 2nd backward, mu vs the canonical phi, 1a/1b apply tail). HONEST
     # CAVEAT: SG11/15 mamba reach L3-TC + single-step parity but WON'T GROK on L3 (the meta-net
     # is untrained — a separate owner-approved host-training task, NOT done here).
     "supergrok11/mamba": dict(model="mamba", opt="supergrok11",
                               factory=_supergrok11_factory,
-                              sharpness_tol=2e-2, mu_tol=3e-3),
+                              sharpness_tol=3e-2, mu_tol=3e-3),
     "supergrok15/mamba": dict(model="mamba", opt="supergrok15",
                               factory=_supergrok15_factory,
-                              sharpness_tol=2e-2, mu_tol=3e-3),
+                              sharpness_tol=3e-2, mu_tol=3e-3),
     # supergrok2 (decoder/vit — the LAST/hardest cell): CONVERTED via the DEDICATED
     # ops.sg2_fused_step entry. The FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase
     # (P3-SG2): in-kernel SEGMENTED SORT (STAGE -1, index-tie-break strategy A) → S0..S5,
     # reading st.sharpness from the SAM 2nd backward (P2.4, shared with SG11/15). The SG2
     # gate (tests/hw/_sg2_l3tc_gate.run_sg2_gate) validates FOUR surfaces: (B1) single-step
-    # vs ops.supergrok2_batched_step (the per-op ORACLE, SAME low-rank indexer) max|Δ{param,
+    # vs the PURE-fp64 oracle_step (RE-ANCHOR task #10; sg2_kernel_mirror's clean numpy fp64
+    # reimpl, validated equivalent — the per-op CUDA ORACLE is deleted) max|Δ{param,
     # m,v,mu,slow,gru_state}| < 1e-5; (A/A/A) bit-determinism (the index-tie-break sort is
     # deterministic by construction); (tie-probe) strategy-A (|g|,idx) perm total-order; and
     # the (N>64 CSA fidelity PROBE) which REPORTS the won't-grok divergence (kernel drops
@@ -607,11 +618,73 @@ def _sg_bf16_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev):
     return sharp
 
 
+def _sg_pure_fp64_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev):
+    """The (g_sam − g)² sharpness the SAM 2nd backward MUST produce, via the PURE-fp64
+    oracle (the model's fp64 fwd+bwd with NO bf16 storage rounds — the SAME instrument
+    scripts/diag_sg_sharpness.py uses, and the ground-truth math the bf16-faithful oracle
+    is itself a rounded approximation of). Runs the oracle TWICE — at p and at p'=p+ron·g
+    (ron=rho/‖g‖_global, g the kernel's reduced grad) — and returns sharpness_fp =
+    (g_sam_fp − g_fp)² flattened (named layout order).
+
+    RE-ANCHOR (task #10): the sharpness / sam_dir checks were against the bf16-faithful
+    oracle (a bf16-rounded reference). Now that the eager per-op CUDA kernels are deleted,
+    the gate is re-anchored to ground-truth fp64 math: the L3-TC kernel's bf16-TC 2nd
+    backward is validated against the PURE-fp64 2nd backward. Measured (diag_sg_sharpness):
+    the kernel sits 2-3× CLOSER to fp64 than the bf16-faithful oracle does, so the floor on
+    (kernel − pure-fp64) is ~2.2e-2 sharpness / 1.87e-2 sam_dir — the 3e-2 / 2.5e-2 tols
+    below are fp64-justified headroom over those measured floors. bf16 STAYS the compute
+    precision (the kernel is unchanged); fp64 is only the reference yardstick.
+
+    The pure-fp64 oracle = the model's ``oracle_loss_and_grads`` run on fp64 params
+    (decoder_oracle / vit_oracle / mamba_oracle — each computes in the param dtype). For
+    mamba this is the published ``_pure_fp64_oracle`` wrapper; decoder/vit have no such
+    wrapper, so we call ``oracle_loss_and_grads`` with doubled params directly (identical
+    call shape, ``(named, tokens/patches, targets) -> (loss, grads)``)."""
+    if model == "decoder":
+        from tests.hw.decoder_oracle import oracle_loss_and_grads as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+        named_d = {n: p.detach().double() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    elif model == "mamba":
+        # The published pure-fp64 mamba oracle (test_mamba_tc._pure_fp64_oracle doubles
+        # the params internally). Same call shape as the bf16-faithful branch above.
+        from tests.hw.test_mamba_tc import _pure_fp64_oracle as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+        named_d = {n: p.detach() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    elif model == "vit":
+        from tests.hw.vit_oracle import oracle_loss_and_grads as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].detach().cpu().double(); a1 = ty[:B16].detach().cpu().to(torch.long)
+        named_d = {n: p.detach().cpu().double() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    else:
+        raise NotImplementedError(f"sg pure-fp64 sharpness oracle not wired for {model}")
+    gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in go.values())).item()
+    ron = rho / gn
+    off = 0; named_pert = {}
+    cpu = (model == "vit")
+    for n_, p in named_ref:
+        k = p.numel()
+        base = (p.detach().cpu().double() if cpu else p.detach().double())
+        gslice = grad[off:off + k].reshape(p.shape)
+        gslice = (gslice.cpu().double() if cpu else gslice.double())
+        named_pert[n_] = base + ron * gslice
+        off += k
+    _lo2, go2 = _orc(named_pert, a0, a1)
+    sharp = torch.cat([((go2[n_] - go[n_]).reshape(-1).double()) ** 2
+                       for n_, _ in named_ref]).float().to(dev)
+    return sharp
+
+
 def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
                       loss, p_after, total, named0, cache, verbose):
     """Dedicated SuperGrok11/15 gate: validate the kernel vs the CANONICAL fp64 math its
     apply_optimizer<SG> calls (ref_sg11_step/ref_sg15_step + ref_sg_phi_forward), plus the
-    SAM 2nd backward (sharpness) vs the bf16-faithful oracle. Returns (ok, detail)."""
+    SAM 2nd backward (sharpness) vs the PURE-fp64 oracle (RE-ANCHOR task #10). Returns
+    (ok, detail)."""
     import math
     import torch
     from grokking_optimizers.dispatch import _opt_scalars_from, fused_train_step
@@ -643,18 +716,21 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     for n_, p in named0:
         layout.append((n_, off, p.numel(), p.shape)); off += p.numel()
 
-    # ── (A) sharpness vs the bf16-faithful 2nd backward (g_sam−g)². Liveness: a real SAM
+    # ── (A) sharpness vs the PURE-fp64 2nd backward (g_sam−g)². Liveness: a real SAM
     # step makes sharpness O((ron·‖∇‖)²) ≫ 0. The factory uses k=… so step 1 IS a SAM step.
+    # RE-ANCHOR (task #10): now compared to ground-truth fp64 math (the eager per-op kernels
+    # are deleted), not the bf16-faithful oracle. The kernel measured 2-3× closer to fp64
+    # than the bf16-faithful oracle was → tol raised 2e-2→3e-2 (floor ~2.2e-2; see _CELLS).
     g_r, c_r, m_ref, data_r, dev_r = _build_cell(model)
     named_ref = [(n, p) for n, p in m_ref.named_parameters() if p.requires_grad]
-    sharp_ref = _sg_bf16_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev)
+    sharp_ref = _sg_pure_fp64_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev)
     assert sam_on != 0.0, f"{cell_key}: looksam_sam==0 — the SAM 2nd backward did not run at step 1"
     assert sharp_ref.abs().max().item() > 1e-8, (
         f"{cell_key}: oracle sharpness is ~0 (the 2nd backward produced no signal) — vacuous gate")
     sh_abs = (k_sharp - sharp_ref).abs().max().item()
     sh_den = sharp_ref.abs().max().item() + 1e-30
     sharp_rel = sh_abs / sh_den
-    sharp_tol = spec.get("sharpness_tol", 2e-2)
+    sharp_tol = spec.get("sharpness_tol", 3e-2)
     sharp_ok = sharp_rel < sharp_tol
     # Liveness on the KERNEL side too: a kernel that skipped the SAM phase would leave
     # sharpness=0 (the zero-init state) → mu=rescale·phi(g,0)≈small, but the apply would
@@ -723,8 +799,8 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
               f"{'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
         print(f"  (1b) STATE vs canonical SG: m={m_rel:.3e} v={v_rel:.3e} (tol 1e-4) "
               f"{'OK' if state_ok else 'FAIL'}", flush=True)
-        print(f"  (A) sharpness vs bf16-faithful 2nd backward: rel={sharp_rel:.3e} "
-              f"(tol {sharp_tol:.0e}, bf16-TC vs bf16-faithful floor) "
+        print(f"  (A) sharpness vs PURE-fp64 2nd backward: rel={sharp_rel:.3e} "
+              f"(tol {sharp_tol:.0e}, bf16-TC vs ground-truth fp64 floor) "
               f"{'OK' if sharp_ok else 'FAIL'}", flush=True)
         print(f"  (B) mu vs rescale·phi(g,sharpness): rel={mu_rel:.3e} (tol {mu_tol:.0e}) "
               f"{'OK' if mu_ok else 'FAIL'}  [rescale={float(rescale):.3g} alpha={alpha:.3g} "
@@ -768,15 +844,16 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
 def run_cell_gate(cell_key, verbose=True):
     """Run gates (1)+(2) for one converted cell. Returns (ok, detail)."""
     from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
-                                              canonicalize_model, fused_train_step)
+                                              canonicalize_model, fused_train_step,
+                                              _opt_scalars_from)
     spec = _CELLS[cell_key]
     model, opt = spec["model"], spec["opt"]
     # ── SuperGrok2 dedicated gate (the LAST/hardest cell). SG2's optimizer phase is the
     # FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward +
-    # sg2_meta_stages), validated against the per-op ORACLE (ops.supergrok2_batched_step,
-    # the SAME low-rank indexer) — NOT the eager opt.step() (its bilevel/sam/ramp binding
-    # is not the L3 apply). tests/hw/_sg2_l3tc_gate owns the (B1)+(A/A/A)+(tie-probe)+(N>64
-    # CSA fidelity probe) verdict; short-circuit run_cell_gate to it.
+    # sg2_meta_stages), validated against the PURE-fp64 oracle_step (RE-ANCHOR task #10;
+    # sg2_kernel_mirror's numpy fp64 reimpl of csa_hca_step_one — NOT the deleted per-op
+    # CUDA oracle, NOT the eager opt.step()). tests/hw/_sg2_l3tc_gate owns the (B1)+(A/A/A)+
+    # (tie-probe)+(N>64 CSA fidelity probe) verdict; short-circuit run_cell_gate to it.
     if opt == "supergrok2":
         from tests.hw._sg2_l3tc_gate import run_sg2_gate
         return run_sg2_gate(model, verbose=verbose)
@@ -815,157 +892,111 @@ def run_cell_gate(cell_key, verbose=True):
         n = p.numel(); p_after[off:off + n].copy_(p.data.reshape(-1)); off += n
 
     # ── SuperGrok11/15 dedicated gate (MODEL-COUPLED SAM 2nd backward + meta-net mu).
-    # The SG path does NOT run the eager opt.step() comparison (its bilevel/ramp binding is
-    # not the L3 apply): it validates the kernel against the CANONICAL fp64 math the kernel's
+    # The SG path validates the kernel against the CANONICAL fp64 math the kernel's
     # apply_optimizer<SG> calls — the same single-source as ref_sg11_step/ref_sg15_step — plus
-    # the SAM 2nd backward (sharpness) vs the bf16-faithful oracle and mu vs rescale·phi. Short-
-    # circuits run_cell_gate (it owns its own (1a/1b)+(A/B)+(2) verdict).
+    # the SAM 2nd backward (sharpness) vs the PURE-fp64 oracle (RE-ANCHOR task #10) and mu vs
+    # rescale·phi. Short-circuits run_cell_gate (it owns its own (1a/1b)+(A/B)+(2) verdict).
     if opt in ("supergrok11", "supergrok15"):
         ok, detail = _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon,
                                        opt_obj, grad, loss, p_after, total,
                                        named0, cache, verbose)
         return ok, detail
 
-    # REFERENCE = the REAL eager optimizer (not a header re-transcription). Build a
-    # FRESH model with the SAME init (same seed), INJECT the kernel's TC-reduced grad
-    # into each p.grad (so both sides consume the BYTE-IDENTICAL gradient — the bf16-TC
-    # grad — isolating the optimizer TAIL math), then run ONE real opt.step() from
-    # zero state. A mechanism the real optimizer has but apply_optimizer<Opt> drops
-    # (grad_clip, per-layer schedule, adaptive alpha) SHOWS UP here as a param mismatch.
-    g_r, c_r, m_ref, data_r, dev_r = _build_cell(model)
-    named_ref = [(n, p) for n, p in m_ref.named_parameters() if p.requires_grad]
-    # confirm the fresh model's init matches p_before (same seed) — the reference is
-    # only valid if it starts from the kernel's input params.
-    p_ref_before = torch.cat([p.data.reshape(-1) for _, p in named_ref])
-    assert torch.equal(p_ref_before, p_before), \
-        f"{cell_key}: reference model init != kernel init (seed mismatch)"
-    opt_ref = spec["factory"](g_r, m_ref.parameters(), c_r)
-    # NEURALGROK: the kernel read the psi-net weights the host scattered from
-    # opt_obj.psi_pack() into the `extra` slice (fused_train_step). The eager
-    # reference must therefore hold the SAME amplifier weights, or it would apply a
-    # DIFFERENT psi(|g|) and the state would diverge for a reason that is NOT a
-    # dropped mechanism. opt_obj and opt_ref draw independent random amplifier inits,
-    # so copy opt_obj's amplifier into opt_ref and mark its kernel-weight snapshot
-    # dirty (so the eager step re-extracts the copied weights). This isolates the
-    # check to the TAIL+psi MATH (the gate's purpose), exactly as the SAME-grad
-    # injection isolates it from the bwd.
-    if opt == "neuralgrok":
-        opt_ref.amplifier.load_state_dict(opt_obj.amplifier.state_dict())
-        opt_ref.mark_amplifier_dirty()
-    # Scatter the kernel's flat TC grad into the reference params' .grad (layout order).
-    off = 0
-    for _, p in named_ref:
-        n = p.numel()
-        p.grad = grad[off:off + n].reshape(p.shape).clone()
-        off += n
-    # NEURALGROK global grad-norm clip: the L3-TC neuralgrok tail NOW applies the SAME
-    # eager clip (kernel P2.5 extended to NeuralGrok; apply_optimizer<NeuralGrok> reads
-    # st.clip_coef and scales the grad before psi+amp, matching clip_grad_norms_device_
-    # side). The former clip-inertness assert is OBSOLETE — when the clip fires, both the
-    # kernel and the eager reference clip identically, so the parity is real (not hollow)
-    # at any seed (incl. seeds where step-1 global grad-norm > grad_clip, e.g. seed 7).
-    if opt == "neuralgrok":
-        # The decoder/vit TC launcher uses raw cudaMalloc scratch (DecTcLauncherScratch),
-        # so the caching-allocator layout differs after the kernel ran. Fully sync the
-        # device before the eager reference's per-op neuralgrok kernel so its psi-weight
-        # staging is not racing the just-finished L3 launch's teardown.
-        torch.cuda.synchronize()
+    # REFERENCE = the CANONICAL fp64 math (the SAME single source — csrc/algorithms/
+    # <opt>.h — the kernel's apply_optimizer<Opt> compiles from), applied PER TENSOR on
+    # the kernel's OWN captured TC-reduced grad + the kernel's pre-step params + ZERO-init
+    # m/v/extra (the state cache zero-inits at step 1), exactly like _run_sg_cell_gate.
+    # RE-ANCHOR (task #10): the eager per-op CUDA kernels are being DELETED, so the gate no
+    # longer builds a fresh eager optimizer + opt_ref.step(); it drives the ground-truth
+    # ref_<opt>_step transcriptions in tests/hw/test_reference_parity.py. bf16 stays the
+    # compute precision (the kernel is unchanged); fp64 is only the reference yardstick. A
+    # mechanism the kernel's tail drops (grad_clip, per-layer β1, the SAM blend) SHOWS UP
+    # here as a param/state mismatch — the references carry those mechanisms explicitly.
+    from tests.hw.test_reference_parity import (
+        ref_adamw_step, ref_lion_step, ref_grokfast_step, ref_grokadamw_step,
+        ref_looksam_apply_step, ref_prodigy_apply_step, ref_muon_step)
+    scalars = _opt_scalars_from(opt_obj, 1)
+    beta1 = float(scalars["beta1"]); beta2 = float(scalars["beta2"])
+    lr = float(scalars["lr"]); eps = float(scalars["eps"])
+    wd = float(scalars["weight_decay"])
+
+    # Per-tensor (name, offset, numel, shape, ndim) in the flat layout (named order).
+    off = 0; layout = []
+    for n_, p in named0:
+        layout.append((n_, off, p.numel(), tuple(p.shape), p.ndim)); off += p.numel()
+
+    # GLOBAL grad-norm clip coefficient (kernel P2.5: grokadamw + neuralgrok clip the
+    # reduced grad BEFORE the tail; inert coef=1 when ‖g‖₂ ≤ grad_clip). Same guard as
+    # _neuralgrok_canonical_mv. At the default gated step it is inert (‖g‖₂<1); it FIRES
+    # at e.g. GATE_SEED=7, and the reference then tracks the kernel exactly.
+    clip_coef = 1.0
+    _gclip = float(opt_obj.param_groups[0].get("grad_clip", 0.0))
+    if _gclip > 0.0:
+        _tn = grad.double().norm().item()
+        if _tn > _gclip:
+            clip_coef = _gclip / (_tn + 1e-6)
+
     # LOOKSAM: the kernel ran the in-kernel SAM 2nd backward (P2.4) on this (step-1) SAM
     # step, writing sam_dir = g_sam − g into the `extra` state slice and BLENDING
-    # g_adj=(1−α)g+α·sam_dir in the apply. The gate validates BOTH surfaces:
-    #   (A) sam_dir parity — vs the bf16-FAITHFUL fp64 oracle's OWN 2nd backward (the
-    #       SAME instrument test_tc_single_step_grad_parity uses for the first grad, NOT
-    #       a fp32-autograd reference: fp32-autograd carries a ~6.6e-2 bf16-storage gap
-    #       that is WRONG for a bf16-TC kernel — measured: kernel-vs-bf16faithful 1.8e-2,
-    #       eager-fp32-vs-bf16faithful 6.6e-2, so the kernel is CLOSER to the bf16 truth
-    #       than fp32 is). We perturb the oracle params by ron·g (ron=rho/‖g‖_global, the
-    #       SAME global-norm perturb the kernel + binding's looksam_perturb_all use, with
-    #       g the kernel's reduced grad) and form sam_dir_bf = g_sam_bf − g_bf. Compared
-    #       at the DESIGN bf16 floor (sam_dir_tol=2e-2). A SKIPPED SAM phase (sam_dir≈0)
-    #       fails it (‖sam_dir_bf‖ is O(ron·‖∇‖)≫0). DECODER-specific (the oracle is the
-    #       decoder one); vit/mamba use their own bf16-faithful oracle when ported.
-    #   (B) apply-tail parity — set opt_ref's sam_direction to the KERNEL's sam_dir so
-    #       opt_ref.step() blends the SAME direction the kernel used; this isolates (1a)
-    #       params + (1b) m/v to the apply math at tight tol (1e-4), free of the 2nd-
-    #       backward bf16 gap. The injected p.grad already holds the kernel's g.
+    # g_adj=(1−α)g+α·sam_dir in the apply (ref_looksam_apply_step). The gate validates two
+    # surfaces, BOTH now anchored to ground-truth fp64 (the eager per-op path is deleted):
+    #   (A) sam_dir parity — vs the PURE-fp64 oracle's OWN 2nd backward, perturbed by ron·g
+    #       (ron=rho/‖g‖_global, g the kernel's reduced grad): sam_dir_fp = g_sam_fp − g_fp,
+    #       compared at the ground-truth fp64 floor (sam_dir_tol=2.5e-2 — RE-ANCHOR task #10;
+    #       was 2e-2 vs the bf16-faithful oracle; the kernel measured ~1.87e-2 to fp64).
+    #   (1a)+(1b) apply tail — ref_looksam_apply_step fed the kernel's OWN sam_dir (k_sam)
+    #       blends the SAME direction the kernel used, isolating params + m/v to the apply
+    #       math at tight tol. A SKIPPED SAM phase (sam_dir≈0) fails (A) — ‖sam_dir_fp‖≫0.
     looksam_sam_dir_rel = None
+    k_sam = None
     if opt == "looksam":
         kstate0 = cache[canon]["state"]
         k_sam = kstate0[2 * total:3 * total]           # the kernel's cached sam_dir
-        # (A) bf16-faithful sam_dir reference (per-model oracle, perturbed by ron·g).
-        #     The SAME bf16-faithful fp64 oracle each model's first-grad gate uses
-        #     (test_<model>_tc), run TWICE (at p and at p'=p+ron·g) → sam_dir_bf =
-        #     g_sam_bf − g_bf, compared to the kernel's sam_dir at the bf16 floor.
+        rho = float(scalars["rho"])
+        # PURE-fp64 sam_dir oracle (per-model, perturbed by ron·g) — the SAME ground-truth
+        # instrument the SG sharpness check uses. _sg_pure_fp64_sharpness_oracle returns
+        # (g_sam−g)² (squared); here we need the signed (g_sam−g), so inline the per-model
+        # oracle (decoder/vit/mamba) twice (at p and p'=p+ron·g) like the SG helper does.
+        g_r, c_r, m_ref, data_r, dev_r = _build_cell(model)
+        named_ref = [(n, p) for n, p in m_ref.named_parameters() if p.requires_grad]
         if model == "decoder":
-            from tests.hw.test_decoder_tc import _bf16_faithful_oracle
+            from tests.hw.decoder_oracle import oracle_loss_and_grads as _orc
             B = int(tx.shape[0]); B16 = B - (B % 16)
-            tok_o = tx[:B16].to(torch.long); tgt_o = ty[:B16].to(torch.long)
-            named_d = {n: p.detach() for n, p in named_ref}
-            _lo, grads_o = _bf16_faithful_oracle(named_d, tok_o, tgt_o)
-            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
-            rho = float(opt_ref.param_groups[0]["rho"])
-            ron = rho / gn
-            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
-            off = 0; named_pert = {}
-            for n_, p in named_ref:
-                k = p.numel()
-                named_pert[n_] = (p.detach().double()
-                                  + ron * grad[off:off + k].reshape(p.shape).double())
-                off += k
-            _lo2, grads_o2 = _bf16_faithful_oracle(named_pert, tok_o, tgt_o)
-            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
-                               for n_, _ in named_ref]).float().to(dev)
+            a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+            named_d = {n: p.detach().double() for n, p in named_ref}
+            _lo, grads_o = _orc(named_d, a0, a1)
+            cpu = False
         elif model == "vit":
-            # ViT bf16-faithful oracle (test_vit_tc._bf16_faithful_oracle): input is
-            # FLOAT image patches [B,16,49] (tx == data[0]), targets [B]. B16-truncate
-            # to match the kernel's B%16 batch (fused_train_step truncates the same way).
-            from tests.hw.test_vit_tc import _bf16_faithful_oracle as _vit_bf16_oracle
+            from tests.hw.vit_oracle import oracle_loss_and_grads as _orc
             B = int(tx.shape[0]); B16 = B - (B % 16)
-            patches_o = tx[:B16].detach().cpu().double()
-            tgt_o = ty[:B16].detach().cpu().to(torch.long)
-            named_d = {n: p.detach().cpu() for n, p in named_ref}
-            _lo, grads_o = _vit_bf16_oracle(named_d, patches_o, tgt_o)
-            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
-            rho = float(opt_ref.param_groups[0]["rho"])
-            ron = rho / gn
-            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
-            off = 0; named_pert = {}
-            for n_, p in named_ref:
-                k = p.numel()
-                named_pert[n_] = (p.detach().cpu().double()
-                                  + ron * grad[off:off + k].reshape(p.shape).cpu().double())
-                off += k
-            _lo2, grads_o2 = _vit_bf16_oracle(named_pert, patches_o, tgt_o)
-            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
-                               for n_, _ in named_ref]).float().to(dev)
+            a0 = tx[:B16].detach().cpu().double(); a1 = ty[:B16].detach().cpu().to(torch.long)
+            named_d = {n: p.detach().cpu().double() for n, p in named_ref}
+            _lo, grads_o = _orc(named_d, a0, a1)
+            cpu = True
         elif model == "mamba":
-            # Mamba bf16-faithful oracle (test_mamba_tc._bf16_faithful_mamba_oracle):
-            # input is int tokens [B,kSeq] (tx == data[0]) like the decoder, targets [B].
-            # B16-truncate to match the kernel's B%16 batch (fused_train_step truncates
-            # the same way; the mamba TC launcher requires B%16==0).
-            from tests.hw.test_mamba_tc import _bf16_faithful_mamba_oracle as _mb_bf16_oracle
+            from tests.hw.test_mamba_tc import _pure_fp64_oracle as _orc
             B = int(tx.shape[0]); B16 = B - (B % 16)
-            tok_o = tx[:B16].detach().cpu().to(torch.long)
-            tgt_o = ty[:B16].detach().cpu().to(torch.long)
-            named_d = {n: p.detach().cpu() for n, p in named_ref}
-            _lo, grads_o = _mb_bf16_oracle(named_d, tok_o, tgt_o)
-            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
-            rho = float(opt_ref.param_groups[0]["rho"])
-            ron = rho / gn
-            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
-            off = 0; named_pert = {}
-            for n_, p in named_ref:
-                k = p.numel()
-                named_pert[n_] = (p.detach().cpu().double()
-                                  + ron * grad[off:off + k].reshape(p.shape).cpu().double())
-                off += k
-            _lo2, grads_o2 = _mb_bf16_oracle(named_pert, tok_o, tgt_o)
-            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
-                               for n_, _ in named_ref]).float().to(dev)
+            a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+            named_d = {n: p.detach() for n, p in named_ref}
+            _lo, grads_o = _orc(named_d, a0, a1)
+            cpu = False
         else:
             raise NotImplementedError(
-                f"{cell_key}: looksam sam_dir reference oracle not wired for {model} "
-                f"(only decoder/vit/mamba bf16-faithful oracles are available here).")
+                f"{cell_key}: looksam sam_dir pure-fp64 oracle not wired for {model} "
+                f"(only decoder/vit/mamba fp64 oracles are available here).")
+        gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
+        ron = rho / gn
+        off = 0; named_pert = {}
+        for n_, p in named_ref:
+            k = p.numel()
+            base = (p.detach().cpu().double() if cpu else p.detach().double())
+            gslice = grad[off:off + k].reshape(p.shape)
+            gslice = (gslice.cpu().double() if cpu else gslice.double())
+            named_pert[n_] = base + ron * gslice
+            off += k
+        _lo2, grads_o2 = _orc(named_pert, a0, a1)
+        r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
+                           for n_, _ in named_ref]).float().to(dev)
         sd_abs = (k_sam - r_sam).abs().max().item()
         sd_den = r_sam.abs().max().item() + 1e-30
         looksam_sam_dir_rel = sd_abs / sd_den
@@ -973,139 +1004,172 @@ def run_cell_gate(cell_key, verbose=True):
         assert r_sam.abs().max().item() > 1e-6, (
             f"{cell_key}: oracle sam_dir is ~0 (the 2nd backward produced no direction) "
             f"— the gate's sam_dir parity would be vacuous.")
-        # (B) set opt_ref's sam_direction to the KERNEL's sam_dir for the apply parity.
-        # LookSAM.step()'s _group_cache only INITIALISES state[p] when len(state)==0, so
-        # we must seed the FULL state (exp_avg/exp_avg_sq/step/sam_direction) here — else
-        # adding only sam_direction makes len(state)>0 and step() KeyErrors on exp_avg.
-        # exp_avg/exp_avg_sq start at ZERO (the kernel's zero-init m/v cache), step=0.
-        off = 0
-        for _, p in named_ref:
-            n = p.numel()
-            stt = opt_ref.state[p]
-            stt["step"] = 0
-            stt["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-            stt["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-            stt["sam_direction"] = k_sam[off:off + n].reshape(p.shape).clone().float()
-            off += n
-        # Invalidate the static cache so step() rebuilds it from the seeded state (the
-        # factory may have warmed it; we want our seeded exp_avg/sam_direction used).
-        opt_ref._static_cache = {}
-    opt_ref.step()
-    p_ref = torch.cat([p.data.reshape(-1) for _, p in named_ref])
 
-    # The kernel and the real optimizer consumed the SAME grad; the only legitimate
-    # difference is fp32 rounding order in the elementwise tail. A DROPPED mechanism
-    # (e.g. grad_clip scaling every grad, or a per-layer beta1) makes this large.
-    abs_err = (p_after - p_ref).abs().max().item()
+    # Drive the canonical fp64 ref per tensor. p_ref/m_ref/v_ref/extra_ref are flat fp64.
+    p_ref = torch.empty(total, device=dev, dtype=torch.float64)
+    r_m = torch.zeros(total, device=dev, dtype=torch.float64)
+    r_v = torch.zeros(total, device=dev, dtype=torch.float64)
+    r_ema = torch.zeros(total, device=dev, dtype=torch.float64)
+    have_v = have_ema = False
+    # NEURALGROK is per-VECTOR (psi reads the whole flat grad together) — apply its
+    # canonical transcription once over the full vector, then slice into the flat refs.
+    if opt == "neuralgrok":
+        ng_m, ng_v, ng_p = _neuralgrok_canonical_mv(grad, opt_obj, step=1, p_before=p_before)
+        r_m = ng_m.double(); r_v = ng_v.double(); p_ref = ng_p.double(); have_v = True
+    else:
+        # muon's 1D AdamW group uses INDEPENDENT aux hyperparameters (adamw_lr/betas/eps);
+        # the 2D NS group uses momentum (==scalars["beta1"]) + lr/wd. ns_steps from the 2D
+        # group (default 5). Read both once.
+        muon_mom = beta1
+        muon_ns = 5
+        aux_lr = aux_b1 = aux_b2 = None
+        if opt == "muon":
+            for pg in opt_obj.param_groups:
+                if "momentum" in pg and "betas" not in pg:
+                    muon_mom = float(pg["momentum"]); muon_ns = int(pg.get("ns_steps", 5))
+                if pg.get("group_type") == "adamw" or "betas" in pg:
+                    ab = pg.get("betas", (0.9, 0.98))
+                    aux_lr = float(pg.get("lr", 1e-3)); aux_b1 = float(ab[0]); aux_b2 = float(ab[1])
+            if aux_lr is None:
+                aux_lr, aux_b1, aux_b2 = lr, 0.9, 0.98
+        for (n_, o, k, sh, nd) in layout:
+            g_t = (grad[o:o + k].double() * clip_coef)   # post-clip (inert when coef=1)
+            p_t = p_before[o:o + k].double().to(dev)
+            z = torch.zeros(k, dtype=torch.float64, device=dev)
+            if opt == "adamw":
+                pn, mn, vn = ref_adamw_step(p_t, g_t, z, z, lr=lr, beta1=beta1,
+                                            beta2=beta2, eps=eps, wd=wd, t=1)
+                r_m[o:o + k] = mn; r_v[o:o + k] = vn; have_v = True
+            elif opt == "lion":
+                # lion: betas=(beta1, 0.99); ea cold-starts at 0; m-slice == exp_avg(ea).
+                lb2 = float(opt_obj.param_groups[0]["betas"][1])
+                pn, ean = ref_lion_step(p_t, g_t, z, lr=lr, beta1=beta1, beta2=lb2, wd=wd)
+                r_m[o:o + k] = ean   # no v for lion (the kernel's v-slice is unused)
+            elif opt == "grokfast":
+                # grokfast.h cold-starts ema=grad at step 1 (grokfast.py _group_cache);
+                # seed the ref ema=g_t ⇒ ema_new = α·g+(1−α)·g = g, g_amp=g+lamb·g.
+                a = float(scalars["alpha"]); lamb = float(scalars["lamb"])
+                pn, mn, vn, eman = ref_grokfast_step(p_t, g_t, z, z, g_t.clone(),
+                                                     alpha=a, lamb=lamb, lr=lr,
+                                                     beta1=beta1, beta2=beta2, eps=eps,
+                                                     wd=wd, t=1)
+                r_m[o:o + k] = mn; r_v[o:o + k] = vn; r_ema[o:o + k] = eman
+                have_v = True; have_ema = True
+            elif opt == "grokadamw":
+                # per-tensor β1 = β1·(1−γ)^layeridx (kernel P3; t == flat named layer index).
+                # COLD-START ema seed = the UNCLIPPED grad at step 1. grokadamw.py
+                # _group_cache clones state["ema"]=p.grad.clone() BEFORE the in-place
+                # global clip runs, so the eager (and kernel: opt_components.cuh
+                # `st.ema[idx]=grad[idx]` raw, line ~451) seed the RAW grad, while the
+                # EMA-filter INPUT + amplification use the CLIPPED grad (g_t). When the
+                # clip is inert (coef=1, seed 42) g_t==raw so this is unchanged; when it
+                # FIRES (seed 7, global ‖g‖>grad_clip) the ema seed MUST be the unclipped
+                # grad or the m/v/ema state diverges from the kernel (params are
+                # clip-invariant at step 1, so only the STATE check catches this).
+                gamma = float(scalars.get("gamma", 0.0))
+                a = float(scalars["alpha"]); lamb = float(scalars["lamb"])
+                li = len([1 for (_nn, _oo, _kk, _ss, _dd) in layout
+                          if _oo < o])   # this tensor's flat layer index
+                b1_i = beta1 * ((1.0 - gamma) ** li)
+                g_raw_t = grad[o:o + k].double().to(dev)   # UNCLIPPED grad (ema seed)
+                pn, mn, vn, eman = ref_grokadamw_step(p_t, g_t, z, z, g_raw_t,
+                                                      alpha=a, lamb=lamb, lr=lr,
+                                                      beta1=b1_i, beta2=beta2, eps=eps,
+                                                      wd=wd, t=1)
+                r_m[o:o + k] = mn; r_v[o:o + k] = vn; r_ema[o:o + k] = eman
+                have_v = True; have_ema = True
+            elif opt == "looksam":
+                # blend the kernel's OWN sam_dir (k_sam); ref_looksam_apply_step does
+                # g_adj=(1−α)g+α·sam_dir then AdamW. betas=(beta1, beta2) from the group.
+                a = float(scalars["alpha"])
+                sam_t = k_sam[o:o + k].double()
+                pn, mn, vn = ref_looksam_apply_step(p_t, g_t, z, z, sam_t, alpha=a, lr=lr,
+                                                    beta1=beta1, beta2=beta2, eps=eps,
+                                                    wd=wd, t=1)
+                r_m[o:o + k] = mn; r_v[o:o + k] = vn; have_v = True
+                # the `extra` slice (sam_dir) is validated separately (looksam_sam_dir_rel).
+            elif opt == "prodigy":
+                # d = d0 = 1e-6 at step 1 (param_init==params ⇒ r=0 ⇒ d stays d0). The
+                # third state slice is `s` (s_track += d·g). step size is d (not lr).
+                d0 = float(scalars.get("d0", 1e-6))
+                pn, mn, vn, sn = ref_prodigy_apply_step(p_t, g_t, z, z, z, d=d0,
+                                                        beta1=beta1, beta2=beta2, eps=eps,
+                                                        wd=wd, t=1)
+                r_m[o:o + k] = mn; r_v[o:o + k] = vn; r_ema[o:o + k] = sn
+                have_v = True; have_ema = True
+            elif opt == "muon":
+                if nd == 2:
+                    # 2D → Newton-Schulz; the m-slice holds buf=μ·buf+g (NO NS); v-slice 0.
+                    pn, bufn = ref_muon_step(p_t.reshape(sh), g_t.reshape(sh), z.reshape(sh),
+                                             momentum=muon_mom, lr=lr, wd=wd, ns_steps=muon_ns)
+                    pn = pn.reshape(-1); r_m[o:o + k] = bufn.reshape(-1)
+                    have_v = True   # 1D tensors below fill v; 2D v-ref stays 0 (kernel writes 0)
+                else:
+                    # 1D → AdamW with the aux group's hyperparameters.
+                    pn, mn, vn = ref_adamw_step(p_t, g_t, z, z, lr=aux_lr, beta1=aux_b1,
+                                                beta2=aux_b2, eps=eps, wd=wd, t=1)
+                    r_m[o:o + k] = mn; r_v[o:o + k] = vn; have_v = True
+            else:
+                raise NotImplementedError(
+                    f"{cell_key}: no canonical fp64 reference wired for opt={opt!r}")
+            p_ref[o:o + k] = pn
+
+    # The kernel and the canonical reference consumed the SAME grad; the only legitimate
+    # difference is fp32-vs-fp64 rounding order in the elementwise tail. A DROPPED mechanism
+    # (grad_clip scaling every grad, a wrong per-layer β1) makes this large.
+    abs_err = (p_after.double() - p_ref).abs().max().item()
     denom = p_ref.abs().max().item() + 1e-30
     rel_err = abs_err / denom
-    # Per-cell PARAM tolerance. Default 1e-4 (fp32 reorder; a dropped mechanism blows
-    # past it). MUON's 2D-weight params go through a 5-iteration Newton-Schulz whose
-    # fp32 vs the eager fp32 NS accumulate to ~2e-3 rel (INTEGRATION-OPTSTAGES §8 sets
-    # the muon NS oracle tol at <2e-3, NOT 1e-9) — so muon uses 2e-3 for (1a). The (1b)
-    # STATE check stays TIGHT (1e-4): the momentum buffer (m) is buf=μ·buf+g, NO NS, so
-    # it must match eager exactly — that is the load-bearing "runs the real optimizer"
-    # check, and a dropped/garbage momentum still fails it at 1e-4.
+    # Per-cell PARAM tolerance. Default 1e-4 (fp32 reorder; a dropped mechanism blows past
+    # it). MUON's 2D-weight params go through a 5-iteration Newton-Schulz whose kernel-fp32
+    # vs fp64 NS accumulate to ~2e-3 rel (INTEGRATION-OPTSTAGES §8) — so muon uses 2e-3 for
+    # (1a). The (1b) STATE check stays TIGHT (1e-4): the momentum buffer (m) is buf=μ·buf+g,
+    # NO NS, so it must match the canonical math exactly (the load-bearing check).
     param_tol = spec.get("param_tol", 1e-4)
     param_ok = rel_err < param_tol
     if verbose:
-        print(f"  (1a) params vs REAL eager: max|Δp|={abs_err:.3e} rel={rel_err:.3e} "
+        print(f"  (1a) params vs canonical fp64: max|Δp|={abs_err:.3e} rel={rel_err:.3e} "
               f"(tol {param_tol:.0e}) {'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
 
-    # ── (1b) STATE vs REAL eager — THE DECISIVE CHECK. At step 1 every Adam-family
-    # tail collapses to ≈sign(g_amp) in the PARAM update (m/bc1=g_amp, sqrt(v/bc2)=
-    # |g_amp|), so (1a) is BLIND to per-layer beta1 (gamma), amplification magnitude,
-    # and STATE INITIALIZATION — all of which live in the optimizer state, not the
-    # sign. So we compare the kernel's post-step state slices [m|v|ema] (in the cache
-    # buffer) against the REAL optimizer's opt.state[p]. A state mismatch == the kernel
-    # is NOT running the real optimizer (e.g. grokfast's ema cold-start: real inits
-    # ema=g0, the kernel inits ema=0 → the ema slice diverges 50x even when params
-    # match). This is what makes the single-step verdict mean "runs the real optimizer".
+    # ── (1b) STATE vs the canonical fp64 ref — THE DECISIVE CHECK. At step 1 every Adam-
+    # family tail collapses to ≈sign(g_amp) in the PARAM update (m/bc1=g_amp, sqrt(v/bc2)=
+    # |g_amp|), so (1a) is BLIND to per-layer β1 (γ), amplification magnitude, and STATE
+    # INITIALIZATION — all of which live in the optimizer state, not the sign. So we compare
+    # the kernel's post-step state slices [m|v|extra] against the canonical references built
+    # above. A state mismatch == the kernel is NOT running the canonical algorithm (e.g.
+    # grokfast's ema cold-start: header seeds ema=g0, a kernel that inited ema=0 → the ema
+    # slice diverges ~50× even when params match). This is what makes (1b) load-bearing.
     kstate = cache[canon]["state"]              # flat [m|v|extra] (3*total)+loss
     k_m = kstate[0:total]; k_v = kstate[total:2 * total]; k_ema = kstate[2 * total:3 * total]
-    # Gather the real optimizer's per-parameter state into flat buffers (layout order).
-    r_m = torch.zeros(total, device=dev); r_v = torch.zeros(total, device=dev)
-    r_ema = torch.zeros(total, device=dev)
-    have_v = have_ema = False
-    off = 0
-    for _, p in named_ref:
-        n = p.numel(); stt = opt_ref.state.get(p, {})
-        # MUON: the eager optimizer keeps the 2D-matrix momentum under the
-        # "momentum_buffer" key (muon.py:196, the Newton-Schulz group), NOT "exp_avg"
-        # — only the 1D AdamW group uses "exp_avg". The kernel stores BOTH in the same
-        # m-slice (st.exp_avg): the running momentum buf=μ·buf+g for the 2D weights and
-        # the AdamW m for the 1D weights. So the (1b) m-reference must read whichever
-        # key the eager optimizer actually populated for THIS tensor. Without this, the
-        # 11 NS matrices read 0 (no "exp_avg" key) and the check reports a phantom 21.x
-        # mismatch even though the kernel's 2D momentum is bit-identical to eager. This
-        # makes (1b) RIGOROUS for Muon (it now validates the real NS-group momentum),
-        # not weaker — a wrong-magnitude buf (which NS would orthogonalize to the same
-        # direction, hiding in (1a) params) fails HERE. Non-Muon cells lack the
-        # "momentum_buffer" key, so the exp_avg branch is unchanged for them.
-        if "momentum_buffer" in stt:
-            r_m[off:off + n].copy_(stt["momentum_buffer"].reshape(-1))
-        elif "exp_avg" in stt:
-            r_m[off:off + n].copy_(stt["exp_avg"].reshape(-1))
-        if "exp_avg_sq" in stt:
-            r_v[off:off + n].copy_(stt["exp_avg_sq"].reshape(-1)); have_v = True
-        if "ema" in stt:
-            r_ema[off:off + n].copy_(stt["ema"].reshape(-1)); have_ema = True
-        # PRODIGY: the kernel's third state slice (extra) holds Prodigy's `s`
-        # trajectory accumulator (s_track), not an EMA. The REAL eager Prodigy keeps
-        # it under the "s" key. Map it into the r_ema comparison slot so the (1b)
-        # STATE check validates the kernel's s_track += d·g against eager (the
-        # apply-tail's third write — load-bearing for the d-trajectory at step≥2).
-        if "s" in stt:
-            r_ema[off:off + n].copy_(stt["s"].reshape(-1)); have_ema = True
-        off += n
     def _rel(a, b):
-        d = (a - b).abs().max().item(); return d / (b.abs().max().item() + 1e-30)
-    # NEURALGROK (1b) reference = the CANONICAL neuralgrok.h math (the gate docstring's
-    # defined reference), NOT the live eager .state. The eager per-op neuralgrok kernel
-    # has a cross-cell contamination bug (see _neuralgrok_canonical_mv): in-process,
-    # after another decoder/vit cell, its g_amp magnitude drifts (eager-m vs canonical
-    # ~1.7e-2) though it is BIT-EXACT to the kernel in a fresh process. The L3-TC kernel
-    # under gate matches the canonical math to ~2.7e-7 regardless. We swap r_m/r_v to the
-    # canonical reference and ALSO report the eager-vs-canonical delta so the eager
-    # contamination is visible, not hidden. (1a) still checks live-eager params.
-    if opt == "neuralgrok":
-        eager_m_rel = _rel(k_m, r_m)
-        eager_v_rel = _rel(k_v, r_v) if have_v else 0.0
-        r_m, r_v = _neuralgrok_canonical_mv(grad, opt_obj, step=1)
-        have_v = True
+        d = (a.double() - b).abs().max().item(); return d / (b.abs().max().item() + 1e-30)
     m_rel = _rel(k_m, r_m)
     v_rel = _rel(k_v, r_v) if have_v else 0.0
     ema_rel = _rel(k_ema, r_ema) if have_ema else None
-    # The kernel and real opt consumed the SAME grad; their state must match to fp32
-    # reorder tol. ema only checked when the optimizer HAS an ema buffer.
+    # The kernel and the canonical ref consumed the SAME grad; their state must match to
+    # fp32-vs-fp64 reorder tol. ema/s only checked when the optimizer HAS that buffer.
     state_ok = (m_rel < 1e-4 and v_rel < 1e-4
                 and (ema_rel is None or ema_rel < 1e-4))
-    # LOOKSAM: the `extra` slice is the SAM direction (sam_dir=g_sam−g), NOT an EMA/s —
-    # so it is NOT in the m/v/ema state check above. It is validated SEPARATELY against
-    # the INDEPENDENT eager 2nd backward (looksam_sam_dir_rel, computed before step())
-    # at the bf16 floor (sam_dir_tol). This is the load-bearing check for the new SAM
-    # machinery — fold it into state_ok so a wrong/skipped sam_dir FAILS the gate.
+    # LOOKSAM: the `extra` slice is the SAM direction (sam_dir=g_sam−g), NOT an EMA/s — so
+    # it is NOT in the m/v/ema state check above. It is validated SEPARATELY against the
+    # PURE-fp64 2nd backward (looksam_sam_dir_rel, computed above) at the ground-truth fp64
+    # floor (sam_dir_tol). Load-bearing for the SAM machinery — fold it into state_ok so a
+    # wrong/skipped sam_dir FAILS the gate.
     sam_ok = True
     if opt == "looksam":
-        sam_tol = spec.get("sam_dir_tol", 2e-2)
+        sam_tol = spec.get("sam_dir_tol", 2.5e-2)
         sam_ok = (looksam_sam_dir_rel is not None and looksam_sam_dir_rel < sam_tol)
         state_ok = state_ok and sam_ok
     if verbose:
         ema_s = f"ema={ema_rel:.3e}" if ema_rel is not None else "ema=n/a"
-        ref_s = "canonical neuralgrok.h" if opt == "neuralgrok" else "REAL eager"
-        print(f"  (1b) STATE vs {ref_s}: m={m_rel:.3e} v={v_rel:.3e} {ema_s} "
+        print(f"  (1b) STATE vs canonical fp64: m={m_rel:.3e} v={v_rel:.3e} {ema_s} "
               f"(tol 1e-4) {'OK' if state_ok else 'FAIL — kernel state != reference'}",
               flush=True)
         if opt == "looksam":
-            print(f"  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel={looksam_sam_dir_rel:.3e} "
-                  f"(tol {spec.get('sam_dir_tol', 2e-2):.0e}, kernel bf16-TC vs bf16-faithful "
-                  f"fp64 oracle = the DESIGN bf16 floor) "
-                  f"{'OK' if sam_ok else 'FAIL — kernel sam_dir != bf16-faithful 2nd backward'}",
-                  flush=True)
-        if opt == "neuralgrok":
-            print(f"       [diag] eager per-op kernel vs canonical: m={eager_m_rel:.3e} "
-                  f"v={eager_v_rel:.3e} (large => eager cross-cell contamination, "
-                  f"out-of-scope CUDA-kernel bug; the L3-TC kernel above is clean)",
+            print(f"  (1b-sam) sam_dir vs PURE-fp64 2nd backward: rel={looksam_sam_dir_rel:.3e} "
+                  f"(tol {spec.get('sam_dir_tol', 2.5e-2):.0e}, kernel bf16-TC vs ground-truth "
+                  f"fp64 oracle floor) "
+                  f"{'OK' if sam_ok else 'FAIL — kernel sam_dir != PURE-fp64 2nd backward'}",
                   flush=True)
     tail_ok = param_ok and state_ok
 

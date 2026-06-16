@@ -310,75 +310,15 @@ class NeuralGrok(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimisation step.
+        """Eager optimiser step — REMOVED (pure L3-TC).
 
-        Args:
-            closure: A closure that re-evaluates the model and returns the loss
-                (optional).
-
-        Returns:
-            The loss value if *closure* is provided, otherwise ``None``.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        if self._use_grad_hooks:
-            return loss
-
-        fused_step = self._fused_step
-        if fused_step is None:
-            fused_step = self._fused_step = _ops.bind("neuralgrok_fused_step")
-
-        # Extract amplifier weights for the fused kernel (cached)
-        if self._meta_weights_dirty or self._cached_meta_weights is None:
-            self._cached_meta_weights = self.amplifier.get_weights()
-            self._meta_weights_dirty = False
-        W1, b1, W_last, b_last = self._cached_meta_weights
-
-        for group in self.param_groups:
-            params_list, exp_avg_list, exp_avg_sq_list, states = \
-                self._group_cache(group)
-
-            if len(params_list) == 0:
-                continue
-
-            grads_list = [_validate_grad(p) for p in params_list]
-            step_list = []
-            for state in states:
-                state["step"] += 1
-                step_list.append(state["step"])
-
-            # Move amplifier weights to same device as params
-            device = params_list[0].device
-            W1_d = W1.to(device)
-            b1_d = b1.to(device)
-            W_last_d = W_last.to(device)
-            b_last_d = b_last.to(device)
-
-            fused_step(
-                params_list,
-                grads_list,
-                exp_avg_list,
-                exp_avg_sq_list,
-                step_list,
-                W1_d,
-                b1_d,
-                W_last_d,
-                b_last_d,
-                group["alpha"],
-                group["beta"],
-                self.amplifier.hidden_dim,
-                group["betas"][0],
-                group["betas"][1],
-                group["lr"],
-                group["weight_decay"],
-                group["eps"],
-                group["grad_clip"],
-            )
-
-        return loss
+        On the L3-TC path the amplified-AdamW tail runs IN the megakernel
+        (fused_train_step scatters ``psi_pack()`` into the kernel state each step);
+        the amplifier itself is still trained host-side via ``train_amplifier_step``
+        / ``maybe_train_amplifier``. The eager kernel dispatch here is gone."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def mark_amplifier_dirty(self) -> None:
         """Mark the cached amplifier weights as stale.
@@ -631,30 +571,10 @@ class NeuralGrok(Optimizer):
                                          amplifier_optimizer=amplifier_optimizer)
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
-        if param.grad is None:
-            return
-        grad = _validate_grad(param)
-        if len(state) == 0:
-            state["step"] = 0
-            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-        state["step"] += 1
-        if self._meta_weights_dirty or self._cached_meta_weights is None:
-            self._cached_meta_weights = self.amplifier.get_weights()
-            self._meta_weights_dirty = False
-        W1, b1, W_last, b_last = self._cached_meta_weights
-        device = param.device
-        _ops.neuralgrok_fused_step(
-            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
-            [state["step"]],
-            W1.to(device), b1.to(device), W_last.to(device), b_last.to(device),
-            group["alpha"], group["beta"],
-            self.amplifier.hidden_dim,
-            group["betas"][0], group["betas"][1],
-            group["lr"], group["weight_decay"], group["eps"],
-            group["grad_clip"],
-        )
+        """Per-parameter eager step (use_grad_hooks path) — REMOVED (pure L3-TC)."""
+        raise NotImplementedError(
+            "L3-TC megakernel only; eager .step() removed — the megakernel owns "
+            "the optimizer update via fused_train_step")
 
     def get_amplifier_optimizer(self, lr: float = 1e-4) -> torch.optim.Adam:
         """Create an Adam optimiser for the amplifier's parameters.

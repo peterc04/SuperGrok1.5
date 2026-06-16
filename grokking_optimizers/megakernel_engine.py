@@ -137,20 +137,25 @@ def dispatch_fused_megakernel(model: str, optimizer: str, *, params=None,
     if params is None or state is None:
         raise ValueError("GPU fused_step needs params, grads, and a state tensor "
                          "([m|v|extra] per param-tensor).")
-    # opt_only selects the C++ tier (dispatch.cpp): L1 → opt_only=True (the fused
-    # optimizer TAIL on the REAL grad — numerically faithful), L3 → opt_only=False
-    # (the kernel also runs the SURROGATE element-local model fwd/bwd, whose loss
-    # does NOT match the real model graph — see BUILD_AND_VALIDATE.md). We pass the
-    # solver-chosen tier through faithfully. NOTE: this entry binds only lr (the
-    # scalar set keeps the inert ABI defaults); a caller that needs real bias
-    # correction / per-optimizer scalars should pass them (the binding accepts the
-    # full keyword set) — grokking_optimizers.dispatch.fused_optimizer_step is the
-    # full-scalar driver the race uses.
-    opt_only = (tier != "L3")
+    # PURE L3-TC (task #10): the L1 optimizer-only tail and the scalar fp32 engine
+    # were removed — there is no lesser path left to invoke. If the solver does not
+    # award this cell the full L3 fwd+bwd+opt tier, hard-fail loudly rather than
+    # silently calling a path that no longer exists (owner directive: L3-TC or
+    # hard-fail, never a silent downgrade). When L3, drive the only surviving entry:
+    # opt_only=False + gemm_impl="wgmma". NOTE: this adapter binds only lr (the scalar
+    # set keeps the inert ABI defaults); a caller needing real bias correction /
+    # per-optimizer scalars should use grokking_optimizers.dispatch.fused_train_step,
+    # the full-scalar driver the race uses.
+    if tier != "L3":
+        raise RuntimeError(
+            f"megakernel_engine.fused_step: solver did not award ({model}, "
+            f"{optimizer}, {solver_arch}) the L3 fwd+bwd+opt tier (got {tier!r}); "
+            "the L1/scalar fallback was removed (pure L3-TC). Investigate the "
+            "solver/cost model rather than downgrading to a path that no longer exists.")
     ops.fused_step(model, optimizer, params,
                    inputs if inputs is not None else params,
                    grads if grads is not None else params, state, float(lr),
-                   opt_only=opt_only)
+                   opt_only=False, gemm_impl="wgmma")
     return params
 
 
