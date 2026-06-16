@@ -16920,6 +16920,8 @@ def build(
     enable_polyhedral: bool = True,
     enable_cost_model: Optional[bool] = None,
     multi_fidelity: Optional[bool] = None,
+    incremental_variant_build: bool = False,
+    capture_workload: Optional[str] = None,
     auto_install_optional_deps: bool = False,
     cross_host: bool = False,
     cross_host_march: Optional[str] = None,
@@ -17084,6 +17086,8 @@ def build(
         strict_numerics=strict_numerics,
         enable_synth_codegen=enable_synth_codegen,
         enable_polyhedral=enable_polyhedral,
+        incremental_variant_build=incremental_variant_build,
+        capture_workload=capture_workload,
         cross_host=cross_host,
         cross_host_march=cross_host_march,
     )
@@ -18100,6 +18104,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                      action="store_false",
                      help="Disable the multi-fidelity proxy while keeping the "
                           "absolute-threshold cost-model gate.")
+    parser.add_argument("--incremental-variant-build", action="store_true",
+                        dest="incremental_variant_build",
+                        help="Build each tuning variant incrementally: recompile "
+                             "ONLY the translation unit(s) whose source reads a "
+                             "changed SG_TUNED_* macro and reuse the prebuilt AOT "
+                             "objects for the rest, then link. The biggest "
+                             "build-throughput lever (a full per-variant rebuild "
+                             "is ~5 min). Conservative — falls back to a full "
+                             "build whenever the changed-macro→TU mapping is not "
+                             "provable, so correctness/coverage is never at risk.")
+    parser.add_argument("--capture-workload", dest="capture_workload",
+                        default=None, metavar="pkg.module:fn",
+                        help="OPT-IN Phase-2 record-and-replay: run this real "
+                             "one-iteration workload once under a torch "
+                             "op-interception shim, snapshot the real kernel "
+                             "inputs, and replay them as the oracle/candidate "
+                             "inputs for the strict-math compare (real data "
+                             "distribution, no per-op crafting). Ignored when a "
+                             "tune_hook is configured. Falls back to schema "
+                             "synthesis on any capture failure.")
     parser.add_argument("--enable-synth-codegen", action="store_true",
                         help="Enable Stream D OpGraph-based generative codegen "
                              "alongside the Jinja2 template variant. The synth "
@@ -18456,6 +18480,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # --no-cost-model / --no-multi-fidelity pass False to force off.
         enable_cost_model=getattr(args, "enable_cost_model", None),
         multi_fidelity=getattr(args, "multi_fidelity", None),
+        incremental_variant_build=bool(
+            getattr(args, "incremental_variant_build", False)),
+        capture_workload=getattr(args, "capture_workload", None),
         auto_install_optional_deps=bool(
             getattr(args, "auto_install_optional_deps", True)),
         # Mandate #23 — cpu-then-target stage implies a cross-host AOT build
