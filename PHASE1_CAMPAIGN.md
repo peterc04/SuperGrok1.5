@@ -35,7 +35,7 @@ Each model at its OWN canonical size (different param counts is honest + normal)
 |-------|----------------------------|-----------------|--------|
 | decoder | GPT-2 XL | d=1600, L=48, h=25 | ~1.5 B |
 | vit | ViT-G/14 | d=1664, L=48, h=16, MLP=8192 | ~1.8 B |
-| mamba | **Mamba-3** (arXiv 2603.15569, ICLR 2026) | d=2048, L=**24**, state=128, head_dim=64 (SISO base) | **1.473 B** (paper's own 1.5B config) |
+| mamba | **Mamba-3** (arXiv 2603.15569, ICLR 2026) — Llama-style **24 Mamba-3 mixers + 24 SwiGLU**, pre-norm (Sec 3.4) | d=2048, L=24, state=128, head_dim=64, d_ff=4096 (SISO base) | **1.528 B** (paper's own 1.5B config, w/ Llama vocab+tied embed) |
 
 - **Grokking science RACE** stays at the toy config (modular arithmetic p=97, seq_len=8,
   d=128 → decoder ~0.42M / vit ~0.42M / mamba ~0.26M) — that's the *science*; the flagship
@@ -70,7 +70,14 @@ Phases (CHECKPOINT before the megakernel — expensive/irreversible):
 
 ---
 
-## 3. Optimization LOOP (compile.py first, then kernels)  — IN PROGRESS
+## 3. Optimization LOOP (compile.py first, then kernels)  — compile.py track ✅ DONE (dry-well), kernel track PENDING
+
+**compile.py track COMPLETE (2026-06-16):** looped rounds 1-5 → terminated on **DRY WELL**.
+Cumulative **9 KEEP / 0 REVERT / 20 SKIP**, self-test held 236/6 throughout (commits e3b9b71,
+8e25a11, c8ee2e5, 311e0eb, ledger 19912db). Top wins: O(n²)→O(n) trial-sidecar summary roll;
+~85× host-identity-probe memoization (both differential-tested bit-identical). All bit-neutral
+host-side hoists — zero kernel/cache-key/trajectory change. **Kernel track** runs after Mamba-3
+lands (d=2048, fp64 parity + 3-seed timing).
 
 The optimization process is **LOOPED**, not one-shot (owner 2026-06-16). Per track:
 
