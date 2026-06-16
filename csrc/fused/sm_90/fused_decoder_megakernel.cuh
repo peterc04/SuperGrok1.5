@@ -396,6 +396,15 @@ __host__ __device__ __forceinline__ int64_t dec_tc_acts_floats(int T, int B) {
 __host__ __device__ __forceinline__ int64_t dec_tc_dw_part_floats() {
     return (dectc::kDecDwSplitK > 1) ? dectc::dec_dw_part_floats(dectc::kDecDwSplitK) : 0;
 }
+// CONTIGUOUS-TRANSPOSE dW scratch floats (SG_TUNED_DEC_DW_STAGE=1 only; 0 on the
+// scalar default → the workspace is byte-identical to every shipped build). Holds
+// the packed K-major transpose (dYt+Xt) of the 9 weights (bf16 elems → ceil/2
+// floats). Carved LAST (after the embed lists) so every prior region's offset is
+// unchanged when this is enabled, and entirely absent when it is 0.
+__host__ __device__ __forceinline__ int64_t dec_tc_dw_transpose_floats(int T, int B) {
+    const int64_t e = dectc::dec_dw_transpose_elems(B, T);   // bf16 elems (0 if stage!=1)
+    return (e + 1) / 2;                                      // → floats (round up)
+}
 // ── STAGED-opt scratch gate (bench-layout-only carve elision) ────────────────
 // The four STAGED-optimizer scratch regions below (Prodigy reduce / Muon NS /
 // LookSAM 2nd-bwd / SuperGrok2 meta-net) are carved UNCONDITIONALLY on the
@@ -519,10 +528,14 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
                                               //   gated to 0 at bench width (adamw-only)
          + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1 + C1-T transposed section)
-         + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
-         + 4;                                 // realign slack: <=3 floats to 16B-align the wbf
-                                              //   cache base (cp.async RING sources must be 16B-
-                                              //   aligned) + 1 for the 8-byte int32-lists realign
+         + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm)
+         + dec_tc_dw_transpose_floats(T, B)   // CONTIGUOUS-TRANSPOSE dW scratch (carve-LAST; 0 unless
+                                              //   SG_TUNED_DEC_DW_STAGE=1 → byte-identical when off)
+         + 4                                  // realign slack: <=3 floats to 16B-align the wbf cache
+                                              //   base (cp.async RING) + 1 for the int32-lists realign
+         + (dectc::kDecDwTransposeActive ? 8 : 0); // +<=7 floats to 16B-align the dW-transpose base
+                                              //   (ONLY when active → the scalar default's size +
+                                              //   every offset is byte-identical to before)
 }
 
 #ifdef SG_DEC_PROFILE
@@ -636,6 +649,22 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
     int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
     int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
+    // CONTIGUOUS-TRANSPOSE dW scratch (SG_TUNED_DEC_DW_STAGE=1), carved AFTER the
+    // embed lists (term order matches dec_tc_workspace_floats — carve-LAST keeps
+    // every prior region's offset unchanged). #if-guarded (not a runtime ternary)
+    // so the scalar default emits ZERO extra carve code → the kernel's register
+    // allocation + PTX are BYTE-IDENTICAL to every shipped build (PTX-verified).
+    // 16B-align the base: the cp.async ring streams it in 16-byte chunks (gmem
+    // source alignment). Each transposed ROW is K-contiguous and K is a multiple
+    // of kWgmmaAtomK=16 (⇒ 8 bf16 = 16B), so once the base is 16B-aligned every
+    // chunk16 half-offset (mn·8 / N·8 / kbase) is too. Bump ≤ 7 floats (covered
+    // by dec_tc_workspace_floats' +8 active-only slack term).
+#if SG_TUNED_DEC_DW_STAGE
+    float* dwt_f = reinterpret_cast<float*>(embed_perm + (int64_t)T);
+    while (((uintptr_t)dwt_f & 0xF) != 0) dwt_f += 1;
+    __nv_bfloat16* dwt_base = dectc::kDecDwTransposeActive
+        ? reinterpret_cast<__nv_bfloat16*>(dwt_f) : nullptr;
+#endif
 
     dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
     dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -726,10 +755,35 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //    dW specs are built into SHARED smem (thread 0; identical for all) so the
     //    9-spec array is NOT on every thread's stack (shrinks the launch's local
     //    reservation — the persistent kernel must place on a memory-tight GPU). ──
-    if (threadIdx.x == 0) dectc::dectc_build_dw_specs(acts, B, T, sm.spec);
+    // Spec build: the 5-arg form (with dwt_base) binds the transpose scratch when
+    // SG_TUNED_DEC_DW_STAGE=1; the scalar default uses the original 4-arg overload
+    // VERBATIM (no extra arg in the PTX) → byte-identical.
+    if (threadIdx.x == 0) {
+#if SG_TUNED_DEC_DW_STAGE
+        dectc::dectc_build_dw_specs(acts, B, T, sm.spec, dwt_base);
+#else
+        dectc::dectc_build_dw_specs(acts, B, T, sm.spec);
+#endif
+    }
     __syncthreads();
     dectc::DecDwSpec* spec = sm.spec;
     const int n_dw = dectc::dectc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+    // CONTIGUOUS-TRANSPOSE staging (SG_TUNED_DEC_DW_STAGE=1): pre-transpose the 9
+    // weights' dY/X into the K-major scratch the specs bind, so the SINGLE-CTA dW
+    // GEMM (dectc_dw_run_tile, the proof wrapper) reads them via the proven
+    // cp.async ring (DecGmemTileSrc*). Runs AFTER B1 (all acts complete) + ONE
+    // grid barrier so a CTA's dW tile reads dYt/Xt written by ANY CTA (the
+    // transpose is grid-strided, owner ≠ the dW tile owner). GATED to kDwG==1
+    // (the wired proof path): when split-K is active the _splitk path keeps the
+    // lambda gather, so the transpose would be wasted work — skip it (and the
+    // barrier). #if-guarded so the scalar default emits NEITHER the transpose call
+    // NOR the extra barrier (byte-identical control flow + grid-barrier count). ──
+#if SG_TUNED_DEC_DW_STAGE
+    if constexpr (dectc::kDecDwTransposeActive) {
+        dectc::dectc_dw_transpose_operands(spec, cta, nCTA);
+        bar.sync();   // B1b: all transposed operands visible before any dW GEMM read
+    }
+#endif
 #ifdef SG_DEC_PROFILE
     __syncthreads(); unsigned long long _dwa = (threadIdx.x == 0) ? clock64() : 0;
 #endif

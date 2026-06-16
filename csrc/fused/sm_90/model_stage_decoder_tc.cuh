@@ -95,7 +95,10 @@ namespace wgs = ::sg::sm90::wgs;
 // 3 seeds (G=8 was +2.6% SLOWER — at d=2048 the dW tiles already fill the grid, so MORE split-K
 // only adds partial-reduce + workspace traffic). The deterministic ascending-chunk reduce is
 // order-stable for any G, so parity + A/A/A determinism hold. G==1 = single-CTA path.
-#define SG_TUNED_DEC_DW_SPLITK 2
+// SUPERSEDED 2026-06-16 → default now G=1: with DW_STAGE=1 (contiguous-layout staging) the
+// single-CTA dW is 2.05× faster than G=2-scalar (920.7 vs 1889.8 ms @ d=2048, gate-green ×3 seeds).
+// split-K was a SCALAR-dW grid-fill mitigation — obsolete now that staging, not the grid, is the lever.
+#define SG_TUNED_DEC_DW_SPLITK 1
 #endif
 
 // ── M-atom INTERLEAVE width cap (task #13 hill-climb win). The GEMM microkernel
@@ -111,7 +114,45 @@ namespace wgs = ::sg::sm90::wgs;
 #define SG_TUNED_DEC_GEMM_INTERLEAVE 2
 #endif
 
+// ── dW STAGING METHOD (Track E P0 redirect; campaign 2026-06-16). The dW GEMM
+//    (dW = dYᵀ·X, K=T) is STAGING-bound, not drain-bound: ~97% of each dW K-step
+//    is the scalar transposed-strided operand gather in stage_kmajor_tile, only
+//    ~3% is the wgmma (vit_findings.md clock64). The reverted P0 pipelined the
+//    MMA — the wrong lever (you cannot hide 97% staging behind 3% MMA). The REAL
+//    lever is faster STAGING. This macro selects HOW the dW operands reach the
+//    wgmma; it changes NEITHER the reduction order NOR the math (only transport),
+//    so fp64-oracle parity + A/A/A determinism are preserved BY CONSTRUCTION.
+//
+//      0 (DEFAULT, revert-safe): the proven scalar path. dectc_dw_run_tile feeds
+//        the engine LAMBDA sources doing the transposed-strided gmem read
+//        dY[k·Nout+m] / X[k·Kin+nn]; the engine's cp.async-ring gate
+//        (DecTileSrcIsGmem) is false for lambdas → synchronous 2-byte
+//        LDG→reg→STS stage_kmajor_tile. Byte-identical to every shipped build.
+//
+//      1 (CONTIGUOUS-LAYOUT, Track E option B): a CHEAP grid-cooperative
+//        pre-transpose (dectc_dw_transpose_operands) writes each weight's dY/X
+//        ONCE per step into a CONTIGUOUS K-major gmem scratch (dYt[Nout,K],
+//        Xt[Kin,K]; rows = the staged mn axis, K-CONTIGUOUS + 16B-aligned). The
+//        dW then builds DecGmemTileSrcA/B over that scratch → the engine's
+//        EXISTING, silicon-validated kRingAsync cp.async ring (the −14.2% fwd/dX
+//        win) streams the operands in 16-byte coalesced cp.async copies instead
+//        of the 2-byte strided gather. NO new MMA, NO TMA substrate, NO new
+//        descriptor path — pure reuse of the proven fast path. The pre-transpose
+//        is a pure bf16 copy (dYt[m,k]=dY[k,m]: no arithmetic) reused across ALL
+//        M-atom-groups × N-tiles × split-K chunks of that weight, so its O(T·N)
+//        one-touch cost amortizes against the dW's many re-reads of each operand.
+#ifndef SG_TUNED_DEC_DW_STAGE
+#define SG_TUNED_DEC_DW_STAGE 1
+#endif
+
 namespace dectc {
+
+// dW staging-method selector (see the SG_TUNED_DEC_DW_STAGE macro doc above).
+// 0 = scalar transposed-strided gather (default, byte-identical); 1 = contiguous
+// K-major pre-transpose + the proven cp.async ring fast path.
+constexpr int kDecDwStage = SG_TUNED_DEC_DW_STAGE;
+static_assert(kDecDwStage == 0 || kDecDwStage == 1,
+              "SG_TUNED_DEC_DW_STAGE must be 0 (scalar) or 1 (contiguous-transpose)");
 
 constexpr int kDecMaxIL = SG_TUNED_DEC_GEMM_INTERLEAVE;
 static_assert(kDecMaxIL >= 1 && kDecMaxIL <= 4,
@@ -1483,11 +1524,86 @@ struct DecDwSpec {
     int grad_off;              // element offset of this weight in `grad`
     const __nv_bfloat16* dY_bias;  // same as dY (bias db = Σ_K dY)
     int bias_off;              // element offset of the bias in `grad`
+#if SG_TUNED_DEC_DW_STAGE
+    // CONTIGUOUS-TRANSPOSE staging scratch (SG_TUNED_DEC_DW_STAGE=1 only). These
+    // three pointers exist ONLY when the macro is set, so the scalar-default
+    // struct (and therefore DecTcSmem's smem footprint + the kernel's register
+    // allocation) is BYTE-IDENTICAL to every shipped build (PTX-verified). dYt =
+    // K-major TRANSPOSE of dY, shape [Mpad, K] row-major (dYt[m,k] = dY[k,m]); Xt
+    // = [Kin, K] (Xt[n,k] = X[k,n]). Rows are K-CONTIGUOUS + 16B-aligned (K is a
+    // multiple of kWgmmaAtomK=16 ⇒ 8 bf16), so DecGmemTileSrcA/B read them with
+    // the proven 16B cp.async ring instead of the 2-byte transposed-strided
+    // gather. Filled ONCE per step by dectc_dw_transpose_operands (a pure bf16
+    // copy — no math → parity-safe).
+    __nv_bfloat16* dYt;        // [Mpad, K] (transposed dY) — null unless active
+    __nv_bfloat16* Xt;         // [Kin,  K] (transposed X)  — null unless active
+    int64_t t_off;             // element offset of (dYt|Xt) base in the dW-T scratch
+#endif
 };
 
+// ── CONTIGUOUS-TRANSPOSE dW scratch geometry (SG_TUNED_DEC_DW_STAGE=1). The 9
+//    weights' transposed operands (dYt[Nout,K] + Xt[Kin,K]) are packed into ONE
+//    contiguous bf16 region. Per weight s the block is (Nout_s + Kin_s)·K_s bf16:
+//    dYt at base+0, Xt at base+Nout_s·K_s. The SAME running-offset walk is used
+//    by the host workspace sizer (dec_tc_dw_transpose_floats) and the device spec
+//    builder (dectc_build_dw_specs) so the carve and the kernel agree exactly. K_s
+//    is T for the 8 layer weights, B for the head — both multiples of kWgmmaAtomK
+//    in every (B, kSeq) the bench/production use (so each transposed ROW is 16B-
+//    aligned, the cp.async-ring chunk16 requirement). Returns bf16 ELEMENTS. ──
+// Per-weight transpose-block bf16 elems: dYt is row-padded to a multiple of 64
+// (the engine's m64 atom) so the cp.async ring's UNGUARDED A-row reads (it has no
+// row_valid check on A) never index past the valid Nout rows — pad rows are
+// zeroed (inert in the wgmma). Xt is NOT row-padded (the ring guards B rows via
+// row_valid → only valid Kin rows are read; pad cols are zero-filled in smem).
+__host__ __device__ __forceinline__ int64_t dec_dw_mpad(int Nout) {
+    return (int64_t)((Nout + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM) * wgs::kWgmmaAtomM;
+}
+__host__ __device__ __forceinline__ int64_t dec_dw_weight_t_elems(int Nout, int Kin, int64_t K) {
+    return (dec_dw_mpad(Nout) + (int64_t)Kin) * K;     // dYt[Mpad,K] + Xt[Kin,K]
+}
+// True only when the contiguous-transpose path is BOTH selected (stage==1) AND
+// actually wired (single-CTA dW, splitk==1 — the proof path; the split-K path
+// keeps the lambda gather). When false the scratch is 0-sized / unused and the
+// run-tile never reads dYt/Xt, so the workspace + control flow are byte-identical
+// to the scalar default.
+constexpr bool kDecDwTransposeActive = (kDecDwStage == 1) && (kDecDwSplitK == 1);
+
+__host__ __device__ __forceinline__ int64_t dec_dw_transpose_elems(int B, int T) {
+    if (!kDecDwTransposeActive) return 0;
+    const int64_t Kly = T, Khd = B;
+    int64_t e = 0;
+    // 8 layer weights (per layer: qkv 3d×d, attn_out d×d, ff0 dff×d, ff2 d×dff).
+    for (int li = 0; li < dec::kLayers; ++li) {
+        e += dec_dw_weight_t_elems(3 * dec::kD, dec::kD,   Kly);  // qkv
+        e += dec_dw_weight_t_elems(dec::kD,     dec::kD,   Kly);  // attn_out
+        e += dec_dw_weight_t_elems(dec::kDff,   dec::kD,   Kly);  // ff0
+        e += dec_dw_weight_t_elems(dec::kD,     dec::kDff, Kly);  // ff2
+    }
+    e += dec_dw_weight_t_elems(dec::kVocab, dec::kD, Khd);        // head (K=B)
+    return e;
+}
+
 // Build the 9 specs (called by all CTAs; cheap). T = B*kSeq.
+//
+// When SG_TUNED_DEC_DW_STAGE==1, `dwt_base` is the contiguous bf16 transpose
+// scratch (dec_dw_transpose_elems sized) and each spec's dYt/Xt/t_off are bound
+// to its packed sub-block (same running-offset walk as dec_dw_transpose_elems +
+// the host carve). On the scalar path pass dwt_base=nullptr → dYt/Xt stay null.
+__device__ __forceinline__ void dectc_build_dw_specs(
+        const DecActs& acts, int B, int T, DecDwSpec spec[9],
+        __nv_bfloat16* dwt_base);
+
+// Back-compat overload (scalar path / pre-existing call sites): no transpose
+// scratch. Forwards with dwt_base=nullptr so dYt/Xt are null and stage==0 runs
+// the proven lambda gather unchanged.
 __device__ __forceinline__ void dectc_build_dw_specs(
         const DecActs& acts, int B, int T, DecDwSpec spec[9]) {
+    dectc_build_dw_specs(acts, B, T, spec, /*dwt_base=*/nullptr);
+}
+
+__device__ __forceinline__ void dectc_build_dw_specs(
+        const DecActs& acts, int B, int T, DecDwSpec spec[9],
+        __nv_bfloat16* dwt_base) {
     // dec_layout offsets: see kDecOffsets. Weight tensor indices (and bias idx):
     //   L0: in_w=2 (in_b=3), out_w=4 (out_b=5), ff0_w=10 (ff0_b=11), ff2_w=12 (ff2_b=13)
     //   L1: in_w=14(15), out_w=16(17), ff0_w=22(23), ff2_w=24(25)
@@ -1507,6 +1623,75 @@ __device__ __forceinline__ void dectc_build_dw_specs(
     DecDwSpec& hd = spec[8];
     hd.dY = acts.dY_logits; hd.X = acts.X_hn; hd.Nout = dec::kVocab; hd.Kin = dec::kD; hd.K = B;
     hd.grad_off = kDecOffsets[28]; hd.bias_off = kDecOffsets[29]; hd.dY_bias = hd.dY;
+
+    // CONTIGUOUS-TRANSPOSE bind (stage==1): pack each weight's dYt[Mpad,K] then
+    // Xt[Kin,K] into dwt_base via the SAME running-offset walk dec_dw_transpose_elems
+    // uses (so the kernel offsets == the host carve). On the scalar path (dwt_base
+    // null / stage==0) leave dYt/Xt null → dectc_dw_run_tile takes the lambda gather.
+    // #if-guarded (not if-constexpr): the dYt/Xt/t_off fields only EXIST when the
+    // macro is set, so the scalar default's struct + smem are byte-identical.
+#if SG_TUNED_DEC_DW_STAGE
+    if (kDecDwTransposeActive && dwt_base != nullptr) {
+        int64_t e = 0;
+        for (int s = 0; s < 9; ++s) {
+            DecDwSpec& sp = spec[s];
+            sp.t_off = e;
+            sp.dYt   = dwt_base + e;                                  // [Mpad, K]
+            sp.Xt    = dwt_base + e + dec_dw_mpad(sp.Nout) * sp.K;    // [Kin,  K]
+            e += dec_dw_weight_t_elems(sp.Nout, sp.Kin, sp.K);
+        }
+    } else {
+        for (int s = 0; s < 9; ++s) { spec[s].dYt = nullptr; spec[s].Xt = nullptr; spec[s].t_off = 0; }
+    }
+#else
+    (void)dwt_base;
+#endif
+}
+
+// ── CONTIGUOUS-TRANSPOSE PASS (SG_TUNED_DEC_DW_STAGE=1). Grid-cooperatively
+//    transpose each weight's dY[K,Nout] → dYt[Nout,K] and X[K,Kin] → Xt[Kin,K]
+//    into the packed dW-T scratch the specs bind. ELEMENT-OWNED (one writer per
+//    output element, fixed mapping) → DETERMINISTIC and A/A/A-safe; PURE bf16
+//    COPY (dYt[m,k]=dY[k,m] — NO arithmetic, NO reduction) → fp64-oracle parity
+//    is trivially preserved (the wgmma later consumes the SAME bf16 operand
+//    values in the SAME ascending-k order; only their MEMORY LAYOUT changed from
+//    transposed-strided gmem to K-contiguous gmem). Called by ALL CTAs after the
+//    backward writes dY/X to acts and BEFORE the dW phase, fenced by the existing
+//    B1 grid barrier (no new barrier). The total work is Σ_s (Nout_s+Kin_s)·K_s
+//    bf16 stores, touched ONCE per step and reused across every dW work item +
+//    split-K chunk of that weight. ──
+__device__ __forceinline__ void dectc_dw_transpose_operands(
+        const DecDwSpec spec[9], int cta, int nCTA) {
+#if SG_TUNED_DEC_DW_STAGE
+    if constexpr (!kDecDwTransposeActive) { (void)spec; (void)cta; (void)nCTA; return; }
+    const int tpb = blockDim.x;
+    const int64_t stride = (int64_t)nCTA * tpb;
+    const int64_t lane0  = (int64_t)cta * tpb + threadIdx.x;
+    for (int s = 0; s < 9; ++s) {
+        const DecDwSpec& sp = spec[s];
+        if (sp.dYt == nullptr) continue;
+        const int64_t K = sp.K, Nout = sp.Nout, Kin = sp.Kin;
+        const int64_t Mpad = dec_dw_mpad(sp.Nout);
+        // dYt[m,k] = dY[k,m] for m<Nout; pad rows [Nout,Mpad) = 0 (inert — the
+        // ring reads A rows unguarded, so the row dim is padded to a 64-atom
+        // boundary). Linear out-index i = m*K+k over the FULL padded [Mpad,K).
+        const int64_t ndy = Mpad * K;
+        for (int64_t i = lane0; i < ndy; i += stride) {
+            const int64_t m = i / K, k = i % K;
+            sp.dYt[i] = (m < Nout) ? sp.dY[k * Nout + m] : __float2bfloat16(0.f);
+        }
+        // Xt[n,k] = X[k,n], n in [0,Kin), k in [0,K). Linear out-index i = n*K+k.
+        // (No row pad: the ring guards B rows via row_valid → pad N-tile cols are
+        // zero-filled in smem, never read from Xt.)
+        const int64_t nx = Kin * K;
+        for (int64_t i = lane0; i < nx; i += stride) {
+            const int64_t n = i / K, k = i % K;
+            sp.Xt[i] = sp.X[k * Kin + n];
+        }
+    }
+#else
+    (void)spec; (void)cta; (void)nCTA;   // scalar default: no transpose pass
+#endif
 }
 
 // ── dW M-atom INTERLEAVE group width (task #13 H3). A dW output "tile" (work
@@ -1561,21 +1746,60 @@ __device__ __forceinline__ void dectc_dw_run_tile(
     const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
     const int k_steps = sp.K / wgs::kWgmmaAtomK;     // K = T or B (must be /16; padded by caller)
     const int Nout = sp.Nout, Kin = sp.Kin;
-    const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
-    // The engine (tc_gemm_block_unpipelined, mbase0=mbase) passes the GLOBAL row
-    // m = mbase + (group-local row) to srcA/out (it adds mbase0 itself), so the
-    // accessors use `m` RAW — adding mbase again would double-count (the selftest
-    // gemm_dw_kernel passes mbase0=0, m_atoms=all, and uses m raw; we shard the
-    // atoms into groups, pass mbase0=mbase, and likewise use m raw).
-    // A[m=out, k=t] = dY[t,out]  (transposed read); B[n=in, k=t] = X[t,in] (transposed).
-    auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
-        return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };
-    auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
-        int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
+    // out(m,n,v): m is GLOBAL (engine adds mbase0=mbase); identical on both paths.
     auto out  = [&] (int m, int n, float v) {
         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
-    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kDecDwIL>(
-        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
+    // ── SCALAR transposed-strided gather (DEFAULT path; lambda sources). The
+    //    engine (tc_gemm_block_unpipelined, mbase0=mbase) passes the GLOBAL row
+    //    m = mbase + (group-local row) to srcA/out (it adds mbase0 itself), so the
+    //    accessors use `m` RAW (the selftest gemm_dw_kernel passes mbase0=0 + m
+    //    raw; we shard atoms into groups, pass mbase0=mbase, likewise m raw).
+    //    A[m=out,k=t]=dY[t,out], B[n=in,k=t]=X[t,in] — both TRANSPOSED-strided.
+    //    Lambda sources ⇒ DecTileSrcIsGmem=false ⇒ the engine's kRingAsync gate is
+    //    OFF ⇒ the synchronous 2-byte LDG→reg→STS stage_kmajor_tile. ──
+    auto run_scalar = [&] {
+        const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
+        auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
+            return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };
+        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+            int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kDecDwIL>(
+            mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
+    };
+#if SG_TUNED_DEC_DW_STAGE
+    if constexpr (kDecDwTransposeActive) {
+        // DEFENSIVE: a caller that did NOT run dectc_dw_transpose_operands (e.g.
+        // the PP-stage / SAM dW phases, which build specs via the 4-arg overload →
+        // dYt/Xt null) falls back to the scalar gather rather than dereferencing a
+        // null transpose scratch. The wired proof path (fused_decoder_megakernel_tc)
+        // always populates dYt/Xt first, so it takes the fast contiguous branch.
+        if (sp.dYt == nullptr || sp.Xt == nullptr) { run_scalar(); return; }
+        // ── CONTIGUOUS-LAYOUT path: the operands were PRE-TRANSPOSED into K-major
+        //    gmem (dYt[Mpad,K], Xt[Kin,K]) by dectc_dw_transpose_operands, so the
+        //    A/B rows are now K-CONTIGUOUS + 16B-aligned. Feeding the engine the
+        //    flat-gmem DecGmemTileSrc{A,B} (the SAME POD sources the fwd/dX
+        //    wrappers use) FLIPS DecTileSrcIsGmem to true → the engine's proven
+        //    cp.async ring (kRingAsync) streams them in 16-byte coalesced copies
+        //    instead of stage_kmajor_tile's 2-byte transposed-strided gather. The
+        //    wgmma issue sequence + ascending-k accumulation are UNCHANGED (the
+        //    same A[m,k]=dY[k,m] / B[n,k]=X[k,n] operand values reach the MMA in
+        //    the same order) → bit-identical to the scalar path. A's row dim is
+        //    padded to Mpad (64-atom boundary) so the ring's UNGUARDED A reads
+        //    stay in-bounds; B uses rows_valid=Kin-n0 (the ring zero-fills pad
+        //    N-cols). ld = K (the transposed row stride in elements).
+        const int K = (int)sp.K;
+        DecGmemTileSrcA srcA{sp.dYt, K};                       // A[m,k] = dYt[m·K + k]
+        DecGmemTileSrcB srcB{sp.Xt + (int64_t)n0 * K, K, Kin - n0};  // B[n,k] = Xt[(n0+n)·K + k]
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kDecDwIL>(
+            mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
+    } else {
+        // stage==1 but split-K active → the _splitk path handles the dW; this
+        // single-CTA wrapper keeps the scalar gather (consistent + unused).
+        run_scalar();
+    }
+#else
+    run_scalar();
+#endif
 }
 
 // ════════════════════════════════════════════════════════════════════════

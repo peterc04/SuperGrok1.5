@@ -57,4 +57,7 @@ compile.py vs regular nvcc @ d=2048 (adamw/decoder, `20013f7`): **A→B = +0.43%
 - P1 epilogue fusion; P2 ViT B1 barrier imbalance; #23 compile.py tiered spill management.
 
 ---
+## Track E — dW contiguous-layout staging: **KEEP +2.05× — the campaign's first major structural win** (2026-06-16)
+The Track-E redirect lever (after the P0 pipelining revert). `SG_TUNED_DEC_DW_STAGE=1` (Option B, contiguous-layout): a cheap grid-cooperative pre-transpose writes each weight's dY/X **once per step** into K-contiguous scratch → the dW reuses the proven `kRingAsync` cp.async ring (the −14.2% fwd/dX win) instead of the scalar transposed-strided gather. **Measured @ d=2048/B=16384, 3 seeds:** stage=0/sk=1 scalar **1889.8 ms** → stage=1/sk=1 contiguous **920.7 ms = 2.05× faster**; vs production stage=0/sk=2 (1925.5 ms) = **2.09×**. Roofline **2.08% → 4.35% (doubled)**. **fp64 PARITY + A/A/A GATE GREEN: 11/11 decoder cells × seeds {42,7,123}.** Production default set to **stage=1, splitk=1** — **SUPERSEDES the Track-C split-K=2 KEEP** (split-K was a scalar-dW grid-fill mitigation; with fast staging the single-CTA dW wins). **Mechanism validated:** the dW was staging-bound (~97% staging) → fixing the *staging* (not pipelining the MMA, the reverted P0) was the lever. **KEY REFRAME: the megakernel's ~2% roofline was a STAGING artifact, not a hardware ceiling.** Next: the same fix on ViT dW (even more staging-dominated → likely a bigger win) + Mamba.
+
 *Maintained going forward: every future apply→gate→verdict lands here with its measured numbers + the mechanistic why.*
