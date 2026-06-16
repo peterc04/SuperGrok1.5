@@ -1212,13 +1212,13 @@ def _mamba_layout_body(d: int) -> str:
     # over there pins this byte-for-byte (fails the build with the required value if
     # a field drifts). At d=128 this is 58249 floats = 232996 B (= 227.5 KB, the
     # SCALAR-megakernel CTA dynamic smem). Field groups (mirror the struct order):
-    la = (seq * d + seq                                  # mixn_xhat, mixn_r
+    la = (seq                                            # mixn_r (mixn_xhat dropped: recomputed from raw x in bwd)
           + seq * di + seq * di                          # x_in, z
           + seq * dtr + 3 * seq * nh + seq * Nc          # dt_lr, dt_pre/A_mod/u_lam, theta
           + 4 * seq * Nc + 4 * seq                       # Br/Bi/Cr/Ci + their _r recips
           + seq * Nc * 2 + seq * Nc * 2                  # Bbar, Cbar
           + seq * di                                     # y_scan
-          + seq * d + seq * d + seq                      # h1, mlpn_xhat, mlpn_r
+          + seq * d + seq                                # h1, mlpn_r (mlpn_xhat dropped: recomputed from h1)
           + seq * dff + seq * dff)                       # g_pre, u_mlp
     smem_floats = (_MAMBA_LAYERS * seq * d + seq * d      # layer_in, final_in
                    + _MAMBA_LAYERS * la                   # act[layers]

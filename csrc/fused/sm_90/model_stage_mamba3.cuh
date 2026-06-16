@@ -148,8 +148,8 @@ struct MambaSampleSmem {
     // reads. The block-level "h1" (= x + mixer_out) is cached so mlp_norm's input
     // and the mixer-residual reconstruction are available in the backward.
     struct LayerAct {
-        // --- mixer pre-norm (RMSNorm_mix) cache ---
-        float mixn_xhat[mb::kSeq][mb::kD];     // xhat = x*r
+        // --- mixer pre-norm (RMSNorm_mix) cache: only the recip (xhat recomputed
+        //     in bwd from the raw block input layer_in[li], saving kSeq*kD floats) ---
         float mixn_r[mb::kSeq];                // rsqrt(mean(x^2)+eps)
         // --- mixer internals ---
         float x_in[mb::kSeq][mb::kDInner];     // in_proj first half (= x_main, scan/x_proj/D input)
@@ -171,9 +171,8 @@ struct MambaSampleSmem {
         float Cbar[mb::kSeq][mb::kStateC][2];  // (Cr2, -Ci2)
         float y_scan[mb::kSeq][mb::kDInner];   // selective-scan output (per channel)
         // --- block inter-residual + mlp pre-norm (RMSNorm_mlp) cache ---
-        float h1[mb::kSeq][mb::kD];            // x + mixer_out (mlp_norm input)
-        float mlpn_xhat[mb::kSeq][mb::kD];     // mlp_norm xhat
-        float mlpn_r[mb::kSeq];                // mlp_norm rms recip
+        float h1[mb::kSeq][mb::kD];            // x + mixer_out (mlp_norm input; raw x for mlpn bwd)
+        float mlpn_r[mb::kSeq];                // mlp_norm rms recip (xhat recomputed from h1 in bwd)
         // --- SwiGLU internals ---
         float g_pre[mb::kSeq][mb::kDff];       // gate_proj out (pre-SiLU)
         float u_mlp[mb::kSeq][mb::kDff];       // up_proj out
@@ -894,7 +893,9 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
         MambaSampleSmem::LayerAct* a = &sm->act[li];
         float* hin = &sm->layer_in[li][0][0];   // block input (residual)
         // --- mixer sub-block: h1 = hin + mixer(RMSNorm_mix(hin)) ---
-        mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &a->mixn_xhat[0][0], &a->mixn_r[0],
+        // xhat written to throwaway scratch (adj_c) — only the recip is cached; the
+        // backward recomputes xhat from the raw block input layer_in[li].
+        mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mixn_r[0],
                        sm->red, mb::kD, mb::kD);   // xn -> sm->dr
         // mix_out written into adj_b at WIDTH-kD stride (s*kD+j); read it the same way.
         float* mo = &sm->adj_b[0][0];
@@ -905,7 +906,8 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
         }
         __syncthreads();
         // --- SwiGLU sub-block: h2 = h1 + mlp(RMSNorm_mlp(h1)) ---
-        mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &a->mlpn_xhat[0][0], &a->mlpn_r[0],
+        // xhat throwaway (adj_c); backward recomputes from the raw h1.
+        mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mlpn_r[0],
                        sm->red, mb::kD, mb::kD);   // h1n -> sm->dr
         mb_swiglu_fwd(L, &sm->dr[0][0], a, mo, sm);  // mlp_out -> sm->adj_b (kD-strided)
         float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0] : &sm->final_in[0][0];
@@ -1245,24 +1247,21 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
         const MambaWeights::Layer& L = w.layer[li];
         const MambaGrad::Layer& G = g.layer[li];
         MambaSampleSmem::LayerAct* a = &sm->act[li];
-        // (block input layer_in[li] is read implicitly via the mixer_norm xhat cache;
-        //  the residual flows through sm->dh.)
+        float* hin = &sm->layer_in[li][0][0];   // block input (raw x for mixer_norm bwd)
         // h2 = h1 + mlp(mlp_norm(h1)). dh2 = sm->dh.
         //   dh1 = dh2 (residual) + rmsnorm_bwd(swiglu_bwd(dh2)).
-        // recompute h1n = mlp_norm(h1) -> sm->dr (mlp_norm fwd, scratch xhat in wff... use cache).
-        //   We cached mlpn_xhat + mlpn_r, so h1n = mlpn_xhat * mlp_w.
+        // recompute h1n = mlp_norm(h1) = (h1 * mlpn_r) * mlpn_w  (xhat from the raw h1).
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
-            sm->dr[s][j] = a->mlpn_xhat[s][j] * L.mlpn_w[j];   // h1n
+            sm->dr[s][j] = (a->h1[s][j] * a->mlpn_r[s]) * L.mlpn_w[j];   // h1n
         }
         __syncthreads();
-        // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n (sm->adj_a row d-wide... use sm->wff? need [kSeq,d]).
-        //   route dh1n -> sm->fn_xhat (free now: head done) [kSeq,d].
+        // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n -> sm->fn_xhat (free: head done).
         mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
-        // rmsnorm_mlp bwd: dh1_mlpnorm = rmsnorm_bwd(dh1n) ; dh1 = dh2 + dh1_mlpnorm.
-        //   dh1n in sm->fn_xhat; xhat = mlpn_xhat; out dh1_mlpnorm -> sm->dr.
-        mb_rmsnorm_bwd(&sm->fn_xhat[0][0], &a->mlpn_xhat[0][0], &a->mlpn_r[0], L.mlpn_w,
-                       &sm->dr[0][0], G.mlpn_w, sm->red, mb::kD);
+        // rmsnorm_mlp bwd (raw-x variant: recompute xhat from h1 * mlpn_r). dh1n in
+        //   sm->fn_xhat; out dh1_mlpnorm -> sm->dr (ldDx=kD).
+        mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], &a->h1[0][0], &a->mlpn_r[0], L.mlpn_w,
+                            &sm->dr[0][0], G.mlpn_w, sm->red, mb::kD, mb::kD);
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
             sm->dh[s][j] += sm->dr[s][j];   // dh1 = dh2(residual) + mlp_norm path
@@ -1270,17 +1269,17 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
         __syncthreads();
         // h1 = x + mixer(mixer_norm(x)). dh1 = sm->dh.
         //   dx = dh1 (residual) + rmsnorm_bwd(mixer_bwd(dh1)).
-        // recompute xn = mixer_norm(hin) -> sm->dr (xhat * mix_w).
+        // recompute xn = mixer_norm(hin) = (hin * mixn_r) * mixn_w (xhat from raw hin).
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
-            sm->dr[s][j] = a->mixn_xhat[s][j] * L.mixn_w[j];   // xn
+            sm->dr[s][j] = (hin[s * mb::kD + j] * a->mixn_r[s]) * L.mixn_w[j];   // xn
         }
         __syncthreads();
         // mixer bwd: dmix_out = dh1 (sm->dh) ; xn in sm->dr ; out dxn -> sm->fn_xhat.
         mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
-        // rmsnorm_mix bwd: dx_mixnorm = rmsnorm_bwd(dxn) ; dx = dh1 + dx_mixnorm.
-        mb_rmsnorm_bwd(&sm->fn_xhat[0][0], &a->mixn_xhat[0][0], &a->mixn_r[0], L.mixn_w,
-                       &sm->dr[0][0], G.mixn_w, sm->red, mb::kD);
+        // rmsnorm_mix bwd (raw-x variant: recompute xhat from hin * mixn_r).
+        mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], hin, &a->mixn_r[0], L.mixn_w,
+                            &sm->dr[0][0], G.mixn_w, sm->red, mb::kD, mb::kD);
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
             sm->dh[s][j] += sm->dr[s][j];   // dx = dh1(residual) + mixer_norm path

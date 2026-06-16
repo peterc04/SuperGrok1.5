@@ -155,8 +155,8 @@ constexpr int kMambaMaxTensorNumel = mamba_layout_check::max_size();
 //    field count is pinned by model_stage_mamba3.cuh static_assert
 //    (sizeof(MambaSampleSmem) == kMambaSmemBytes), which fails the build with the
 //    required value if this differs. It is kept strictly inside (48 KB, 224 KB).
-constexpr int64_t kMambaSmemFloats = 362249;
-constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 1448996
+constexpr int64_t kMambaSmemFloats = 329481;
+constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 1317924
 static_assert(kMambaSmemBytes > 48 * 1024,
               "mamba3_layout: if the smem ever drops below 48KB, switch the "
               "launcher back to STATIC smem (no opt-in needed).");
@@ -267,8 +267,8 @@ constexpr int kMambaMaxTensorNumel = mamba_layout_check::max_size();
 //    field count is pinned by model_stage_mamba3.cuh static_assert
 //    (sizeof(MambaSampleSmem) == kMambaSmemBytes), which fails the build with the
 //    required value if this differs. It is kept strictly inside (48 KB, 224 KB).
-constexpr int64_t kMambaSmemFloats = 58057;
-constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 232228
+constexpr int64_t kMambaSmemFloats = 53961;
+constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 215844
 static_assert(kMambaSmemBytes > 48 * 1024,
               "mamba3_layout: if the smem ever drops below 48KB, switch the "
               "launcher back to STATIC smem (no opt-in needed).");

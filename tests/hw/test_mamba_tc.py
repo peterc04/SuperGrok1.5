@@ -107,10 +107,18 @@ def _build_m3(named, dtype):
     (cast to `dtype`). `named`'s keys match the model's named_parameters() exactly;
     the model ALSO registers a `pos_ids` buffer (not in `named`), so load_state_dict
     is called with strict=False (the buffer keeps its registered arange value, which
-    is what model_forward reads). Returns the live model with grads disabled."""
+    is what model_forward reads). Returns the live model with grads disabled.
+
+    DEVICE: the model is placed on the DEVICE of the incoming `named` tensors. The
+    gate runs at the production batch (B≈4176) — the Mamba-3 manual fp64 backward
+    materializes dense [B, n_heads, head_dim, Nc, 2] scan intermediates, which are
+    pathologically slow on CPU at that B but fast on the H100 (fp64). Running the
+    fp64 ground-truth oracle on the SAME GPU is faithful (fp64 is fp64) and keeps the
+    looksam/SG gates from timing out."""
     from grokking_optimizers.mamba3_block import Mamba3Model
-    model = Mamba3Model(**_M3_CFG).to(dtype)
-    sd = {k: v.to(dtype) for k, v in named.items()}
+    dev = next(iter(named.values())).device
+    model = Mamba3Model(**_M3_CFG).to(dtype).to(dev)
+    sd = {k: v.to(dtype).to(dev) for k, v in named.items()}
     model.load_state_dict(sd, strict=False)   # pos_ids buffer (only non-param) kept
     for p in model.parameters():
         p.requires_grad_(False)
@@ -166,15 +174,16 @@ def _bf16_faithful_mamba_oracle(named, tokens, targets):
 
     # Build the live fp64 model so we can read the exact module structure/shapes
     # the kernel mirrors, and use named_parameters() (doubled) as the weight dict.
-    model = _build_m3(named, torch.float64)
-    P = {k: v.double() for k, v in model.named_parameters()}
-    nl = len(model.layers)
-    eps = model.norm.eps
+    # Keep params on the TOKENS' device so the index_select + matmuls are consistent.
     Bn, S = tokens.shape
     dev = tokens.device
+    model = _build_m3(named, torch.float64)
+    P = {k: v.double().to(dev) for k, v in model.named_parameters()}
+    nl = len(model.layers)
+    eps = model.norm.eps
 
     # ---- embedding (bf16 layer-0 input: the in_proj A-operand + residual) ----
-    pos_ids = model.pos_ids.reshape(-1)[:S]
+    pos_ids = model.pos_ids.reshape(-1)[:S].to(dev)
     h = bf(P["tok.weight"][tokens] + P["pos.weight"][pos_ids].unsqueeze(0))  # [B,S,d]
 
     caches = []
@@ -369,7 +378,8 @@ def _pure_fp64_oracle(named, tokens, targets):
     Mamba-1 wrapper: (named, tokens, targets) -> (loss, grads)."""
     from tests.hw import mamba3_oracle
     model = _build_m3(named, torch.float64)
-    loss, cache = mamba3_oracle.model_forward(model, tokens, targets)
+    dev = model.tok.weight.device   # the fp64 oracle model lives on CPU; match tokens to it
+    loss, cache = mamba3_oracle.model_forward(model, tokens.to(dev), targets.to(dev))
     grads = mamba3_oracle.model_backward(model, cache)
     return loss.item(), grads
 
