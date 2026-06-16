@@ -56,6 +56,13 @@ ROOT = Path(__file__).resolve().parent.parent
 TUNE_DIR = ROOT / "results" / "tuning"
 LOG_DIR = TUNE_DIR / "logs"
 
+# [kill-switch] Halt ALL tuning — including any wrapper that imports this module — by
+# creating ROOT/.STOP_TUNING. Added 2026-06-16 to stop a runaway tuning relaunch-loop
+# from a background agent; DELETE the sentinel to re-enable tuning.
+if (ROOT / ".STOP_TUNING").exists():
+    sys.stderr.write("[tune_optimizers] .STOP_TUNING sentinel present — refusing to run.\n")
+    sys.exit(0)
+
 # Step caps per model (the "fidelity" axis — real task, bounded budget).
 # Decoder groks ~1k-4k for working optimizers; mamba is a slow grokker
 # (AdamW itself needs >6k), so it gets the largest budget.
