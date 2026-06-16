@@ -1,0 +1,769 @@
+{
+  "compile_track": [
+    {
+      "rank": 1,
+      "flagship": true,
+      "id": "compile-01-singlecell-source-scoping",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_resolve_sources 9810-9836 (globs ALL fused TUs); dispatch-table coupling comment 9815-9826",
+      "kind": "behavior",
+      "grounded": "CONFIRMED: _resolve_sources at 9830-9835 sorted(fused_dir.iterdir()) globs every mega_<model>_<opt> TU unconditionally for every build; 4 megakernel model TUs linked into every single-cell .so.",
+      "description": "Scope the fused-TU set to the tuned cell only; precompile the other 3 model megakernels to .o once and link via prebuilt-.o index, turning a 4-megakernel AOT build into a 1-megakernel build.",
+      "mechanism": "Comment at 9815-9826 documents the HARD CONSTRAINT this must respect: fused_dispatch_table.inc references EVERY mega_<model>_<opt> symbol unconditionally, so naive source-dropping fails at dlopen ('undefined symbol: sg::fused::sm90::mega_\u2026'). The candidate's prebuilt-.o link path is the correct workaround \u2014 populate spec with bindings+launchers+models+[current-cell megakernel], link the 3 non-tuned megakernel .o files via spec.ldflags. _plan_incremental_build already reuses AOT .o for unchanged TUs, so the plumbing exists.",
+      "expected_effect": "AOT build 60-75% faster for single-cell sweeps (~4x source reduction). JIT variant builds unaffected.",
+      "gate": "Self-test: dlopen symbol resolution preserved for ALL 4 cells (the dispatch-table symbols must all still resolve); measured AOT wall-clock with full sweep.",
+      "risk": "med",
+      "confidence": "high",
+      "note": "Highest-value compile item: directly attacks the 4x-redundant-megakernel-link that every single-cell build pays. The dispatch-table symbol coupling (9815-9826) is the real engineering risk and the candidate correctly addresses it."
+    },
+    {
+      "rank": 2,
+      "id": "compile-06-build-pool-variant-compilation",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "TODO at 14383-14392 (explicit deferred-workstream marker); _make_variant_timer closure",
+      "kind": "perf",
+      "grounded": "CONFIRMED: TODO at 14383 states the variant timer compiles each .so SERIALLY inline in the closure and 'the compile \u2014 not the timing \u2014 dominates wall-clock'.",
+      "description": "ProcessPoolExecutor to pre-compile the next K candidate variants in parallel while the GPU times the current variant, overlapping I/O-bound compile with timing.",
+      "mechanism": "The author's own TODO (14383-14392) names this as a 'large speedup' but explicitly defers it: 'touches cache-write concurrency, the TimingWorker handshake, and ninja-build-dir isolation \u2026 intentionally NOT attempted \u2026 Do not half-wire a pool here.' So the mechanism is real but the three named hazards (per-variant ninja build-dir isolation to avoid .o collisions, cache-write races, worker handshake) MUST be solved together.",
+      "expected_effect": "20-35% wall-clock reduction on Bayesian/Exhaustive sweeps where compile dominates, scaling with NCPUS.",
+      "gate": "Self-test: no variant .so collision/corruption (ninja-dir isolation); reproducibility (same trial sequence \u2192 same winners); measured full-sweep wall-clock.",
+      "risk": "med",
+      "confidence": "med",
+      "note": "High ceiling, but the author flagged the exact integration hazards \u2014 needs the cache-concurrency + ninja-isolation done as one piece, not incrementally."
+    },
+    {
+      "rank": 3,
+      "id": "compile-04-cost-model-feature-expansion",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_COST_MODEL_NUMERIC_FEATURES 5103+ (block_log2, occupancy_estimate, regpressure_estimate, cluster_volume\u2026), FEATURE_DIM 5158, featurize_config",
+      "kind": "perf",
+      "grounded": "CONFIRMED: the numeric feature tuple exists at 5103+ with the listed hand-engineered features; FEATURE_DIM is computed at 5158.",
+      "description": "Add tile_m/tile_n coverage, occupancy-vs-regpressure Pareto, ILP proxy, mem-bw/flops ratio, and interaction terms (block\u00d7maxrregcount); retrain from existing sidecar trial data.",
+      "mechanism": "Expand featurize_config + _COST_MODEL_NUMERIC_FEATURES + FEATURE_DIM; rescore historical trials from the .jsonl sidecars. Better cost-model MAE \u2192 better multi-fidelity/absolute-threshold pruning in the variant timer.",
+      "expected_effect": "Cost-model MAE 15-25% lower \u2192 10-20% better pruning accuracy; indirect sweep-time win scaling with pruned-trial count.",
+      "gate": "Self-test: feature computation sound; cost-model MAE on historical trials; ablation old-vs-new features.",
+      "risk": "low",
+      "confidence": "high"
+    },
+    {
+      "rank": 4,
+      "id": "compile-05-prefilter-rule-ordering",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "ss_prefilter rule parse 2911-2950; compile_feasibility_check 3091-3093 (rules compiled into a list per call)",
+      "kind": "perf",
+      "grounded": "CONFIRMED: rules eval left-to-right (3098 loop over compiled list in YAML order); 3092-3093 compiles them once per check.",
+      "description": "Reorder prefilter rules by elimination ratio (highest-rejection first) measured on a config sample; optional dominance short-circuit.",
+      "mechanism": "Add a rule-optimization pass that measures per-rule elimination ratio on a ~1000-config sample (or historical data), reorders the compiled list so the most-eliminating rule runs first \u2192 average-case short-circuit. The 'byte-identical survivor set' gate makes reordering provably safe (AND-of-rules is order-independent for the result, only for cost).",
+      "expected_effect": "30-60% fewer rule evals per config on tight rule sets; 5-10% faster sweep initialization at large Cartesian sizes.",
+      "gate": "Self-test: prefiltered survivor set byte-identical before/after reorder; measured prefilter wall-clock on large config sets.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Genuinely new (the compile() caching half of the original claim is already done at 3092). Reordering is the live part; the byte-identical-survivor gate makes it safe."
+    },
+    {
+      "rank": 5,
+      "id": "compile-03-tpe-prior-biasing",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "run_bayesian setup 6309-6400 (bias_trial_queue threaded at 6385-6400); TPESampler 6326-6331",
+      "kind": "perf",
+      "grounded": "PARTIALLY: bias_trial_queue / STALL_DIM_HINTS plumbing exists (6385-6400); the cold-start n_startup_trials is structure-agnostic.",
+      "description": "Seed TPE startup with cost-model-ranked feasible configs (re-rank the feasible set by predicted ms before study.ask) and warm-start Parzen estimators from prior d=128 runs (cross-depth transfer).",
+      "mechanism": "Extend bias_trial_queue to enqueue top-K cost-model-predicted configs in addition to stall-hints; add a re-ranking phase before study.ask() filtering by cost-model decile. Transfer: reuse a cached cost_model for the same (opt,model,arch,vendor) at another depth as a feature-weight prior. Subsumes compile-09's startup-feasibility-pass (register-feasible startup configs) \u2014 merge the two: rank by predicted-ms AND filter infeasible-register configs in one warm-start pass.",
+      "expected_effect": "Startup (first 50-100 trials) 20-35% faster convergence; 10-15% overall on mid budgets; infeasible-trial rate drops (compile-09 contribution).",
+      "gate": "Self-test: startup configs feasible + correctly ranked; convergence metric (time-to-top-K) vs baseline TPE.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "DEDUP: absorbs compile-09 (megakernel-tile startup-feasibility-pass) \u2014 both bias TPE startup; compile-09's register-feasibility filter becomes the feasibility leg of this candidate's warm-start."
+    },
+    {
+      "rank": 6,
+      "id": "compile-08-sidecar-summary-incremental-batching",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_read_trial_log_summary 6847-6893; _SIDECAR_SUMMARY_ACCUM 6940-6948; record_trial 7559-7600",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: the accumulator memoizes (n_trials,best_ms); the proposal extends it to cache per-trial feature vectors + predictions.",
+      "description": "Cache per-trial feature vectors and cost-model predictions in the sidecar accumulator so cost-model retrain on reload skips recomputing features for the full history.",
+      "mechanism": "Extend _SIDECAR_SUMMARY_ACCUM to store feature_cache/predicted_cache keyed by config_key; record_trial computes+caches once on append; retrain reuses cached features.",
+      "expected_effect": "Cost-model retrain at Bayesian startup 20-40% faster for long-running experiments (feature recompute ~30% of train time).",
+      "gate": "Self-test: feature-cache consistency across sidecar reload; measured retrain time.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Synergistic with compile-04 (expanded features make caching them more valuable)."
+    },
+    {
+      "rank": 7,
+      "id": "compile-02-nvcc-device-caching-extension",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_torch_load 12389-12557; _sccache_env 10881-10924",
+      "kind": "perf",
+      "grounded": "PLAUSIBLE but UNVERIFIED soundness: claims the cicc\u2192ptxas device pass is deterministic w.r.t. (source,flags) and thus cacheable like sccache.",
+      "description": "Hash-keyed object cache around the nvcc device passes (cicc\u2192ptxas) keyed on (TU source + device flags + device macro set), linking cached .o on hit.",
+      "mechanism": "Instrument _torch_load to capture the device-compile command line; pre-hash; check a local .o cache; populate on miss. SOUNDNESS RISK: ptxas output is NOT guaranteed bit-reproducible across all flag combos and toolkit builds; the cache must key on the EXACT nvcc/ptxas version + every -D that reaches device code (overlaps the COMPILE_PY_BUILD_CACHE_HOIST audit). If sccache already wraps the host pass, the marginal win is only the device pass.",
+      "expected_effect": "Author estimates 30-50% per-variant build-time on 60-75% hit rate after warmup; contingent on device-pass reproducibility holding.",
+      "gate": "Self-test: device .o binary equivalence under full rebuild (the make-or-break check); measured per-variant build time.",
+      "risk": "med",
+      "confidence": "med",
+      "note": "DEDUP: COMPILE_PY_BUILD_CACHE_HOIST (root compile.py, non-existent file) folds in here as the cache-key-completeness audit (verify ALL SG_TUNED_* device macros participate in the key) \u2014 that audit is the correctness prerequisite for this cache to be sound."
+    },
+    {
+      "rank": 8,
+      "id": "compile-07-cache-key-collision-avoidance",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_hash_sources/_hash_flags 2829-2844; build_aot 16607-16618; cache.is_aot_fresh 16633-16643",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: AOT cache key = H(sources,flags,search_space,pgo); a tuned-macro build with the same source set could in principle alias the AOT entry.",
+      "description": "Fold a hash of the tuned-macro set into the AOT cache key (or separate aot_primary vs aot_tuned entries) to prevent a tuned-macro .so aliasing the no-macro AOT .so.",
+      "mechanism": "_hash_sources optionally takes variant_id; when spec carries tuned macros, fold them into the AOT key. Correctness/reliability gain (eliminates a rare stale-.so reuse); negligible timing.",
+      "expected_effect": "Eliminates a latent incorrect-cache-hit class; no perf change.",
+      "gate": "Self-test: macro'd vs no-macro AOT entries never collide; prior tuned configs + new sweeps don't step on each other.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "DEDUP: this IS the concrete fix the COMPILE_PY_BUILD_CACHE_HOIST audit (rank-7 note) would recommend; pair them."
+    },
+    {
+      "rank": 9,
+      "id": "compile-10-host-side-hoisting-caching",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "prefilter compile 2936 + 3092; _resolve_sources iterdir 9832; _torch_load logging 12407-12413",
+      "kind": "micro",
+      "grounded": "PARTIAL: prefilter rules already compiled once per check-call (3092); the cross-sweep memo + cached iterdir + batched report-writes are the residual.",
+      "description": "Hoist prefilter compile() to a sweep-level cache, cache sorted(fused_dir.iterdir()) with mtime-watch, batch report.write into a deferred-flush buffer.",
+      "mechanism": "Memoize the compiled-rule list across the whole sweep (not just per check-call); cache the fused TU Path list keyed (arch,mtime); flush report writes once per Bayesian iteration.",
+      "expected_effect": "2-5ms host latency per trial \u2192 1-2% wall-clock at large budgets.",
+      "gate": "Self-test: prefilter output identical; pure-caching, no functional change.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Lowest compile-track value; the prefilter-compile leg is largely already done. Synergizes with compile-01 (the iterdir cache) and compile-05 (the rule list)."
+    }
+  ],
+  "model_track": [
+    {
+      "rank": 1,
+      "flagship": true,
+      "id": "PERF-004-SPLIT-K-FINE-GRAIN",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decoder_tc.cuh",
+      "locus": "Split-K dW machinery 1576-1592; tunable kDecDwSplitK 93-95,120-121 (default 4, static_assert >=1 only)",
+      "kind": "perf",
+      "grounded": "CONFIRMED: Split-K with DETERMINISTIC ascending-chunk reduce (no float atomics, fixed order) at 1576-1592; G==1 routes to single-CTA path; comment documents ~62% idle SMs in P2 (50 dW tiles / 132 SMs).",
+      "description": "Raise SG_TUNED_DEC_DW_SPLITK from 4 toward 8 (or grid-adaptive) to fill the ~62% idle SMs in P2 dW; floor-balanced partition guarantees no empty chunks.",
+      "mechanism": "Each (output_tile,chunk) is a work item; more chunks \u2192 fuller occupancy. The partial-reduce is O(1)/chunk via the deterministic ascending-chunk sum \u2192 PARITY + A/A/A preserved BY CONSTRUCTION (the candidate is bit-neutral). Constraint: dw_part scratch scales linearly with G (offset formula at 1587); must validate against the documented 62 MB workspace headroom.",
+      "expected_effect": "10-20% P2 wall-clock at d=2048 by raising dW occupancy from ~38% toward 60%+. P2 dW is the documented post-H2 bottleneck.",
+      "gate": "Kernel: fp64 parity + ascending-chunk-sum determinism bit-identical to G=1; 3-seed timing at d=2048 with G in {4,6,8}; workspace-memory bounds validation.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "FLAGSHIP MODEL ITEM: bit-neutral by construction (deterministic reduce), attacks the single largest documented d=2048 inefficiency (62% idle SMs in P2), gated only by a pure tunable bump + workspace headroom. Highest gain\u00d7confidence/risk in the whole set. UNLIKE the swizzle and S=3 items, kDecDwSplitK has NO blocking static_assert (only >=1)."
+    },
+    {
+      "rank": 2,
+      "id": "PERF-005-ATOM-INTERLEAVE-DW-EXPAND",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decoder_tc.cuh",
+      "locus": "M-atom interleave 502-532, 559-668; kDecMaxIL 106-114 (default 2, static_assert 1..4)",
+      "kind": "perf",
+      "grounded": "CONFIRMED: kIL=min(MaxAtomsM,kDecMaxIL); interleave issues kIL wgmmas/k-step into independent WgmmaAccum<N> acc[kIL] sharing one B-tile (503,524-531); static_assert allows up to 4.",
+      "description": "Expand dW M-atom interleave width from 2 to 4 for large-Nout dW tiles (ff0 [512,128], ff2 [128,512]) to deepen tensor-pipe MMA overlap while keeping B-staging constant.",
+      "mechanism": "k-step issues kIL back-to-back wgmmas into independent fp32 accumulators; per-atom accumulation stays ASCENDING-k (k=0 overwrite, k>0 add) \u2192 bit-identical numerics + A/A/A unchanged (comment 497-499). Cost: 4\u00d7(N/2) fp32 accumulator regs per thread + 4 A-tiles/slot smem \u2014 the smem is pre-sized for kAtomsM=production-max and the static_assert already permits 4. Best delivered via BEHAVIOR-003 (per-orientation IL) so fwd/dX stay at the proven 2 and only dW goes to 4.",
+      "expected_effect": "15-25% dW K-loop reduction for Nout>=256 via tensor-pipe saturation; marginal for small Nout.",
+      "gate": "Kernel: fp64 parity (ascending-k per atom); 3-seed timing on ff0/ff2 dW tiles at d=2048; register-spill check (PTX -v) that 4\u00d7(N/2) accumulators don't spill.",
+      "risk": "med",
+      "confidence": "high",
+      "note": "DEDUP: subsumes BEHAVIOR-003-ATOM-INTERLEAVE-WIDTH-CONFIG (per-GEMM IL tunable) and IL_LOOP_UNROLL_AND_PIPELINING \u2014 all three are the same interleave-width lever. BEHAVIOR-003's per-orientation split is the SAFE delivery vehicle (keeps fwd/dX at 2). Register-spill at IL=4 is the real gate."
+    },
+    {
+      "rank": 3,
+      "id": "BEHAVIOR-002-DW-SPLIT-K-ADAPTIVE",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decoder_tc.cuh",
+      "locus": "kDecDwSplitK tunable 93-95; dectc_build_dw_specs ~1485-1506",
+      "kind": "behavior",
+      "grounded": "CONFIRMED: G is currently a compile-time #define; the deterministic reduce works for any G.",
+      "description": "Make G adaptive at launch: G = clamp(max(4, nCTA/dW_tile_count), workspace-bound) so one compiled kernel adapts to GPU count / batch size without recompile.",
+      "mechanism": "Device-side dectc_dw_splitk_adaptive(nCTA, dW_tile_count) returns G; minor kernel-signature change to accept G as a runtime param instead of #define. Determinism holds for any G (ascending-chunk sum).",
+      "expected_effect": "Same occupancy boost as PERF-004 but auto-tuned across launch shapes; no recompile per shape.",
+      "gate": "Kernel: fp64 parity + workspace bounds validation for G up to 8.",
+      "risk": "low",
+      "confidence": "med",
+      "note": "Natural follow-on to flagship PERF-004: PERF-004 finds the best static G, BEHAVIOR-002 makes it shape-adaptive. Sequence them (static first, then adaptive)."
+    },
+    {
+      "rank": 4,
+      "id": "VIT_TC_001",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "head logits 850-867; head bwd dhn 1007-1011",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: head loops over kVocab with per-thread scatter + early-exit (o<kVocab) at small Vocab.",
+      "description": "Tile the vocab loop (e.g. 32-output blocks/thread) in head CE fwd AND cache out_w in smem for the head-bwd dhn contraction (VIT_TC_008), eliminating per-sample 97-weight rescans.",
+      "mechanism": "Block the vocab loop to cut warp-divergent early-exit + L1 thrash; stage out_w [kD\u00d7kVocab ~50KB] into smem once per block so the dhn=\u03a3_o dlogits\u00b7out_w contraction reads smem not gmem. Numerics unchanged (same reduction, same order).",
+      "expected_effect": "2-5% head CE fwd + 3-5% head bwd; both P1-head and P1-bwd-head benefit.",
+      "gate": "Kernel: bit-identical logits/softmax/loss + dhn; 3-seed timing at d=2048; head clock64 delta if SG_VIT_PROFILE.",
+      "risk": "low",
+      "confidence": "med",
+      "note": "DEDUP: merges VIT_TC_001 (fwd vocab tiling) + VIT_TC_008 (bwd out_w smem cache) + VIT_TC_013 (warp-per-sample) \u2014 all target the same head-CE per-sample/per-vocab inefficiency. 50KB smem for out_w must be checked against the kernel's existing ~42KB static budget (occupancy assert at fused_decoder 317)."
+    },
+    {
+      "rank": 5,
+      "id": "VIT_TC_010",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "tc_gemm_block_unpipelined M-atom interleave 348-402; wgmma orchestration 355-387",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: the ViT GEMM engine mirrors the decoder interleave (#pragma unroll 1 on the group loop, one group at a time).",
+      "description": "Software-pipeline the ViT GEMM group loop: issue group g's MMAs, then stage group g+1's B-tile during g's wgmma_wait, overlapping stage latency with compute.",
+      "mechanism": "Restructure the g0 loop as a classic prologue/steady pipeline (the same pattern the decoder cp.async ring already uses). Accumulation order unchanged (ascending-k per atom) \u2192 bit-identical. Applies to fwd/dX/dW call sites.",
+      "expected_effect": "2-4% per call site; cumulative ~3-4% across P1+P2.",
+      "gate": "Kernel: fp64 parity (ascending-k preserved); 3-seed timing at d=2048.",
+      "risk": "med",
+      "confidence": "med",
+      "note": "DEDUP: merges VIT_TC_010 + VIT_TC_018 (both pipeline the ViT M-atom interleave) + VIT_TC_011 (P1 tile-loop unroll, weaker variant). This is the decoder PERF-005 idea ported to ViT; once the decoder interleave-width work lands, port the winning structure here."
+    },
+    {
+      "rank": 6,
+      "id": "VIT_TC_002",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "LN fwd 572-585 (mean-loop+vit_block_sum, then var-loop+vit_block_sum); LN bwd 593-621",
+      "kind": "micro",
+      "grounded": "CONFIRMED: lines 572-577 do TWO block reductions (mean then variance) with the variance loop reading (xr[j]-mean) \u2014 a genuine two-pass.",
+      "description": "Reduce LN sync/reduction count by merging the dgamma/dbeta + sda/sdax passes in LN BWD (NOT the fwd mean/var, which cannot be single-passed without breaking numerics).",
+      "mechanism": "SCOPED DOWN from the original (fwd fusion is parity-unsafe \u2014 see dropped note): the LN-bwd fusion at 597-620 combines the dgw/dgb accumulation loop with the sda/sdax loop under a single owner-per-j rule, cutting __syncthreads from ~5 to 2-3 WITHOUT changing accumulation order. The fwd two-pass variance MUST stay two-pass (\u03a3(x-mean)\u00b2 needs mean first; sum/sumsq fusion changes rounding).",
+      "expected_effect": "2-4% LN bwd (runs 2\u00d7/layer); decoder LN has identical shape (dual win).",
+      "gate": "Kernel: deterministic single-owner-per-j accumulation, numerics bit-identical; 3-seed timing.",
+      "risk": "med",
+      "confidence": "med",
+      "note": "DEDUP+SCOPE: VIT_TC_002 (fwd) + VIT_TC_003 (bwd) merged; the FWD-fusion half is DROPPED for parity (\u03a3(x-mean)\u00b2 is inherently two-pass), only the BWD sync-merge survives and only the sync-count, not accumulation, may change."
+    },
+    {
+      "rank": 7,
+      "id": "VIT_TC_006",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "patch_proj input staging 700-706 (float->bf16) then smem stage 711-728 with a __syncthreads between",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: two cooperative loops + a sync; the candidate's own size estimate was self-corrected to ~3% of GEMM volume.",
+      "description": "Fuse the float->bf16 patch conversion with the Major-K smem staging into one stage_kmajor_tile pass, saving one __syncthreads and improving L1 locality.",
+      "mechanism": "stage_kmajor_tile reads float patches, converts inline, writes Major-K in one pass. bf16 conversion bit-identical.",
+      "expected_effect": "~1% (patch_proj is a small fraction of token-GEMM volume).",
+      "gate": "Kernel: bf16 conversion identical, zero numeric change; 3-seed timing.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Small but clean and bit-neutral. The original's own size correction (94%\u21923%) is the honest figure."
+    },
+    {
+      "rank": 8,
+      "id": "VIT_TC_020",
+      "track": "model",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/fused_vit_megakernel.cuh",
+      "locus": "P3 apply_optimizer dispatch 1098-1099; per-element adamw bc1/bc2",
+      "kind": "micro",
+      "grounded": "PLAUSIBLE: maps onto the same per-element-vs-per-tensor scalar question as the decoder elemwise track; bc1/bc2 broadcast.",
+      "description": "Broadcast bc1=1-b1^step, bc2=1-b2^step (and Muon/SG aux variants) once per CTA in smem before the P3 tensor loop, instead of recomputing the powf per dispatch.",
+      "mechanism": "Compute the powers once into __shared__ with one __syncthreads, pass to apply_optimizer. Same powf math, reordered \u2192 bit-identical.",
+      "expected_effect": "2-4% P3 (fewer fp32 powf + better I-cache reuse) across optimizers.",
+      "gate": "Kernel: math identical (same powf, hoisted); 3-seed timing at d=2048.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "NOTE the decoder twin already hoists Muon aux bc1/bc2 to per-TENSOR (fused_decoder 1297-1298) \u2014 verify whether ViT P3 actually recomputes per-element before investing; if the compiler already hoists the loop-invariant powf, this is a no-op. Cross-track sibling of elemwise-002/elemwise-015."
+    }
+  ],
+  "optimizer_track": [
+    {
+      "rank": 1,
+      "flagship": true,
+      "id": "elemwise-001",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/algorithms/adamw.h",
+      "locus": "adamw_step 30-62, adamw_step_vec4 65-105 (EXISTS, hand-written, never called); P3 loop fused_decoder 288-289",
+      "kind": "perf",
+      "grounded": "CONFIRMED: adamw_step_vec4 is fully implemented at 65-105 but the P3 loop (fused_decoder 288-289) calls per-element apply_optimizer<Opt>; the vec4 path is dead.",
+      "description": "Wire the existing vec4 fast-path into the P3 tail for FP32 AdamW(-tail) optimizers, gated on per-tensor size%4==0, processing 4 elements/call.",
+      "mechanism": "P3 loop at 288 calls apply_optimizer<Opt> scalar; for the AdamW branch (opt_components 386) route a size%4==0 aligned tensor through adamw_step_vec4. Bulk float4 load/store of (param,exp_avg,exp_avg_sq,grad) cuts L1 bandwidth 4x and relieves register pressure (P3 runs near the 200-reg threshold). Math is bit-identical (same per-lane FLOPs, same order). REALITY: only the AdamW/SG2-tail branch has a vec4 today; extending to the 9 other branches is more work, so scope v1 to AdamW + SG2-tail.",
+      "expected_effect": "2-4% at d=2048 from reduced L1 misses + register relief on large tensors; neutral on the few <256-elem tensors.",
+      "gate": "fp64 parity hard-gate (vec4 is bit-identical math) + 3-seed timing at d=2048.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "FLAGSHIP OPTIMIZER ITEM: the vec4 kernel is ALREADY WRITTEN and validated-shaped (adamw.h:65-105) but unused \u2014 lowest-effort/highest-certainty win in the track. Bit-identical by construction. The decoder tensors at d=2048 are large enough (ff0/ff2 65536 elems) to bite."
+    },
+    {
+      "rank": 2,
+      "id": "elemwise-019",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "P3 codegen / autotune search space",
+      "kind": "perf",
+      "grounded": "PLAUSIBLE: P3 was never autotuned (the search space targets the GEMM tile/IL/stages, not the optimizer tail).",
+      "description": "Add P3-specific autotune knobs: {vec_width:{1,2,4}, smem_scalar_cache:{off,on}, small-tensor batch threshold} and tune on live steps.",
+      "mechanism": "Orthogonal P3 search dimension; generate specializations, autotune, pick winner. This is the systematic vehicle that MEASURES elemwise-001 (vec_width), elemwise-013 (batch threshold), elemwise-015 (smem scalar cache) rather than hand-guessing them.",
+      "expected_effect": "1-3% if the current scalar/no-cache default is sub-optimal (likely, since P3 is untuned); +2-3x compile time per cell for the extra configs.",
+      "gate": "3-seed timing at d=2048 for top-K winners vs baseline.",
+      "risk": "med",
+      "confidence": "high",
+      "note": "DEDUP/UMBRELLA: this is the autotune harness that turns elemwise-001/013/015 from guesses into measured wins. Sequence: land elemwise-001 (vec4) first as a proven default, then let this knob explore the rest."
+    },
+    {
+      "rank": 3,
+      "id": "elemwise-011",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_components.cuh",
+      "locus": "FusedOptState struct 105-243 (300+ bytes, interleaved null pointers)",
+      "kind": "perf",
+      "grounded": "CONFIRMED: FusedOptState (105-243) is a large struct with shared Adam scalars interleaved among many optimizer-specific pointers (psi_*, sam_dir, orth, s_track, smart_grad\u2026).",
+      "description": "Reorder FusedOptState to pack the hot shared Adam scalars (lr,beta1,beta2,eps,wd,bc1,bc2) into the first cache line; push rarely-touched per-optimizer pointers later.",
+      "mechanism": "apply_optimizer's hot path reads only the shared scalars; grouping them into one 64B line reduces cache-line bouncing across the P3 element loop. No semantic change (field reorder only).",
+      "expected_effect": "<1% standalone; 3-5% combined with elemwise-001 (vec4) + the sg2-001 scalar-prefetch family (reduced cache-line traffic compounds).",
+      "gate": "fp64 parity hard-gate (pure field reorder) + 3-seed timing.",
+      "risk": "low",
+      "confidence": "med",
+      "note": "DEDUP: pairs with sg2-001 (cache per-tensor scalars in regs at stage entry) \u2014 both reduce per-element scalar-load traffic; same theme as elemwise-015 (smem scalar cache) and elemwise-018 (__restrict__). Land as a small bundle."
+    },
+    {
+      "rank": 4,
+      "id": "sg2-002-gs-materialization",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergrok2.cuh",
+      "locus": "g_sorted/s_sorted materialization 1207-1230 (two passes + two __syncthreads)",
+      "kind": "perf",
+      "grounded": "CONFIRMED: 1210-1218 writes g_sorted/s_sorted into ws.q then 1224-1227 copies to ws.win_k/win_v \u2014 two full-N passes + two syncs; the author's own comment (1220-1223) shows they considered strided views and chose the copy for simplicity.",
+      "description": "Compute g_sorted/s_sorted on-the-fly in GRU/PEER via perm indirection (grad[perm[r]], sharp[perm[r]]) instead of materializing through ws.q then copying.",
+      "mechanism": "Remove 1210-1227; pass perm+grad+sharp into sg2_stage_gru/peer which gather inline. Saves 2\u00d7(N\u00b7sizeof(float)) HBM writes + 2 CTA-wide syncs. PARITY: the gather order must be byte-identical to the current materialized order (same perm[r] map) \u2014 the comment confirms GRU/PEER already read grad[perm[r]], so the math is unchanged, only the staging is removed.",
+      "expected_effect": "For large N saves ~800KB writes + 2 syncs/tensor; small absolute but real on the SG2 cell's hottest tensors.",
+      "gate": "compile.py self-test + fp64 parity (GRU/PEER logic unchanged, indexing shift only); 3-seed timing across mixed N at d=2048.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Best-grounded SG2 item: the two-pass+two-sync is right there at 1207-1230 and the author flagged it as a simplicity-over-perf choice that this candidate reverses. SG2 is the HCA/CSA NSA meta-optimizer \u2014 parity gate is the d-estimate/loss trajectory."
+    },
+    {
+      "rank": 5,
+      "id": "sg2-009-hca-dense-attn-unroll",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergrok2.cuh",
+      "locus": "sg2_stage_hca_attention 739-775 (Nh loop, no outer unroll)",
+      "kind": "perf",
+      "grounded": "PLAUSIBLE: the head_dim inner loop unrolls but the outer Nh loop (small, 2-8 for typical N) does not.",
+      "description": "Add #pragma unroll 2/4 on the HCA dense-attention Nh loop to expose ILP across the online-softmax accumulation.",
+      "mechanism": "Nh<=N/HCA_COMPRESS is small; unrolling the outer loop pipelines the online-softmax reductions. Same math (online-softmax is associative-stable in this fixed order) \u2192 bit-identical.",
+      "expected_effect": "5-10% on the HCA attention stage (~40% of S2).",
+      "gate": "compile.py: numerical equivalence; measure HCA attention stage latency at d=2048.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "Cleanest pure-perf SG2 micro: a pragma on a small loop, no layout/order change. Cross-track sibling of the decoder/ViT interleave-pipelining theme."
+    },
+    {
+      "rank": 6,
+      "id": "sg2-020-vectorized-gru-state-io",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergrok2.cuh",
+      "locus": "sg2_stage_gru state I/O 816-821, 853 (element-by-element)",
+      "kind": "perf",
+      "grounded": "PLAUSIBLE: GRU_HIDDEN=4 default means one float4 per element \u2014 a natural vec4 boundary for the state load/store.",
+      "description": "Vectorize gru_state load/store as float4 (GRU_HIDDEN=4 \u2192 exactly one float4/element), coalescing into 4x-wider transactions.",
+      "mechanism": "Replace scalar gru_state reads/writes with float4; __ldg on reads. Same I/O, vectorized \u2192 bit-identical. NOTE this collides with sg2-006 (gru_state scatter reorder) \u2014 they touch the same writes; pick vectorization (lower risk) over the scatter-reorder unless profiling shows scatter is the dominant stall.",
+      "expected_effect": "2-5% GRU stage I/O.",
+      "gate": "compile.py: numerical equivalence (vectorized I/O); measure GRU state I/O bandwidth at d=2048.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "DEDUP: supersedes sg2-006 (scatter-opt) for the same gru_state writes \u2014 vec4 is the lower-risk lever; only pursue sg2-006 if vec4 leaves a measured scatter stall."
+    },
+    {
+      "rank": 7,
+      "id": "sg2-001-scalar-prefetch",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergrok2.cuh",
+      "locus": "sg2_meta_stages scalar tid-indexed loads 1245-1247",
+      "kind": "perf",
+      "grounded": "CONFIRMED: sc.alpha[tid]/beta1[tid]/gru_decay[tid]/lamb_eff[tid]/bc1[tid]/bc2[tid] are indexed at the apply call (1245-1247).",
+      "description": "Cache the 6 per-tensor scalars into registers at sg2_meta_stages entry instead of re-indexing by tid per stage.",
+      "mechanism": "Load the 6 floats once at entry; reuse in S3/S5. ~6 regs/thread, acceptable per the header's 40-78 reg estimate.",
+      "expected_effect": "1-2 cycles/tensor latency hiding; negligible bandwidth.",
+      "gate": "compile.py self-test + fp64 parity (scalar order fixed); 3-seed timing with P~30 tensors.",
+      "risk": "low",
+      "confidence": "high",
+      "note": "DEDUP: same theme as elemwise-011 (struct repack) / elemwise-015 (smem scalar cache) \u2014 bundle the 'load shared scalars once' family. Lowest absolute SG2 gain but trivially safe."
+    },
+    {
+      "rank": 8,
+      "id": "elemwise-018",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_components.cuh",
+      "locus": "apply_optimizer + per-element step fns 381-520 (some ptrs __restrict__, some not)",
+      "kind": "behavior",
+      "grounded": "CONFIRMED: apply_optimizer params are __restrict__ (382) but several callee step fns and FusedOptState-sourced pointers are not uniformly annotated.",
+      "description": "Audit and add __restrict__ to all provably-disjoint pointer params across apply_optimizer and the step functions.",
+      "mechanism": "Uniform __restrict__ relaxes aliasing assumptions \u2192 better register allocation. No semantic change.",
+      "expected_effect": "1-2% from improved allocation.",
+      "gate": "fp64 parity hard-gate + 3-seed timing.",
+      "risk": "low",
+      "confidence": "med",
+      "note": "Bundle with elemwise-011 (struct repack) as a single low-risk codegen-quality pass; verify disjointness per optimizer (state buffers ARE disjoint by construction)."
+    },
+    {
+      "rank": 9,
+      "id": "elemwise-020",
+      "track": "optimizer",
+      "file": "/workspace/SuperGrok1.5/csrc/algorithms/prodigy.h",
+      "locus": "prodigy_apply_step s_track[idx] += d*g (line 92); bound in fused_decoder 153",
+      "kind": "perf",
+      "grounded": "PARTIAL/AUDIT: s_track is WRITTEN (prodigy.h:92) and bound (fused_decoder:153) but the FUSED d-reduction (prodigy_precompute_reduce_phaseA, opt_stages_precompute 653) reads param_init/grad \u2014 s_track's downstream READ in the fused path is unconfirmed.",
+      "description": "Determine whether s_track is read anywhere in the FUSED Prodigy path; if dead, remove the per-element load+store.",
+      "mechanism": "Trace s_track consumers in the fused d-estimate. If the fused d-reduction never reads it (eager uses it for the d-numerator trajectory), the write is dead HERE and removable (1 load+1 store/element saved). PARITY RISK: if the d-trajectory does depend on it, removal diverges the d-estimate \u2014 so this is an AUDIT-FIRST, remove-only-if-provably-dead item.",
+      "expected_effect": "1-2% on Prodigy IF dead; zero if live.",
+      "gate": "fp64 parity hard-gate (Prodigy d-estimate trajectory must be bit-identical) + 3-seed timing \u2014 only proceed if the audit proves s_track unread in the fused path.",
+      "risk": "med",
+      "confidence": "med",
+      "note": "Keep as an AUDIT task, not a blind edit. The fused-vs-eager Prodigy d-trajectory parity is the make-or-break \u2014 do not remove a state write that the d-estimate consumes."
+    }
+  ],
+  "dropped": [
+    {
+      "id": "WGMMA_SMEM_BANK_SWIZZLE",
+      "track": "model",
+      "reason": "PARITY-RISK + FALSE MECHANISM. Claims 'enable kSwizzle128B, no numerics change, only descriptor bits 63:62 differ.' GROUND TRUTH (wgmma.cuh 250-288 + staging 584-594): the descriptor LBO/SBO (lbo=MN*16, sbo=128) and the smem staging map (half*(MN*8)+mn*8) are derived SPECIFICALLY for the NONE/INTERLEAVE layout. 128B swizzle requires a DIFFERENT smem tile layout AND different LBO/SBO; flipping only the swizzle bits makes the wgmma read garbage. The 'zero-copy' claim is false. The substrate supports the modes for the self-test, but production GEMM would need a full re-stage + re-derived descriptors \u2014 not the bit-neutral edit claimed."
+    },
+    {
+      "id": "PERF-001-SWIZZLE-128B",
+      "track": "compile",
+      "reason": "DUPLICATE of WGMMA_SMEM_BANK_SWIZZLE; same false 'zero-copy descriptor change' premise. Same parity-risk: the staging loop (model_stage_decoder_tc 584-594) writes the NONE-layout interleave; 128B swizzle needs a different write map + LBO/SBO. Dropped for the same reason."
+    },
+    {
+      "id": "BEHAVIOR-001-SWIZZLE-MODE-SELECT",
+      "track": "model",
+      "reason": "Tunable wrapper for the swizzle change that is itself parity-unsafe in production. Exposing -DSG_TUNED_WGMMA_SWIZZLE doesn't make 128B correct without re-staging + re-deriving LBO/SBO (wgmma.cuh 250-288). The substrate template param exists; the model-header staging does not produce a swizzled layout. Dropped: would compile and silently corrupt the GEMM."
+    },
+    {
+      "id": "PERF-002-FENCE-CONSOLIDATION",
+      "track": "compile",
+      "reason": "PARITY/CORRECTNESS-RISK. The cp.async ring (model_stage_decoder_tc 607-628) issues cp_async_wait_group<0>+fence_async_proxy+__syncthreads per k-iter to publish the slot before its first wgmma read; the comment (545-551,617-619) documents this as the silicon-validated tile_pipeline handshake with WAR-safety on slot (k+1)%S. Moving the async-proxy fence outside the loop breaks the gmem->smem visibility ordering the wgmma depends on \u2014 a memory-ordering hazard, not a free micro-op. The 1-2% claim is not worth risking the validated handshake."
+    },
+    {
+      "id": "RING_DEPTH_INCREASE_S3",
+      "track": "model",
+      "reason": "BLOCKED BY DESIGN INVARIANT + not a free bump. kDecTcStages is hard static_assert'd <=2 (model_stage_decoder_tc 116-117: 'must be 1 or 2'); S=3 requires lifting the assert AND redesigning the 2-slot WAR-safety (slot drained at k-1, released at k). The S=2 double-buffer is the already-validated mamba-TC carryover (comment 82-89). S=3 is real ring-buffer rework with smem growth, not the tunable bump the candidate implies."
+    },
+    {
+      "id": "PERF-003-RING-PREFETCH-LATENCY",
+      "track": "compile",
+      "reason": "DUPLICATE of RING_DEPTH_INCREASE_S3 (both need S>=3). Same static_assert<=2 wall (116-117) and same 3-slot WAR-safety redesign + smem/register growth. The 5-10% ceiling is real but the candidate misframes it as a tunable; it is a ring rewrite gated by an explicit design invariant."
+    },
+    {
+      "id": "PERF-006-BIAS-GRID-STRIDE",
+      "track": "compile",
+      "reason": "ALREADY DONE (self-admitted). The candidate text itself says 'COMPLETED positive-impact change \u2026 No further optimization needed here.' Confirmed at model_stage_decoder_tc 1715-1727: the single-owner grid-stride column-sum is already in place ('WAS: each CTA strided ALL bias outputs \u2026 this task set out to fix'). Reference-only, no action."
+    },
+    {
+      "id": "VIT_TC_012",
+      "track": "model",
+      "reason": "FALSE PREMISE. Claims ViT P2 dW uses q.next_block() atomicAdd work-steal with contention to eliminate. Ground truth (fused_vit_megakernel 612: 'for (int item=cta; item<n_dw*kDwG; item+=nCTA)' and 619 'for (int gt=cta; gt<n_dw; gt+=nCTA)') \u2014 the ViT P2 dW ALREADY uses exactly the deterministic fixed-stride round-robin partition the candidate proposes. The optimization is already implemented."
+    },
+    {
+      "id": "VIT_TC_002-FWD-HALF",
+      "track": "model",
+      "reason": "PARTIAL-DROP (fwd-fusion half). The fwd LN mean/variance fusion claims 'bit-identical (same accumulation order)' but \u03a3(x-mean)\u00b2 is INHERENTLY two-pass: a single-pass sum/sumsq computes var=E[x\u00b2]-E[x]\u00b2 which is a DIFFERENT rounding (catastrophic-cancellation-prone) \u2192 fails fp32 bit-identity. The bwd sync-merge half is kept (model_track rank 6); only the parity-breaking fwd fusion is dropped."
+    },
+    {
+      "id": "elemwise-009",
+      "track": "optimizer",
+      "reason": "SUB-NOISE + REVERSES A DELIBERATE CHOICE. Claims '2 powf per Muon optimization' done on-device. Ground truth (fused_decoder 1297-1298): a_bc1/a_bc2 are computed ONCE PER TENSOR (outside the element loop at 1299), not per element. The comment explicitly states they were 'kept out of the mirror to shrink the host ABI; fp32 powf, tol 2e-3 ample' \u2014 a deliberate ABI-shrink. ~2 powf \u00d7 ~11 Muon-1D tensors = sub-noise; widening the host ABI by 2 floats to save it reverses an intentional decision."
+    },
+    {
+      "id": "elemwise-008",
+      "track": "optimizer",
+      "reason": "FALSE PREMISE. Claims psi_b2 'read PER ELEMENT \u2026 10K redundant reads.' Ground truth (opt_components 483-484): psi_b2 IS read once before the psi forward; it's a single scalar deref of loop-invariant st.psi_W2[kPsiHidden] that the compiler trivially hoists. The 'hoist outside the element loop' is already effectively done; no real redundancy at -O3."
+    },
+    {
+      "id": "elemwise-017",
+      "track": "optimizer",
+      "reason": "INFEASIBLE (data dependency) + GrokAdamW-only marginal. Proposes merging P2.5 global-norm into P2 grad-reduction for 'one pass instead of two.' Ground truth (fused_decoder 929-970): P2.5 computes \u03a3g\u00b2 over the ASSEMBLED reduced grad, which does not exist until P2 completes \u2014 they are inherently sequential. Cannot fuse without breaking the dependency. Also GrokAdamW/NeuralGrok-only and the norm pass is one sweep over ~400K elems."
+    },
+    {
+      "id": "elemwise-002",
+      "track": "optimizer",
+      "reason": "SUB-NOISE in the scalar path. Claims sg_safe_bc called TWICE per element. Ground truth (adamw.h 53-54): in scalar adamw_step, sg_safe_bc(bc1)/(bc2) are each called ONCE; they are single fmaxf on loop-invariant scalars the compiler hoists out of the element loop. (The vec4 path 97-100 does call them 4x, but vec4 enablement is covered by flagship elemwise-001, which can fold the CSE.) No standalone action."
+    },
+    {
+      "id": "elemwise-003",
+      "track": "optimizer",
+      "reason": "SELF-ADMITTED <0.5% and the candidate itself rates 'update is not the bottleneck.' fma-fusing the AdamW tail is a register micro that nvcc already does at -O3 (fma contraction default-on). Sub-noise."
+    },
+    {
+      "id": "elemwise-004",
+      "track": "optimizer",
+      "reason": "NO-OP by candidate's own text: 'these are already guarded via if-constexpr on OptId.' Adds runtime scalar checks for clarity only; 'Negligible perf (checks are free).' Not a perf or correctness change."
+    },
+    {
+      "id": "elemwise-005",
+      "track": "optimizer",
+      "reason": "SELF-ADMITTED <0.1% kernel impact ('even 10x speedup yields <0.1%'). Prodigy phaseB serial-on-thread-0 is a tiny fraction of P3; parallelizing risks the deterministic owner-sum order for no measurable gain. Beneficial only hypothetically 'if other optimizations reduce P3 dramatically' \u2014 not now."
+    },
+    {
+      "id": "elemwise-006",
+      "track": "optimizer",
+      "reason": "<1% on the actual model. Candidate states decoder avg tensor ~14K \u2192 savings <1%; the SG11/15 per-tensor mu/gate is already computed once per tensor with a per-tensor sync. Pre-kernel extraction adds a launch + state buffer for sub-1% on the target geometry."
+    },
+    {
+      "id": "elemwise-007",
+      "track": "optimizer",
+      "reason": "SELF-ADMITTED <0.5%. The GrokAdamW '3 grad reads' is actually grad[idx] read once (opt_components 450) + a step==1-only cold-path reseed (451); the compiler CSEs grad[idx]. Register live-range relief is marginal per the candidate's own rating."
+    },
+    {
+      "id": "elemwise-010",
+      "track": "optimizer",
+      "reason": "DUPLICATE of sg2/Muon matmul vectorization theme + 'Negligible on decoder.' muon_matmul vectorization is ViT-Muon-only (2D matrices), narrow, and the K-contraction stays scalar. Low reach; the broader vec4 win is captured by flagship elemwise-001 and the autotune harness elemwise-019."
+    },
+    {
+      "id": "elemwise-012",
+      "track": "optimizer",
+      "reason": "PARITY-RISK for sub-noise. Replacing expf in the SG11 sigmoid gate with a polynomial approx (error <1e-3) trades exactness for a gate computed ONCE PER TENSOR (~32 expf/step total) \u2014 negligible time, and the approximation introduces a numerics deviation that must clear the fp64 hard-gate it cannot strictly satisfy. Not worth it."
+    },
+    {
+      "id": "elemwise-013",
+      "track": "optimizer",
+      "reason": "HIGH-RISK + subsumed. Batching small tensors per CTA claim alters TaskQueue claim semantics (determinism risk) for a win only if the decoder has many <256-elem tensors. The systematic version (small-tensor batch threshold) is folded into the autotune harness elemwise-019; the standalone TaskQueue rework is not warranted."
+    },
+    {
+      "id": "elemwise-014",
+      "track": "optimizer",
+      "reason": "PARITY-RISK (hard-gate fail). FP16 intermediate accumulators for m/v/update cannot satisfy the fp64 parity hard-gate \u2014 fp16 moment math is not bit-identical to the fp32 reference (the candidate itself flags 'VERY HARD-GATE' and risk=high/confidence=low). Numerics regression by construction."
+    },
+    {
+      "id": "elemwise-015",
+      "track": "optimizer",
+      "reason": "DEDUP into the scalar-cache bundle (kept via elemwise-011 + sg2-001). SMEM-caching bc1/bc2/lr/... is the same 'load shared scalars once' theme; on its own the candidate rates 1-2% only if register-bound and 'negligible if L1 misses dominate.' Folded, not separately tracked."
+    },
+    {
+      "id": "elemwise-016",
+      "track": "optimizer",
+      "reason": "DEDUP into elemwise-001 (P2 reduction theme). Using block_reduce_sum_f32 helpers in P2 grad assembly must preserve the deterministic owner-sum order (parity leg); the realistic 0.4-2% overlaps the broader P2/vec4 work and the determinism constraint makes a swap-in non-trivial. Lower priority than the flagship; folded."
+    },
+    {
+      "id": "COMPILE_PY_BUILD_CACHE_HOIST",
+      "track": "compile",
+      "reason": "FABRICATED LOCUS + DEDUP. References /workspace/SuperGrok1.5/compile.py which DOES NOT EXIST (only grokking_optimizers/compile.py). The underlying concern (do all SG_TUNED_* device macros participate in the cache key?) is real and folded into compile-07 (cache-key collision avoidance) + compile-02 (the device-cache soundness prerequisite)."
+    },
+    {
+      "id": "COMPILE_PY_PTXAS_INLINE_HINTS",
+      "track": "compile",
+      "reason": "FABRICATED LOCUS + speculative. References the non-existent root compile.py. Tuning ptxas --inline-threshold/--maxrregcount globally is a blind knob with the candidate's own 'risk: over-inlining bloats code and reduces occupancy.' If pursued at all it belongs in the existing GEMM autotune search space, not a new compile.py feature on a nonexistent file."
+    },
+    {
+      "id": "COMPILE_PY_LOOP_UNROLL_PRAGMAS",
+      "track": "compile",
+      "reason": "DEDUP into the GEMM autotune search space + BUILD-001. The decoder K-loop / group-loop / epilogue pragmas (model_stage_decoder_tc 558,620,655) are already #pragma unroll 1 by deliberate choice (register/smem bound). A -D-injected unroll sweep is BUILD-001's content; dropped as a duplicate framing."
+    },
+    {
+      "id": "BUILD-001-COMPILE-PY-LOOP-UNROLL",
+      "track": "compile",
+      "reason": "FABRICATED LOCUS + low confidence. References a 'compile_kernel_tunables()' in root compile.py that does not exist; the real autotuner is grokking_optimizers/compile.py and the K-loop pragmas live in the .cuh headers. The idea (auto-suggest unroll depths from PTX register pressure) is speculative (the loops are intentionally unroll 1) and would more naturally be a search-space dimension than a PTX-parsing feature."
+    },
+    {
+      "id": "BUILD-002-COMPILE-PY-BANK-CONFLICT-REPORT",
+      "track": "compile",
+      "reason": "INFORMATIONAL-ONLY (candidate's own classification) + serves the dropped swizzle items. 'No direct perf gain, but supports optimization decisions' \u2014 and the decisions it supports (PERF-001 swizzle selection) are themselves dropped as parity-unsafe. Porting CUTLASS bank-conflict simulation to compile.py is high-effort tooling for a downstream change we're not making."
+    },
+    {
+      "id": "QUALITY-001-DESCRIPTOR-BOUNDS-CHECK",
+      "track": "optimizer",
+      "reason": "NON-PERF + zero current bug. Debug-only assert on LBO/SBO 14-bit fields (wgmma.cuh 220-241). The fields are enforced by design (tiles sized so LBO/SBO << 16384) and there is no reported corruption. Zero production cost but also zero positive impact on the campaign's perf/parity objective; a nicety, not an optimization."
+    },
+    {
+      "id": "QUALITY-002-WGMMA-CONVERGENCE-CHECK",
+      "track": "optimizer",
+      "reason": "NON-PERF dev-mode check. __ballot divergence detector at the wgmma issue site (wgmma.cuh 574-591); fires only under SG_WGMMA_SAFETY_CHECKS in dev. No runtime/parity impact in production builds; the warpgroup .aligned convergence is already guaranteed by the kernel structure. Not an optimization."
+    },
+    {
+      "id": "PERF-007-DESCRIPTOR-CACHING",
+      "track": "compile",
+      "reason": "SUB-NOISE, self-rated confidence=low. make_desc_A/B are ~10 cheap integer ops (wgmma.cuh 220-241) the compiler already hoists for fixed-layout loops (smem_base+lbo/sbo are loop-invariant per atom group); precomputing them by hand duplicates -O3 LICM. 1-2% claim is optimistic for already-hoistable arithmetic."
+    },
+    {
+      "id": "PP_STAGE_BOUNDARY_P2P_COPY",
+      "track": "model",
+      "reason": "OUT OF SCOPE (multi-GPU PP) + no single-GPU effect. pp_stage_decoder_tc handoff (158-173); the candidate itself states 'Single-GPU loopback: no effect.' The campaign's gate is single-node d=2048 fused-megakernel timing; an async P2P/NCCL overlap is a multi-GPU pipeline feature outside the measured regime."
+    },
+    {
+      "id": "RING_ASYNC_GUARD_ELIMINATION",
+      "track": "model",
+      "reason": "SELF-ADMITTED NEGLIGIBLE (<0.1%) for the actual geometry. The row_valid pad guard (model_stage_decoder_tc 595-601) matters only for large ragged V; decoder V=99 in N=128 is tiny. Candidate: 'Negligible for small pad regions. Relevant only if V large.' No bite at the decoder's shapes."
+    },
+    {
+      "id": "EARLY_DECTC_SPEC_BUILD",
+      "track": "model",
+      "reason": "SELF-ADMITTED ~0-1% and confidence=low. Overlapping the ~1us dectc_build_dw_specs (9 structs ~100B) behind tile-drain (fused_decoder 710-729) is in the noise; introduces a CTA-0-collective + extra barrier-fence reasoning for a microsecond. Not worth the data-race surface."
+    },
+    {
+      "id": "P2_GRAD_ASSEMBLY_VECTORIZATION",
+      "track": "model",
+      "reason": "DEDUP into the P2/vec theme (kept via elemwise-001/016 family) + low marginal. P2 grad-assembly element loops; the win is 'often overlap-masked by P1 straggler variance' (candidate). The general vectorization lever is captured; this specific locus is lower-confidence and overlap-masked."
+    },
+    {
+      "id": "PRODIGY_REDUCE_DOUBLE_BUFFERING",
+      "track": "model",
+      "reason": "SELF-ADMITTED <0.5% even if fully hidden. Prodigy fixed-partition reduce (fused_decoder 1022-1068) is a tiny fraction of P2; ping/pong overlap of CTA0 owner-sum is microscopic. Confidence=low by the candidate. No measurable bite."
+    },
+    {
+      "id": "LAUNCH_BOUNDS_OCCUPANCY_TUNING",
+      "track": "model",
+      "reason": "CONTRADICTS A HARD INVARIANT. Proposes __launch_bounds__ 512 / 2 CTAs per SM. The kernel is a PERSISTENT one-CTA-per-SM GridBarrier design; the host launcher ASSERTS occ>=1 and the comment (fused_decoder 314-320) states ~42KB smem + high reg count already can't fit >1 block/SM ('reduce footprint or fall back'). Doubling blockDim/nCTA would break the grid-barrier rendezvous and almost certainly fail the occupancy assert. Architecturally incompatible."
+    },
+    {
+      "id": "sg2-018-host-sort-fusion-investigation",
+      "track": "optimizer",
+      "reason": "INTEGRATION-LEVEL (not a kernel-parity gate) + large. Moving the host torch.argsort (sg2_meta_tail.cu:60, driver-precomputed perm/unsort) into an in-kernel STAGE -1 is an end-to-end wall-clock change requiring the composed-megakernel sort path, gated at integration level not fp64-parity-at-d=2048. SG2-meta NSA architecture; high blast radius for a host-side ~10-50ms that's outside the kernel timing the campaign measures."
+    },
+    {
+      "id": "sg2-003-compress-inline-opt",
+      "track": "optimizer",
+      "reason": "PARITY-RISK in the HCA/CSA pooling math. Refactoring sg2_stage_compress (579-607) to compute softmax(compress_w) once per j then share across d channels reorders the pooling reduction; the CSA/HCA compress is the NSA-derived core whose fp64 parity is load-bearing. Medium gain (~28 expf/tensor saved) does not justify perturbing the meta-net numerics that the gate oracle validates."
+    },
+    {
+      "id": "sg2-004-topk-bitonic-register",
+      "track": "optimizer",
+      "reason": "HIGH-RISK, confidence=low, conditional. Warp-bitonic top-k (sg2_stage_topk 660-690) must reproduce the insertion-sort tie-order EXACTLY for determinism; the occupancy win is gated on register pressure being the limiter ('low likelihood, but worth measuring'). High parity risk for a speculative occupancy bump."
+    },
+    {
+      "id": "sg2-005-peer-routing-fused-mlp",
+      "track": "optimizer",
+      "reason": "PARITY-RISK + DEDUP with sg2-011/sg2-015. Reordering the PEER expert-MLP accumulation across the Cartesian (ia,ib) loop (974-980) changes the fp32 summation order of the expert outputs \u2192 parity risk on the SG2 smart-grad. Medium confidence; the PEER product-key family (sg2-011 key-cache, sg2-015 bounds-check) are lower-reach siblings also dropped."
+    },
+    {
+      "id": "sg2-006-gru-state-scatter-opt",
+      "track": "optimizer",
+      "reason": "DEDUP/SUPERSEDED by sg2-020. Both touch gru_state writes (816-821,853); sg2-020's float4 vectorization is the lower-risk lever for the same coalescing goal. The deferred-unsort scatter reorder adds a pass + sync for a 5-10% stall-cycle claim only on non-trivial permutations \u2014 pursue only if vec4 leaves a measured scatter stall."
+    },
+    {
+      "id": "sg2-007-weight-staging-async",
+      "track": "optimizer",
+      "reason": "MARGINAL + medium confidence; weak vs the kept SG2 items. cp.async weight staging (sg2_stage_weights 362-397) overlaps only the first tensor's S0-S1; the cooperative-loop staging is already a one-time per-tensor cost amortized across the stage pipeline. Lower reach than sg2-002/009/020; not worth the cp.async handshake addition here."
+    },
+    {
+      "id": "sg2-008-workspace-carve-static",
+      "track": "optimizer",
+      "reason": "SELF-ADMITTED 'no measurable perf change expected (memory bandwidth, not arithmetic, is the bottleneck).' Precomputing sg2_carve_ws offsets (472-511) saves ~20-30 integer ops/tensor the compiler already strength-reduces. Confidence=low by the candidate. Sub-noise."
+    },
+    {
+      "id": "sg2-010-csa-attn-soft-selection",
+      "track": "optimizer",
+      "reason": "PARITY-RISK BEHAVIOR CHANGE, confidence=low. Replacing CSA hard top-k with temperature-softmax over all Nc changes the OPTIMIZER ALGORITHM (smoother gradients, hyperparameter-dependent), explicitly may 'diverge.' This is a quality/behavior experiment requiring temperature tuning and a loss-trajectory study, not a positive-or-neutral perf edit; fails the never-regress-numerics rule unless it happens to converge."
+    },
+    {
+      "id": "sg2-011-peer-product-key-cache",
+      "track": "optimizer",
+      "reason": "HIGH-RISK, confidence=low, 'unlikely to be bottleneck.' Caching sa/sb product-key projections across heads (899-945) requires per-head Wq/A/B differ so the cacheable intermediate is narrow; the candidate itself rates it unlikely-bottleneck. Smem pressure + memoization complexity for a speculative few FMAs."
+    },
+    {
+      "id": "sg2-012-task-queue-prefetch",
+      "track": "optimizer",
+      "reason": "SELF-ADMITTED NEGLIGIBLE. Prefetching st.n[t]/row_off[t] (small ints 'likely in L1') before sg2_meta_stages; 'Negligible on average \u2026 helps for pathological schedules.' confidence=low. No bite on typical P~30."
+    },
+    {
+      "id": "sg2-013-tensor-loop-unroll",
+      "track": "optimizer",
+      "reason": "FRAGILE (compile-time NTensors) + 1-2% speculative. Templating on a fixed P=30 tensor count (1287-1292) breaks the general dynamic-tensor-count path the persistent kernel relies on; only valid for one race config. confidence=low. Brittle for a small instruction-scheduling gain."
+    },
+    {
+      "id": "sg2-014-register-spill-analysis",
+      "track": "optimizer",
+      "reason": "INVESTIGATION, not a concrete edit; conditional ('If no spilling, this is a no-op'). Worth a one-line ptxas -v check but not a candidate to schedule \u2014 if spill is found, the fix (move arrays to workspace) becomes its own concrete proposal. As written it's a measurement task with unknown payoff."
+    },
+    {
+      "id": "sg2-015-expert-indexing-bounds-check-opt",
+      "track": "optimizer",
+      "reason": "SUB-NOISE (1-2 cycles per 16 lookups) + DEDUP with sg2-005 PEER family. Moving the eidx clamp (960-966) to the top-k stage removes a usually-not-taken branch; the branch predictor already handles it. Negligible and tangled with the PEER-loop parity surface."
+    },
+    {
+      "id": "sg2-016-lut-compress-weights",
+      "track": "optimizer",
+      "reason": "PARITY-RISK QUANTIZATION, confidence=low. Pre-quantizing learned compress_w to 256-bucket LUT softmax introduces quantization error (candidate: '<5% \u2026 requires tuning bucket count') \u2014 a numerics deviation that cannot clear the fp64 hard-gate on the NSA meta-net. Behavior change, not neutral."
+    },
+    {
+      "id": "sg2-017-sync-reduction-async",
+      "track": "optimizer",
+      "reason": "HIGH-RISK ordering rework, confidence=low. Decoupling the 13 __syncthreads of the 6-stage sg2_meta_stages for cross-tensor overlap breaks the strict stage ordering the deterministic SG2 path depends on; 'requires decoupling the task queue from stage ordering (more complex).' Large parity surface on the meta-optimizer for a speculative 5-10% on high-variance batches."
+    },
+    {
+      "id": "sg2-019-smem-bank-conflict-analysis",
+      "track": "optimizer",
+      "reason": "INVESTIGATION + self-admitted '<1%' at default d=8. SG2SmemWeights bank-conflict profiling (320-359); the matrices are d\u00d7d with d=8 (tiny). Confidence=low. Measurement task with sub-1% expected payoff at the production d; not a concrete schedulable edit."
+    },
+    {
+      "id": "VIT_TC_003",
+      "track": "model",
+      "reason": "DEDUP into VIT_TC_002 (model rank 6, bwd half). Same LN-bwd loop fusion (597-620); merged. Standalone it's medium-risk (register overhead, 5\u21922-3 syncs) and identical-locus to the kept bwd-merge."
+    },
+    {
+      "id": "VIT_TC_004",
+      "track": "model",
+      "reason": "SELF-ADMITTED 1-3%, confidence=low, S=17 'already tiny.' Transposing the full-attention reduction (628-670) for a 17-position sequence is register/divergence churn the candidate rates marginal; medium-risk for low reach."
+    },
+    {
+      "id": "VIT_TC_005",
+      "track": "model",
+      "reason": "HIGH-RISK, confidence=low. Staging datt[si][hh][kSeq] in smem for the attn-bwd dscores (880-953) is a careful-ownership refactor 'modest due to already-good HBM bandwidth at small S.' High parity surface (attention bwd accumulation order) for 1-2%."
+    },
+    {
+      "id": "VIT_TC_007",
+      "track": "model",
+      "reason": "DEDUP/overlap with VIT_TC_011/VIT_TC_019 (activation write-back / L1 locality theme) + medium/low. Cooperative smem staging of per-layer Act write-back (753-820); 'Modest due to L1 cache already being effective on small-d paths.' Lower-confidence sibling of the kept ViT pipelining item."
+    },
+    {
+      "id": "VIT_TC_008",
+      "track": "model",
+      "reason": "DEDUP into VIT_TC_001 (model rank 4). The out_w smem cache for head-bwd dhn is folded into the merged head-CE item; same locus (1007-1011), same 50KB-smem caveat."
+    },
+    {
+      "id": "VIT_TC_009",
+      "track": "model",
+      "reason": "SELF-ADMITTED <1%, confidence=low, 'code-cleanliness improvement.' Merging the three P2 assembly drains (vittc_dw_biases/clspos/lnvec) saves a few percent of ~5% of total. Negligible; cleanup not perf."
+    },
+    {
+      "id": "VIT_TC_011",
+      "track": "model",
+      "reason": "DEDUP into VIT_TC_010 (model rank 5) + lower confidence. P1 tile-loop unroll (561-594) is the weaker variant of the ViT GEMM pipelining; 'Modest due to CTA already achieving high occupancy.' Folded."
+    },
+    {
+      "id": "VIT_TC_013",
+      "track": "model",
+      "reason": "DEDUP into VIT_TC_001 (model rank 4). Warp-per-sample head-CE decomposition; same head-CE inefficiency, folded. Standalone 1-2% and 'small batch makes this marginal.'"
+    },
+    {
+      "id": "VIT_TC_014",
+      "track": "compile",
+      "reason": "SELF-ADMITTED <0.5%, confidence=low. __forceinline__ on vit_gelu/etc (model_stage_vit.cuh) \u2014 'calls already inlined in the scalar path by default.' Robustness nicety, no measurable perf."
+    },
+    {
+      "id": "VIT_TC_015",
+      "track": "model",
+      "reason": "MEDIUM-RISK contiguous-slab refactor for 1-2%, confidence=med, overlaps VIT_TC_019. Repacking VitTileScratch's 11 buffers into one slab (531-552) is a broad indexing change for an L2-locality guess; lower priority than the kept ViT items."
+    },
+    {
+      "id": "VIT_TC_016",
+      "track": "model",
+      "reason": "HIGH-RISK BEHAVIOR change, confidence=low, SAM-only. Selective-SAM sparse recompute (676-776) requires offline sharpness analysis to pick parameter blocks and only fires for LookSAM/SuperGrok SAM steps; the 'subset' is a numerics change to the SAM 2nd-backward, not a neutral edit. Off-path and parity-risky."
+    },
+    {
+      "id": "VIT_TC_017",
+      "track": "compile",
+      "reason": "CONDITIONAL no-op, confidence=low. Bank-swap offset for VitTcSmem dW-specs (366-380) is 'Negligible at default kVitMaxIL=2 (no conflict)'; only bites at kVitMaxIL=4 which isn't the production setting. Speculative on an untaken config."
+    },
+    {
+      "id": "VIT_TC_018",
+      "track": "model",
+      "reason": "DEDUP into VIT_TC_010 (model rank 5). Same ViT M-atom interleave pipelining (355-387); merged."
+    },
+    {
+      "id": "VIT_TC_019",
+      "track": "model",
+      "reason": "MEDIUM-effort buffer transpose for 1-3% L1, confidence=med; overlaps VIT_TC_007/015. Transposing VitActs layout (264-270) from per-layer to per-channel touches all fwd/bwd indexing for a backward-L1 guess. Lower priority than the kept ViT GEMM-pipelining and head-CE items; revisit only if L1 profiling flags it."
+    }
+  ],
+  "summary": "SCOPE/GROUNDING: root /workspace/SuperGrok1.5/compile.py DOES NOT EXIST \u2014 every candidate citing it (COMPILE_PY_BUILD_CACHE_HOIST, COMPILE_PY_PTXAS_INLINE_HINTS, BUILD-001/002) has a fabricated locus; the real autotuner is grokking_optimizers/compile.py and the K-loop pragmas live in the .cuh headers. I read the production GEMM core, the swizzle substrate, the P3/apply_optimizer dispatch, adamw.h, the SG2 meta-stages, and the cited compile.py loci.\n\n96 raw \u2192 27 kept (10 compile / 8 model / 9 optimizer), 49 dropped (incl. dedup merges). \n\nTHREE FALSE-PREMISE THEMES drove the biggest drops: (1) SWIZZLE (WGMMA_SMEM_BANK_SWIZZLE / PERF-001 / BEHAVIOR-001) \u2014 claimed 'flip descriptor bits 63:62, zero-copy, bit-neutral,' but wgmma.cuh:250-288 derives LBO/SBO and the staging map at model_stage_decoder_tc.cuh:584-594 SPECIFICALLY for the NONE/INTERLEAVE layout; 128B swizzle needs a different smem write-map + re-derived LBO/SBO or the GEMM reads garbage. Parity-risk, not free. (2) S=3 RING (RING_DEPTH_INCREASE_S3 / PERF-003) \u2014 kDecTcStages is hard static_assert'd <=2 (lines 116-117); S=3 is a ring rewrite, not a tunable bump. (3) ALREADY-DONE / FALSE-PREMISE \u2014 PERF-006 bias grid-stride is self-admittedly complete (1715-1727); VIT_TC_012 claims an atomicAdd work-steal to remove but fused_vit_megakernel.cuh:612 ALREADY uses the proposed deterministic round-robin. LAUNCH_BOUNDS_OCCUPANCY_TUNING contradicts the persistent one-CTA-per-SM GridBarrier invariant (occ>=1 assert, 42KB smem). VIT_TC_002's fwd-LN fusion was split: the bwd-sync-merge survives, the fwd \u03a3(x-mean)\u00b2 single-pass is dropped (inherently two-pass; bit-identity unachievable).\n\nFLAGSHIPS (one per track):\n- MODEL \u2192 PERF-004 Split-K dW increase (4\u21928): bit-NEUTRAL by construction (deterministic ascending-chunk reduce, 1576-1592), attacks the single largest documented d=2048 inefficiency (~62% idle SMs in P2 dW), gated only by a clean tunable bump (kDecDwSplitK has NO blocking assert, only >=1) + workspace-headroom check. Highest gain\u00d7confidence/risk in the entire set.\n- OPTIMIZER \u2192 elemwise-001 vec4 AdamW: the float4 fast-path is ALREADY WRITTEN (adamw.h:65-105) but never called \u2014 the P3 loop (fused_decoder:288) runs scalar. Lowest-effort/highest-certainty, bit-identical, bites on the large ff0/ff2 tensors at d=2048.\n- COMPILE \u2192 compile-01 single-cell source scoping: _resolve_sources (9810-9836) links all 4 megakernel TUs into every single-cell .so; scoping to one + prebuilt-.o linking is a ~4x AOT build-time win. The dispatch-table symbol coupling (9815-9826) is the real engineering risk and the candidate correctly proposes the prebuilt-.o workaround.\n\nTOP KEPT THEMES: (a) tensor-pipe / M-atom-interleave deepening \u2014 decoder PERF-005 (IL 2\u21924 on large dW, the BEHAVIOR-003 per-orientation split is the safe vehicle, gated on register-spill) ported to ViT via VIT_TC_010/018; (b) vectorization + scalar-load-traffic reduction \u2014 vec4 (elemwise-001), float4 GRU I/O (sg2-020), FusedOptState repack + per-tensor scalar caching + __restrict__ (elemwise-011/sg2-001/elemwise-018 bundle); (c) cost-model & search smarts \u2014 feature expansion (compile-04), TPE warm-start absorbing register-feasibility (compile-03+09), prefilter rule reordering (compile-05), sidecar feature caching (compile-08); (d) SG2 staging cleanup \u2014 drop the g_sorted/s_sorted double-pass+double-sync (sg2-002, author-flagged simplicity-over-perf), HCA attn Nh unroll (sg2-009). DEDUPS: elemwise-013/015 \u2192 autotune harness elemwise-019; VIT_TC_001/008/013 \u2192 one head-CE item; VIT_TC_002/003 \u2192 one LN-bwd item; sg2-006 \u2192 sg2-020; COMPILE_PY_BUILD_CACHE_HOIST \u2192 compile-07+02. Most elemwise micros (002/003/004/007/008/009) are sub-noise or false-premise (the compiler already CSEs/hoists the cited 'redundant' scalar reads, and Muon aux bc1/bc2 is already per-tensor at 1297-1298, deliberately kept off the host ABI). Two AUDIT-not-edit items retained: elemwise-020 (Prodigy s_track dead only if the fused d-trajectory never reads it \u2014 parity-gated) and sg2-014 (ptxas -v spill check)."
+}

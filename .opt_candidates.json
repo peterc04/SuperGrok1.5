@@ -1,0 +1,532 @@
+{
+  "compile_track": [
+    {
+      "id": "json-indent-removal",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "line 7110 (_save_locked): json.dumps(serialized, indent=2, sort_keys=True)",
+      "description": "Drop indent=2 from the cache JSON serialization (switch to compact separators), KEEPING sort_keys=True for deterministic output.",
+      "mechanism": "VERIFIED at line 7110: payload = json.dumps(serialized, indent=2, sort_keys=True). The cache is consumed programmatically only; indent=2 inflates file size and serialization time. Compact separators=(',',':') preserve all data and determinism (sort_keys stays). In-memory state and cache semantics identical.",
+      "expected_effect": "5-15% faster cache saves on large caches; smaller cache files. No numerics change.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "Verified locus; MUST retain sort_keys=True (determinism). Cheapest+safest compile win \u2014 bank first."
+    },
+    {
+      "id": "variant-build-sig-hash-redundancy",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "lines 14884-14887 + 14832 (timer closure _make_variant_timer, build_sig + variant_sources=list(sources))",
+      "description": "In the per-trial timer closure, hoist _hash_sources(sources) to compute once per sweep and reuse on the common path where variant_sources==sources; only recompute for the poly/synth variant branch.",
+      "mechanism": "VERIFIED line 14832: variant_sources = list(sources) is taken unconditionally then replaced only in the poly/synth branch (which is OFF by default per the inline comment). The build_sig hash of sources is redundant per-trial when sources are unchanged. Hashing the same file set once and reusing is hash-value-identical, so cache keys are unchanged.",
+      "expected_effect": "10-20% reduction in per-variant hash I/O during sweeps with thousands of trials (esp. poly/synth OFF). No cache-semantics change.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "MERGED with variant-sources-list-copy-elision (same locus 14832, the list-copy is the cheaper half of this same hoist). High-value: hot per-trial path."
+    },
+    {
+      "id": "version-gated-flags-cache",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "lines 12268 (build_aot), 16429 (_version_gated_flags_for_hash), 14883 (timer closure); plus _probe_nvcc_version 10846-10862",
+      "description": "Add a module-level per-arch cache for _version_gated_flags_for_hash(arch) / the nvcc version probe, so the deterministic result is computed once per process instead of re-derived in build_aot, the timer closure, and _device_cflags.",
+      "mechanism": "_version_gated_flags_for_hash(arch) is deterministic per arch (it probes nvcc once and maps to flags). It is invoked from at least 3 sites; in JIT sweeps the timer closure path runs thousands of times for the same arch. A lazy {arch->flags} dict eliminates redundant probes/derivation. Detected version and emitted flags are byte-identical, so no kernel codegen changes.",
+      "expected_effect": "5-10% faster JIT sweeps (removes ~1000 redundant probe/derivation lookups); AOT sees 1-2 calls avoided.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "MERGED 3 near-duplicates: version-gated-flags-cache + register-usage-level-early-probe + flag-probe-cache-warmup all reduce to 'cache the deterministic per-arch nvcc-version/flags result once'. Keep this best-described one."
+    },
+    {
+      "id": "prefilter-early-exit-cartesian",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "ss_prefilter (lines 3017-3047); compile_feasibility_check rule eval (lines 3073-3116)",
+      "description": "Order the prefilter rule evaluation cheapest/most-discriminating-first (e.g. dimension-bound checks like warps_per_block<=32 before cluster_volume*math) so configs that fail an early cheap rule skip the expensive rule evals. Same cartesian product, same survivors, same per-rule results \u2014 only short-circuit order changes.",
+      "mechanism": "VERIFIED compile_feasibility_check builds a closure of rules; reordering the rule list so high-rejection cheap rules run first short-circuits ~90% of candidates before the expensive checks. Survivors are bit-identical because rule predicates and the AND-composition are unchanged.",
+      "expected_effect": "20-30% faster prefilter on exhaustive/billion-config sweeps; negligible on Bayesian (per-trial capped).",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "med",
+      "synth_note": "MERGED prefilter-early-exit-cartesian + prefilter-rule-ordering + feature-macro-dedup-and-order's ordering idea. The static cheap-first ordering (this one) is safe and needs no profiling pass; prefilter-rule-ordering's profile-driven reorder is the riskier variant folded in but de-scoped to the static form."
+    },
+    {
+      "id": "measured-ms-window-algo",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "lines 15752-15755 (_make_variant_timer: measured_ms rolling window, del _meas[:len(_meas)-2000])",
+      "description": "Replace the list + del-slice rolling window for measured timings with collections.deque(maxlen=2000) so append+discard is O(1) instead of O(n) once the window fills.",
+      "mechanism": "VERIFIED lines 15752-15755: _meas.append(tms_f); if len>2000: del _meas[:len-2000]. deque(maxlen=2000) auto-discards in O(1). Iteration order is identical to the list, so the multi-fidelity quantile estimate is bit-identical and the cost-model rejection is unchanged.",
+      "expected_effect": "O(n)->O(1) window maintenance after cold-start; eliminates ~500k list-slice ops on 1000+ trial sweeps. Micro (0.1-1%) but in the hot timer path.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "Verified locus. Self-contained, hot-path, bit-identical quantile \u2014 safe early win."
+    },
+    {
+      "id": "multi-fidelity-finite-sort-cache",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_multi_fidelity_prune_decision (lines 5802-5858), specifically 5834-5846 (finite-list build + sort) and the len(finite)<8 check",
+      "description": "Move the len(finite)<8 early-return BEFORE the finite-list filter + sort so short/cold-start windows skip the wasted comprehension and O(n log n) sort.",
+      "mechanism": "The function currently builds and sorts the finite list, then returns False when <8 samples (never using the sorted list). Reordering the length guard ahead of the filter/sort eliminates wasted work; the <8 semantics are unchanged.",
+      "expected_effect": "Eliminates list-build+sort on every multi-fidelity check with <8 samples (common at cold-start / short sweeps). 0.5-2% on short sweeps.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "Pure reordering, identical decision. Pairs naturally with measured-ms-window-algo (same pruning machinery)."
+    },
+    {
+      "id": "featurize-config-dim-index",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "featurize_config (lines 5178-5331), line 5201 dim_by_name + the repeated _values_of(name) calls (5233/5242/5251)",
+      "description": "Pre-compute the needed dim value lists (vec/unroll/ns) once from dim_by_name at the top of featurize_config instead of calling the _values_of dict-lookup helper ~6 times per config.",
+      "mechanism": "dim_by_name is built once (line 5201); the 6 repeated _values_of(name) dict.get lookups per feature vector are redundant. Hoisting the 3 distinct lookups to locals yields a bit-identical feature vector (cost-model input unchanged).",
+      "expected_effect": "1-3% when cost model is active (featurize is called ~15-20x/trial); negligible when CM disabled.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "MERGED featurize-config-dim-index + dim-by-name-cache-featurize + config-key-dead-dims-cache (all 'hoist a per-call lookup-table build out of a hot featurize/key function'). Keep the in-call hoist (this one); the lru_cache variant is unneeded complexity."
+    },
+    {
+      "id": "seed-trials-validation-early-exit",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "run_bayesian (lines 6326-6361), seed_trials injection loop (dim_names/dim_value_sets built at 6327-6330)",
+      "description": "Hoist the loop-invariant dim_names / dim_value_sets construction (lines 6327-6330) out of the seed_trials loop to before it; leave per-trial validation unchanged.",
+      "mechanism": "dim_names and dim_value_sets do not depend on the seed-trial iterate, so building them per-iteration is redundant. Moving them above the loop is a straight refactor with identical validation behavior.",
+      "expected_effect": "1-5% when seed trials are used (saves 150-750 redundant list/dict builds); negligible when 0 seed trials (common).",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "Verified pattern; trivially safe loop-invariant hoist. Only bites when seed_trials set."
+    },
+    {
+      "id": "early-stop-window-slice-cache",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "BayesianEarlyStopper.should_stop() (lines 6008-6063), EI window slice _improvement_window[-patience:] (6040-6042)",
+      "description": "Cache the recent-window tail-slice used for the EI computation and invalidate it only when observe() extends the window, instead of re-slicing on every should_stop() poll.",
+      "mechanism": "_improvement_window is append-only (in observe()); should_stop() re-slices [-patience:] every poll even when no new observation arrived. Caching the slice and dirtying it in observe() yields identical EI inputs.",
+      "expected_effect": "1-3% on long sweeps (eliminates 900+ redundant slices when should_stop polls every trial with patience 50-100).",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "med",
+      "synth_note": "Self-contained; EI logic byte-identical. Slightly lower confidence than the pure hoists so ordered after them."
+    },
+    {
+      "id": "cost-model-quantile-stability",
+      "track": "compile",
+      "file": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "locus": "_multi_fidelity_prune_decision (lines 5844-5853, manual linear-interpolation quantile)",
+      "description": "Use numpy.percentile for the multi-fidelity quantile when numpy is already imported (featurize_config imports it unconditionally nearby), keeping the existing pure-Python fallback if numpy import fails.",
+      "mechanism": "The manual Python linear-interpolation quantile is ~5-10x slower than np.percentile on the trimmed window. numpy is already loaded on this path. RISK NOTE: np.percentile default linear interpolation must match the existing manual formula exactly; this only affects the PRUNE decision (not kernel numerics), so a tiny quantile delta cannot break fp64 parity \u2014 but it CAN change which configs get pruned, altering the search trajectory. Confirm the interpolation method matches before keeping.",
+      "expected_effect": "1-3% when cost-model+multi-fidelity enabled; saves ~0.1-0.5ms per multi-fidelity check.",
+      "risk": "med",
+      "needs_fp64_parity_gate": false,
+      "confidence": "med",
+      "synth_note": "Search-trajectory-affecting (not output-affecting). Ordered last in compile_track: must byte-verify np.percentile matches the manual interpolation, else search results drift vs the recorded baseline."
+    }
+  ],
+  "kernel_track": [
+    {
+      "id": "launcher_cond_alloc",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu",
+      "locus": "dec_tc_launcher_scratch() lines 55-71; mega_decoder_real_adamw_tc() lines 114-121 (cudaGetDevice + cudaDeviceGetAttribute on every call); vit launcher ~80-86; mamba launcher ~104-113",
+      "description": "Cache n_sms (and the device id) in the per-device launcher scratch struct, computed once per device, instead of calling cudaGetDevice + cudaDeviceGetAttribute(MultiProcessorCount) on every launcher invocation in the training loop.",
+      "mechanism": "VERIFIED lines 114-121: both CUDA API calls run every step. n_sms is a fixed per-device property; the launcher already maintains a per-device DecTcLauncherScratch (dec_tc_launcher_scratch(dev,need)). Storing n_sms there (set on first touch of a device) removes 2 host-side CUDA calls per step. Kernel launch params, grid barrier, and all device-side numerics are byte-identical \u2014 this is host-side only and CANNOT affect fp64 parity.",
+      "expected_effect": "~1-2% reduction in host launcher overhead per optimizer step on single-GPU training; affects decoder/vit/mamba equally.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "high",
+      "synth_note": "MERGED launcher_cond_alloc + sg2_launcher_cond_alloc (identical hoist, applied to base + SG2 entry points). Host-side, parity-trivial (kernel unchanged), highest-confidence kernel-track win \u2014 bank first. Still runs the parity gate per protocol but it is a formality here."
+    },
+    {
+      "id": "launcher_nCTA_cap_branch",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu",
+      "locus": "mega_decoder_real_adamw_tc() lines 120-121 (if (ncta_cap>0 && ncta_cap<nCTA) nCTA=ncta_cap); vit ~85-86; mamba ~112-113",
+      "description": "Replace the short-circuit conditional nCTA cap with a branchless min: nCTA = (ncta_cap>0) ? min(n_sms, ncta_cap) : n_sms. Host-side cold-path tidy; identical resulting nCTA.",
+      "mechanism": "VERIFIED line 120-121. The resulting nCTA value is identical for all inputs (ncta_cap<=0 -> n_sms; else min). Branchless form is purely a host-side codegen tidy. nCTA feeds the grid dim only; device numerics unchanged, parity-trivial.",
+      "expected_effect": "Negligible (~0.01-0.05% host); consistency/clarity. Bundle with launcher_cond_alloc since same files/lines.",
+      "risk": "low",
+      "needs_fp64_parity_gate": false,
+      "confidence": "med",
+      "synth_note": "Co-located with launcher_cond_alloc (same 3 launcher files, adjacent lines). Apply together to amortize the build+gate cost. Value is mostly bundling, not standalone."
+    },
+    {
+      "id": "descriptor_base_offset_constexpr",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/wgmma.cuh",
+      "locus": "make_desc_A_kmajor (lines 275-279) and make_desc_B_kmajor (lines 283-288)",
+      "description": "Ensure the LBO/SBO descriptor field computations fold at compile time when MN is a template parameter (mark the lbo/sbo locals constexpr) so no runtime multiply/shift is emitted per descriptor build in the consumer k-loop.",
+      "mechanism": "VERIFIED lines 276-277/285-286: lbo = (uint32_t)MN*16u, sbo=128u \u2014 already const uint32_t with template-constant MN, so a good compiler already folds these. Making them explicitly constexpr (and confirming make_smem_desc's >>4 folds) is a belt-and-suspenders codegen hint. These functions ARE on the production path (called by all 3 model_stage_*_tc.cuh). Descriptor bits are bit-identical, so wgmma inputs and fp64 parity are unchanged.",
+      "expected_effect": "0-2% in the descriptor-gen arithmetic of long-K tiles; likely already folded, so realistically ~0 but cannot regress.",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "med",
+      "synth_note": "MERGED descriptor_base_offset_constexpr + smem_desc_immediate_encoding (both 'fold/cheapen the make_*desc bit-assembly'). Production-real (unlike the tile_pipeline turnkey candidates). Likely a no-op since already const-foldable; keep only if 3-seed timing shows a real delta. Parity gate required because it touches the GEMM descriptor path."
+    },
+    {
+      "id": "dec-wbf-convert-loop-bound",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decoder_tc.cuh",
+      "locus": "dectc_wbf_convert (lines 327-352): bf16 weight-cache conversion, runtime tr=i>=kWbfTotalElems split + per-iter modulo/division for the transposed section",
+      "description": "Split the single conversion loop (with the per-iteration boolean tr and the off%nout / off/nout for the transposed section) into two compile-time-bounded loops (straight section then transposed section) so the per-iteration branch and modulo/division are removed.",
+      "mechanism": "VERIFIED the section boundary kWbfTotalElems is a compile-time constant, so the loop can be statically partitioned into [0,kWbfTotalElems) and [kWbfTotalElems,kWbfCacheElems) with dedicated index arithmetic. The bf16 values written to the cache are bit-identical (same source elements to same destinations), so parity holds. Runs in P0 (cache conversion, ~1% of wall, overlaps other CTA work).",
+      "expected_effect": "<0.3% on P0 only; neutral-to-+0.1%.",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "low",
+      "synth_note": "Real production code (decoder weight prestage). Low ceiling (P0 overlaps), low confidence \u2014 ordered near the end. Parity gate required (touches the bf16 weight cache feeding the GEMM)."
+    },
+    {
+      "id": "vit-head-logits-unroll",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "vittc_forward_tile, lines 850-856 (head-logits inner dot over vit::kD=128, currently #pragma unroll 4)",
+      "description": "Raise the head-logits inner k-loop unroll from 4 to 8 to expose more independent fp32 FMA chains, without changing accumulation order or data types.",
+      "mechanism": "A single float accumulator over 128 elements with a single bf16 load per step; unroll 8 keeps the SAME left-to-right accumulation order (no reassociation), so the fp32 sum is bit-identical and parity holds. More in-flight FMAs improve ILP on the 256-thread CTA. RISK: unroll factor changes can nudge ptxas register allocation; the gate's 3-seed timing + parity catches any regression.",
+      "expected_effect": "1-3% on the head fwd sub-phase; ~1-2% of total step at most.",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "high",
+      "synth_note": "Pure unroll-factor bump, same accumulation order => parity-safe by construction. Highest-confidence among the ILP-unroll candidates. Verify ptxas doesn't spill (3-seed timing gate)."
+    },
+    {
+      "id": "vit-attn-bwd-tile-loop-unroll",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh",
+      "locus": "vittc_attn_bwd_tile, lines 913-931 (dscores inner loop over kSeq=17, currently not unrolled)",
+      "description": "Add #pragma unroll on the compile-time-bounded kSeq=17 dscores loop in attention backward to expose the 17 independent multiply-accumulate chains; ascending-kj order preserved.",
+      "mechanism": "kSeq=17 is compile-time fixed; full unroll adds ~34 instructions with no register explosion and keeps the SAME ascending-kj order, so dscores accumulation is bit-identical. ILP-only change.",
+      "expected_effect": "0.5-1% on attention bwd (~5-8% of P2); ~0.025-0.04% overall.",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "high",
+      "synth_note": "Same class as vit-head-logits-unroll (order-preserving unroll on a fixed bound). Low ceiling but parity-safe. Gate confirms no spill."
+    },
+    {
+      "id": "tc-gemm-loop-unroll",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_mamba_tc.cuh",
+      "locus": "stage_kmajor_tile (lines 125-135) #pragma unroll 1; call sites 407-409/428-430/449-451/684-686/707-708/723-724/1071-1072",
+      "description": "Relax the conservative #pragma unroll 1 on the HBM->smem staging loop (per call site) to allow ILP unroll of the cp.async/STS issue in the fwd/dX/dW projection staging, where the staging overlaps wgmma and is not the critical path.",
+      "mechanism": "The staging loop only writes smem; the bytes landed and their offsets are unchanged by unrolling, so the GEMM operand tile is bit-identical and parity holds (determinism unchanged). Relaxing unroll 1 lets ptxas issue multiple STS/cp.async per iteration. RISK: must NOT change the cp.async double-buffer WAR choreography \u2014 apply only to the staging issue loop body, not the ring barrier sequence. Keep the generic template at unroll 1 and relax per-call-site.",
+      "expected_effect": "0.5-1% on projection GEMMs (projected GEMMs are a small wall fraction; diminishing returns).",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "med",
+      "synth_note": "Production-real (mamba staging). Lower confidence: unroll on a staging loop can raise register pressure in the producer warpgroup (SG_TUNED_PROD_REGS=40 budget). Ordered after the order-preserving fp32 unrolls. Parity gate mandatory (GEMM operand path)."
+    },
+    {
+      "id": "mbtc-reduce-smem-bank-conflict",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_mamba_tc.cuh",
+      "locus": "sm.red 256-float reduction slot used by GrokAdamW P2.5 (lines ~751-759), LookSAM P2.4 norm (~748-768), Prodigy P2.6 (~863-890); analogous fused_mamba_megakernel.cuh 752-759",
+      "description": "Pad the sm.red reduction slot to 257 floats so the power-of-2 tree reduction's stride-128 accesses no longer collide on the 64-bank H100 (stride 128 floats = 512B = 2x32-way conflict). Reduction order/values unchanged; only a 4-byte slack added.",
+      "mechanism": "The standard tree reduction reads/writes sm.red[tid] and sm.red[tid+stride]; at stride 128 the two land on conflicting banks. Padding to 257 (odd) breaks the power-of-2 stride alias. The reduction arithmetic and ascending order are unchanged => bit-identical fp64 result. RISK: must confirm the struct still fits the smem budget and that sm.red isn't aliased/overlaid with another buffer at a fixed offset (it is the engine's shared reduction slot \u2014 verify no union/overlay assumes 256). Parity gate covers correctness.",
+      "expected_effect": "1-3% per block-reduce latency on grok-enabled cells (GrokAdamW/NeuralGrok/LookSAM/SG11/SG15/SG2); ~0.2-0.5% wall on those runs. AdamW/Lion/Grokfast/Muon/Prodigy mostly unaffected.",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "med",
+      "synth_note": "MERGED mbtc-reduce-smem-bank-conflict + looksam-norm-reduce-opt (the shfl-tree variant) \u2014 keep the padding approach (simpler, no barrier-structure change; the shfl variant is risk:med and saves no smem). Must verify smem-arena offset/overlay assumptions before keeping. Real win only on grok cells."
+    },
+    {
+      "id": "sg2_expert_eidx_bounds_guard_remove",
+      "track": "kernel",
+      "file": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergrok2.cuh",
+      "locus": "sg2_stage_peer (lines 964-966): eidx=ta_i[ia]*pkd+tb_i[ib]; if(eidx<0)eidx=0; if(eidx>num_experts-1)eidx=num_experts-1",
+      "description": "Remove the two clamp guards on eidx that can never trigger (ta_i/tb_i come from the top-k insertion sort and are provably in [0,pkd), so eidx in [0,pkd^2)=[0,num_experts)).",
+      "mechanism": "The expert index is constructed from top-k-selected indices that are bounded by construction, so eidx is always in range and the clamps are dead. Removing them changes no value ever taken (parity-neutral), saving 2 instructions per expert route. RISK: this is the SG2 meta-optimizer (drives all grok cells); the safety guard's removal is only sound if the in-range invariant truly always holds \u2014 keep the clamp behavior identical by first adding a debug assert, validate, then drop. Parity gate confirms no behavioral change.",
+      "expected_effect": "~0.1-0.2% on PEER (negligible).",
+      "risk": "low",
+      "needs_fp64_parity_gate": true,
+      "confidence": "med",
+      "synth_note": "Verified the guards exist and are dead under the documented invariant. Tiny ceiling; value is mostly that it's parity-clean and removes branches. Ordered late. Keep only if it shows ANY 3-seed improvement (likely neutral)."
+    }
+  ],
+  "dropped": [
+    {
+      "id": "sg2_restrict_const_access",
+      "reason": "ALREADY SATISFIED (verified): every pointer param in sg2_stage_project/compress/indexer_q/indexer_k/csa_attention/hca_attention (W, compress_w, proj_W, idx_DQ, idx_K, c_k, c_v, win_k, win_v, x, out) already carries __restrict__ (lines 557-735). The 'w' weight bundle is a const WeightsT& whose struct members can't take __restrict__ from the reference. No-op."
+    },
+    {
+      "id": "dec-ln-fwd-const-ptr",
+      "reason": "ALREADY SATISFIED (verified lines 908-912): xhat and inv (the pointers the candidate names) already have __restrict__, as do x/gamma/beta/y. The only unqualified pointer is 'red' (the shared reduction slot), which the candidate doesn't mention and which aliases the engine smem arena (qualifying it would be unsafe). No-op as described."
+    },
+    {
+      "id": "prefilter-env-dict-reuse",
+      "reason": "PREMISE FALSE (verified lines 3121-3127): _iter_prefilter_with_status already calls compile_feasibility_check ONCE before the loop (check=...) and reuses the closure per-config. The claimed per-iteration recompile does not exist. No-op."
+    },
+    {
+      "id": "descriptor_cache_reuse",
+      "reason": "PRODUCTION DEAD-CODE: targets tc_pipelined_gemm_m64nNk16 consumer loop (tile_pipeline.cuh 326-344), which grep confirms is called ONLY by wgmma_selftest.cu, never by any production megakernel. Would pass the parity gate (selftest) but produce ZERO production step-timing delta, so it can never satisfy 'faster on >=3 seeds'."
+    },
+    {
+      "id": "producer_btree_reduction",
+      "reason": "PRODUCTION DEAD-CODE: targets pipeline_produce_ktile (tile_pipeline.cuh 221-240), used only by the self-test. Production staging is tc_gemm_block_unpipelined::stage_k_async in model_stage_decoder_tc.cuh. Zero production effect."
+    },
+    {
+      "id": "consume_loop_async_interleave",
+      "reason": "PRODUCTION DEAD-CODE + PARITY RISK: targets tc_pipelined_gemm_m64nNk16 (self-test-only) AND reorders mbarrier wait vs wgmma (needs_fp64_parity_gate per auditor, risk:med). Double-disqualified."
+    },
+    {
+      "id": "cp_async_batch_prefetch",
+      "reason": "PRODUCTION DEAD-CODE: unrolls pipeline_produce_ktile cp.async loop (self-test-only). The production cp.async ring (stage_k_async) is the already-KEPT P5 patch; this does not touch it."
+    },
+    {
+      "id": "producer_slot_early_compute",
+      "reason": "PRODUCTION DEAD-CODE: targets tc_pipelined_gemm_m64nNk16 producer block (self-test-only)."
+    },
+    {
+      "id": "pipeline_parity_tracking_init",
+      "reason": "PRODUCTION DEAD-CODE: parity-array init in tc_pipelined_gemm_m64nNk16 (self-test-only); also off-critical-path prologue."
+    },
+    {
+      "id": "smem_alignment_check_removal",
+      "reason": "PRODUCTION DEAD-CODE: alignment arithmetic in tc_pipelined_gemm_m64nNk16 (self-test-only); off-critical-path prologue even there."
+    },
+    {
+      "id": "wgmma_issue_early_dispatch",
+      "reason": "PARITY/PERF RISK: reorders commit_group/wait_group relative to the k-loop in wgmma_mainloop_kchain (risk:med). The kchain ordering (one fence, ascending-k issue, commit+wait at end) is the silicon-validated determinism contract; reordering risks the bitwise-reproducible accumulation guarantee. Not clearly neutral."
+    },
+    {
+      "id": "wgmma_fence_redundancy_remove",
+      "reason": "PARITY RISK on a validated barrier contract: dropping the wgmma_fence before the first issue depends on a caller-side pre-zero/pre-fence guarantee; the megakernels' fresh-tile path relies on the default fence. Mis-applying silently corrupts the first k-step accumulator. Ceiling ~0.5%; not worth the parity exposure."
+    },
+    {
+      "id": "sg2_peer_partition_heads",
+      "reason": "PARITY RISK (auditor-flagged needs_fp64_parity_gate, risk:med): restructures PEER per-head computation from per-thread to CTA-cooperative with smem head-aggregation. This is the SG2 meta-optimizer feeding all grok cells; moving the head reduction into smem is a non-trivial algorithm refactor that needs a new parity derivation. Violates hard rule (1) 'no rewrites needing new parity derivation'."
+    },
+    {
+      "id": "sg2_topk_static_unroll",
+      "reason": "PARITY RISK: 2-way unroll of the outer s-loop processing s=i and s=i+2 'independently before converging' changes the insertion order on score ties. sg2_stage_topk is documented to match csa_indexer_topk_kernel exactly with ascending-s tie-break; reordering breaks the stable tie-break and diverges from the fp64 mirror."
+    },
+    {
+      "id": "sg2_gru_h_old_stack",
+      "reason": "PARITY RISK: reorders the GRU h_new = (1-z)*h_old + z*h_tilde arithmetic / early-materializes (1-z)*h_old. The file's own comments (lines 832-839) stress this stage must match the fp64 reference's exact FMA precision; any reassociation can diverge invisibly until the 1e-5 GPU parity gate. Not clearly bit-neutral."
+    },
+    {
+      "id": "sg2_gru_sequential_write",
+      "reason": "PARITY RISK: 2-4x unroll of the GRU output loop to overlap tanhf latencies across channels. The per-channel reductions (ah += Wh*xin) are independent so order is fine, BUT this is on the precision-sensitive GRU path; combined with the explicit accurate-transcendental discipline (expf/tanhf must match torch), an aggressive unroll that lets the compiler reassociate the k-reduction risks a parity drift. Excluded under the conservative neutral-only rule."
+    },
+    {
+      "id": "sg2_expert_mlp_fuse_relu",
+      "reason": "PARITY RISK (low but nonzero): 2-way unroll + pipelining of the expert MLP ReLU chain (W1*g+b1 -> relu -> W2*relu) on the SG2 meta-optimizer path. Reordering FMAs across the ReLU on the all-grok-cells critical numeric path is not guaranteed bit-identical; ceiling ~1-2% of PEER doesn't justify the parity exposure."
+    },
+    {
+      "id": "sg2_topk_register_spill_async",
+      "reason": "PARITY-ADJACENT RISK / heavy refactor: moves the top-k insertion-sort state from per-thread registers to a CTA-synchronous smem buffer, introducing a new sync phase into topk. risk:med; changes the topk dataflow structure on the meta-optimizer path. Too invasive for the neutral-only ratchet; needs its own derivation/validation."
+    },
+    {
+      "id": "sg2_launch_bounds_maxreg",
+      "reason": "EXPLICITLY NON-NEUTRAL: auditor states 'unpredictable; could be +5% (worse) or -5% (better)', needs_fp64_parity_gate, confidence low. Adding a maxreg cap to sg2_meta_optimizer_megakernel is a speculative occupancy gamble, directly violating the neutral-or-positive hard rule."
+    },
+    {
+      "id": "maxrregcount-list-early-dedup",
+      "reason": "MICRO no-op-ish AOT-only (~5-10ms once per build) AND overlaps the version-gated-flags-cache idea (cache static per-arch data). Negligible; folded conceptually into version-gated-flags-cache. Not worth a separate ratchet slot."
+    },
+    {
+      "id": "nvcc-threads-adaptive-capping",
+      "reason": "RISK:med behavioral change to build concurrency (raise --threads cap 8->12-16). Can starve other processes / change peak build RAM; not a kernel-semantics-neutral guarantee and confidence med. Build-env-dependent; excluded from the safe ratchet."
+    },
+    {
+      "id": "split-compile-aggressive-dispatch",
+      "reason": "Adds an env knob (SPLIT_COMPILE_THREADS) with zero direct perf effect (auditor: 'Zero direct perf impact'). Pure configurability, nothing to gate on the build-time ratchet. Out of scope for a perf ratchet."
+    },
+    {
+      "id": "max-jobs-cgroup-aware-default",
+      "reason": "Robustness/OOM-avoidance feature, not a build-SPEED win on normal hosts ('On normal hosts, no change'). The compile_track gate is build/tune time on the dev host, which it won't move. Valuable ops hardening but not a ratchet candidate."
+    },
+    {
+      "id": "incremental-build-plan-caching",
+      "reason": "RISK:med, confidence med, and gated on the phase-2 incremental_variant_build flag being ON. Correctness depends on a macro-set cache key being complete; a missed dependency yields a stale/incorrect build. Too risky for the safe early ratchet; revisit only if incremental builds are enabled and isolated."
+    },
+    {
+      "id": "ninja-reuse-detection",
+      "reason": "RISK:med, confidence med: skipping cmake regeneration via an input-fingerprint marker risks stale build.ninja on edge cases (flag/include changes the fingerprint misses). Build-correctness exposure outweighs the 5-15% conditional gain for a discovery-stage ratchet."
+    },
+    {
+      "id": "tpe-sampler-multivariate-default",
+      "reason": "CHANGES SEARCH BEHAVIOR (not neutral): exposing/altering TPESampler multivariate/constant_liar changes which configs are sampled, i.e. the autotune trajectory and results vs the recorded baseline. risk:med. The ratchet compares against a fixed baseline; this would invalidate the comparison."
+    },
+    {
+      "id": "include-walk-cache-mtime-precision",
+      "reason": "Correctness HARDENING for coarse-mtime/NFS filesystems, not a speed win ('Negligible cost on modern local filesystems'). Adds a content hash to the cache key \u2014 slightly SLOWER on the common local-FS path. Doesn't move the build-time gate; out of scope."
+    },
+    {
+      "id": "lazy-sidecar-index-load",
+      "reason": "DEDUP/LOW: ~2-5% on cache.save only when trials are never read; overlaps json-indent-removal (the dominant cache.save cost) and host-history-dedup. Marginal and conditional; kept off the ratchet to avoid churn. Subsumed by the cache-save theme."
+    },
+    {
+      "id": "host-history-dedup-efficient",
+      "reason": "DEDUP/LOW: negligible unless host_history>100 (auditor: 'Negligible on typical builds, host_history<=20'). Same cache-save theme as json-indent-removal; not worth a separate gate slot."
+    },
+    {
+      "id": "variant-sources-list-copy-elision",
+      "reason": "MERGED into variant-build-sig-hash-redundancy (identical locus line 14832; the list-copy elision is the cheaper half of that same hoist). Kept as part of the survivor, not a standalone entry."
+    },
+    {
+      "id": "cost-model-train-trigger-dedup",
+      "reason": "MICRO (<0.1%, one arithmetic op/trial) and confidence med. Real but immeasurably small; below the noise floor of 3-seed timing. Not worth a ratchet slot."
+    },
+    {
+      "id": "register-usage-level-early-probe",
+      "reason": "MERGED into version-gated-flags-cache (same idea: cache the deterministic per-process nvcc version probe). Kept as part of that survivor."
+    },
+    {
+      "id": "flag-probe-cache-warmup",
+      "reason": "MERGED into version-gated-flags-cache (pre-warm vs lazy-cache the same probe; auditor itself says 'Negligible per-build, probe already cached'). Subsumed."
+    },
+    {
+      "id": "def-load-cache-store-cache-ordering",
+      "reason": "Auditor: the cache-policy flags are a NON-BINDING hint ('the hint is non-binding'), 1-3% ptxas codegen 'marginal', confidence med. Reordering two -Xptxas tokens is unlikely to change SASS; effectively a no-op with no reliable build-time signal to gate on."
+    },
+    {
+      "id": "feature-macro-dedup-and-order",
+      "reason": "Auditor confidence LOW, ~1-2% preprocessor-only and speculative (reorder #define emission for compiler cache locality). No reliable mechanism; the ordering idea is folded into prefilter-early-exit-cartesian where it's actually actionable."
+    },
+    {
+      "id": "ptxas-verbose-flag-conditional",
+      "reason": "DEDUP: same theme as the kept compile_track diagnostic-suppression idea but I am dropping the whole 'gate -Xptxas -v / --warn-on-spills / --resource-usage behind a flag' cluster from the ratchet \u2014 these alter the dev/CI diagnostic stream the P-series ratchet itself relies on (spill warnings, resource usage) to judge patches. Suppressing them would blind the very gate doing the judging. Keep diagnostics ON during the campaign."
+    },
+    {
+      "id": "ptxas-spills-warning-conditional",
+      "reason": "Same as above: --warn-on-spills is exactly the signal used to detect register-pressure regressions in the kernel ratchet. Gating it off during the campaign is counterproductive; the ~2-5% per-variant compile gain isn't worth losing spill visibility."
+    },
+    {
+      "id": "resource-usage-reporting-conditional",
+      "reason": "Same diagnostic-suppression cluster: --resource-usage feeds register/smem occupancy judgments. Keep ON during the audit campaign. ~1-2% compile gain not worth blinding the gate."
+    },
+    {
+      "id": "compress-all-fatbin-conditional",
+      "reason": "TRADEOFF not neutral: gating -compress-all off makes fatbins ~30% larger on disk; the 2-3% compile gain only applies to throwaway JIT and trades artifact size + cache-store I/O. Marginal and adds a mode flag; excluded from the safe ratchet."
+    },
+    {
+      "id": "dec-smem-ring-init-elision",
+      "reason": "NEUTRAL-by-auditor ('Expected wall-clock: neutral-to-+0.5%, register-starved paths only, rare on H100'). Unrolling the pad-row zero-fill in stage_k_async (the KEPT P5 ring) for a maybe-0.5% on rare paths risks perturbing the validated ring choreography for ~nothing. Not worth touching validated code."
+    },
+    {
+      "id": "dec-dw-spec-build-vectorization",
+      "reason": "Auditor confidence LOW, <0.5% on P2, single-owner-thread spec writes. Compiler likely already batches; speculative and below measurement noise."
+    },
+    {
+      "id": "dec-loss-reduce-async-commit",
+      "reason": "Auditor: 'Neutral to +0.1%... net-zero or slightly negative'; all CTAs must sync at B2 anyway. By the auditor's own analysis the current structure is near-optimal. Nothing to gain."
+    },
+    {
+      "id": "dec-tile-scratch-bank-conflict",
+      "reason": "FALSE ALARM (auditor self-retracted, confidence high): DecTileScratch lives in HBM not smem; accesses are coalesced row-wise. 'already optimal, no optimization needed.'"
+    },
+    {
+      "id": "dec-atomicmax-warp-group",
+      "reason": "Profiling-only code behind #ifdef SG_DEC_PROFILE, OFF in production (auditor confidence high). Optimizing it 'would not change production kernel behavior'. Out of scope."
+    },
+    {
+      "id": "dec-muon-buf-rebase-inline",
+      "reason": "Auditor <0.1%, Muon-only (non-default path), confidence low. A loop-invariant pointer the compiler already hoists; immeasurable."
+    },
+    {
+      "id": "dec-lnvec-reduce-thread-split",
+      "reason": "Auditor: 'already optimal' (element-owned fixed-partition reduce, no float atomics), confidence high. Nothing to do."
+    },
+    {
+      "id": "dec-ring-async-await-overlap",
+      "reason": "PARITY RISK (needs_fp64_parity_gate) on the silicon-validated decoder ring prologue; auditor: 'Neutral \u2014 any change risks breaking the RING latency hiding, validated 13/13.' Explicitly do-not-touch."
+    },
+    {
+      "id": "dec-grid-stride-low-cta-bias",
+      "reason": "Auditor: 'Neutral \u2014 tail idle unavoidable without non-deterministic work-stealing, which violates parity. Current design optimal under determinism.' Nothing neutral-or-positive available."
+    },
+    {
+      "id": "dec-m-atom-interleave-register-decay",
+      "reason": "Auditor marginal-to-neutral (~0.5-1% IF spill present, 'rare on H100 with 128 regs'), confidence low, and it's a hint about ptxas liveness analysis that may do nothing or perturb the validated M-atom-interleave wgmma pipeline. Speculative on validated code."
+    },
+    {
+      "id": "dec-embedding-scan-vectorization",
+      "reason": "Auditor: 'already optimal for the element-owned single-writer pattern', confidence high. No change."
+    },
+    {
+      "id": "vit-block-reduce-warp-sync",
+      "reason": "CORRECTNESS/RACE RISK: replacing the __syncthreads in vit_block_sum with a volatile write + __threadfence_block before the warp-0 cross-warp read. risk:med. __threadfence_block does NOT provide the cross-warp execution ordering __syncthreads does; the warp-0 reduce reads other warps' lane-0 smem writes and a fence-without-barrier can race. Not safely neutral."
+    },
+    {
+      "id": "vit-ln-fwd-tile-mean-var-pipeline",
+      "reason": "PARITY RISK: 'interleave mean and variance accumulation' \u2014 variance reads (xr[j]-mean) which DEPENDS on the completed mean reduction; restructuring to accumulate variance incrementally across unroll iterations risks changing the two-pass LN numerics (Welford-style vs two-pass differ in fp). Not guaranteed bit-identical to the reference LN."
+    },
+    {
+      "id": "vit-dw-spec-build-shared",
+      "reason": "DEDUP/LOW overlap with vit-dw-biases-warp-balance and confidence-bounded micro (0.3-0.8% P2). Recomputing vittc_dw_total_tiles twice is cheap pure arithmetic; caching one int in smem adds a sync/owner-write. Marginal; not worth a slot vs the higher-value vit unrolls."
+    },
+    {
+      "id": "vit-stage-kmajor-prefetch",
+      "reason": "DEDUP + UNCERTAIN: __ldg on stage_kmajor_tile reads. The srcA/srcB are already __restrict__ (so the compiler may already emit ldg/L2-bypass), and on the production path operands are weights reused across tiles where L1 caching can HELP \u2014 forcing __ldg/L2-only could hurt. risk/benefit unclear (auditor confidence med, 'modest'); not clearly neutral-or-positive."
+    },
+    {
+      "id": "vit-loss-reduce-fp32-accum",
+      "reason": "PARITY-SENSITIVE micro: warp-parallel-izing the CTA-0 fp64 loss sum. Auditor claims fp64 associativity deterministic, but a warp-tree reorders the additions vs the current serial loop -> fp64 sum can differ in the last ULPs, perturbing the parity gate's loss check. 0.1-0.5% ceiling not worth the parity exposure."
+    },
+    {
+      "id": "vit-dw-biases-warp-balance",
+      "reason": "Auditor 0.5-1% on P2 bias reduction but it RESTRUCTURES the (s,warp) column-ownership partition (pre-computed [o_start,o_end) ranges). Changing per-warp ownership of a deterministic reduce risks altering accumulation order -> parity. Not a free neutral change; needs derivation."
+    },
+    {
+      "id": "vit-patch-row-gather-coalesce",
+      "reason": "MICRO (0.2-0.5% on 1 of 10 dW tiles, ~0.01-0.04% overall), confidence med. Precompute a [Tp] trow lookup adds a local array (register/smem) to save a divmod; on the patch_proj staging path the win is below 3-seed timing noise."
+    },
+    {
+      "id": "mbtc-load-local-const",
+      "reason": "Auditor <0.1% ('P2 not critical path for most cells'), caching blockDim.x to a register \u2014 the compiler already keeps blockDim.x in a special register; immeasurable. Below noise floor."
+    },
+    {
+      "id": "embed-owner-scan-tile-cache",
+      "reason": "Auditor confidence low, <0.5% for mamba vocab=99 ('fine already, small footprint'), explicitly 'deferred if profiling shows sub-1%'. Tiling the embed owner-scan is a real change for ~nothing at the production vocab; not worth gating."
+    },
+    {
+      "id": "scan-adapter-ptx-exp2-cache",
+      "reason": "Auditor confidence low, <0.1% ('expf already well-pipelined; loop is memory-bound on state-save, not compute-bound'); auditor concludes 'no clear win without algorithmic change.' Nothing neutral-positive to do."
+    },
+    {
+      "id": "mbtc-dw-partial-reduce-coalesce",
+      "reason": "Auditor self-retracted (confidence low): 'current structure already well-coalesced, row-major iteration matches row-major memory; no obvious improvement.' <0.1%."
+    },
+    {
+      "id": "wgmma_accum_zero_pragma_unroll_full",
+      "reason": "OFF-CRITICAL-PATH + self-contradictory mechanism (proposes '#pragma unroll 1' to 'fully unroll', which is backwards). WgmmaAccum::zero is prologue-only; auditor 'negligible perf on critical path', confidence low. No reliable win."
+    },
+    {
+      "id": "wait_group_immediate_parametrize",
+      "reason": "MICRO (0-1%, one instruction), confidence low. wgmma_wait_group already takes N as a template 'n' immediate (verified line 401, asm uses \"n\"(N)); a wait_group<0> specialization saves ~nothing measurable. Below noise."
+    },
+    {
+      "id": "tile_geom_template_fold",
+      "reason": "TileGeom is already a struct of static constexpr members (verified lines 104-115) folded at instantiation; a 'lookup table keyed by N' is not faster to compile and changes nothing at runtime. Auditor confidence low, build-speed only with no real mechanism. No-op."
+    },
+    {
+      "id": "state_bind_fusion",
+      "reason": "MICRO (~0.1-0.3%, 2-4 pointer-arith instrs in the host launcher), confidence med; auditor notes 'compiler may already do this as CSE'. Host-side immeasurable; not worth a slot (the launcher_cond_alloc bundle already covers the launcher)."
+    },
+    {
+      "id": "error_check_consolidation",
+      "reason": "Auditor 'Negligible (~0.1% at most), primarily code-style', confidence low. Single branch per step on a fixed device; branch predictor already nails it. Nothing to gate."
+    },
+    {
+      "id": "launcher_scratch_init_order",
+      "reason": "Auditor 'Negligible (~0.05%), primarily code-ordering', confidence low; '3 ptrs fit in one cacheline'. Compiler/cache already optimal. Below noise."
+    },
+    {
+      "id": "mamba_nCTA_occupancy",
+      "reason": "RISK:med and confidence med: caching mb_tc_launched_nctas occupancy result. The occupancy-driven nCTA is the launch grid size; caching is fine ONLY if it's truly invariant per (device,OptId) \u2014 but it depends on the kernel's register footprint which can change across builds, so a stale cache could launch a wrong/over-subscribed grid. Real benefit only if that query is expensive (unknown). Excluded from safe ratchet; the launcher_cond_alloc (n_sms only) covers the safe part."
+    },
+    {
+      "id": "state_buffer_reuse_doc",
+      "reason": "Zero performance impact by the auditor's own statement (static_asserts documenting state aliasing). Maintainability-only; nothing for either gate to measure. Out of scope for a perf ratchet (though worth doing as hygiene separately)."
+    }
+  ],
+  "summary": "The highest-value, lowest-risk wins are all host-side or search-machinery hoists that are bit-neutral by construction: in compile.py, drop JSON indent on cache saves, cache the per-arch nvcc version/flags probe, hoist the per-trial build-signature hash and loop-invariant featurize/seed-trial/early-stop computations out of hot loops, and swap the measured-ms rolling window to a deque \u2014 these bank fast because the in-file _self_test gate plus build/tune time judge them and none touch emitted kernel semantics. On the kernel side the safest ratchet leader is caching n_sms in the launcher scratch (pure host-side, parity-trivial), followed by a small family of order-preserving #pragma-unroll bumps on fixed-bound fp32 loops (vit head-logits 4->8, vit attn-bwd kSeq=17, mamba staging) that keep accumulation order identical, plus one real smem bank-conflict fix (pad sm.red to 257 floats) that helps only the grok-enabled cells. The single biggest synthesis finding is that an entire cluster of tile_pipeline.cuh candidates (descriptor_cache_reuse, producer_btree_reduction, consume_loop_async_interleave, cp_async_batch_prefetch, producer_slot_early_compute, parity/alignment init) target tc_pipelined_gemm_m64nNk16 / pipeline_produce_ktile / TilePipeline, which grep confirms are SELF-TEST-ONLY and never called by any production megakernel \u2014 they would pass the parity gate yet move zero production step-time, so they are dropped as production dead-code; the real production GEMM staging is tc_gemm_block_unpipelined's already-KEPT cp.async ring. Most SuperGrok2 candidates were dropped either as already-satisfied no-ops (every stage pointer already carries __restrict__) or as parity risks on the meta-optimizer's precision-sensitive GRU/top-k/expert paths (insertion-sort tie-break reorders, GRU FMA reassociation, maxreg gambles), and three compile candidates (prefilter-env-dict-reuse, descriptor_base_offset_constexpr-as-already-folded, dec-ln-fwd-const-ptr) were confirmed already implemented in the source."
+}
