@@ -364,8 +364,13 @@ struct DecTcSmem {
     // 2·(2·2KB + 4KB)=16KB; DecTcSmem total ~17.5KB ≪ the 48KB static cap.
     static constexpr int kDecAtomsPerSlot =
         (dectc::kAtomsM < dectc::kDecMaxIL) ? dectc::kAtomsM : dectc::kDecMaxIL;
-    __nv_bfloat16 sA[dectc::kDecTcStages * kDecAtomsPerSlot * 64 * 16];
-    __nv_bfloat16 sB[dectc::kDecTcStages * SG_TUNED_TILE_N * 16];
+    // alignas(16): the cp.async RING (fwd/dX staging) lands 16-byte LDGSTS
+    // chunks here, which require a 16B-aligned smem destination. Every
+    // tile-internal offset is a multiple of 8 bf16 (16B) and the sA block size
+    // is a multiple of 16B at every legal (stages, IL, TILE_N), so the alignas
+    // changes NO member offset — it only pins the guarantee the ring needs.
+    alignas(16) __nv_bfloat16 sA[dectc::kDecTcStages * kDecAtomsPerSlot * 64 * 16];
+    alignas(16) __nv_bfloat16 sB[dectc::kDecTcStages * SG_TUNED_TILE_N * 16];
     float red[256];
     dectc::DecDwSpec spec[9];
 };
@@ -513,9 +518,11 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
          + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
          + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
                                               //   gated to 0 at bench width (adamw-only)
-         + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1)
+         + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1 + C1-T transposed section)
          + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm; carve-LAST)
-         + 1;                                 // 8-byte realign slack for the int32 lists base
+         + 4;                                 // realign slack: <=3 floats to 16B-align the wbf
+                                              //   cache base (cp.async RING sources must be 16B-
+                                              //   aligned) + 1 for the 8-byte int32-lists realign
 }
 
 #ifdef SG_DEC_PROFILE
@@ -609,6 +616,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
     // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
     float* wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+    // 16B-align the bf16 cache base: the cp.async RING streams it in 16-byte
+    // chunks (gmem source alignment requirement). Bump <= 3 floats, covered by
+    // dec_tc_workspace_floats' slack term; deterministic (the workspace base is
+    // >=256B-aligned, so the bump depends only on the carve offsets).
+    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
     float* embed_ws = wbf_f + dectc::dec_wbf_floats();
 #else
     // Production: carve AFTER the (full-size) SG2 region via the existing chain
@@ -616,6 +628,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     // for the SG2 int64 row_off64 reads). The bf16 weight pre-stage cache (C1)
     // is interposed here; embed lists stay carve-LAST.
     float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+    // 16B-align the bf16 cache base for the cp.async RING (see the bench-branch
+    // note; bump <= 3 floats, covered by dec_tc_workspace_floats' slack term).
+    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
     float* embed_ws = wbf_f + dectc::dec_wbf_floats();
 #endif
     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned

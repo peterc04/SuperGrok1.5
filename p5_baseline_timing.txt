@@ -1,0 +1,13 @@
+=== BASELINE decoder timing (current binary = decoder baseline) 01:10:30Z ===
+TIMING {"model": "decoder", "opt": "adamw", "seed": 42, "median_ms": 8.423467407226562, "min_ms": 8.416823120117188, "walls_ms": [8.4693, 8.4168, 8.4249, 8.4235, 8.4217]}
+TIMING {"model": "decoder", "opt": "lion", "seed": 42, "median_ms": 8.411235961914063, "min_ms": 8.399541625976562, "walls_ms": [8.4112, 8.4185, 8.3995, 8.4105, 8.4452]}
+TIMING {"model": "decoder", "opt": "grokfast", "seed": 42, "median_ms": 8.505361938476563, "min_ms": 8.502936401367187, "walls_ms": [8.5057, 8.5054, 8.505, 8.5063, 8.5029]}
+TIMING {"model": "decoder", "opt": "looksam", "seed": 42, "median_ms": 19.468409423828124, "min_ms": 19.4628955078125, "walls_ms": [19.4647, 19.4629, 19.4684, 19.4729, 19.489]}
+TIMING {"model": "decoder", "opt": "adamw", "seed": 7, "median_ms": 8.390985107421875, "min_ms": 8.383302612304687, "walls_ms": [8.4216, 8.391, 8.3997, 8.3904, 8.3833]}
+TIMING {"model": "decoder", "opt": "lion", "seed": 7, "median_ms": 8.38640869140625, "min_ms": 8.375989990234375, "walls_ms": [8.3867, 8.3864, 8.3933, 8.3864, 8.376]}
+TIMING {"model": "decoder", "opt": "grokfast", "seed": 7, "median_ms": 8.475476684570312, "min_ms": 8.4725634765625, "walls_ms": [8.4753, 8.4726, 8.4755, 8.4769, 8.4786]}
+TIMING {"model": "decoder", "opt": "looksam", "seed": 7, "median_ms": 19.450849609375, "min_ms": 19.43598388671875, "walls_ms": [19.448, 19.436, 19.4592, 19.465, 19.4508]}
+TIMING {"model": "decoder", "opt": "adamw", "seed": 123, "median_ms": 8.388668212890625, "min_ms": 8.386900634765626, "walls_ms": [8.4073, 8.3887, 8.3872, 8.3869, 8.4034]}
+TIMING {"model": "decoder", "opt": "lion", "seed": 123, "median_ms": 8.359976806640624, "min_ms": 8.357825317382812, "walls_ms": [8.3578, 8.4222, 8.36, 8.3584, 8.3805]}
+TIMING {"model": "decoder", "opt": "grokfast", "seed": 123, "median_ms": 8.46558837890625, "min_ms": 8.459776000976563, "walls_ms": [8.4705, 8.4656, 8.4772, 8.4598, 8.4651]}
+TIMING {"model": "decoder", "opt": "looksam", "seed": 123, "median_ms": 19.469107666015624, "min_ms": 19.44825439453125, "walls_ms": [19.4483, 19.475, 19.4691, 19.4788, 19.4662]}
