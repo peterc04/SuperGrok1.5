@@ -559,11 +559,11 @@ inline ViTScratch& vit_scratch_for(const torch::Tensor& params) {
  return it->second;
 }
 
-// PHASE-2 Mamba L3-REAL: the flat param element count for the small Mamba
-// (ntok=99,p=97,d=128,layers=2,seq=8). MUST equal sg::fused::sm90::
-// kMambaTotalElems (the device-side constant in mamba3_layout.cuh). Mamba carries
-// int32 tokens like the decoder (NOT ViT's float patches) — see the branch.
-constexpr int64_t kMambaTotalElems = 259425;
+// PHASE-2 Mamba L3-REAL: the flat param element count for the Mamba-3 toy
+// (ntok=99,p=97,d=128,state=128,head_dim=64,layers=2,seq=8 → 45 tensors). MUST
+// equal sg::fused::sm90::kMambaTotalElems (the device-side constant in
+// mamba3_layout.cuh). Mamba carries int32 tokens like the decoder. */
+constexpr int64_t kMambaTotalElems = 593713;
 constexpr int     kMambaSeq        = 8;   // mirror of SG_MB_SEQ
 
 // PHASE-2 Mamba L3-REAL scratch: modeled on DecoderScratch/decoder_scratch_for.

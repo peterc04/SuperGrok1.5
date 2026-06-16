@@ -146,29 +146,15 @@ static std::vector<torch::Tensor> tc_train_step(
 // bit-exact on its own operands, calibrating the per-tensor bf16 tol as headroom
 // over a GEMM-exact floor. Reuses the cached workspace (call AFTER tc_train_step).
 static std::vector<torch::Tensor> tc_dump_outproj_operands(torch::Tensor params, int64_t B) {
-    TcScratch& sc = tc_scratch_for(params, (int)B, tc_effective_nctas(params, 4));
-    const int T = (int)B * mb::kSeq;
-    auto acts_bf16 = sc.workspace.slice(0, 0, mbtc::mb_acts_floats(T)).view(torch::kBFloat16);
-    // walk mb_acts_bind to dY_dyout[1] and X_ygated[1].
-    const int64_t d = mb::kD, di = mb::kDInner, dr = mb::kDtRank, dbc = mb::kDbc;
-    const int64_t Td = (int64_t)T * d, Tdi = (int64_t)T * di, Tdr = (int64_t)T * dr,
-                  Tdbc = (int64_t)T * dbc, T2di = (int64_t)T * 2 * di;
-    int64_t off = 0, off_Xyg1 = -1, off_dYout1 = -1;
-    for (int li = 0; li < mb::kLayers; ++li) {
-        off += Td;            // X_in
-        off += Tdi;           // X_xmain
-        off += Tdr;           // X_dtraw
-        if (li == 1) off_Xyg1 = off;
-        off += Tdi;           // X_ygated
-        off += T2di;          // dY_dxz
-        off += Tdbc;          // dY_dxdbc
-        off += Tdi;           // dY_ddtpre
-        if (li == 1) off_dYout1 = off;
-        off += Td;            // dY_dyout
-    }
-    auto dYout1 = acts_bf16.slice(0, off_dYout1, off_dYout1 + Td).to(torch::kFloat32).to(torch::kCPU);
-    auto Xyg1 = acts_bf16.slice(0, off_Xyg1, off_Xyg1 + Tdi).to(torch::kFloat32).to(torch::kCPU);
-    return {dYout1, Xyg1};   // [T*d], [T*d_inner]
+    // OBSOLETE on the Mamba-3 scalar-per-sample path: there is no stored bf16 acts
+    // region (the dW is accumulated scalar-style into the per-CTA full-grad partial,
+    // not output-stationary on wgmma). The Mamba-1 calibration hook this served is
+    // not part of the fp64 parity gate; the grad parity is validated end-to-end by
+    // the keystone grad-parity test + the looksam/SG sam_dir/sharpness gates.
+    (void)params; (void)B;
+    TORCH_CHECK(false, "tc_dump_outproj_operands: obsolete on the Mamba-3 scalar path "
+                       "(no stored bf16 projection acts; dW is in the full-grad partial).");
+    return {};
 }
 
 #if SG_MB_SCALAR_MEGAKERNEL

@@ -94,168 +94,351 @@ _TC_NCTA_CAP = int(os.environ.get("SG_TC_NCTA_CAP", "8"))
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  The bf16-FAITHFUL fp64 Mamba oracle (the named R2 reference): mamba_oracle's
-#  fwd+bwd in fp64 with EVERY value the TC kernel STORES rounded to bf16 at the
-#  SAME points. The PRECISION FORK (pinned to model_stage_mamba_tc.cuh):
-#    * layer_in bf16 (in_proj input AND the residual add).
-#    * x_main / dt_raw FP32 into scan/conv/gate/D-skip; ONLY the bf16 COPY
-#      consumed by x_proj / dt_proj (and held as that GEMM's dW X-operand) rounded.
-#    * the 4 projection OUTPUTS' adjoints (dxz, dx_dbc, ddt_pre, dy_out) bf16; dh0 bf16.
-#    * LN / SiLU / softplus / scan / conv / gate / skip / head / CE: fp32 (fp64 here).
+#  Mamba-3 TOY config (mirrors mamba3_oracle.TOY + mlp_ratio=2 — the live model the
+#  L3-TC tail gate builds: 45 params, 593713 elements). The oracle wrappers below
+#  build a live Mamba3Model with THIS config and load the gate's `named` dict.
+# ════════════════════════════════════════════════════════════════════════════
+_M3_CFG = dict(p=97, ntok=99, seq_len=8, d=128, nl=2, state_dim=128,
+               head_dim=64, expand_factor=2, mlp_ratio=2)
+
+
+def _build_m3(named, dtype):
+    """Build a live Mamba3Model at _M3_CFG in `dtype` and load `named` into it
+    (cast to `dtype`). `named`'s keys match the model's named_parameters() exactly;
+    the model ALSO registers a `pos_ids` buffer (not in `named`), so load_state_dict
+    is called with strict=False (the buffer keeps its registered arange value, which
+    is what model_forward reads). Returns the live model with grads disabled."""
+    from grokking_optimizers.mamba3_block import Mamba3Model
+    model = Mamba3Model(**_M3_CFG).to(dtype)
+    sd = {k: v.to(dtype) for k, v in named.items()}
+    model.load_state_dict(sd, strict=False)   # pos_ids buffer (only non-param) kept
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+# Mamba-3 toy shape constants (replace the old mamba_oracle Mamba-1 globals the
+# standalone GPU tests used). VOCAB=ntok, P_HEAD=head width p, SEQ=seq_len,
+# D_MODEL=d. D_INNER = expand_factor*d is the mixer inner width (out_proj's K).
+VOCAB = _M3_CFG["ntok"]
+P_HEAD = _M3_CFG["p"]
+SEQ = _M3_CFG["seq_len"]
+D_MODEL = _M3_CFG["d"]
+D_INNER = _M3_CFG["expand_factor"] * _M3_CFG["d"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The bf16-FAITHFUL fp64 Mamba-3 oracle (the named R2 reference): the Mamba-3
+#  oracle's fwd+bwd PRIMITIVES (mamba3_oracle.*) re-run in fp64 with EVERY value
+#  the Mamba-3 TC kernel STORES rounded to bf16 at the SAME points. The PRECISION
+#  FORK (the standard bf16-faithful contract the decoder/vit oracles use, applied
+#  to Mamba-3's projection set — Sec 3.4 dropped the conv1d + SSM-input SiLU):
+#    * EVERY Linear/GEMM rounds its A-operand (the input ACTIVATION) to bf16, and
+#      EVERY Linear's dY (output-grad) adjoint is rounded to bf16. The weight is
+#      also taken bf16 as the GEMM's other operand (matches the wgmma operands).
+#    * The 7 per-block projections are in_proj, x_proj, dt_proj, out_proj (mixer)
+#      + gate_proj, up_proj, down_proj (SwiGLU MLP); plus the head out-Linear.
+#    * layer-boundary residual stream rounded bf16 (each block's input `h` is the
+#      in_proj A-operand AND the residual add; the final stream into the head norm
+#      is fp32, like the kernel's last-layer output).
+#    * RMSNorm / SiLU / softplus / sigmoid / the complex-trapezoidal SCAN / the
+#      D-skip / the gate / cross-entropy: fp32 (fp64 here) — NOT rounded. The scan
+#      is the Mamba-3 analogue of the Mamba-1 selective scan (kept scalar/fp32).
+#    * dt_proj has a bias (added in fp32); cross-entropy + the scalar head dlogits
+#      are fp32 (no bf16), matching the Mamba-1 oracle.
+#  Re-uses mamba3_oracle's VERIFIED primitive fwd/bwd (rmsnorm_*, silu/silu_grad,
+#  softplus_grad, scan_forward/backward, cross_entropy_*), inserting bf() at the
+#  GEMM operands + dY adjoints only — so the scan/RMSNorm/gate math is bit-for-bit
+#  the pure-fp64 derivation and only the projection boundaries carry bf16 noise.
 #  Runs on CPU (fp64, tiny) so it never competes with the kernel for GPU memory.
+#  Tolerance is generous (sam_dir 2.5e-2 / sharpness 3e-2) precisely to absorb the
+#  bf16-vs-fp64 gap, so this faithful oracle need only be in the right ballpark.
 # ════════════════════════════════════════════════════════════════════════════
 def _bf16_faithful_mamba_oracle(named, tokens, targets):
-    from tests.hw.mamba_oracle import (
-        VOCAB, P_HEAD, D_MODEL, N_LAYERS, SEQ, D_INNER, STATE, DT_RANK, DBC,
-        CONV_K, LN_EPS, silu, silu_grad, softplus, softplus_grad,
-        layernorm_forward, layernorm_backward, selective_scan_forward,
-        selective_scan_backward, conv1d_forward, conv1d_backward, MambaWeights)
+    import torch.nn.functional as F
+    from tests.hw.mamba3_oracle import (
+        silu, silu_grad, softplus_grad, rmsnorm_forward, rmsnorm_backward,
+        scan_forward, scan_backward, cross_entropy_forward, cross_entropy_backward)
     B16 = torch.bfloat16
 
     def bf(x):
         return x.to(B16).to(torch.float64)
 
-    W = MambaWeights.from_named({k: v.double() for k, v in named.items()})
+    # Build the live fp64 model so we can read the exact module structure/shapes
+    # the kernel mirrors, and use named_parameters() (doubled) as the weight dict.
+    model = _build_m3(named, torch.float64)
+    P = {k: v.double() for k, v in model.named_parameters()}
+    nl = len(model.layers)
+    eps = model.norm.eps
     Bn, S = tokens.shape
     dev = tokens.device
-    pos_ids = torch.arange(S, device=dev)
-    # embedding (bf16 layer-0 input)
-    h = bf(bf(W.tok)[tokens] + bf(W.pos)[pos_ids].unsqueeze(0))   # X_in[0] bf16
+
+    # ---- embedding (bf16 layer-0 input: the in_proj A-operand + residual) ----
+    pos_ids = model.pos_ids.reshape(-1)[:S]
+    h = bf(P["tok.weight"][tokens] + P["pos.weight"][pos_ids].unsqueeze(0))  # [B,S,d]
+
     caches = []
-    for li in range(N_LAYERS):
-        L = W.layers[li]
-        x_in = h                                                  # bf16 (in_proj + residual)
-        # in_proj (bf16 GEMM): xz = x_in @ in_w^T
-        xz = bf(x_in) @ bf(L["in_w"]).t()                         # operands bf16; fp64 acc
-        x_main_raw, z = xz.split(D_INNER, dim=-1)                 # fp32/fp64 (scan/conv inputs)
-        # conv1d (fp32) → conv ; x_main = silu(conv)  (FP32 into scan/gate)
-        conv = conv1d_forward(x_main_raw, L["conv_w"], L["conv_b"])
-        x_main = silu(conv)
-        x_main_b = bf(x_main)                                     # X_xmain bf16 (x_proj operand)
-        # x_proj (bf16 GEMM): x_dbc = x_main_b @ x_proj_w^T
-        x_dbc = x_main_b @ bf(L["x_proj_w"]).t()                  # [.,40], fp64 acc
-        dt_raw, Bmat, Cmat = x_dbc.split([DT_RANK, STATE, STATE], dim=-1)
-        dt_raw_b = bf(dt_raw)                                     # X_dtraw bf16 (dt_proj operand)
-        # dt_proj (bf16 GEMM, +bias fp32): dt_pre = dt_raw_b @ dt_proj_w^T + b
-        dt_pre = dt_raw_b @ bf(L["dt_proj_w"]).t() + L["dt_proj_b"].double()
-        # selective scan (FP32) — x_main fp32, Bmat/Cmat fp32
-        y_scan, scan_cache = selective_scan_forward(x_main, dt_pre, Bmat, Cmat, L["A_log"])
-        # gate+skip (FP32): y = (y_scan + x_main*D)*silu(z)
+    for li in range(nl):
+        mixer = model.layers[li].mixer
+        H, Pp, Nc = mixer.n_heads, mixer.head_dim, mixer.complex_dim
+        di, dt_rank = mixer.d_inner, mixer.dt_rank
+        pre = f"layers.{li}."
+
+        # ============ Mamba-3 MIXER sub-block (pre-norm + residual) ============
+        x_block_in = h                                            # bf16 residual stream
+        xn_mix, mixn_cache = rmsnorm_forward(h, P[pre + "mixer_norm.weight"], eps)
+        # in_proj (bf16 GEMM): xz = bf(xn_mix) @ bf(W)^T
+        xn_mix_b = bf(xn_mix)                                     # in_proj A-operand bf16
+        xz = xn_mix_b @ bf(P[pre + "mixer.in_proj.weight"]).t()   # fp64 acc
+        x_main, z = xz.split(di, dim=-1)                          # fp32/fp64
+        x_in = x_main                                            # NO conv, NO SiLU on SSM input
+        x_in_b = bf(x_in)                                        # x_proj A-operand bf16
+        # x_proj (bf16 GEMM)
+        proj = x_in_b @ bf(P[pre + "mixer.x_proj.weight"]).t()
+        dt_lr, A_mod, theta, u_lam, Br, Bi, Cr, Ci = torch.split(
+            proj, [dt_rank, H, Nc, H, Nc, Nc, Nc, Nc], dim=-1)
+        # dt_proj (bf16 GEMM, +bias fp32)
+        dt_lr_b = bf(dt_lr)                                       # dt_proj A-operand bf16
+        dt_pre = dt_lr_b @ bf(P[pre + "mixer.dt_proj.weight"]).t() + P[pre + "mixer.dt_proj.bias"]
+        dt = F.softplus(dt_pre)                                  # [B,L,H]  (fp32)
+        base_rate = torch.exp(P[pre + "mixer.A_log"])           # [H]
+        A_arg = A_mod + base_rate.view(1, 1, -1)
+        A_real = -F.softplus(A_arg)                             # [B,L,H]
+        lam = torch.sigmoid(u_lam)                              # [B,L,H]
+        # BCNorm + all-ones biases (fp32)
+        Brn, Bcache = rmsnorm_forward(Br, P[pre + "mixer.B_norm.weight"], eps)
+        Bin, Bicache = rmsnorm_forward(Bi, P[pre + "mixer.Bhat_norm.weight"], eps)
+        Crn, Ccache = rmsnorm_forward(Cr, P[pre + "mixer.C_norm.weight"], eps)
+        Cin, Cicache = rmsnorm_forward(Ci, P[pre + "mixer.Chat_norm.weight"], eps)
+        Br2 = Brn + P[pre + "mixer.B_bias"]
+        Bi2 = Bin + P[pre + "mixer.Bhat_bias"]
+        Cr2 = Crn + P[pre + "mixer.C_bias"]
+        Ci2 = Cin + P[pre + "mixer.Chat_bias"]
+        Bbar = torch.stack((Br2, Bi2), dim=-1)
+        Cbar = torch.stack((Cr2, -Ci2), dim=-1)
+        # complex exponential-trapezoidal scan (FP32 — NOT rounded)
+        x_h = x_in.view(Bn, S, H, Pp)
+        y_h, scan_cache = scan_forward(x_h, dt, A_real, theta, lam, Bbar, Cbar, H, Pp, Nc)
+        y = y_h.reshape(Bn, S, di)
+        # D-skip + gated output (FP32)
+        y_skip = y + x_in * P[pre + "mixer.D"].view(1, 1, di)
         sz = silu(z)
-        y_skip = y_scan + x_main * L["D"].view(1, 1, D_INNER)
         y_gated = y_skip * sz
-        y_gated_b = bf(y_gated)                                   # X_ygated bf16 (out_proj operand)
-        # out_proj (bf16 GEMM): y_out = y_gated_b @ out_w^T
-        y_out = y_gated_b @ bf(L["out_w"]).t()                    # fp64 acc
-        r = y_out + x_in                                         # residual (x_in bf16)
-        out, ln_cache = layernorm_forward(r, L["n_w"], L["n_b"])
-        h = bf(out) if li + 1 < N_LAYERS else out                # X_in[li+1] bf16 / final fp32
-        caches.append(dict(x_in=x_in, x_main=x_main, x_main_b=x_main_b, z=z, sz=sz,
-                           conv=conv, x_main_raw=x_main_raw, dt_raw=dt_raw, dt_raw_b=dt_raw_b,
-                           Bmat=Bmat, Cmat=Cmat, dt_pre=dt_pre, y_scan=y_scan, y_skip=y_skip,
-                           y_gated=y_gated, y_gated_b=y_gated_b, y_out=y_out, ln_cache=ln_cache,
-                           scan_cache=scan_cache))
-    # final norm (last pos) + scalar head + CE
+        # out_proj (bf16 GEMM)
+        y_gated_b = bf(y_gated)                                  # out_proj A-operand bf16
+        mix_out = y_gated_b @ bf(P[pre + "mixer.out_proj.weight"]).t()
+        h1 = x_block_in + mix_out                               # block residual (bf16 stream + fp64 out)
+
+        # ============ SwiGLU MLP sub-block (pre-norm + residual) ===============
+        h1n, mlpn_cache = rmsnorm_forward(h1, P[pre + "mlp_norm.weight"], eps)
+        h1n_b = bf(h1n)                                          # gate_proj/up_proj A-operand bf16
+        g_pre = h1n_b @ bf(P[pre + "mlp.gate_proj.weight"]).t()
+        u = h1n_b @ bf(P[pre + "mlp.up_proj.weight"]).t()
+        s = silu(g_pre)
+        prod = s * u
+        prod_b = bf(prod)                                       # down_proj A-operand bf16
+        mlp_out = prod_b @ bf(P[pre + "mlp.down_proj.weight"]).t()
+        h2 = h1 + mlp_out
+
+        # next block's input stream is bf16 (its in_proj A-operand + residual);
+        # the FINAL block's output stays fp32 into the head norm (kernel's last layer).
+        h = bf(h2) if li + 1 < nl else h2
+        caches.append(dict(
+            x_block_in=x_block_in, mixn_cache=mixn_cache, xn_mix_b=xn_mix_b,
+            x_in=x_in, x_in_b=x_in_b, z=z, dt_lr=dt_lr, dt_lr_b=dt_lr_b,
+            dt_pre=dt_pre, A_arg=A_arg, base_rate=base_rate, lam=lam,
+            Bcache=Bcache, Bicache=Bicache, Ccache=Ccache, Cicache=Cicache,
+            scan_cache=scan_cache, y_skip=y_skip, sz=sz, y_gated=y_gated,
+            y_gated_b=y_gated_b, h1=h1, mlpn_cache=mlpn_cache, h1n_b=h1n_b,
+            g_pre=g_pre, u=u, s=s, prod=prod, prod_b=prod_b,
+            H=H, Pp=Pp, Nc=Nc, di=di, dt_rank=dt_rank, pre=pre))
+
+    # ---- final RMSNorm (last token) + scalar head + cross-entropy (fp32) ----
     h_last = h[:, -1, :]
-    hn, nc = layernorm_forward(h_last, W.norm_w.double(), W.norm_b.double())
-    logits = hn @ W.out_w.double().t() + W.out_b.double()        # scalar head fp32
-    mx = logits.max(dim=-1, keepdim=True).values
-    logz = mx.squeeze(-1) + torch.log(torch.exp(logits - mx).sum(dim=-1))
-    loss = (logz - logits.gather(1, targets.unsqueeze(1)).squeeze(1)).mean()
-    # ── backward ──
+    hn, nc = rmsnorm_forward(h_last, P["norm.weight"], eps)
+    logits = hn @ P["out.weight"].t() + P["out.bias"]           # scalar head fp32
+    loss = cross_entropy_forward(logits, targets)
+
+    # ============================ BACKWARD ===================================
     grads = {}
-    sm = torch.softmax(logits, dim=-1); oh = torch.zeros_like(sm)
-    oh.scatter_(1, targets.unsqueeze(1), 1.0)
-    dlogits = (sm - oh) / Bn                                     # scalar head fp32 (NO bf16)
+    dlogits = cross_entropy_backward(logits, targets)           # fp32 (NO bf16)
     grads["out.weight"] = dlogits.t() @ hn
     grads["out.bias"] = dlogits.sum(0)
-    dhn = dlogits @ W.out_w.double()
-    dh_last, dnw, dnb = layernorm_backward(dhn, nc)
-    grads["norm.weight"] = dnw; grads["norm.bias"] = dnb
-    dh = torch.zeros(Bn, S, D_MODEL, device=dev, dtype=torch.float64); dh[:, -1, :] = dh_last
-    for li in reversed(range(N_LAYERS)):
-        L = W.layers[li]; lc = caches[li]
-        dr, dn_w, dn_b = layernorm_backward(dh, lc["ln_cache"])
-        grads[f"layers.{li}.norm.weight"] = dn_w; grads[f"layers.{li}.norm.bias"] = dn_b
-        dy_out = dr
-        dx_residual = dr.clone()
-        dy_out_b = bf(dy_out)                                    # dY_dyout bf16
-        # out_proj: dW = dy_out_b^T @ y_gated_b (P2 K=T) ; dX = dy_out_b @ out_w_b
-        grads[f"layers.{li}.out_proj.weight"] = dy_out_b.reshape(-1, D_MODEL).t() @ lc["y_gated_b"].reshape(-1, D_INNER)
-        dy_gated = dy_out_b @ bf(L["out_w"])                     # bf16 GEMM dX → fp32
-        # gate+skip bwd (FP32)
-        sz = lc["sz"]
-        dy_skip = dy_gated * sz
+    dhn = dlogits @ P["out.weight"]
+    dh_last, grads["norm.weight"] = rmsnorm_backward(dhn, nc)
+
+    d = P["tok.weight"].shape[1]
+    dh = torch.zeros(Bn, S, d, device=dev, dtype=torch.float64)
+    dh[:, -1, :] = dh_last
+    for li in reversed(range(nl)):
+        lc = caches[li]
+        pre = lc["pre"]
+        H, Pp, Nc, di = lc["H"], lc["Pp"], lc["Nc"], lc["di"]
+
+        # ---- SwiGLU MLP backward (h2 = h1 + mlp(mlp_norm(h1))) ----
+        d_ff = lc["prod_b"].shape[-1]
+        dh1 = dh.clone()                                        # residual path
+        dmlp_out = dh                                          # [B,S,d]
+        # down_proj [d,d_ff]: dW = dY^T @ prod_b ; dX = dY @ W   (dY adjoint bf16)
+        dmlp_out_b = bf(dmlp_out)                               # down_proj dY bf16
+        grads[pre + "mlp.down_proj.weight"] = (
+            dmlp_out_b.reshape(-1, d).t() @ lc["prod_b"].reshape(-1, d_ff))
+        dprod = dmlp_out_b @ bf(P[pre + "mlp.down_proj.weight"])  # fp32 [B,S,d_ff]
+        ds = dprod * lc["u"]
+        du = dprod * lc["s"]
+        dg_pre = ds * silu_grad(lc["g_pre"])
+        # gate_proj / up_proj: dY adjoints bf16, dW vs h1n_b, dX vs W (bf16)
+        dg_pre_b = bf(dg_pre); du_b = bf(du)
+        grads[pre + "mlp.gate_proj.weight"] = dg_pre_b.reshape(-1, dg_pre_b.shape[-1]).t() @ lc["h1n_b"].reshape(-1, d)
+        grads[pre + "mlp.up_proj.weight"] = du_b.reshape(-1, du_b.shape[-1]).t() @ lc["h1n_b"].reshape(-1, d)
+        dh1n = dg_pre_b @ bf(P[pre + "mlp.gate_proj.weight"]) + du_b @ bf(P[pre + "mlp.up_proj.weight"])
+        dh1_mlpnorm, grads[pre + "mlp_norm.weight"] = rmsnorm_backward(dh1n, lc["mlpn_cache"])
+        dh1 = dh1 + dh1_mlpnorm
+
+        # ---- Mamba-3 mixer backward (h1 = x + mixer(mixer_norm(x))) ----
+        dx_block = dh1.clone()                                  # residual path
+        dmix_out = dh1                                         # [B,S,d]
+        # out_proj [d,di]: dW = dY^T @ y_gated_b ; dX = dY @ W   (dY adjoint bf16)
+        dmix_out_b = bf(dmix_out)                               # out_proj dY bf16
+        grads[pre + "mixer.out_proj.weight"] = dmix_out_b.reshape(-1, d).t() @ lc["y_gated_b"].reshape(-1, di)
+        dy_gated = dmix_out_b @ bf(P[pre + "mixer.out_proj.weight"])  # fp32 [B,S,di]
+        # gate + D-skip backward (FP32)
+        dy_skip = dy_gated * lc["sz"]
         dsz = dy_gated * lc["y_skip"]
         dz = dsz * silu_grad(lc["z"])
-        dy_scan = dy_skip
-        dx_main = dy_skip * L["D"].view(1, 1, D_INNER).double()
-        grads[f"layers.{li}.D"] = (dy_skip * lc["x_main"]).sum(dim=(0, 1))
-        # scan bwd (FP32)
-        dx_scan, ddt_pre, dBmat, dCmat, dA_log = selective_scan_backward(dy_scan, lc["scan_cache"])
-        grads[f"layers.{li}.A_log"] = dA_log
-        dx_main = dx_main + dx_scan
-        ddt_pre_b = bf(ddt_pre)                                  # dY_ddtpre bf16
-        # dt_proj: dW = ddt_pre_b^T @ dt_raw_b (P2) ; db = Σ ddt_pre_b ; dX = ddt_pre_b @ dt_proj_w_b
-        grads[f"layers.{li}.dt_proj.weight"] = ddt_pre_b.reshape(-1, D_INNER).t() @ lc["dt_raw_b"].reshape(-1, DT_RANK)
-        grads[f"layers.{li}.dt_proj.bias"] = ddt_pre_b.reshape(-1, D_INNER).sum(0)
-        ddt_raw = ddt_pre_b @ bf(L["dt_proj_w"])                 # bf16 GEMM dX → fp32 [.,dt_rank]
-        # x_proj: dx_dbc = cat[ddt_raw, dBmat, dCmat] (bf16 adjoint) ; dW = dx_dbc_b^T @ x_main_b
-        dx_dbc = torch.cat([ddt_raw, dBmat, dCmat], dim=-1)      # [.,40] fp32
-        dx_dbc_b = bf(dx_dbc)                                    # dY_dxdbc bf16
-        grads[f"layers.{li}.x_proj.weight"] = dx_dbc_b.reshape(-1, DBC).t() @ lc["x_main_b"].reshape(-1, D_INNER)
-        dx_main3 = dx_dbc_b @ bf(L["x_proj_w"])                  # bf16 GEMM dX → fp32
-        dx_main = dx_main + dx_main3
-        # conv bwd (FP32): dconv = dx_main * silu'(conv)
-        dconv = dx_main * silu_grad(lc["conv"])
-        dx_main_raw, dW_conv, db_conv = conv1d_backward(dconv, lc["x_main_raw"], L["conv_w"])
-        grads[f"layers.{li}.conv1d.weight"] = dW_conv; grads[f"layers.{li}.conv1d.bias"] = db_conv
-        # in_proj: dxz = cat[dx_main_raw, dz] (bf16 adjoint) ; dW = dxz_b^T @ x_in_b ; dX = dxz_b @ in_w_b
-        dxz = torch.cat([dx_main_raw, dz], dim=-1)              # [.,2*d_inner] fp32
-        dxz_b = bf(dxz)                                          # dY_dxz bf16
-        grads[f"layers.{li}.in_proj.weight"] = dxz_b.reshape(-1, 2 * D_INNER).t() @ bf(lc["x_in"]).reshape(-1, D_MODEL)
-        dx_inproj = dxz_b @ bf(L["in_w"])                       # bf16 GEMM dX → fp32
-        dh = dx_inproj + dx_residual                            # fans to prev layer / embedding
-    dh_b = bf(dh)                                               # dh0 bf16
-    dtok = torch.zeros_like(W.tok.double())
-    dtok.index_add_(0, tokens.reshape(-1), dh_b.reshape(-1, D_MODEL))
+        grads[pre + "mixer.D"] = (dy_skip * lc["x_in"]).sum(dim=(0, 1))
+        dx_in = dy_skip * P[pre + "mixer.D"].view(1, 1, di)
+        # scan backward (FP32) — dy [B,L,di] -> [B,L,H,P]
+        sg = scan_backward(dy_skip.view(Bn, S, H, Pp), lc["scan_cache"])
+        dx_in = dx_in + sg["dx_h"].reshape(Bn, S, di)
+        # Cbar = (Cr2,-Ci2), Bbar = (Br2,Bi2)
+        dBr2 = sg["dBbar"][..., 0]; dBi2 = sg["dBbar"][..., 1]
+        dCr2 = sg["dCbar"][..., 0]; dCi2 = -sg["dCbar"][..., 1]
+        grads[pre + "mixer.B_bias"] = dBr2.sum(dim=(0, 1))
+        grads[pre + "mixer.Bhat_bias"] = dBi2.sum(dim=(0, 1))
+        grads[pre + "mixer.C_bias"] = dCr2.sum(dim=(0, 1))
+        grads[pre + "mixer.Chat_bias"] = dCi2.sum(dim=(0, 1))
+        dBr, grads[pre + "mixer.B_norm.weight"] = rmsnorm_backward(dBr2, lc["Bcache"])
+        dBi, grads[pre + "mixer.Bhat_norm.weight"] = rmsnorm_backward(dBi2, lc["Bicache"])
+        dCr, grads[pre + "mixer.C_norm.weight"] = rmsnorm_backward(dCr2, lc["Ccache"])
+        dCi, grads[pre + "mixer.Chat_norm.weight"] = rmsnorm_backward(dCi2, lc["Cicache"])
+        # dt: ddt(post-softplus) -> dt_pre via softplus' -> dt_proj bwd (dY bf16)
+        ddt_pre = sg["ddt"] * softplus_grad(lc["dt_pre"])
+        ddt_pre_b = bf(ddt_pre)                                 # dt_proj dY bf16
+        grads[pre + "mixer.dt_proj.weight"] = ddt_pre_b.reshape(-1, H).t() @ lc["dt_lr_b"].reshape(-1, lc["dt_rank"])
+        grads[pre + "mixer.dt_proj.bias"] = ddt_pre_b.reshape(-1, H).sum(0)
+        ddt_lr = ddt_pre_b @ bf(P[pre + "mixer.dt_proj.weight"])  # fp32 [.,dt_rank]
+        # A_real = -softplus(A_arg); A_arg = A_mod + exp(A_log)
+        dA_arg = sg["dA_real"] * (-softplus_grad(lc["A_arg"]))
+        dA_mod = dA_arg
+        grads[pre + "mixer.A_log"] = (dA_arg * lc["base_rate"].view(1, 1, -1)).sum(dim=(0, 1))
+        # lambda = sigmoid(u_lam)
+        du_lam = sg["dlam"] * (lc["lam"] * (1.0 - lc["lam"]))
+        dtheta = sg["dtheta"]
+        # reassemble x_proj output adjoint, round to bf16, x_proj bwd
+        dproj = torch.cat([ddt_lr, dA_mod, dtheta, du_lam, dBr, dBi, dCr, dCi], dim=-1)
+        dproj_b = bf(dproj)                                     # x_proj dY bf16
+        grads[pre + "mixer.x_proj.weight"] = dproj_b.reshape(-1, dproj_b.shape[-1]).t() @ lc["x_in_b"].reshape(-1, di)
+        dx_in3 = dproj_b @ bf(P[pre + "mixer.x_proj.weight"])    # fp32
+        dx_in = dx_in + dx_in3
+        # x_in = x_main (no SiLU) ; xz = [x_main | z] = in_proj(xn_mix). dY bf16.
+        dxz = torch.cat([dx_in, dz], dim=-1)
+        dxz_b = bf(dxz)                                         # in_proj dY bf16
+        grads[pre + "mixer.in_proj.weight"] = dxz_b.reshape(-1, 2 * di).t() @ lc["xn_mix_b"].reshape(-1, d)
+        dxn_mix = dxz_b @ bf(P[pre + "mixer.in_proj.weight"])   # fp32
+        dx_mixnorm, grads[pre + "mixer_norm.weight"] = rmsnorm_backward(dxn_mix, lc["mixn_cache"])
+        dh = dx_block + dx_mixnorm                              # x fans to block residual + mixer_norm
+
+    # ---- embeddings (h0 = tok[tokens] + pos[pos_ids]); dh0 bf16 ----
+    dh_b = bf(dh)
+    dtok = torch.zeros_like(P["tok.weight"])
+    dtok.index_add_(0, tokens.reshape(-1), dh_b.reshape(-1, d))
     grads["tok.weight"] = dtok
-    grads["pos.weight"] = dh_b.reshape(Bn, S, D_MODEL).sum(0)
+    grads["pos.weight"] = dh_b.sum(dim=0)                       # [S,d]
     return loss.item(), grads
 
 
 def _pure_fp64_oracle(named, tokens, targets):
-    """The bf16-noise FLOOR: mamba_oracle in pure fp64 (no storage rounds)."""
-    from tests.hw.mamba_oracle import oracle_loss_and_grads
-    return oracle_loss_and_grads({k: v.double() for k, v in named.items()}, tokens, targets)
+    """The bf16-noise FLOOR: mamba3_oracle in pure fp64 (no storage rounds).
+
+    Builds the live fp64 Mamba3Model at the toy config (loading `named`, doubled),
+    runs mamba3_oracle.model_forward + model_backward (the VERIFIED hand-derived
+    manual fwd/bwd that matches autograd to ~1e-15 in fp64), and returns
+    (loss_float, grads_dict) keyed by the named_parameter names — model_backward
+    already returns the dict keyed that way. Same call contract as the old
+    Mamba-1 wrapper: (named, tokens, targets) -> (loss, grads)."""
+    from tests.hw import mamba3_oracle
+    model = _build_m3(named, torch.float64)
+    loss, cache = mamba3_oracle.model_forward(model, tokens, targets)
+    grads = mamba3_oracle.model_backward(model, cache)
+    return loss.item(), grads
 
 
-def _eager_mamba_named(seed=123):
-    """Init the Mamba params via the oracle's spec on CPU (deterministic)."""
-    from tests.hw.mamba_oracle import mamba_param_spec
+def mamba3_param_layout():
+    """The flat Mamba-3 layout (the 45-tensor named_parameters() order of the toy
+    Mamba3Model at _M3_CFG), as the dict shape the gate/standalone tests consume
+    (mirrors the old mamba_oracle.mamba_param_layout): names / offsets / sizes /
+    shapes / total / n_tensors. Built from the LIVE model so it stays in lockstep
+    with mamba3_block.py (and matches megakernel_codegen._mamba_param_sizes(128))."""
+    from grokking_optimizers.mamba3_block import Mamba3Model
+    m = Mamba3Model(**_M3_CFG)
+    names, sizes, shapes, offsets = [], [], [], []
+    off = 0
+    for n, p in m.named_parameters():
+        names.append(n)
+        sizes.append(p.numel())
+        shapes.append(tuple(p.shape))
+        offsets.append(off)
+        off += p.numel()
+    return dict(names=names, offsets=offsets, sizes=sizes, shapes=shapes,
+                total=off, n_tensors=len(names))
+
+
+def mamba3_param_spec():
+    """(name, shape) pairs for the 45 Mamba-3 toy params, in named order."""
+    lay = mamba3_param_layout()
+    return list(zip(lay["names"], lay["shapes"]))
+
+
+def _eager_mamba3_named(seed=123):
+    """Init the 45 Mamba-3 toy params with a sane, valid init on CPU
+    (deterministic). Used only by the standalone test_mamba_tc.py GPU tests (the
+    L3-TC tail gate builds the LIVE model instead), so the exact values only need
+    to be a valid fixed point — parity is structural, not value-specific.
+
+    Init mirrors mamba3_block.py's module defaults:
+      A_log        = log(arange(1..n_heads))         (= log of 1,2,3,4 -> A=-exp<0 stable)
+      D            = ones(d_inner)
+      *_bias (B/C) = ones(complex_dim)               (Appendix F all-ones)
+      *norm.weight = ones                            (RMSNorm init)
+      dt_proj.bias = zeros ; out.bias = zeros
+      everything else (projection weights, embeddings) = 0.05*randn
+    """
     g = torch.Generator().manual_seed(seed)
     named = {}
-    for name, shape in mamba_param_spec():
-        # match the kernel's expectation of small init; the exact init only needs
-        # to be a valid fixed point (parity is structural, not value-specific).
+    for name, shape in mamba3_param_spec():
         if name.endswith("A_log"):
-            named[name] = torch.rand(shape, generator=g) * 0.5 + 0.1   # A_log>0 → A=-exp<0 stable
-        elif "norm" in name and name.endswith(".weight") or name.endswith("n.weight"):
+            n_heads = shape[0]
+            named[name] = torch.log(torch.arange(1, n_heads + 1, dtype=torch.float32)).contiguous()
+        elif name.endswith(".D"):
             named[name] = torch.ones(shape)
-        elif name.endswith(".bias") or name.endswith("_b") or name.endswith(".D"):
-            named[name] = torch.zeros(shape) if not name.endswith(".D") else torch.rand(shape, generator=g)
-        else:
+        elif name.endswith("_bias"):                       # B_bias/Bhat_bias/C_bias/Chat_bias
+            named[name] = torch.ones(shape)
+        elif name.endswith("norm.weight"):                 # all RMSNorm weights (mixer/mlp/BC/final)
+            named[name] = torch.ones(shape)
+        elif name.endswith(".bias"):                       # dt_proj.bias, out.bias
+            named[name] = torch.zeros(shape)
+        else:                                              # projection weights + embeddings
             named[name] = 0.05 * torch.randn(shape, generator=g)
-    # LayerNorm weights to 1 (the oracle's nn.LayerNorm init).
-    for name in named:
-        if name.endswith("norm.weight"):
-            named[name] = torch.ones_like(named[name])
     return named
 
 
+# Back-compat alias: some callers may still reference the Mamba-1 name.
+_eager_mamba_named = _eager_mamba3_named
+
+
 def _flat(named):
-    from tests.hw.mamba_oracle import mamba_param_layout
-    lay = mamba_param_layout()
+    lay = mamba3_param_layout()
     return torch.cat([named[n].reshape(-1) for n in lay["names"]]).contiguous()
 
 
@@ -286,14 +469,12 @@ def test_tc_single_step_grad_parity():
     the kernel's storage points). Loss rel ≤ 5e-3. The calibration witness
     (printed): kernel-vs-bf16faithful against bf16faithful-vs-fp64 (the floor)
     + the layer-0/layer-1 split (a real bug → early layers ≫ late)."""
-    from tests.hw.mamba_oracle import mamba_param_layout
     mod = _build_tc_module()
     _disable_tf32()
     dev = "cuda"
-    named = _eager_mamba_named(seed=123)
+    named = _eager_mamba3_named(seed=123)
     B = 128
     g = torch.Generator().manual_seed(5)
-    from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
     tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g)
     targets = torch.randint(0, P_HEAD, (B,), generator=g)
     loss_o, grads_o = _bf16_faithful_mamba_oracle(named, tokens, targets)
@@ -307,10 +488,12 @@ def test_tc_single_step_grad_parity():
     rel_loss = abs(loss_k - loss_o) / (abs(loss_o) + 1e-30)
     print(f"[mbtc] loss kernel={loss_k:.6f} bf16-oracle={loss_o:.6f} rel={rel_loss:.2e}")
     assert rel_loss < _TC_LOSS_REL, f"TC loss rel {rel_loss:.2e} > {_TC_LOSS_REL}"
-    lay = mamba_param_layout()
+    lay = mamba3_param_layout()
     worst = 0.0; worst_name = ""
     l0w, l1w, floor = [], [], 0.0
-    PROJ = ("in_proj.weight", "x_proj.weight", "dt_proj.weight", "out_proj.weight")
+    # Mamba-3 mixer projection weights (the TC GEMMs); named as layers.N.mixer.*.
+    PROJ = ("mixer.in_proj.weight", "mixer.x_proj.weight",
+            "mixer.dt_proj.weight", "mixer.out_proj.weight")
     for name, off, sz, shape in zip(lay["names"], lay["offsets"], lay["sizes"], lay["shapes"]):
         kg = kgrad[off:off + sz].reshape(shape)
         og = grads_o[name]; fp = grads_fp[name].double()
@@ -340,11 +523,10 @@ def test_tc_proj_dw_exact_on_own_operands():
     stored bf16 acts: dump dY_dyout[L1], X_ygated[L1], contract fp32 ascending-t,
     compare to the kernel's out_proj.weight[L1] grad slice. ~1e-6 isolates the dW
     GEMM from the operand-chain bf16 divergence (calibrates the per-tensor tol)."""
-    from tests.hw.mamba_oracle import (mamba_param_layout, D_MODEL, D_INNER, SEQ, VOCAB, P_HEAD)
     mod = _build_tc_module()
     _disable_tf32()
     dev = "cuda"
-    named = _eager_mamba_named(seed=7)
+    named = _eager_mamba3_named(seed=7)
     B = 128
     g = torch.Generator().manual_seed(11)
     tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g)
@@ -361,8 +543,8 @@ def test_tc_proj_dw_exact_on_own_operands():
     dY = dY.double().reshape(T, D_MODEL)
     X = X.double().reshape(T, D_INNER)
     ref = dY.t() @ X    # [d, d_inner] — out_proj.weight[L1] grad, fp32 over the kernel's bf16 acts
-    lay = mamba_param_layout()
-    idx = lay["names"].index("layers.1.out_proj.weight")
+    lay = mamba3_param_layout()
+    idx = lay["names"].index("layers.1.mixer.out_proj.weight")
     off, sz, shape = lay["offsets"][idx], lay["sizes"][idx], lay["shapes"][idx]
     kg = kgrad[off:off + sz].reshape(shape)
     err = (kg - ref).abs().max().item(); den = ref.abs().max().item() + 1e-30
@@ -375,11 +557,10 @@ def test_tc_proj_dw_exact_on_own_operands():
 def test_tc_determinism():
     """(3) A/A/A bit-identical: three TC steps from the same state produce
     bit-identical (loss, grad). Fixed tile/dW/partial ownership + ascending-k/t/CTA."""
-    from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
     mod = _build_tc_module()
     _disable_tf32()
     dev = "cuda"
-    named = _eager_mamba_named(seed=3)
+    named = _eager_mamba3_named(seed=3)
     B = 64
     g = torch.Generator().manual_seed(9)
     tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g).to(dev)
@@ -402,11 +583,10 @@ def test_tc_determinism():
 def test_tc_short_trajectory():
     """(4) 50 TC steps: the loss decreases and stays finite (the trained cell is a
     real optimizer over the real grad — a broken grad diverges or stalls)."""
-    from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
     mod = _build_tc_module()
     _disable_tf32()
     dev = "cuda"
-    named = _eager_mamba_named(seed=21)
+    named = _eager_mamba3_named(seed=21)
     B = 64
     g = torch.Generator().manual_seed(13)
     tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g).to(dev)
@@ -430,11 +610,10 @@ def test_tc_step_time_vs_scalar():
     fleet may be live). Only the 4 projections are TC + the scalar scan is a big
     share of Mamba FLOPs, so expect a MODEST speedup, not the decoder's 1.8×."""
     import time
-    from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
     mod = _build_tc_module()
     _disable_tf32()
     dev = "cuda"
-    named = _eager_mamba_named(seed=2)
+    named = _eager_mamba3_named(seed=2)
     B = 64
     g = torch.Generator().manual_seed(4)
     tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g).to(dev)

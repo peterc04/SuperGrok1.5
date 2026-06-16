@@ -479,7 +479,18 @@ def _raw_model(c, device):
     gc = c.get("grad_checkpoint", True)
     if mt == "decoder": return Transformer(nl, d, h, c["num_tokens"], 4, grad_checkpoint=gc).to(device)
     elif mt == "vit":   return ViT(p=p, patch_dim=c.get("patch_dim",49), num_patches=c.get("num_patches",16), d=d, h=h, nl=nl, grad_checkpoint=gc).to(device)
-    elif mt == "mamba": return MambaModel(p=p, ntok=c["num_tokens"], seq_len=c.get("seq_len",8), d=d, nl=nl, grad_checkpoint=gc).to(device)
+    elif mt == "mamba":
+        # Mamba-3 (replaces Mamba-1 MambaModel). Local import: mamba3_block imports
+        # only torch, but we follow the existing grokking_optimizers submodule-import
+        # convention (cf. lowprec import) and keep this off the top-level path.
+        # Mamba3Model has NO grad_checkpoint arg; SSM/MLP knobs use canonical-toy
+        # defaults (state_dim=128, head_dim=64, expand=2, mlp_ratio=2) and are
+        # config-overridable for larger configs.
+        from grokking_optimizers.mamba3_block import Mamba3Model
+        return Mamba3Model(p=p, ntok=c["num_tokens"], seq_len=c.get("seq_len",8),
+                           d=d, nl=nl, state_dim=c.get("mamba_state_dim",128),
+                           head_dim=c.get("mamba_head_dim",64), expand_factor=c.get("mamba_expand",2),
+                           mlp_ratio=c.get("mamba_mlp_ratio",2)).to(device)
     else: raise ValueError(f"Unknown: {mt}")
 
 def build_model(c, device, do_compile=False):

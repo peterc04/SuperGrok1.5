@@ -1274,7 +1274,7 @@ _DECODER_TOTAL_ELEMS = 422755   # small decoder (vocab=99,d=128,heads=4,layers=2
 _DECODER_SEQ = 4
 _VIT_TOTAL_ELEMS = 418017       # small ViT (p=97,d=128,heads=4,layers=2,patch=49,npatch=16)
 _VIT_PATCH_ELEMS = 16 * 49      # 784 patch pixels per sample ([16][49] row-major)
-_MAMBA_TOTAL_ELEMS = 259425     # small Mamba (ntok=99,p=97,d=128,layers=2,seq=8)
+_MAMBA_TOTAL_ELEMS = 593713     # Mamba-3 toy (ntok=99,p=97,d=128,state=128,head_dim=64,layers=2,seq=8): 45 tensors
 _MAMBA_SEQ = 8
 
 # L3-REAL per-(canonical_model) ABI spec for fused_train_step. Each model carries

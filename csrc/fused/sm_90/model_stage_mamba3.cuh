@@ -2,93 +2,75 @@
 #define SG_FUSED_SM90_MODEL_STAGE_MAMBA3_CUH_
 // ============================================================================
 // csrc/fused/sm_90/model_stage_mamba3.cuh — PHASE 2 of the TRUE L3 fused
-// megakernel: the REAL Mamba (selective-SSM) forward + backward as in-kernel
+// megakernel: the REAL **Mamba-3** (SISO) forward + backward as in-kernel
 // stages of the persistent megakernel. ONE HEADER PER MODEL (COMPONENT_CONTRACT).
 //
-// HONESTY: this is the genuine eager architecture (grokking_race_v2.py
-// _raw_model -> MambaModel / SelectiveSSMLayer), transcribed LINE-FOR-LINE from
-// the verified PyTorch oracle in tests/hw/mamba_oracle.py, which is asserted
-// bit-identical (fp64, ~1e-15 rel) to torch.autograd for the loss and EVERY one
-// of the 28 parameter gradients — INCLUDING the selective-scan backward (the
-// reverse-time recurrence for dA_log,dB,dC,ddt,dx, derived in the oracle with the
-// derivation written out). There is NO placeholder math on this path.
+// HONESTY: this is the genuine Mamba-3 architecture (arXiv 2603.15569, ICLR
+// 2026), transcribed LINE-FOR-LINE from the verified PyTorch oracle in
+// tests/hw/mamba3_oracle.py + grokking_optimizers/mamba3_block.py, which is
+// asserted bit-identical (fp64, ~4e-15 rel) to torch.autograd for the loss and
+// EVERY one of the 45 parameter gradients — INCLUDING the complex
+// exponential-trapezoidal selective-scan backward (the reverse-time recurrence
+// with the width-2 beta-coupling, the per-head coefficient Jacobian fold, and
+// the per-step 2x2 rotations). There is NO placeholder math on this path.
 //
-// ARCHITECTURE (exact; cites grokking_race_v2.py lines):
-//   MambaModel(p=97, ntok=99, seq_len=8, d=128, nl=2)         (:451-462, :477)
-//     tok = Embedding(99,128) (:454); pos = Embedding(8,128) (:454), arange(8)
-//     2 x SelectiveSSMLayer(d=128) (:455):
-//       d_inner=256(=d*2), state_dim=16, dt_rank=max(d/16,1)=8           (:408-411)
-//       in_proj  = Linear(128, 2*256=512, bias=False)                    (:412)
-//       conv1d   = Conv1d(256,256,k=3,pad=1,groups=256,bias=True) NON-CAUSAL (:413)
-//       x_proj   = Linear(256, 8+2*16=40, bias=False)                    (:415)
-//       dt_proj  = Linear(8, 256, bias=True)                             (:416)
-//       A_log    = log(arange(1,17)).expand(256,16); A = -exp(A_log)     (:417-418,:423)
-//       D        = ones(256)                                             (:419)
-//       out_proj = Linear(256, 128, bias=False)                          (:420)
-//       norm     = LayerNorm(128) (POST, per layer)                      (:421)
-//       forward (:442-449):
-//         residual=x; xz=in_proj(x); x_main,z = xz.chunk(2,-1)
-//         x_main = SiLU(conv1d(x_main))      (depthwise NON-causal k=3 pad=1)
-//         dt,B,C = x_proj(x_main).split([8,16,16],-1)
-//         y = selective_scan(x_main, dt_proj(dt), B, C)   (softplus INSIDE scan)
-//         y = out_proj((y + x_main*D) * SiLU(z))
-//         return norm(y + residual)
-//     norm = LayerNorm(128) (:456 final); out = Linear(128,97) (:456 head, p=97!)
-//     forward: h=tok+pos; for l: h=l(h); return out(norm(h[:,-1,:])) (:460-462)
-//   loss = cross_entropy(logits, targets) (mean over batch; :745).
+// ARCHITECTURE (exact; cites MAMBA3_REFERENCE.md sections):
+//   Full Llama-style stack (Sec 3.4): tok+pos embed -> nl x Mamba3Block ->
+//   final RMSNorm -> Linear head on the LAST token; CE loss.
+//   Each Mamba3Block (one Llama layer):
+//       h = h + Mamba3Mixer( RMSNorm_mix(h) )      # mixer residual OFF
+//       h = h + SwiGLU_MLP ( RMSNorm_mlp(h) )      # down(SiLU(gate)*up), no bias
+//   Mamba3Layer (mixer), forward:
+//       xz = in_proj(x); x_main,z = chunk(2)       # NO conv1d, NO SSM-input SiLU
+//       (dt_lr,A_mod,theta,u_lam,Br,Bi,Cr,Ci) = x_proj(x_main).split
+//       dt   = softplus(dt_proj(dt_lr)+b)          # PER HEAD
+//       A    = -softplus(A_mod + exp(A_log))       # PER HEAD scalar real part
+//       lam  = sigmoid(u_lam)                      # PER HEAD trapezoid gate
+//       Bbar = (BCNorm(Br)+B_bias, BCNorm(Bi)+Bhat_bias)   # head-shared, per Nc
+//       Cbar = (BCNorm(Cr)+C_bias, -(BCNorm(Ci)+Chat_bias))
+//       y    = mamba3_scan(x_main, dt, A, phi=dt*theta, lam, Bbar, Cbar)  (Eq 25)
+//       y    = (y + x_main*D) * SiLU(z)            # D per-channel skip, gated out
+//       out  = out_proj(y)
+//   Layout (MAMBA3_REFERENCE.md sec 1, RESOLVED):
+//     PER HEAD     : dt, A_real, lambda                 [n_heads]
+//     HEAD-SHARED  : theta, B, Bhat, C, Chat            [N_c]
+//     PER CHANNEL  : x (SSM input), D skip, gate z       [d_inner]
+//   State h_t[b,h,p,c,:] is a 2-vector per complex coord c; rotation angle
+//   phi[h,c] = dt[h]*theta[c] (per-head per-coord). y = Cbar^T h (real part).
 //
-//   selective_scan(x,dt,B,C)  (:422-441, the PYTHON FALLBACK the race runs):
-//     A=-exp(A_log); dt=softplus(dt); h=0;
-//     for t: h = exp(dt_t*A)*h + (dt_t*B_t)*x_t ; y_t = sum_s C_t*h_t.
+// THE SCAN RECURRENCE (Eq 25, the heart of the kernel):
+//     v_t = Bbar_t (.) x_t                              # 2-vector (Br*x, Bi*x)
+//     h_t = alpha_t*(R_t@h_{t-1}) + beta_t*(R_t@v_{t-1}) + gamma_t*v_t
+//     y_t = sum_{c,d} Cbar_t[c,d] * h_t[b,h,p,c,d]
+//   alpha=exp(dt*A), gamma=lam*dt, beta=(1-lam)*dt*alpha (per head).
+//   R(phi)@(w0,w1) = (cos*w0 - sin*w1, sin*w0 + cos*w1).
 //
-// NUMERICS (verified in the oracle; see mamba_oracle.py):
-//   * SiLU(x)=x*sigmoid(x); SiLU'(x)=sig(x)*(1+x*(1-sig(x))).
-//   * softplus(x)=log1p(exp(x)); softplus'(x)=sigmoid(x).
-//   * Conv1d NON-causal: y[t]=b + W0*x[t-1] + W1*x[t] + W2*x[t+1] (zero-pad).
-//   * A=-exp(A_log) -> dA_log = dA*A.
-//   * LayerNorm eps=1e-5; dx uses the two mean-correction terms.
-//   * CE MEAN over B -> dlogits=(softmax-onehot)/B; head width p=97.
+// THE SCAN BACKWARD (reverse time, MAMBA3_REFERENCE.md sec 6.2). Carry TWO
+// adjoints per (b,h,p,c): gh=dL/dh_t and gv=dL/dv_t (the WIDTH-2 coupling —
+// v_{t-1} feeds step t-1's gamma-term AND step t's beta-term). See mb_scan_bwd.
 //
 // PARALLELIZATION (Option B, batch-parallel, deterministic — IDENTICAL to the
-// decoder PHASE-1 design):
-//   * Each CTA owns a FIXED contiguous batch slice (by blockIdx.x — NOT the
-//     work-steal queue; fp32 sums aren't associative so a varying batch->CTA
-//     grouping is non-deterministic). The whole CTA cooperates on ONE sample at a
-//     time and iterates its slice SEQUENTIALLY.
-//   * Per-sample, each dW element has a SINGLE owner thread that does
-//     partial[e] += contrib across the slice's samples in fixed order
-//     (__syncthreads between samples) — single-writer, no atomics, deterministic.
-//   * THE SCAN EXPLOIT (seq=8, trivially short): the selective scan is a
-//     SEQUENTIAL recurrence over seq=8 per (batch, channel j in [0,256)). One
-//     thread owns channel j, holds the state h[STATE=16] in REGISTERS, and
-//     UNROLLS t=0..7. The full h[seq][d_inner][state] (~128 KB/sample) does NOT
-//     fit smem — keeping h per-channel in registers is the justification for the
-//     thread-per-channel scan. The BACKWARD recomputes the per-channel forward
-//     scan keeping h_hist[seq+1][state] in REGISTERS (seq=8 trivial — NO
-//     checkpoint, unlike the long-sequence scan_backward_kernel in csrc/scan),
-//     then reverse-scans the dA,dB,dC,ddt,dx recurrence.
-//   * One grid barrier, then a deterministic cross-CTA reduce (ascending CTA
-//     index), another barrier, then apply_optimizer<Opt>. (Composition lives in
-//     fused_mamba_megakernel.cuh — see INTEGRATION-MAMBA.md.)
+// decoder PHASE-1 design): each CTA owns a FIXED contiguous batch slice; the
+// whole CTA cooperates on ONE sample at a time. THE SCAN EXPLOIT (seq=8): one
+// thread owns SSM channel j in [0,d_inner); within its head (h=j/head_dim) it
+// holds the complex state h[Nc][2] in REGISTERS and unrolls t=0..7. The backward
+// recomputes the forward keeping h_hist[seq+1][Nc][2] AND v_hist[seq+1][Nc][2]
+// in registers (seq=8 trivial — NO checkpoint). The per-head coefficient grads
+// (dalpha/dbeta/dgamma/dphi) are reduced over the head_dim channels in a head;
+// the head-shared dBbar/dCbar/dtheta are reduced over ALL channels (ascending
+// lane/warp -> deterministic). One grid barrier, deterministic cross-CTA reduce,
+// another barrier, apply_optimizer<Opt> (composition in fused_mamba_megakernel.cuh).
 //
-// SMEM BUDGET PER CTA — HONEST DEVIATION FROM THE DECODER (documented):
-//   The decoder's <48 KB static footprint relied on recompute-in-backward; that
-//   trick exists ONLY to clear the 48 KB static-smem cliff. Mamba's d_inner=256
-//   makes EVEN ONE layer's activation set (5x [kSeq,d_inner] + caches ≈ 45 KB)
-//   bump the cliff, and the full live set is ~74 KB regardless — so recompute
-//   buys nothing here. We therefore CACHE BOTH LAYERS' forward activations (the
-//   clean, bug-free choice) and declare the CTA smem DYNAMIC with a
-//   cudaFuncSetAttribute(MaxDynamicSharedMemorySize) opt-in (sm_90 has ~228 KB
-//   smem/SM; one persistent block/SM still places, occupancy>=1 holds, NO CUDA
-//   graphs). sizeof(MambaSampleSmem) is computed + reported by mamba3_layout.cuh
-//   (kMambaSmemBytes) and is the value the launcher opts into. The scan state is
-//   NOT in smem — it is per-thread registers (the seq=8 exploit), which is what
-//   keeps the smem from exploding to the 128 KB the naive h-in-smem would need.
-//   See INTEGRATION-MAMBA.md for the dynamic-smem launch spec (built in a later
-//   composition step; this header is launcher-agnostic).
+// SMEM BUDGET PER CTA: the per-sample MambaSampleSmem caches BOTH layers'
+// forward activations + the SwiGLU/RMSNorm caches + the complex B/C streams; the
+// scan complex STATE is per-thread registers (the seq=8 exploit), NOT smem. The
+// CTA smem is DYNAMIC (cudaFuncSetAttribute opt-in) — kMambaSmemBytes
+// (mamba3_layout.cuh) is the static_assert-pinned sizeof(MambaSampleSmem).
 //
-// fp32 compute is the correctness baseline. bf16 compute is a flagged TODO (it
-// would default to THIS fp32 path) — see the TODO(bf16) markers.
+// fp32 compute is the correctness baseline. The TC variant
+// (model_stage_mamba_tc.cuh) reuses mb:: dims, MambaWeights/Grad, the
+// MambaSampleSmem::LayerAct cache type, and the scalar scan/RMSNorm device fns
+// VERBATIM; only the 7 projection GEMMs run on wgmma there.
 // ============================================================================
 
 #include "csrc/fused/megakernel_common.cuh"
@@ -99,26 +81,45 @@
 
 namespace sg { namespace fused { namespace sm90 {
 
-// ── Mamba compile-time shape constants (mirror tests/hw/mamba_oracle.py and
+// ── Mamba-3 compile-time shape constants (mirror mamba3_block.py and
 //    csrc/fused/sm_90/mamba3_layout.cuh; static_asserts there guard the count +
 //    total against named_parameters()). ───────────────────────────────────────
 namespace mb {
-constexpr int kVocab  = SG_MB_VOCAB;   // 99  (tok embedding rows)
-constexpr int kPHead  = SG_MB_PHEAD;   // 97  (head width; DISTINCT from vocab)
-constexpr int kD      = SG_MB_D;       // 128 (d_model)
-constexpr int kLayers = SG_MB_LAYERS;  // 2
-constexpr int kSeq    = SG_MB_SEQ;     // 8
-constexpr int kDInner = SG_MB_DINNER;  // 256 (d*2)
-constexpr int kState  = SG_MB_STATE;   // 16
-constexpr int kDtRank = SG_MB_DTRANK;  // 8
-constexpr int kDbc    = kDtRank + 2 * kState;  // 40 (x_proj out width)
-constexpr int kConvK  = SG_MB_CONVK;   // 3
-constexpr float kLnEps = 1e-5f;        // torch LayerNorm default
+constexpr int kVocab  = SG_MB_VOCAB;    // 99  (tok embedding rows)
+constexpr int kPHead  = SG_MB_PHEAD;    // 97  (head width; DISTINCT from vocab)
+constexpr int kD      = SG_MB_D;        // 128 (d_model)
+constexpr int kLayers = SG_MB_LAYERS;   // 2
+constexpr int kSeq    = SG_MB_SEQ;      // 8
+constexpr int kDInner = SG_MB_DINNER;   // 256 (d*2)
+constexpr int kState  = SG_MB_STATE;    // 128 (REAL state N)
+constexpr int kStateC = SG_MB_STATEC;   // 64  (complex dim Nc = N/2)
+constexpr int kHeadDim = SG_MB_HEADDIM; // 64  (P)
+constexpr int kNHeads = SG_MB_NHEADS;   // 4   (d_inner/head_dim)
+constexpr int kDtRank = SG_MB_DTRANK;   // 8
+constexpr int kXProj  = SG_MB_XPROJ;    // 336 (x_proj out width)
+constexpr int kDff    = SG_MB_DFF;      // 256 (SwiGLU inner)
+constexpr float kRmsEps = 1e-5f;        // RMSNorm eps (mamba3_block default)
+// x_proj output split offsets: [dt_lr | A_mod | theta | u_lam | Br | Bi | Cr | Ci]
+constexpr int kOffDtLr = 0;
+constexpr int kOffAmod = kOffDtLr + kDtRank;        // + dt_rank
+constexpr int kOffThet = kOffAmod + kNHeads;        // + n_heads
+constexpr int kOffULam = kOffThet + kStateC;        // + Nc
+constexpr int kOffBr   = kOffULam + kNHeads;        // + n_heads
+constexpr int kOffBi   = kOffBr   + kStateC;        // + Nc
+constexpr int kOffCr   = kOffBi   + kStateC;        // + Nc
+constexpr int kOffCi   = kOffCr   + kStateC;        // + Nc
+static_assert(kOffCi + kStateC == kXProj, "mamba3: x_proj split must sum to kXProj");
+static_assert(kDInner % kHeadDim == 0 || kHeadDim == kDInner,
+              "mamba3: d_inner must be a multiple of head_dim (or single-head fallback)");
 }  // namespace mb
 
 // ── Elementwise activations + derivatives (the real F.silu / F.softplus). ─────
 __device__ __forceinline__ float mb_sigmoid(float x) {
     return 1.0f / (1.0f + __expf(-x));
+}
+__device__ __forceinline__ float mb_sigmoid_grad(float x) {  // s*(1-s)
+    const float s = mb_sigmoid(x);
+    return s * (1.0f - s);
 }
 __device__ __forceinline__ float mb_silu(float x) {
     return x * mb_sigmoid(x);
@@ -136,72 +137,105 @@ __device__ __forceinline__ float mb_softplus_grad(float x) {  // sigmoid(x)
 }
 
 // ── Per-CTA scratch for one sample. POD held in smem (one instance per CTA).
-//    BOTH layers' forward activations are cached (see SMEM BUDGET note). The scan
-//    state h[kState] is NOT here (per-thread registers). x_main = silu(conv) is
-//    derived on the fly (one fewer cached buffer). ─────────────────────────────
+//    BOTH layers' forward activations are cached. The scan complex STATE is NOT
+//    here (per-thread registers — the seq=8 exploit). ──────────────────────────
 struct MambaSampleSmem {
-    // Cross-layer chain: input to each layer (= residual x for that layer), and
-    // the final-layer output feeding the head norm.
-    float layer_in[mb::kLayers][mb::kSeq][mb::kD];   // 2*8*128
-    float final_in[mb::kSeq][mb::kD];                // 8*128
-    // Per-layer cached forward activations (both layers): the values the backward
-    // reads. x_main is recomputed as silu(conv) where needed.
+    // Cross-block residual stream: the INPUT to each block (= residual x), and
+    // the final-block output feeding the head norm.
+    float layer_in[mb::kLayers][mb::kSeq][mb::kD];   // block input (residual)
+    float final_in[mb::kSeq][mb::kD];                // final-block output -> head
+    // Per-block cached forward activations (both blocks): the values the backward
+    // reads. The block-level "h1" (= x + mixer_out) is cached so mlp_norm's input
+    // and the mixer-residual reconstruction are available in the backward.
     struct LayerAct {
-        float x_main_raw[mb::kSeq][mb::kDInner];     // pre-conv (in_proj first half)
-        float z[mb::kSeq][mb::kDInner];              // gate branch (in_proj 2nd half)
-        float conv[mb::kSeq][mb::kDInner];           // PRE-silu conv output
-        float dt_pre[mb::kSeq][mb::kDInner];         // dt_proj out (PRE-softplus)
-        float y_scan[mb::kSeq][mb::kDInner];         // selective-scan output
-        float Bmat[mb::kSeq][mb::kState];            // scan B
-        float Cmat[mb::kSeq][mb::kState];            // scan C
-        float ln_xhat[mb::kSeq][mb::kD];             // per-layer norm xhat
-        float ln_inv[mb::kSeq];                      // per-layer norm inv_std
+        // --- mixer pre-norm (RMSNorm_mix) cache ---
+        float mixn_xhat[mb::kSeq][mb::kD];     // xhat = x*r
+        float mixn_r[mb::kSeq];                // rsqrt(mean(x^2)+eps)
+        // --- mixer internals ---
+        float x_in[mb::kSeq][mb::kDInner];     // in_proj first half (= x_main, scan/x_proj/D input)
+        float z[mb::kSeq][mb::kDInner];        // in_proj second half (gate)
+        float dt_lr[mb::kSeq][mb::kDtRank];    // dt_proj input (x_proj slice)
+        float dt_pre[mb::kSeq][mb::kNHeads];   // dt_proj out + bias (PRE-softplus, per head)
+        float A_mod[mb::kSeq][mb::kNHeads];    // x_proj A_mod slice (per head)
+        float u_lam[mb::kSeq][mb::kNHeads];    // x_proj lambda logit (per head)
+        float theta[mb::kSeq][mb::kStateC];    // x_proj theta slice (head-shared)
+        // BCNorm caches: pre-norm raw streams + their rms recip. Streams: Br,Bi,Cr,Ci.
+        float Br[mb::kSeq][mb::kStateC];       // pre-BCNorm B real
+        float Bi[mb::kSeq][mb::kStateC];       // pre-BCNorm B imag (Bhat)
+        float Cr[mb::kSeq][mb::kStateC];       // pre-BCNorm C real
+        float Ci[mb::kSeq][mb::kStateC];       // pre-BCNorm C imag (Chat)
+        float Br_r[mb::kSeq]; float Bi_r[mb::kSeq];   // BCNorm rms recips
+        float Cr_r[mb::kSeq]; float Ci_r[mb::kSeq];
+        // post-norm+bias 2-vector streams (the scan reads these):
+        float Bbar[mb::kSeq][mb::kStateC][2];  // (Br2, Bi2)
+        float Cbar[mb::kSeq][mb::kStateC][2];  // (Cr2, -Ci2)
+        float y_scan[mb::kSeq][mb::kDInner];   // selective-scan output (per channel)
+        // --- block inter-residual + mlp pre-norm (RMSNorm_mlp) cache ---
+        float h1[mb::kSeq][mb::kD];            // x + mixer_out (mlp_norm input)
+        float mlpn_xhat[mb::kSeq][mb::kD];     // mlp_norm xhat
+        float mlpn_r[mb::kSeq];                // mlp_norm rms recip
+        // --- SwiGLU internals ---
+        float g_pre[mb::kSeq][mb::kDff];       // gate_proj out (pre-SiLU)
+        float u_mlp[mb::kSeq][mb::kDff];       // up_proj out
     } act[mb::kLayers];
     // Final-norm caches (last position used) + head logits.
     float fn_xhat[mb::kSeq][mb::kD];
-    float fn_inv[mb::kSeq];
+    float fn_r[mb::kSeq];
     float logits[mb::kPHead];
-    // Backward adjoint scratch (reused across the per-layer chain). Named by their
-    // FIRST use; the comments at each backward step note the reuse.
-    float dh[mb::kSeq][mb::kD];                      // running grad wrt block output
-    float dr[mb::kSeq][mb::kD];                      // LN-bwd output (dy_out / dx_residual)
-    float adj_a[mb::kSeq][mb::kDInner];              // dy_gated -> dx_main accumulator
-    float adj_b[mb::kSeq][mb::kDInner];              // dy_scan / dz / dconv scratch
-    float adj_c[mb::kSeq][mb::kDInner];              // ddt_pre / dx_main_raw scratch
-    float dbc[mb::kSeq][mb::kDbc];                   // dx_dbc = cat[ddt_raw,dB,dC]
-    float dBmat[mb::kSeq][mb::kState];               // scan-bwd dB (reduced over channels)
-    float dCmat[mb::kSeq][mb::kState];               // scan-bwd dC (reduced over channels)
-    // Reductions across threads (row stats: mean/max/sum). 256 threads.
-    float red[256];
+    // Backward adjoint scratch (reused across the per-block chain).
+    float dh[mb::kSeq][mb::kD];                // running grad wrt block output
+    float dr[mb::kSeq][mb::kD];                // RMSNorm-bwd output / residual scratch
+    float adj_a[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
+    float adj_b[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
+    float adj_c[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
+    float wff_a[mb::kSeq][mb::kDff];           // d_ff-wide scratch (MLP)
+    float wff_b[mb::kSeq][mb::kDff];           // d_ff-wide scratch (MLP)
+    float xproj[mb::kSeq][mb::kXProj];         // x_proj fwd out / dx_proj staging
+    // scan-bwd cross-channel reduce targets (head-shared), per timestep:
+    float dBbar[mb::kSeq][mb::kStateC][2];
+    float dCbar[mb::kSeq][mb::kStateC][2];
+    float dtheta[mb::kSeq][mb::kStateC];
+    // Reductions across threads. 256 threads = 8 warps; the two-level block
+    // reduce uses red[warp] (warp<=7) then red[0]. 64 slots = ample headroom
+    // (kept small so the CTA dynamic smem stays under the H100 per-block opt-in
+    // cap of 227 KB — the full 256-slot red pushed sizeof past it by ~0.5 KB).
+    float red[64];
 };
-// SAFETY: the launcher opts into kMambaSmemBytes of DYNAMIC smem (mamba3_layout.cuh)
-// via cudaFuncSetAttribute. Static __shared__ would have the compiler enforce the
-// size; the dynamic path does not — so PIN the layout constant to the actual struct
-// here (both symbols are in scope). A field added to MambaSampleSmem without
-// updating kMambaSmemFloats would otherwise SILENTLY under-allocate smem at launch.
+// SAFETY: the launcher opts into kMambaSmemBytes of DYNAMIC smem (mamba3_layout.cuh).
+// PIN the layout constant to the actual struct here so a field added without
+// updating kMambaSmemFloats fails the BUILD (vs. silently under-allocating).
 static_assert((int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
               "model_stage_mamba3: sizeof(MambaSampleSmem) drifted from "
               "kMambaSmemBytes (mamba3_layout.cuh). Update kMambaSmemFloats.");
 
-// ── Typed views over the flat weight blob using the generated offsets. ─────────
+// ── Typed views over the flat weight blob using the generated offsets. The
+//    ORDER MUST match _mamba_param_sizes() / named_parameters() EXACTLY. ────────
 struct MambaWeights {
     const float* tok;     // [kVocab, kD]
     const float* pos;     // [kSeq, kD]
     struct Layer {
-        const float* A_log;     // [d_inner, state]
+        const float* mixn_w;    // mixer_norm.weight [d]
+        const float* A_log;     // [n_heads]
         const float* D;         // [d_inner]
+        const float* B_bias;    // [Nc]
+        const float* Bhat_bias; // [Nc]
+        const float* C_bias;    // [Nc]
+        const float* Chat_bias; // [Nc]
         const float* in_w;      // [2*d_inner, d]
-        const float* conv_w;    // [d_inner, 1, 3]
-        const float* conv_b;    // [d_inner]
-        const float* x_proj_w;  // [dbc, d_inner]
-        const float* dt_proj_w; // [d_inner, dt_rank]
-        const float* dt_proj_b; // [d_inner]
+        const float* x_proj_w;  // [x_proj_out, d_inner]
+        const float* dt_proj_w; // [n_heads, dt_rank]
+        const float* dt_proj_b; // [n_heads]
+        const float* B_norm_w;    // [Nc]
+        const float* Bhat_norm_w; // [Nc]
+        const float* C_norm_w;    // [Nc]
+        const float* Chat_norm_w; // [Nc]
         const float* out_w;     // [d, d_inner]
-        const float* n_w;       // [d]
-        const float* n_b;       // [d]
+        const float* mlpn_w;    // mlp_norm.weight [d]
+        const float* gate_w;    // [d_ff, d]
+        const float* up_w;      // [d_ff, d]
+        const float* down_w;    // [d, d_ff]
     } layer[mb::kLayers];
-    const float* norm_w;  // [d]
-    const float* norm_b;  // [d]
+    const float* norm_w;  // final norm [d]
     const float* out_w;   // [kPHead, d]
     const float* out_b;   // [kPHead]
 };
@@ -212,20 +246,28 @@ __device__ __forceinline__ MambaWeights mb_bind(const float* p) {
     w.tok = p + kMambaOffsets[i++];
     w.pos = p + kMambaOffsets[i++];
     for (int li = 0; li < mb::kLayers; ++li) {
-        w.layer[li].A_log     = p + kMambaOffsets[i++];
-        w.layer[li].D         = p + kMambaOffsets[i++];
-        w.layer[li].in_w      = p + kMambaOffsets[i++];
-        w.layer[li].conv_w    = p + kMambaOffsets[i++];
-        w.layer[li].conv_b    = p + kMambaOffsets[i++];
-        w.layer[li].x_proj_w  = p + kMambaOffsets[i++];
-        w.layer[li].dt_proj_w = p + kMambaOffsets[i++];
-        w.layer[li].dt_proj_b = p + kMambaOffsets[i++];
-        w.layer[li].out_w     = p + kMambaOffsets[i++];
-        w.layer[li].n_w       = p + kMambaOffsets[i++];
-        w.layer[li].n_b       = p + kMambaOffsets[i++];
+        w.layer[li].mixn_w      = p + kMambaOffsets[i++];
+        w.layer[li].A_log       = p + kMambaOffsets[i++];
+        w.layer[li].D           = p + kMambaOffsets[i++];
+        w.layer[li].B_bias      = p + kMambaOffsets[i++];
+        w.layer[li].Bhat_bias   = p + kMambaOffsets[i++];
+        w.layer[li].C_bias      = p + kMambaOffsets[i++];
+        w.layer[li].Chat_bias   = p + kMambaOffsets[i++];
+        w.layer[li].in_w        = p + kMambaOffsets[i++];
+        w.layer[li].x_proj_w    = p + kMambaOffsets[i++];
+        w.layer[li].dt_proj_w   = p + kMambaOffsets[i++];
+        w.layer[li].dt_proj_b   = p + kMambaOffsets[i++];
+        w.layer[li].B_norm_w    = p + kMambaOffsets[i++];
+        w.layer[li].Bhat_norm_w = p + kMambaOffsets[i++];
+        w.layer[li].C_norm_w    = p + kMambaOffsets[i++];
+        w.layer[li].Chat_norm_w = p + kMambaOffsets[i++];
+        w.layer[li].out_w       = p + kMambaOffsets[i++];
+        w.layer[li].mlpn_w      = p + kMambaOffsets[i++];
+        w.layer[li].gate_w      = p + kMambaOffsets[i++];
+        w.layer[li].up_w        = p + kMambaOffsets[i++];
+        w.layer[li].down_w      = p + kMambaOffsets[i++];
     }
     w.norm_w = p + kMambaOffsets[i++];
-    w.norm_b = p + kMambaOffsets[i++];
     w.out_w  = p + kMambaOffsets[i++];
     w.out_b  = p + kMambaOffsets[i++];
     return w;
@@ -233,30 +275,42 @@ __device__ __forceinline__ MambaWeights mb_bind(const float* p) {
 
 struct MambaGrad {
     float* tok; float* pos;
-    struct Layer { float* A_log; float* D; float* in_w; float* conv_w;
-        float* conv_b; float* x_proj_w; float* dt_proj_w; float* dt_proj_b;
-        float* out_w; float* n_w; float* n_b; } layer[mb::kLayers];
-    float* norm_w; float* norm_b; float* out_w; float* out_b;
+    struct Layer {
+        float* mixn_w; float* A_log; float* D;
+        float* B_bias; float* Bhat_bias; float* C_bias; float* Chat_bias;
+        float* in_w; float* x_proj_w; float* dt_proj_w; float* dt_proj_b;
+        float* B_norm_w; float* Bhat_norm_w; float* C_norm_w; float* Chat_norm_w;
+        float* out_w; float* mlpn_w; float* gate_w; float* up_w; float* down_w;
+    } layer[mb::kLayers];
+    float* norm_w; float* out_w; float* out_b;
 };
 __device__ __forceinline__ MambaGrad mb_bind_grad(float* p) {
     MambaGrad w; int i = 0;
     w.tok = p + kMambaOffsets[i++];
     w.pos = p + kMambaOffsets[i++];
     for (int li = 0; li < mb::kLayers; ++li) {
-        w.layer[li].A_log     = p + kMambaOffsets[i++];
-        w.layer[li].D         = p + kMambaOffsets[i++];
-        w.layer[li].in_w      = p + kMambaOffsets[i++];
-        w.layer[li].conv_w    = p + kMambaOffsets[i++];
-        w.layer[li].conv_b    = p + kMambaOffsets[i++];
-        w.layer[li].x_proj_w  = p + kMambaOffsets[i++];
-        w.layer[li].dt_proj_w = p + kMambaOffsets[i++];
-        w.layer[li].dt_proj_b = p + kMambaOffsets[i++];
-        w.layer[li].out_w     = p + kMambaOffsets[i++];
-        w.layer[li].n_w       = p + kMambaOffsets[i++];
-        w.layer[li].n_b       = p + kMambaOffsets[i++];
+        w.layer[li].mixn_w      = p + kMambaOffsets[i++];
+        w.layer[li].A_log       = p + kMambaOffsets[i++];
+        w.layer[li].D           = p + kMambaOffsets[i++];
+        w.layer[li].B_bias      = p + kMambaOffsets[i++];
+        w.layer[li].Bhat_bias   = p + kMambaOffsets[i++];
+        w.layer[li].C_bias      = p + kMambaOffsets[i++];
+        w.layer[li].Chat_bias   = p + kMambaOffsets[i++];
+        w.layer[li].in_w        = p + kMambaOffsets[i++];
+        w.layer[li].x_proj_w    = p + kMambaOffsets[i++];
+        w.layer[li].dt_proj_w   = p + kMambaOffsets[i++];
+        w.layer[li].dt_proj_b   = p + kMambaOffsets[i++];
+        w.layer[li].B_norm_w    = p + kMambaOffsets[i++];
+        w.layer[li].Bhat_norm_w = p + kMambaOffsets[i++];
+        w.layer[li].C_norm_w    = p + kMambaOffsets[i++];
+        w.layer[li].Chat_norm_w = p + kMambaOffsets[i++];
+        w.layer[li].out_w       = p + kMambaOffsets[i++];
+        w.layer[li].mlpn_w      = p + kMambaOffsets[i++];
+        w.layer[li].gate_w      = p + kMambaOffsets[i++];
+        w.layer[li].up_w        = p + kMambaOffsets[i++];
+        w.layer[li].down_w      = p + kMambaOffsets[i++];
     }
     w.norm_w = p + kMambaOffsets[i++];
-    w.norm_b = p + kMambaOffsets[i++];
     w.out_w  = p + kMambaOffsets[i++];
     w.out_b  = p + kMambaOffsets[i++];
     return w;
@@ -303,110 +357,105 @@ __device__ __forceinline__ float mb_block_max(float v, float* red) {
 }
 
 // ── Primitive linear op (CTA-cooperative). y[s,:out] = x[s,:in] @ W[out,in]^T
-//    (+ b). One thread per (s,o), strided. ──────────────────────────────────────
+//    (+ b). One thread per (s,o), strided. `ldX`/`ldY` are the row strides (in
+//    elements) of x/y (so a packed view into a wider buffer works). ───────────
 __device__ __forceinline__ void mb_linear(
-        const float* __restrict__ x, int in_dim,
+        const float* __restrict__ x, int in_dim, int ldX,
         const float* __restrict__ W, const float* __restrict__ b, int out_dim,
-        float* __restrict__ y) {
+        float* __restrict__ y, int ldY) {
     const int total = mb::kSeq * out_dim;
     for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
         const int s = idx / out_dim, o = idx % out_dim;
-        const float* xr = x + s * in_dim;
+        const float* xr = x + (int64_t)s * ldX;
         const float* Wr = W + (int64_t)o * in_dim;
         float acc = (b != nullptr) ? b[o] : 0.0f;
         #pragma unroll 4
         for (int k = 0; k < in_dim; ++k) acc += xr[k] * Wr[k];
-        y[s * out_dim + o] = acc;
+        y[(int64_t)s * ldY + o] = acc;
     }
     __syncthreads();
 }
 
-// ── LayerNorm forward (last dim width=d). Caches xhat + inv_std. ──────────────
-// ldX is the EXPLICIT row stride of x (no default) — the caller stages the
-// residual into adj_c, whose DECLARED width is kDInner (256), not kD (128).
-// The packed-stride read (x + s*kD) was the stride-bug class of 5cb32b8 all
-// over again: row 0 correct, rows 1..7 read uninitialized smem — caught on
-// first silicon run of the cell (the CPU mirror indexes semantically and
-// cannot see it). y/xhat_out remain packed kD-wide buffers.
-__device__ __forceinline__ void mb_layernorm_fwd(
-        const float* __restrict__ x, const float* __restrict__ gamma,
-        const float* __restrict__ beta, float* __restrict__ y,
-        float* __restrict__ xhat_out, float* __restrict__ inv_out, float* red,
-        int ldX) {
+// ── RMSNorm forward over the last dim (width=D). y = x*rsqrt(mean(x^2)+eps)*w.
+//    Caches xhat = x*r and r (per row). NO mean-subtract, NO bias (RMS, not LN).
+//    ldX = explicit row stride of x. xhat_out/y packed D-wide. (mamba3_oracle
+//    rmsnorm_forward.) `width` so it serves both kD (norms) and kStateC (BCNorm).
+__device__ __forceinline__ void mb_rmsnorm_fwd(
+        const float* __restrict__ x, const float* __restrict__ w,
+        float* __restrict__ y, float* __restrict__ xhat_out,
+        float* __restrict__ r_out, float* red, int width, int ldX) {
     for (int s = 0; s < mb::kSeq; ++s) {
-        const float* xr = x + s * ldX;
-        float sum = 0.0f;
-        for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) sum += xr[j];
-        float mean = mb_block_sum(sum, red) / (float)mb::kD;
-        float vs = 0.0f;
-        for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) { float c = xr[j] - mean; vs += c * c; }
-        float var = mb_block_sum(vs, red) / (float)mb::kD;
-        float inv = rsqrtf(var + mb::kLnEps);
-        if (threadIdx.x == 0) inv_out[s] = inv;
-        for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-            float xh = (xr[j] - mean) * inv;
-            xhat_out[s * mb::kD + j] = xh;
-            y[s * mb::kD + j] = xh * gamma[j] + beta[j];
+        const float* xr = x + (int64_t)s * ldX;
+        float ss = 0.0f;
+        for (int j = threadIdx.x; j < width; j += blockDim.x) { float v = xr[j]; ss += v * v; }
+        float ms = mb_block_sum(ss, red) / (float)width;
+        float r = rsqrtf(ms + mb::kRmsEps);
+        if (threadIdx.x == 0) r_out[s] = r;
+        for (int j = threadIdx.x; j < width; j += blockDim.x) {
+            float xh = xr[j] * r;
+            xhat_out[(int64_t)s * width + j] = xh;
+            y[(int64_t)s * width + j] = xh * w[j];
         }
         __syncthreads();
     }
 }
 
-// ── LayerNorm backward (mirrors decoder dec_layernorm_bwd; accumulates affine). ─
-__device__ inline void mb_layernorm_bwd(
+// ── RMSNorm backward (mamba3_oracle rmsnorm_backward):
+//     dw   = sum_rows (dy * xhat)
+//     dxhat= dy * w
+//     dx   = r * (dxhat - xhat * (sum_lastdim(dxhat*xhat) / D))
+//    dy packed width-wide; xhat packed width-wide; dx_out packed width-wide.
+//    gw is ACCUMULATED (+=). ─────────────────────────────────────────────────
+__device__ inline void mb_rmsnorm_bwd(
         const float* __restrict__ dy, const float* __restrict__ xhat,
-        const float* __restrict__ inv, const float* __restrict__ gamma,
-        float* __restrict__ dx_out, float* __restrict__ gw, float* __restrict__ gb,
-        float* red) {
-    for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-        float dgw = 0.0f, dgb = 0.0f;
+        const float* __restrict__ r, const float* __restrict__ w,
+        float* __restrict__ dx_out, float* __restrict__ gw, float* red, int width) {
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float dgw = 0.0f;
         #pragma unroll
-        for (int s = 0; s < mb::kSeq; ++s) {
-            float d = dy[s * mb::kD + j];
-            dgb += d; dgw += d * xhat[s * mb::kD + j];
-        }
-        gw[j] += dgw; gb[j] += dgb;
+        for (int s = 0; s < mb::kSeq; ++s)
+            dgw += dy[(int64_t)s * width + j] * xhat[(int64_t)s * width + j];
+        gw[j] += dgw;
     }
     for (int s = 0; s < mb::kSeq; ++s) {
-        const float* dyr = dy + s * mb::kD;
-        const float* xhr = xhat + s * mb::kD;
-        float sda = 0.0f, sdax = 0.0f;
-        for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-            float dxhat = dyr[j] * gamma[j];
-            sda += dxhat; sdax += dxhat * xhr[j];
+        const float* dyr = dy + (int64_t)s * width;
+        const float* xhr = xhat + (int64_t)s * width;
+        float sdax = 0.0f;
+        for (int j = threadIdx.x; j < width; j += blockDim.x) {
+            float dxhat = dyr[j] * w[j];
+            sdax += dxhat * xhr[j];
         }
-        sda = mb_block_sum(sda, red);
         sdax = mb_block_sum(sdax, red);
-        float inv_s = inv[s];
-        for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-            float dxhat = dyr[j] * gamma[j];
-            dx_out[s * mb::kD + j] =
-                inv_s * (dxhat - (sda + xhr[j] * sdax) / (float)mb::kD);
+        float corr = sdax / (float)width;
+        float rs = r[s];
+        for (int j = threadIdx.x; j < width; j += blockDim.x) {
+            float dxhat = dyr[j] * w[j];
+            dx_out[(int64_t)s * width + j] = rs * (dxhat - xhr[j] * corr);
         }
         __syncthreads();
     }
 }
 
 // ── dW += dY^T @ X for a linear Y = X @ W^T (+ b). dX = dY @ W (set or add).
-//    Owner-thread per (o,i) for dW; db[o]+=Σ_s dY. Mirrors decoder dec_linear_bwd.─
+//    Owner-thread per (o,i) for dW; db[o]+=Σ_s dY. ldX/ldY are x/dY row strides.─
 __device__ inline void mb_linear_bwd(
-        const float* __restrict__ dY, const float* __restrict__ X,
+        const float* __restrict__ dY, int ldY, const float* __restrict__ X, int ldX,
         const float* __restrict__ W, int in_dim, int out_dim,
         float* __restrict__ dW, float* __restrict__ db,
-        float* __restrict__ dx_out, bool set_dx) {
+        float* __restrict__ dx_out, int ldDx, bool set_dx) {
     const int wtot = out_dim * in_dim;
     for (int idx = threadIdx.x; idx < wtot; idx += blockDim.x) {
         const int o = idx / in_dim, i = idx % in_dim;
         float acc = 0.0f;
         #pragma unroll
-        for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * out_dim + o] * X[s * in_dim + i];
+        for (int s = 0; s < mb::kSeq; ++s) acc += dY[(int64_t)s * ldY + o] * X[(int64_t)s * ldX + i];
         dW[(int64_t)o * in_dim + i] += acc;
     }
     if (db != nullptr) {
         for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
             float acc = 0.0f;
             #pragma unroll
-            for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * out_dim + o];
+            for (int s = 0; s < mb::kSeq; ++s) acc += dY[(int64_t)s * ldY + o];
             db[o] += acc;
         }
     }
@@ -414,105 +463,104 @@ __device__ inline void mb_linear_bwd(
     for (int idx = threadIdx.x; idx < xtot; idx += blockDim.x) {
         const int s = idx / in_dim, i = idx % in_dim;
         float acc = 0.0f;
-        for (int o = 0; o < out_dim; ++o) acc += dY[s * out_dim + o] * W[(int64_t)o * in_dim + i];
-        if (set_dx) dx_out[s * in_dim + i] = acc;
-        else dx_out[s * in_dim + i] += acc;
+        for (int o = 0; o < out_dim; ++o) acc += dY[(int64_t)s * ldY + o] * W[(int64_t)o * in_dim + i];
+        if (set_dx) dx_out[(int64_t)s * ldDx + i] = acc;
+        else dx_out[(int64_t)s * ldDx + i] += acc;
     }
     __syncthreads();
 }
 
-// ── CONV1D (depthwise, NON-causal, k=3, pad=1) forward. ───────────────────────
-//   out[t,c] = b[c] + W[c,0,0]*in[t-1,c] + W[c,0,1]*in[t,c] + W[c,0,2]*in[t+1,c].
-//   Mirrors mamba_oracle.conv1d_forward.
-__device__ inline void mb_conv1d_fwd(const float* __restrict__ in,
-                              const float* __restrict__ W,
-                              const float* __restrict__ b,
-                              float* __restrict__ out) {
-    const int total = mb::kSeq * mb::kDInner;
-    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        const int t = idx / mb::kDInner, c = idx % mb::kDInner;
-        const float* Wc = W + (int64_t)c * mb::kConvK;
-        float acc = b[c];
+// ── RMSNorm backward variant that recomputes xhat = x*r from the RAW pre-norm
+//    input x (so callers that did NOT cache xhat — BCNorm, which caches only the
+//    raw stream + recip — can reuse it). dx_out is written with row stride ldDx
+//    (so it can land in a packed slice of a wider buffer). gw ACCUMULATED. ─────
+__device__ inline void mb_rmsnorm_bwd_rawx(
+        const float* __restrict__ dy, const float* __restrict__ x,
+        const float* __restrict__ r, const float* __restrict__ w,
+        float* __restrict__ dx_out, float* __restrict__ gw,
+        float* red, int width, int ldDx) {
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float dgw = 0.0f;
         #pragma unroll
-        for (int k = 0; k < mb::kConvK; ++k) {
-            const int tt = t + k - 1;   // k=0->t-1, k=1->t, k=2->t+1
-            if (tt >= 0 && tt < mb::kSeq) acc += Wc[k] * in[tt * mb::kDInner + c];
-        }
-        out[t * mb::kDInner + c] = acc;
+        for (int s = 0; s < mb::kSeq; ++s)
+            dgw += dy[(int64_t)s * width + j] * (x[(int64_t)s * width + j] * r[s]);
+        gw[j] += dgw;
     }
-    __syncthreads();
+    for (int s = 0; s < mb::kSeq; ++s) {
+        const float* dyr = dy + (int64_t)s * width;
+        const float* xr  = x  + (int64_t)s * width;
+        float rs = r[s];
+        float sdax = 0.0f;
+        for (int j = threadIdx.x; j < width; j += blockDim.x) {
+            float xhat = xr[j] * rs;
+            float dxhat = dyr[j] * w[j];
+            sdax += dxhat * xhat;
+        }
+        sdax = mb_block_sum(sdax, red);
+        float corr = sdax / (float)width;
+        for (int j = threadIdx.x; j < width; j += blockDim.x) {
+            float xhat = xr[j] * rs;
+            float dxhat = dyr[j] * w[j];
+            dx_out[(int64_t)s * ldDx + j] = rs * (dxhat - xhat * corr);
+        }
+        __syncthreads();
+    }
 }
 
-// ── CONV1D backward. dW[c,0,k]+=Σ_t dy[t,c]*in[t+k-1,c]; db[c]+=Σ_t dy[t,c];
-//   dx[tt,c]=Σ_k W[c,0,k]*dy[tt-k+1,c] (in-range). Mirrors conv1d_backward.
-__device__ inline void mb_conv1d_bwd(const float* __restrict__ dy,
-                             const float* __restrict__ in,
-                             const float* __restrict__ W,
-                             float* __restrict__ dW, float* __restrict__ db,
-                             float* __restrict__ dx_out) {
-    for (int c = threadIdx.x; c < mb::kDInner; c += blockDim.x) {
-        float dwk[mb::kConvK]; float dbc = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < mb::kConvK; ++k) dwk[k] = 0.0f;
-        #pragma unroll
-        for (int t = 0; t < mb::kSeq; ++t) {
-            float dyv = dy[t * mb::kDInner + c];
-            dbc += dyv;
-            #pragma unroll
-            for (int k = 0; k < mb::kConvK; ++k) {
-                const int tt = t + k - 1;
-                if (tt >= 0 && tt < mb::kSeq) dwk[k] += dyv * in[tt * mb::kDInner + c];
-            }
-        }
-        #pragma unroll
-        for (int k = 0; k < mb::kConvK; ++k) dW[(int64_t)c * mb::kConvK + k] += dwk[k];
-        db[c] += dbc;
-    }
-    const int total = mb::kSeq * mb::kDInner;
-    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        const int tt = idx / mb::kDInner, c = idx % mb::kDInner;
-        const float* Wc = W + (int64_t)c * mb::kConvK;
-        float acc = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < mb::kConvK; ++k) {
-            const int t = tt - k + 1;   // tt = t+k-1 -> t = tt-k+1
-            if (t >= 0 && t < mb::kSeq) acc += Wc[k] * dy[t * mb::kDInner + c];
-        }
-        dx_out[tt * mb::kDInner + c] = acc;
-    }
-    __syncthreads();
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-//  SELECTIVE SCAN forward — THE CORE EXPLOIT. One thread owns channel j; holds
-//  the state h[kState] in REGISTERS and unrolls t=0..kSeq-1. Reads x_main (=silu
-//  (conv)) [t][j], dt_pre [t][j] (PRE-softplus), Bmat[t][s], Cmat[t][s],
-//  A_log[j][s]. Writes y_scan[t][j]. Mirrors selective_scan_forward.
-//    A[s]=-exp(A_log[j,s]); dt_t=softplus(dt_pre[t,j]);
-//    h[s] = exp(dt_t*A[s])*h[s] + dt_t*Bmat[t,s]*x[t,j]; y[t,j]=Σ_s Cmat[t,s]*h[s].
-//  x_main is passed in (caller materialises silu(conv) into a buffer). ──────────
+// ════════════════════════════════════════════════════════════════════════
+//  COMPLEX EXPONENTIAL-TRAPEZOIDAL SELECTIVE SCAN — forward (Eq 25). One thread
+//  owns SSM channel j in [0,d_inner). Its head is h = j/head_dim. Within the
+//  head it holds the complex state h[Nc][2] in REGISTERS and unrolls t=0..kSeq-1.
+//  Reads (from the LayerAct cache `a`): x_in[t][j], dt_pre[t][h] (per head),
+//  A_mod[t][h], u_lam[t][h], theta[t][c], Bbar[t][c][:], Cbar[t][c][:], and
+//  A_log[h]. Writes y_scan[t][j]. Mirrors mamba3_oracle.scan_forward.
+//    alpha=exp(dt*A); A=-softplus(A_mod+exp(A_log)); dt=softplus(dt_pre);
+//    lam=sigmoid(u_lam); gamma=lam*dt; beta=(1-lam)*dt*alpha; phi=dt*theta.
+//    v_t = (Br2*x, Bi2*x);  h_t = alpha*R h_{t-1} + beta*R v_{t-1} + gamma*v_t;
+//    y_t = sum_c (Cbar0*h0 + Cbar1*h1).
+// ════════════════════════════════════════════════════════════════════════
 __device__ inline void mb_scan_fwd(const float* __restrict__ A_log,
-                           const float* __restrict__ x_main,  // [kSeq,d_inner]
                            const MambaSampleSmem::LayerAct* a,
                            float* __restrict__ y_scan_out) {
     for (int j = threadIdx.x; j < mb::kDInner; j += blockDim.x) {
-        float A[mb::kState];
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s)
-            A[s] = -__expf(A_log[(int64_t)j * mb::kState + s]);
-        float h[mb::kState];
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s) h[s] = 0.0f;
-        #pragma unroll
+        const int h = j / mb::kHeadDim;
+        const float base_rate = __expf(A_log[h]);       // exp(A_log[h])
+        // complex state (real,imag) per coord + previous v_t. NOTE: these per-coord
+        // arrays (kStateC=64 each × 4) are RUNTIME-INDEXED local memory — the c-loop
+        // is intentionally NOT #pragma unroll'd (full unroll would force 256 regs >
+        // the 255 cap and the carried state across the t-loop would not persist; that
+        // was the "t=0 right, t>0 wrong" bug). The t-loop (only kSeq=8) stays rolled.
+        float hr[mb::kStateC], hi[mb::kStateC];
+        float vpr[mb::kStateC], vpi[mb::kStateC];        // v_{t-1}
+        for (int c = 0; c < mb::kStateC; ++c) { hr[c]=0.f; hi[c]=0.f; vpr[c]=0.f; vpi[c]=0.f; }
         for (int t = 0; t < mb::kSeq; ++t) {
-            const float xv = x_main[t * mb::kDInner + j];
-            const float dt_t = mb_softplus(a->dt_pre[t][j]);
+            const float xv = a->x_in[t][j];
+            const float dt_t = mb_softplus(a->dt_pre[t][h]);
+            const float A_t = -mb_softplus(a->A_mod[t][h] + base_rate);
+            const float lam = mb_sigmoid(a->u_lam[t][h]);
+            const float alpha = __expf(dt_t * A_t);
+            const float gamma = lam * dt_t;
+            const float beta = (1.0f - lam) * dt_t * alpha;
             float yacc = 0.0f;
-            #pragma unroll
-            for (int s = 0; s < mb::kState; ++s) {
-                const float adec = __expf(dt_t * A[s]);
-                h[s] = adec * h[s] + dt_t * a->Bmat[t][s] * xv;
-                yacc += a->Cmat[t][s] * h[s];
+            for (int c = 0; c < mb::kStateC; ++c) {
+                const float phi = dt_t * a->theta[t][c];
+                float cs, sn; __sincosf(phi, &sn, &cs);
+                // v_t = Bbar_t (.) x_t
+                const float vr = a->Bbar[t][c][0] * xv;
+                const float vi = a->Bbar[t][c][1] * xv;
+                // R @ h_{t-1}
+                const float Rhr = cs * hr[c] - sn * hi[c];
+                const float Rhi = sn * hr[c] + cs * hi[c];
+                // R @ v_{t-1}
+                const float Rvr = cs * vpr[c] - sn * vpi[c];
+                const float Rvi = sn * vpr[c] + cs * vpi[c];
+                // h_t = alpha*Rh + beta*Rv + gamma*v_t
+                const float nhr = alpha * Rhr + beta * Rvr + gamma * vr;
+                const float nhi = alpha * Rhi + beta * Rvi + gamma * vi;
+                hr[c] = nhr; hi[c] = nhi;
+                vpr[c] = vr; vpi[c] = vi;
+                // y_t += Cbar . h_t
+                yacc += a->Cbar[t][c][0] * nhr + a->Cbar[t][c][1] * nhi;
             }
             y_scan_out[t * mb::kDInner + j] = yacc;
         }
@@ -520,159 +568,320 @@ __device__ inline void mb_scan_fwd(const float* __restrict__ A_log,
     __syncthreads();
 }
 
-// SELECTIVE SCAN backward. Per channel j (one thread): RECOMPUTE the forward
-// keeping h_hist[kSeq+1][kState] in registers (seq=8 — NO checkpoint), then
-// reverse-scan (derivation transcribed from mamba_oracle.selective_scan_backward):
-//   gh[s] += Cmat[t,s]*dy[t,j]   (full dL/dh_t after adding y_t's direct term)
-//   dC_js[t,s] = h_t[s]*dy[t,j];  dB_js[t,s] = dt_t*x*gh[s]
-//   dx_main_scan[t,j] = Σ_s Bmat[t,s]*dt_t*gh[s]
-//   ddt_post = Σ_s (A[s]*a_t*h_{t-1}+Bmat[t,s]*x)*gh[s]
-//   dA[s] += dt_t*a_t*h_{t-1}*gh[s];  gh[s] <- a_t*gh[s]
-//   ddt_pre[t,j] = ddt_post * softplus'(dt_pre[t,j])
-//   dA_log[j,s]  += dA[s]*A[s]   (A=-exp(A_log))   (owner j -> plain write)
-// dBmat/dCmat are shared across channels -> reduced over threads in a FIXED order
-// (mb_block_sum, ascending lane/warp = deterministic) into smem dBmat/dCmat.
+// ════════════════════════════════════════════════════════════════════════
+//  COMPLEX SCAN backward (reverse time). Per channel j (one thread, head
+//  h=j/head_dim): RECOMPUTE the forward keeping h_hist[kSeq+1] AND v_hist[kSeq+1]
+//  (complex) in registers (seq=8 — NO checkpoint), then reverse-scan the
+//  two-adjoint (gh,gv) recurrence (MAMBA3_REFERENCE.md sec 6.2).
+//
+//  PER-CHANNEL outputs (this thread owns channel j):
+//    dx_in[t,j]  (the scan's contribution to x_in)
+//    ddt_pre[t,h] (per head — accumulated across the head_dim channels via block
+//                  reduce BY HEAD), dA_mod, du_lam (per head, same)
+//  HEAD-SHARED outputs (reduced over ALL channels into smem):
+//    dBbar[t,c,:], dCbar[t,c,:], dtheta[t,c]
+//
+//  The per-head dalpha/dbeta/dgamma/dphi are folded into ddt/dA_real/dlam/dtheta
+//  via the sec 6.3 coefficient Jacobian. Because alpha/beta/gamma/phi are shared
+//  by the head_dim channels of a head, the head-scalar grads are summed over the
+//  channels in the head (block reduce restricted to the head's lanes), then the
+//  owner of that head writes ddt_pre/dA_mod/du_lam.
+//
+//  dA_log[h] = sum_t dA_real[t,h] * (-sigmoid(A_arg)) * exp(A_log[h]); the
+//  -softplus and exp(A_log) Jacobians fold here. (Accumulated into g_A_log.)
+//
+//  Determinism: the head-shared dBbar/dCbar/dtheta block-reduce per (t,c) in the
+//  reverse loop (ascending lane/warp); the per-head coeff grads block-reduce per
+//  (t,h). Same addends, fixed order -> A/A/A bit-identical.
+// ════════════════════════════════════════════════════════════════════════
 __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
-                           const float* __restrict__ x_main,    // [kSeq,d_inner]
                            const MambaSampleSmem::LayerAct* a,
-                           const float* __restrict__ dy_scan,   // [kSeq,d_inner]
-                           float* __restrict__ dx_main_scan,    // [kSeq,d_inner] SET
-                           float* __restrict__ ddt_pre,         // [kSeq,d_inner] SET
-                           float* __restrict__ dBmat,           // [kSeq,kState] += (smem; zeroed by caller)
-                           float* __restrict__ dCmat,           // [kSeq,kState] += (smem; zeroed by caller)
-                           float* __restrict__ g_A_log,         // [d_inner,state] partial (+=)
+                           const float* __restrict__ dy_scan,     // [kSeq,d_inner]
+                           float* __restrict__ dx_in,             // [kSeq,d_inner] SET
+                           float* __restrict__ ddt_pre,           // [kSeq,n_heads] SET (per head)
+                           float* __restrict__ dA_mod,            // [kSeq,n_heads] SET
+                           float* __restrict__ du_lam,            // [kSeq,n_heads] SET
+                           float* __restrict__ dBbar,             // [kSeq,Nc,2]  smem (+=, zeroed by caller)
+                           float* __restrict__ dCbar,             // [kSeq,Nc,2]  smem
+                           float* __restrict__ dtheta,            // [kSeq,Nc]    smem
+                           float* __restrict__ g_A_log,           // [n_heads] partial (+=)
                            float* __restrict__ red) {
-    // DETERMINISM / REGISTER-PRESSURE FIX (TC wgmma A/A/A race root cause): the
-    // previous form stashed dB/dC for ALL kSeq·kState pairs in per-thread arrays
-    // dB_loc[kSeq][kState] + dC_loc[kSeq][kState] (256 fp32 = 1 KB/thread) ONLY to
-    // block-reduce them in a trailing pass. Those arrays cannot live in registers,
-    // so they SPILL to local memory; the spill inflated the whole-kernel frame
-    // (STACK 4368 B for the LookSAM instantiation vs 3088 for AdamW), which tipped
-    // ptxas into ALSO spilling the wgmma fp32 ACCUMULATOR (N/2=64 regs) of the
-    // double-buffered projection GEMM inside its async issue→stage→wait window —
-    // exactly the ptxas C7515 hazard ("non-wgmma instructions defining accumulator
-    // registers between start and end of the pipeline stage"). A spilled
-    // accumulator reloaded WHILE wgmma.mma_async is concurrently writing it is
-    // NON-DETERMINISTIC (denormal-scale grad drift, occasionally NaN) — A/A/A FAIL,
-    // exposed by the SAM-2nd-pass mamba cells (looksam/SG11/SG15) and shared with
-    // mamba×prodigy (their <Opt> instantiations push registers over the spill
-    // threshold; AdamW/Lion/Grokfast happen to stay under it, which is why ONLY the
-    // basic cells were deterministic). FIX: keep ONLY the CURRENT timestep's dB/dC
-    // row (kState fp32 each) and block-reduce IN the reverse loop — the kSeq·kState
-    // arrays vanish, the frame drops below the accumulator-spill point for EVERY
-    // instantiation, and the GEMM accumulator stays register-resident → the wgmma
-    // is deterministic BY CONSTRUCTION. The MATH is byte-identical: the per-(t,s)
-    // block sum runs in the SAME ascending lane/warp order (mb_block_sum), over the
-    // SAME addends, into the SAME dBmat/dCmat slots — only the storage of the
-    // already-computed dB/dC moved from "all-t array, reduce after" to "per-t row,
-    // reduce now". ALL threads (active j<d_inner AND the dead j>=d_inner tail, here
-    // none since blockDim==d_inner) reach every mb_block_sum, so the in-loop block
-    // reduction is well-formed. Per-thread gh/dA state is untouched by the reduce.
-    // REGISTER-PRESSURE NOTE (part of the A/A/A determinism fix): a_save[kSeq][kState]
-    // (128 fp32) is DROPPED — adec = exp(dt_t·A[s]) is recomputed in the reverse loop
-    // (a cheap intrinsic) rather than cached. This + the fused dB/dC reduce below shrinks
-    // the scan-bwd's spilled local frame so the whole-kernel stack stays under the
-    // wgmma-accumulator-spill threshold for the register-heavier instantiations
-    // (the SAM-2nd-pass cells inline this backward TWICE). adec is bit-identical whether
-    // cached or recomputed (same __expf, same args), so parity/determinism are unchanged.
     const bool active = (threadIdx.x < mb::kDInner);
-    float A[mb::kState], hh[mb::kSeq + 1][mb::kState];
-    float dt_save[mb::kSeq];
-    float gh[mb::kState], dA[mb::kState];
     const int j = threadIdx.x;
+    const int h = active ? (j / mb::kHeadDim) : 0;
+    const float base_rate = active ? __expf(A_log[h]) : 0.0f;
+    // Per-(t) cached scalars (recomputed), per-channel forward state history.
+    float dt_save[mb::kSeq], alpha_s[mb::kSeq], beta_s[mb::kSeq], gamma_s[mb::kSeq];
+    float A_s[mb::kSeq], lam_s[mb::kSeq];
+    // complex state history: hh[t] = h_{t-1} (hh[0]=0), v stored as vh[t]=v_t.
+    float hhr[mb::kSeq + 1][mb::kStateC], hhi[mb::kSeq + 1][mb::kStateC];
+    float vhr[mb::kSeq][mb::kStateC], vhi[mb::kSeq][mb::kStateC];
     if (active) {
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s) {
-            A[s] = -__expf(A_log[(int64_t)j * mb::kState + s]);
-            hh[0][s] = 0.0f;
-        }
-        // forward recompute -> hh[t+1] = h_t (hh[0] = h_{-1} = 0).
-        #pragma unroll
+        for (int c = 0; c < mb::kStateC; ++c) { hhr[0][c]=0.f; hhi[0][c]=0.f; }
         for (int t = 0; t < mb::kSeq; ++t) {
-            const float xv = x_main[t * mb::kDInner + j];
-            const float dt_t = mb_softplus(a->dt_pre[t][j]);
-            dt_save[t] = dt_t;
-            #pragma unroll
-            for (int s = 0; s < mb::kState; ++s) {
-                const float adec = __expf(dt_t * A[s]);
-                hh[t + 1][s] = adec * hh[t][s] + dt_t * a->Bmat[t][s] * xv;
+            const float xv = a->x_in[t][j];
+            const float dt_t = mb_softplus(a->dt_pre[t][h]);
+            const float A_t = -mb_softplus(a->A_mod[t][h] + base_rate);
+            const float lam = mb_sigmoid(a->u_lam[t][h]);
+            const float alpha = __expf(dt_t * A_t);
+            const float gamma = lam * dt_t;
+            const float beta = (1.0f - lam) * dt_t * alpha;
+            dt_save[t]=dt_t; A_s[t]=A_t; lam_s[t]=lam; alpha_s[t]=alpha; beta_s[t]=beta; gamma_s[t]=gamma;
+            for (int c = 0; c < mb::kStateC; ++c) {
+                const float phi = dt_t * a->theta[t][c];
+                float cs, sn; __sincosf(phi, &sn, &cs);
+                const float vr = a->Bbar[t][c][0] * xv;
+                const float vi = a->Bbar[t][c][1] * xv;
+                const float prev_vr = (t > 0) ? vhr[t-1][c] : 0.0f;
+                const float prev_vi = (t > 0) ? vhi[t-1][c] : 0.0f;
+                const float Rhr = cs * hhr[t][c] - sn * hhi[t][c];
+                const float Rhi = sn * hhr[t][c] + cs * hhi[t][c];
+                const float Rvr = cs * prev_vr - sn * prev_vi;
+                const float Rvi = sn * prev_vr + cs * prev_vi;
+                hhr[t+1][c] = alpha_s[t] * Rhr + beta_s[t] * Rvr + gamma_s[t] * vr;
+                hhi[t+1][c] = alpha_s[t] * Rhi + beta_s[t] * Rvi + gamma_s[t] * vi;
+                vhr[t][c] = vr; vhi[t][c] = vi;
             }
         }
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s) { gh[s] = 0.0f; dA[s] = 0.0f; }
     }
-    // REVERSE scan with FUSED per-timestep dB/dC block-reduce. The reverse loop runs
-    // t = kSeq-1 .. 0; reducing IN ASCENDING t order (matching the old trailing
-    // pass's t=0..kSeq-1 over INDEPENDENT (t,s) reductions — each dBmat[t]/dCmat[t]
-    // slot is summed from one addend per channel, so the t-iteration order does not
-    // change any individual slot's value) requires the reduce to walk t up while the
-    // recurrence walks t down. So compute the whole reverse recurrence first into a
-    // per-thread dB/dC row cache is what we AVOID; instead we reduce slot t exactly
-    // when the reverse loop produces it (descending t). Slot independence makes the
-    // visitation order irrelevant to the result.
-    #pragma unroll
-    for (int t = mb::kSeq - 1; t >= 0; --t) {
-        float dB_row[mb::kState], dC_row[mb::kState];   // THIS t only (kState fp32)
-        if (active) {
-            const float xv = x_main[t * mb::kDInner + j];
-            const float dt_t = dt_save[t];
-            const float dyv = dy_scan[t * mb::kDInner + j];
-            float dx_acc = 0.0f, ddt_acc = 0.0f;
-            #pragma unroll
-            for (int s = 0; s < mb::kState; ++s) {
-                const float h_t = hh[t + 1][s];
-                const float h_tm1 = hh[t][s];
-                const float adec = __expf(dt_t * A[s]);   // recompute (a_save dropped)
-                const float cc = a->Cmat[t][s];
-                const float bb = a->Bmat[t][s];
-                dC_row[s] = h_t * dyv;
-                gh[s] += cc * dyv;
-                dB_row[s] = dt_t * xv * gh[s];
-                dx_acc += bb * dt_t * gh[s];
-                ddt_acc += (A[s] * adec * h_tm1 + bb * xv) * gh[s];
-                dA[s] += dt_t * adec * h_tm1 * gh[s];
-                gh[s] = adec * gh[s];
-            }
-            dx_main_scan[t * mb::kDInner + j] = dx_acc;
-            ddt_pre[t * mb::kDInner + j] = ddt_acc * mb_softplus_grad(a->dt_pre[t][j]);
-        } else {
-            #pragma unroll
-            for (int s = 0; s < mb::kState; ++s) { dB_row[s] = 0.0f; dC_row[s] = 0.0f; }
-        }
-        // Block-reduce THIS timestep's dB/dC across channels (fixed ascending
-        // lane/warp order) → dBmat[t]/dCmat[t]. Same addends + same order as the
-        // old trailing reduce; slot t is independent of every other t.
-        #pragma unroll
-        for (int s = 0; s < mb::kState; ++s) {
-            float sb = mb_block_sum(dB_row[s], red);
-            float sc = mb_block_sum(dC_row[s], red);
-            if (threadIdx.x == 0) { dBmat[t * mb::kState + s] += sb; dCmat[t * mb::kState + s] += sc; }
-        }
-    }
+    // reverse-time adjoints (per channel): gh = dL/dh_t, gv = dL/dv_t (from t+1).
+    float ghr[mb::kStateC], ghi[mb::kStateC], gvr[mb::kStateC], gvi[mb::kStateC];
     if (active) {
         #pragma unroll
-        for (int s = 0; s < mb::kState; ++s)
-            g_A_log[(int64_t)j * mb::kState + s] += dA[s] * A[s];
+        for (int c = 0; c < mb::kStateC; ++c) { ghr[c]=0.f; ghi[c]=0.f; gvr[c]=0.f; gvi[c]=0.f; }
+    }
+    // Per-head dA_log accumulation across t (this channel contributes via its head;
+    // reduced by head). dA_log[h] += sum_t dA_real[t,h]*(-sigmoid(A_arg))*exp(A_log[h]).
+    float dAlog_acc = 0.0f;   // this channel's running sum (folded per head at end)
+    for (int t = mb::kSeq - 1; t >= 0; --t) {
+        // This channel's per-(t,head) coefficient-grad contributions (summed over c).
+        float dalpha = 0.f, dbeta = 0.f, dgamma = 0.f, dt_phi = 0.f;
+        float dx_acc = 0.0f;
+        const float xv = active ? a->x_in[t][j] : 0.0f;
+        const float dt_t = active ? dt_save[t] : 0.0f;
+        const float a_t = active ? alpha_s[t] : 0.0f;
+        const float b_t = active ? beta_s[t] : 0.0f;
+        const float g_t = active ? gamma_s[t] : 0.0f;
+        const float dyv = active ? dy_scan[t * mb::kDInner + j] : 0.0f;
+        for (int c = 0; c < mb::kStateC; ++c) {
+            float dBbar0 = 0.f, dBbar1 = 0.f, dCbar0 = 0.f, dCbar1 = 0.f, dphi = 0.f;
+            if (active) {
+                const float phi = dt_t * a->theta[t][c];
+                float cs, sn; __sincosf(phi, &sn, &cs);
+                // (1) y_t = sum Cbar . h_t -> gh += Cbar * dy ; dCbar += h_t * dy
+                const float h0 = hhr[t+1][c], h1 = hhi[t+1][c];
+                dCbar0 = h0 * dyv; dCbar1 = h1 * dyv;
+                ghr[c] += a->Cbar[t][c][0] * dyv;
+                ghi[c] += a->Cbar[t][c][1] * dyv;          // gh now = full dL/dh_t
+                // (2) v_t total grad = gv + gamma*gh ; v_t = Bbar*x
+                const float dv0 = gvr[c] + g_t * ghr[c];
+                const float dv1 = gvi[c] + g_t * ghi[c];
+                dx_acc += dv0 * a->Bbar[t][c][0] + dv1 * a->Bbar[t][c][1];
+                dBbar0 = dv0 * xv; dBbar1 = dv1 * xv;
+                // (3) rotated terms Rh = R h_{t-1}, Rv = R v_{t-1}; coeff + phi grads
+                const float hr_p = hhr[t][c], hi_p = hhi[t][c];
+                const float vr_p = (t>0)? vhr[t-1][c]:0.0f, vi_p = (t>0)? vhi[t-1][c]:0.0f;
+                const float Rh0 = cs * hr_p - sn * hi_p, Rh1 = sn * hr_p + cs * hi_p;
+                const float Rv0 = cs * vr_p - sn * vi_p, Rv1 = sn * vr_p + cs * vi_p;
+                dalpha += Rh0 * ghr[c] + Rh1 * ghi[c];
+                dbeta  += Rv0 * ghr[c] + Rv1 * ghi[c];
+                dgamma += vhr[t][c] * ghr[c] + vhi[t][c] * ghi[c];
+                // dphi via R'(phi)=[[-sin,-cos],[cos,-sin]] on h_{t-1}(coef alpha) & v_{t-1}(coef beta)
+                const float dRh = ghr[c]*(-sn*hr_p - cs*hi_p) + ghi[c]*(cs*hr_p - sn*hi_p);
+                const float dRv = ghr[c]*(-sn*vr_p - cs*vi_p) + ghi[c]*(cs*vr_p - sn*vi_p);
+                dphi = a_t * dRh + b_t * dRv;
+                dt_phi += dphi * a->theta[t][c];           // dt-fold term (sum_c dphi*theta)
+                // (4) propagate to prev step (R^T): R^T g = (cs*g0+sn*g1, -sn*g0+cs*g1)
+                const float g0 = ghr[c], g1 = ghi[c];
+                const float RTg0 = cs * g0 + sn * g1;
+                const float RTg1 = -sn * g0 + cs * g1;
+                gvr[c] = b_t * RTg0; gvi[c] = b_t * RTg1;   // dL/dv_{t-1}
+                ghr[c] = a_t * RTg0; ghi[c] = a_t * RTg1;   // dL/dh_{t-1}
+            }
+            // head-shared reduces (per t,c): block-sum across ALL channels (ascending).
+            float sB0 = mb_block_sum(dBbar0, red);
+            float sB1 = mb_block_sum(dBbar1, red);
+            float sC0 = mb_block_sum(dCbar0, red);
+            float sC1 = mb_block_sum(dCbar1, red);
+            float sTh = mb_block_sum(active ? (dphi * dt_t) : 0.0f, red);  // dtheta[t,c] += dphi*dt
+            if (threadIdx.x == 0) {
+                dBbar[(t * mb::kStateC + c) * 2 + 0] += sB0;
+                dBbar[(t * mb::kStateC + c) * 2 + 1] += sB1;
+                dCbar[(t * mb::kStateC + c) * 2 + 0] += sC0;
+                dCbar[(t * mb::kStateC + c) * 2 + 1] += sC1;
+                dtheta[t * mb::kStateC + c] += sTh;
+            }
+        }
+        if (active) dx_in[t * mb::kDInner + j] = dx_acc;
+        // ── Fold the per-head coefficient Jacobians (sec 6.3) for step t. The
+        //    head_dim channels of a head share alpha/beta/gamma/dt/A/lam, so sum
+        //    each channel's dalpha/dbeta/dgamma/dt_phi over the head, then the owner
+        //    writes the per-head ddt_pre/dA_mod/du_lam. Reduce-by-head via masked
+        //    block sums (one per head, ascending) keeps it deterministic.
+        //    ddt(post-softplus) = dalpha*(A*alpha) + dbeta*((1-lam)*alpha*(1+dt*A))
+        //                       + dgamma*lam + dt_phi
+        //    dlam = dbeta*(-dt*alpha) + dgamma*dt
+        //    dA_real = dalpha*(dt*alpha) + dbeta*((1-lam)*dt^2*alpha)
+        //    then ddt_pre = ddt*softplus'(dt_pre); dA_mod = dA_real*(-sigmoid(A_arg));
+        //         du_lam = dlam*lam*(1-lam); dA_log fold uses dA_real*(-sig)*exp(A_log).
+        const float A_t = active ? A_s[t] : 0.0f;
+        const float lam = active ? lam_s[t] : 0.0f;
+        float ddt_c = 0.f, dlam_c = 0.f, dAreal_c = 0.f;
+        if (active) {
+            ddt_c   = dalpha*(A_t*a_t) + dbeta*((1.0f-lam)*a_t*(1.0f+dt_t*A_t)) + dgamma*lam + dt_phi;
+            dlam_c  = dbeta*(-dt_t*a_t) + dgamma*dt_t;
+            dAreal_c= dalpha*(dt_t*a_t) + dbeta*((1.0f-lam)*dt_t*dt_t*a_t);
+        }
+        // Reduce the 3 head scalars over the channels of each head. Loop heads;
+        // each head's lanes [h*head_dim, (h+1)*head_dim) contribute, owner = first lane.
+        #pragma unroll
+        for (int hh = 0; hh < mb::kNHeads; ++hh) {
+            const bool mine = active && (h == hh);
+            float sddt   = mb_block_sum(mine ? ddt_c   : 0.0f, red);
+            float sdlam  = mb_block_sum(mine ? dlam_c  : 0.0f, red);
+            float sdAr   = mb_block_sum(mine ? dAreal_c: 0.0f, red);
+            if (threadIdx.x == 0) {
+                // A_arg = A_mod + exp(A_log); A_real = -softplus(A_arg)
+                // (read A_mod/dt_pre/u_lam at any lane — use the cached per-(t,h) values).
+                const float dt_pre_h = a->dt_pre[t][hh];
+                const float u_lam_h  = a->u_lam[t][hh];
+                const float A_arg_h  = a->A_mod[t][hh] + __expf(A_log[hh]);
+                ddt_pre[t * mb::kNHeads + hh] = sddt * mb_softplus_grad(dt_pre_h);
+                du_lam [t * mb::kNHeads + hh] = sdlam * mb_sigmoid_grad(u_lam_h);
+                dA_mod [t * mb::kNHeads + hh] = sdAr * (-mb_softplus_grad(A_arg_h));
+            }
+            __syncthreads();
+        }
+        // dA_log[h] += sum_t dA_real[t,h]*(-sigmoid(A_arg))*exp(A_log[h]). Fold the
+        // per-channel dAreal here (same channel-in-head contribution).
+        if (active) {
+            const float A_arg = a->A_mod[t][h] + base_rate;
+            dAlog_acc += dAreal_c * (-mb_sigmoid(A_arg)) * base_rate;
+        }
+    }
+    // reduce dA_log over the head's channels (owner writes the per-head partial).
+    #pragma unroll
+    for (int hh = 0; hh < mb::kNHeads; ++hh) {
+        const bool mine = active && (h == hh);
+        float sAl = mb_block_sum(mine ? dAlog_acc : 0.0f, red);
+        if (threadIdx.x == 0) g_A_log[hh] += sAl;
+        __syncthreads();
     }
     __syncthreads();
 }
 
-// ── Materialise x_main = silu(conv) for layer li into `out` [kSeq,d_inner]. ────
-__device__ __forceinline__ void mb_make_x_main(const MambaSampleSmem::LayerAct* a,
-                                               float* __restrict__ out) {
-    const int total = mb::kSeq * mb::kDInner;
-    for (int idx = threadIdx.x; idx < total; idx += blockDim.x)
-        out[idx] = mb_silu(a->conv[idx / mb::kDInner][idx % mb::kDInner]);
+// ════════════════════════════════════════════════════════════════════════
+//  MIXER forward for one sample (CTA-cooperative). Input = xn (= RMSNorm_mix(x),
+//  [kSeq,d]) staged by the block. Caches mixer internals into `a`. Writes the
+//  bare mixer output (residual=False) into `mix_out` [kSeq,d]. Uses sm scratch.
+//  Mirrors mamba3_oracle.layer_forward (residual OFF).
+// ════════════════════════════════════════════════════════════════════════
+__device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+                            const float* __restrict__ xn,   // [kSeq,d] (mixer input)
+                            MambaSampleSmem::LayerAct* a,
+                            float* __restrict__ mix_out,     // [kSeq,d] OUT
+                            MambaSampleSmem* sm) {
+    // xz = in_proj(xn); split rows [0,d_inner)->x_in, [d_inner,2di)->z.
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+        const int s = idx / mb::kDInner, o = idx % mb::kDInner;
+        const float* xr = xn + (int64_t)s * mb::kD;
+        const float* Wr0 = L.in_w + (int64_t)o * mb::kD;
+        const float* Wr1 = L.in_w + (int64_t)(mb::kDInner + o) * mb::kD;
+        float a0 = 0.f, a1 = 0.f;
+        #pragma unroll 4
+        for (int k = 0; k < mb::kD; ++k) { float xv = xr[k]; a0 += xv * Wr0[k]; a1 += xv * Wr1[k]; }
+        a->x_in[s][o] = a0;       // = x_main (NO conv, NO SiLU)
+        a->z[s][o] = a1;
+    }
     __syncthreads();
+    // x_proj(x_in) -> sm->xproj [kSeq,xproj]; split into the SSM params.
+    mb_linear(&a->x_in[0][0], mb::kDInner, mb::kDInner, L.x_proj_w, nullptr,
+              mb::kXProj, &sm->xproj[0][0], mb::kXProj);
+    // route the splits into the LayerAct caches.
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kXProj; idx += blockDim.x) {
+        const int s = idx / mb::kXProj, o = idx % mb::kXProj;
+        const float v = sm->xproj[s][o];
+        if (o < mb::kOffAmod) a->dt_lr[s][o - mb::kOffDtLr] = v;
+        else if (o < mb::kOffThet) a->A_mod[s][o - mb::kOffAmod] = v;
+        else if (o < mb::kOffULam) a->theta[s][o - mb::kOffThet] = v;
+        else if (o < mb::kOffBr) a->u_lam[s][o - mb::kOffULam] = v;
+        else if (o < mb::kOffBi) a->Br[s][o - mb::kOffBr] = v;
+        else if (o < mb::kOffCr) a->Bi[s][o - mb::kOffBi] = v;
+        else if (o < mb::kOffCi) a->Cr[s][o - mb::kOffCr] = v;
+        else a->Ci[s][o - mb::kOffCi] = v;
+    }
+    __syncthreads();
+    // dt_pre = dt_proj(dt_lr) + bias  [kSeq, n_heads] (PER HEAD).
+    mb_linear(&a->dt_lr[0][0], mb::kDtRank, mb::kDtRank, L.dt_proj_w, L.dt_proj_b,
+              mb::kNHeads, &a->dt_pre[0][0], mb::kNHeads);
+    // BCNorm (RMSNorm over Nc) + biases -> Bbar=(Br2,Bi2), Cbar=(Cr2,-Ci2). The
+    //   normed output lands in sm->adj_a at WIDTH-kStateC stride (s*Nc+c), NOT the
+    //   [kSeq][kDInner] field stride — read it back with the same Nc stride.
+    float* an = &sm->adj_a[0][0];
+    mb_rmsnorm_fwd(&a->Br[0][0], L.B_norm_w, an, &sm->adj_b[0][0], &a->Br_r[0], sm->red, mb::kStateC, mb::kStateC);
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        a->Bbar[s][c][0] = an[s * mb::kStateC + c] + L.B_bias[c];
+    }
+    __syncthreads();
+    mb_rmsnorm_fwd(&a->Bi[0][0], L.Bhat_norm_w, an, &sm->adj_b[0][0], &a->Bi_r[0], sm->red, mb::kStateC, mb::kStateC);
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        a->Bbar[s][c][1] = an[s * mb::kStateC + c] + L.Bhat_bias[c];
+    }
+    __syncthreads();
+    mb_rmsnorm_fwd(&a->Cr[0][0], L.C_norm_w, an, &sm->adj_b[0][0], &a->Cr_r[0], sm->red, mb::kStateC, mb::kStateC);
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        a->Cbar[s][c][0] = an[s * mb::kStateC + c] + L.C_bias[c];
+    }
+    __syncthreads();
+    mb_rmsnorm_fwd(&a->Ci[0][0], L.Chat_norm_w, an, &sm->adj_b[0][0], &a->Ci_r[0], sm->red, mb::kStateC, mb::kStateC);
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        a->Cbar[s][c][1] = -(an[s * mb::kStateC + c] + L.Chat_bias[c]);   // Cbar imag = -(Ci2)
+    }
+    __syncthreads();
+    // selective scan -> a->y_scan.
+    mb_scan_fwd(L.A_log, a, &a->y_scan[0][0]);
+    // y_gated = (y_scan + x_in*D) * silu(z) -> sm->adj_a ; out = out_proj(y_gated).
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+        const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+        float yv = a->y_scan[s][c] + a->x_in[s][c] * L.D[c];
+        sm->adj_a[s][c] = yv * mb_silu(a->z[s][c]);
+    }
+    __syncthreads();
+    mb_linear(&sm->adj_a[0][0], mb::kDInner, mb::kDInner, L.out_w, nullptr,
+              mb::kD, mix_out, mb::kD);
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-//  FORWARD for one sample (CTA-cooperative). Mirrors mamba_oracle.mamba_forward.
-//  Caches BOTH layers' forward activations into sm->act[li]; returns sample NLL.
-// ────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════
+//  SwiGLU forward for one sample. Input h1n = RMSNorm_mlp(h1). Caches g_pre,u_mlp.
+//  out = down(silu(gate(x)) * up(x)). Mirrors mamba3_oracle.swiglu_forward.
+// ════════════════════════════════════════════════════════════════════════
+__device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
+                             const float* __restrict__ h1n,   // [kSeq,d]
+                             MambaSampleSmem::LayerAct* a,
+                             float* __restrict__ mlp_out,      // [kSeq,d] OUT
+                             MambaSampleSmem* sm) {
+    mb_linear(h1n, mb::kD, mb::kD, L.gate_w, nullptr, mb::kDff, &a->g_pre[0][0], mb::kDff);
+    mb_linear(h1n, mb::kD, mb::kD, L.up_w,   nullptr, mb::kDff, &a->u_mlp[0][0], mb::kDff);
+    // prod = silu(g_pre) * u -> sm->wff_a.
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+        const int s = idx / mb::kDff, o = idx % mb::kDff;
+        sm->wff_a[s][o] = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
+    }
+    __syncthreads();
+    mb_linear(&sm->wff_a[0][0], mb::kDff, mb::kDff, L.down_w, nullptr, mb::kD, mlp_out, mb::kD);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  FORWARD for one sample (CTA-cooperative). Mirrors mamba3_oracle.model_forward
+//  + block_forward. Caches BOTH blocks' activations into sm->act[li]. Returns NLL.
+// ════════════════════════════════════════════════════════════════════════
 __device__ inline float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
                                     int target, MambaSampleSmem* sm) {
-    // Embedding + positional.
+    // Embedding + positional -> layer_in[0].
     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
         const int s = idx / mb::kD, j = idx % mb::kD;
         sm->layer_in[0][s][j] = w.tok[(int64_t)tokens_s[s] * mb::kD + j]
@@ -683,90 +892,41 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
     for (int li = 0; li < mb::kLayers; ++li) {
         const MambaWeights::Layer& L = w.layer[li];
         MambaSampleSmem::LayerAct* a = &sm->act[li];
-        float* hin = &sm->layer_in[li][0][0];   // residual x
-        // xz = in_proj(x); split in_w rows [0,d_inner)->x_main_raw, [d_inner,2di)->z.
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, o = idx % mb::kDInner;
-            const float* xr = hin + s * mb::kD;
-            const float* Wr0 = L.in_w + (int64_t)o * mb::kD;
-            const float* Wr1 = L.in_w + (int64_t)(mb::kDInner + o) * mb::kD;
-            float a0 = 0.0f, a1 = 0.0f;
-            #pragma unroll 4
-            for (int k = 0; k < mb::kD; ++k) { float xv = xr[k]; a0 += xv * Wr0[k]; a1 += xv * Wr1[k]; }
-            a->x_main_raw[s][o] = a0;
-            a->z[s][o] = a1;
-        }
-        __syncthreads();
-        // conv1d (NON-causal) -> a->conv (PRE-silu, cached for bwd).
-        mb_conv1d_fwd(&a->x_main_raw[0][0], L.conv_w, L.conv_b, &a->conv[0][0]);
-        // x_main = silu(conv) materialised into adj_a scratch (transient this layer).
-        mb_make_x_main(a, &sm->adj_a[0][0]);
-        // x_proj(x_main) -> dt_raw (stage in dbc scratch), Bmat, Cmat.
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDbc; idx += blockDim.x) {
-            const int s = idx / mb::kDbc, o = idx % mb::kDbc;
-            const float* xr = &sm->adj_a[s][0];   // x_main
-            const float* Wr = L.x_proj_w + (int64_t)o * mb::kDInner;
-            float acc = 0.0f;
-            #pragma unroll 4
-            for (int k = 0; k < mb::kDInner; ++k) acc += xr[k] * Wr[k];
-            if (o < mb::kDtRank) sm->dbc[s][o] = acc;   // dt_raw staged in dbc[:, :dt_rank]
-            else if (o < mb::kDtRank + mb::kState) a->Bmat[s][o - mb::kDtRank] = acc;
-            else a->Cmat[s][o - mb::kDtRank - mb::kState] = acc;
-        }
-        __syncthreads();
-        // dt_pre = dt_proj(dt_raw) + bias  -> a->dt_pre (cached).
-        // mb_linear over the dt_raw staged in dbc[:, :dt_rank] (row stride kDbc!).
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, o = idx % mb::kDInner;
-            const float* xr = &sm->dbc[s][0];   // dt_raw occupies [0,dt_rank)
-            const float* Wr = L.dt_proj_w + (int64_t)o * mb::kDtRank;
-            float acc = L.dt_proj_b[o];
-            #pragma unroll
-            for (int k = 0; k < mb::kDtRank; ++k) acc += xr[k] * Wr[k];
-            a->dt_pre[s][o] = acc;
-        }
-        __syncthreads();
-        // selective scan -> a->y_scan (cached).
-        mb_scan_fwd(L.A_log, &sm->adj_a[0][0], a, &a->y_scan[0][0]);
-        // gate+skip+out_proj: y_gated=(y_scan + x_main*D)*silu(z); stage in adj_b.
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, c = idx % mb::kDInner;
-            float yv = a->y_scan[s][c] + sm->adj_a[s][c] * L.D[c];   // x_main = adj_a
-            sm->adj_b[s][c] = yv * mb_silu(a->z[s][c]);              // adj_b := y_gated
-        }
-        __syncthreads();
-        // r = out_proj(y_gated) + residual; staged into adj_c[:, :d] then LN -> dst.
+        float* hin = &sm->layer_in[li][0][0];   // block input (residual)
+        // --- mixer sub-block: h1 = hin + mixer(RMSNorm_mix(hin)) ---
+        mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &a->mixn_xhat[0][0], &a->mixn_r[0],
+                       sm->red, mb::kD, mb::kD);   // xn -> sm->dr
+        // mix_out written into adj_b at WIDTH-kD stride (s*kD+j); read it the same way.
+        float* mo = &sm->adj_b[0][0];
+        mb_mixer_fwd(L, &sm->dr[0][0], a, mo, sm);   // mix_out -> sm->adj_b (kD-strided)
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
-            const int s = idx / mb::kD, o = idx % mb::kD;
-            const float* Wr = L.out_w + (int64_t)o * mb::kDInner;
-            const float* yg = &sm->adj_b[s][0];
-            float acc = 0.0f;
-            #pragma unroll 4
-            for (int c = 0; c < mb::kDInner; ++c) acc += yg[c] * Wr[c];
-            sm->adj_c[s][o] = acc + hin[s * mb::kD + o];   // adj_c := r (uses [.,:d])
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            a->h1[s][j] = hin[s * mb::kD + j] + mo[s * mb::kD + j];   // h1 = x + mixer_out
         }
         __syncthreads();
-        float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0]
-                                            : &sm->final_in[0][0];
-        mb_layernorm_fwd(&sm->adj_c[0][0], L.n_w, L.n_b, dst,
-                         &a->ln_xhat[0][0], &a->ln_inv[0], sm->red,
-                         /*ldX=*/mb::kDInner);  // adj_c rows are kDInner wide
+        // --- SwiGLU sub-block: h2 = h1 + mlp(RMSNorm_mlp(h1)) ---
+        mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &a->mlpn_xhat[0][0], &a->mlpn_r[0],
+                       sm->red, mb::kD, mb::kD);   // h1n -> sm->dr
+        mb_swiglu_fwd(L, &sm->dr[0][0], a, mo, sm);  // mlp_out -> sm->adj_b (kD-strided)
+        float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0] : &sm->final_in[0][0];
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            dst[s * mb::kD + j] = a->h1[s][j] + mo[s * mb::kD + j];   // h2 = h1 + mlp_out
+        }
+        __syncthreads();
     }
 
-    // Final norm (LAST position) + head -> logits -> NLL.
+    // Final RMSNorm (LAST position) + head -> logits -> NLL.
     const float* hlast = &sm->final_in[mb::kSeq - 1][0];
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) sum += hlast[j];
-    float mean = mb_block_sum(sum, sm->red) / (float)mb::kD;
-    float vs = 0.0f;
-    for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) { float c = hlast[j] - mean; vs += c * c; }
-    float var = mb_block_sum(vs, sm->red) / (float)mb::kD;
-    float inv = rsqrtf(var + mb::kLnEps);
-    if (threadIdx.x == 0) sm->fn_inv[0] = inv;
+    float ss = 0.0f;
+    for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) { float v = hlast[j]; ss += v * v; }
+    float ms = mb_block_sum(ss, sm->red) / (float)mb::kD;
+    float r = rsqrtf(ms + mb::kRmsEps);
+    if (threadIdx.x == 0) sm->fn_r[mb::kSeq - 1] = r;
     for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-        float xh = (hlast[j] - mean) * inv;
+        float xh = hlast[j] * r;
         sm->fn_xhat[mb::kSeq - 1][j] = xh;
-        sm->adj_a[0][j] = xh * w.norm_w[j] + w.norm_b[j];   // hn staged in adj_a[0]
+        sm->adj_a[0][j] = xh * w.norm_w[j];   // hn (RMSNorm, NO bias) -> adj_a[0]
     }
     __syncthreads();
     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
@@ -787,16 +947,249 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
     return logz - sm->logits[target];
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════
+//  MIXER backward for one sample (CTA-cooperative, residual OFF). Given dmix_out
+//  [kSeq,d] (= dL/d(mixer output)), accumulates the mixer's weight grads into G
+//  and writes dxn [kSeq,d] (grad wrt the mixer INPUT = RMSNorm_mix(x)). Mirrors
+//  mamba3_oracle.layer_backward (residual path handled by the block).
+//  Scratch contract on entry: sm->dr holds the mixer's recomputed input xn
+//  (re-staged by the caller). Uses adj_a/b/c, xproj, dBbar/dCbar/dtheta.
+// ════════════════════════════════════════════════════════════════════════
+__device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGrad::Layer& G,
+                            const float* __restrict__ xn,    // [kSeq,d] mixer input (recomputed)
+                            MambaSampleSmem::LayerAct* a,
+                            const float* __restrict__ dmix_out,  // [kSeq,d]
+                            float* __restrict__ dxn,         // [kSeq,d] OUT
+                            MambaSampleSmem* sm) {
+    // Recompute y_gated -> sm->adj_a (out_proj input). y_gated = (y_scan + x_in*D)*silu(z).
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+        const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+        float yv = a->y_scan[s][c] + a->x_in[s][c] * L.D[c];
+        sm->adj_a[s][c] = yv * mb_silu(a->z[s][c]);
+    }
+    __syncthreads();
+    // out_proj bwd: dW_out += dmix_out^T @ y_gated ; dy_gated = dmix_out @ out_w -> adj_c.
+    mb_linear_bwd(dmix_out, mb::kD, &sm->adj_a[0][0], mb::kDInner, L.out_w,
+                  mb::kDInner, mb::kD, G.out_w, nullptr, &sm->adj_c[0][0], mb::kDInner, true);
+    // gate+skip bwd. y_gated=y_skip*silu(z); y_skip=y_scan + x_in*D.
+    //   dy_skip = dy_gated*sz ; dsz = dy_gated*y_skip ; dz = dsz*silu'(z).
+    //   dy_scan = dy_skip ; dx_in(D-path) = dy_skip*D ; dD += Σ dy_skip*x_in.
+    //   dz -> sm->wff_b (NOT adj_a — the BCNorm bwd below clobbers adj_a; wff_b is
+    //   free in the mixer bwd and kDff>=kDInner wide). adj_b := dy_scan (scan dy).
+    for (int c = threadIdx.x; c < mb::kDInner; c += blockDim.x) {
+        float dDc = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < mb::kSeq; ++s) {
+            float sz = mb_silu(a->z[s][c]);
+            float xm = a->x_in[s][c];
+            float yskip = a->y_scan[s][c] + xm * L.D[c];
+            float dyg = sm->adj_c[s][c];
+            float dyskip = dyg * sz;
+            float dsz = dyg * yskip;
+            sm->wff_b[s][c] = dsz * mb_silu_grad(a->z[s][c]);   // dz (survives BCNorm)
+            dDc += dyskip * xm;
+            sm->adj_b[s][c] = dyskip;          // dy_scan (D-path added back later)
+        }
+        G.D[c] += dDc;
+    }
+    __syncthreads();
+    // selective scan bwd. dy_scan = adj_b. Zero the head-shared reduce buffers first.
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        sm->dBbar[s][c][0] = 0.f; sm->dBbar[s][c][1] = 0.f;
+        sm->dCbar[s][c][0] = 0.f; sm->dCbar[s][c][1] = 0.f;
+        sm->dtheta[s][c] = 0.f;
+    }
+    __syncthreads();
+    // scan bwd outputs: dx_in (scan path) -> sm->wff_b rows [0,d_inner) of row 0..? No:
+    //   route dx_in (scan path) -> sm->adj_c[s][c] (dy_gated consumed). per-head grads
+    //   -> sm->wff_a (3 blocks of kSeq*n_heads); dBbar/dCbar/dtheta -> smem reduce bufs;
+    //   dA_log -> G.A_log (per head).
+    float* ddt_pre_s = &sm->wff_a[0][0];                          // [kSeq,n_heads]
+    float* dA_mod_s  = &sm->wff_a[0][0] + mb::kSeq * mb::kNHeads;  // [kSeq,n_heads]
+    float* du_lam_s  = dA_mod_s + mb::kSeq * mb::kNHeads;          // [kSeq,n_heads]
+    mb_scan_bwd(L.A_log, a, &sm->adj_b[0][0],
+                &sm->adj_c[0][0],      // dx_in (scan path) SET (dy_gated consumed)
+                ddt_pre_s, dA_mod_s, du_lam_s,
+                &sm->dBbar[0][0][0], &sm->dCbar[0][0][0], &sm->dtheta[0][0],
+                G.A_log, sm->red);
+    // dx_in total = scan-path (adj_c) + D-path (dy_skip*D, dy_skip in adj_b) -> adj_c.
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+        const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+        sm->adj_c[s][c] += sm->adj_b[s][c] * L.D[c];   // dx_in = scan + D path
+    }
+    __syncthreads();
+    // dt_proj bwd: dW_dt += ddt_pre^T @ dt_lr ; db_dt += Σ ddt_pre ;
+    //   ddt_lr = ddt_pre @ dt_proj_w -> staged into sm->xproj[:, kOffDtLr..dt_rank).
+    mb_linear_bwd(ddt_pre_s, mb::kNHeads, &a->dt_lr[0][0], mb::kDtRank, L.dt_proj_w,
+                  mb::kDtRank, mb::kNHeads, G.dt_proj_w, G.dt_proj_b,
+                  &sm->xproj[0][mb::kOffDtLr], mb::kXProj, true);
+    // dA_mod -> xproj[:, kOffAmod..) ; dtheta (smem) -> xproj[:, kOffThet..) ;
+    // du_lam -> xproj[:, kOffULam..).  (theta is a direct slice of x_proj output.)
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kNHeads; idx += blockDim.x) {
+        const int s = idx / mb::kNHeads, hh = idx % mb::kNHeads;
+        sm->xproj[s][mb::kOffAmod + hh] = dA_mod_s[s * mb::kNHeads + hh];
+        sm->xproj[s][mb::kOffULam + hh] = du_lam_s[s * mb::kNHeads + hh];
+    }
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        sm->xproj[s][mb::kOffThet + c] = sm->dtheta[s][c];
+    }
+    __syncthreads();
+    // BCNorm backward for each stream. Cbar=(Cr2,-Ci2): dCr2=dCbar0, dCi2=-dCbar1.
+    //   Bbar=(Br2,Bi2): dBr2=dBbar0, dBi2=dBbar1. Each stream: bias grad = Σ_s d*2;
+    //   then RMSNorm bwd (raw pre-norm input x = a->Br/Bi/Cr/Ci, recip = *_r).
+    //   The staged d*2 lands in `an` at WIDTH-kStateC stride (s*Nc+c) so the
+    //   rmsnorm-bwd (which reads dy at that stride) + the bias reduce agree.
+    //   dBr -> xproj[:, kOffBr..); dBi -> kOffBi; dCr -> kOffCr; dCi -> kOffCi.
+    float* anb = &sm->adj_a[0][0];
+    // --- B real (dBr2 = dBbar0) ---
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        anb[s * mb::kStateC + c] = sm->dBbar[s][c][0];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < mb::kStateC; c += blockDim.x) {
+        float acc = 0.f; for (int s = 0; s < mb::kSeq; ++s) acc += anb[s * mb::kStateC + c];
+        G.B_bias[c] += acc;
+    }
+    __syncthreads();
+    mb_rmsnorm_bwd_rawx(anb, &a->Br[0][0], &a->Br_r[0], L.B_norm_w,
+                        &sm->xproj[0][mb::kOffBr], G.B_norm_w, sm->red, mb::kStateC, mb::kXProj);
+    __syncthreads();
+    // --- B imag (dBi2 = dBbar1) ---
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        anb[s * mb::kStateC + c] = sm->dBbar[s][c][1];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < mb::kStateC; c += blockDim.x) {
+        float acc = 0.f; for (int s = 0; s < mb::kSeq; ++s) acc += anb[s * mb::kStateC + c];
+        G.Bhat_bias[c] += acc;
+    }
+    __syncthreads();
+    mb_rmsnorm_bwd_rawx(anb, &a->Bi[0][0], &a->Bi_r[0], L.Bhat_norm_w,
+                        &sm->xproj[0][mb::kOffBi], G.Bhat_norm_w, sm->red, mb::kStateC, mb::kXProj);
+    __syncthreads();
+    // --- C real (dCr2 = dCbar0) ---
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        anb[s * mb::kStateC + c] = sm->dCbar[s][c][0];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < mb::kStateC; c += blockDim.x) {
+        float acc = 0.f; for (int s = 0; s < mb::kSeq; ++s) acc += anb[s * mb::kStateC + c];
+        G.C_bias[c] += acc;
+    }
+    __syncthreads();
+    mb_rmsnorm_bwd_rawx(anb, &a->Cr[0][0], &a->Cr_r[0], L.C_norm_w,
+                        &sm->xproj[0][mb::kOffCr], G.C_norm_w, sm->red, mb::kStateC, mb::kXProj);
+    __syncthreads();
+    // --- C imag (dCi2 = -dCbar1, since Cbar imag = -Ci2) ---
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kStateC; idx += blockDim.x) {
+        const int s = idx / mb::kStateC, c = idx % mb::kStateC;
+        anb[s * mb::kStateC + c] = -sm->dCbar[s][c][1];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < mb::kStateC; c += blockDim.x) {
+        float acc = 0.f; for (int s = 0; s < mb::kSeq; ++s) acc += anb[s * mb::kStateC + c];
+        G.Chat_bias[c] += acc;
+    }
+    __syncthreads();
+    mb_rmsnorm_bwd_rawx(anb, &a->Ci[0][0], &a->Ci_r[0], L.Chat_norm_w,
+                        &sm->xproj[0][mb::kOffCi], G.Chat_norm_w, sm->red, mb::kStateC, mb::kXProj);
+    __syncthreads();
+    // x_proj is now fully assembled in sm->xproj (dt_lr|A_mod|theta|u_lam|Br|Bi|Cr|Ci).
+    //   x_proj bwd: dW_xproj += xproj^T @ x_in ; dx_in(x_proj path) = xproj @ x_proj_w
+    //   -> ADD to dx_in accumulator (sm->adj_c).
+    mb_linear_bwd(&sm->xproj[0][0], mb::kXProj, &a->x_in[0][0], mb::kDInner, L.x_proj_w,
+                  mb::kDInner, mb::kXProj, G.x_proj_w, nullptr, &sm->adj_c[0][0], mb::kDInner, false);
+    // x_in fans into THREE: scan (in adj_c via dx_acc), x_proj (just added), D-skip
+    //   (the D-path: dy_skip*D was added to adj_c above). All folded into adj_c now.
+    //   dx_in = adj_c (complete). x_in = x_main (no SiLU) -> dx_main = dx_in.
+    // in_proj bwd: dxz = [dx_main | dz]. dx_main = adj_c (stride kDInner) ;
+    //   dz = sm->wff_b (stride kDff). Build the in_proj dW + dX directly:
+    //   dW_in += dxz^T @ xn ; dx = dxz @ in_w -> dxn.
+    {
+        const int half = mb::kDInner;
+        for (int o = threadIdx.x; o < 2 * mb::kDInner; o += blockDim.x) {
+            const bool lo = (o < half);
+            const float* dyo = lo ? &sm->adj_c[0][0] : &sm->wff_b[0][0];
+            const int dystride = lo ? mb::kDInner : mb::kDff;
+            const int oo = lo ? o : (o - half);
+            float* gw = G.in_w + (int64_t)o * mb::kD;
+            for (int i = 0; i < mb::kD; ++i) {
+                float acc = 0.0f;
+                #pragma unroll
+                for (int s = 0; s < mb::kSeq; ++s)
+                    acc += dyo[s * dystride + oo] * xn[s * mb::kD + i];
+                gw[i] += acc;
+            }
+        }
+        __syncthreads();
+        // dxn[s,i] = Σ_{o<di} dx_main[s,o]*in_w[o,i] + Σ_{o<di} dz[s,o]*in_w[di+o,i].
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, i = idx % mb::kD;
+            float acc = 0.0f;
+            for (int o = 0; o < mb::kDInner; ++o) {
+                acc += sm->adj_c[s][o] * L.in_w[(int64_t)o * mb::kD + i];
+                acc += sm->wff_b[s][o] * L.in_w[(int64_t)(mb::kDInner + o) * mb::kD + i];
+            }
+            dxn[s * mb::kD + i] = acc;
+        }
+        __syncthreads();
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SwiGLU backward for one sample. Given dmlp_out [kSeq,d], accumulates gate/up/
+//  down weight grads into G and writes dh1n [kSeq,d] (grad wrt mlp_norm output).
+//  Mirrors mamba3_oracle.swiglu_backward. Scratch: wff_a/wff_b, adj_a (d-wide).
+// ════════════════════════════════════════════════════════════════════════
+__device__ inline void mb_swiglu_bwd(const MambaWeights::Layer& L, const MambaGrad::Layer& G,
+                             const float* __restrict__ h1n,  // [kSeq,d] (mlp_norm out, recomputed)
+                             MambaSampleSmem::LayerAct* a,
+                             const float* __restrict__ dmlp_out,  // [kSeq,d]
+                             float* __restrict__ dh1n,        // [kSeq,d] OUT
+                             MambaSampleSmem* sm) {
+    // recompute prod = silu(g_pre)*u -> sm->wff_a (down_proj input).
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+        const int s = idx / mb::kDff, o = idx % mb::kDff;
+        sm->wff_a[s][o] = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
+    }
+    __syncthreads();
+    // down_proj bwd: dW_down += dmlp_out^T @ prod ; dprod = dmlp_out @ down_w -> wff_b.
+    mb_linear_bwd(dmlp_out, mb::kD, &sm->wff_a[0][0], mb::kDff, L.down_w,
+                  mb::kDff, mb::kD, G.down_w, nullptr, &sm->wff_b[0][0], mb::kDff, true);
+    // ds = dprod*u ; du = dprod*s ; dg_pre = ds*silu'(g_pre). Stage dg_pre -> wff_a,
+    //   du -> wff_b (dprod consumed in place).
+    for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+        const int s = idx / mb::kDff, o = idx % mb::kDff;
+        float dprod = sm->wff_b[s][o];
+        float sgp = mb_silu(a->g_pre[s][o]);
+        float ds = dprod * a->u_mlp[s][o];
+        float du = dprod * sgp;
+        sm->wff_a[s][o] = ds * mb_silu_grad(a->g_pre[s][o]);   // dg_pre
+        sm->wff_b[s][o] = du;                                  // du
+    }
+    __syncthreads();
+    // gate_proj bwd: dW_gate += dg_pre^T @ h1n ; dx_gate = dg_pre @ gate_w -> dh1n (SET).
+    mb_linear_bwd(&sm->wff_a[0][0], mb::kDff, h1n, mb::kD, L.gate_w,
+                  mb::kD, mb::kDff, G.gate_w, nullptr, dh1n, mb::kD, true);
+    // up_proj bwd: dW_up += du^T @ h1n ; dx_up = du @ up_w -> ADD to dh1n.
+    mb_linear_bwd(&sm->wff_b[0][0], mb::kDff, h1n, mb::kD, L.up_w,
+                  mb::kD, mb::kDff, G.up_w, nullptr, dh1n, mb::kD, false);
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  BACKWARD for one sample (CTA-cooperative). Assumes mb_forward_sample ran for
-//  THIS sample (act[*] caches + final/fn caches + logits populated). Accumulates
-//  every weight grad into the CTA partial `g`. Mirrors mamba_oracle.mamba_backward
-//  + ssm_layer_backward, in the documented order 1..13.
-// ────────────────────────────────────────────────────────────────────────────
+//  THIS sample. Accumulates every weight grad into the CTA partial `g`. Mirrors
+//  mamba3_oracle.model_backward + block_backward.
+// ════════════════════════════════════════════════════════════════════════
 __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad& g,
                                     const int* tokens_s, int target, int B,
                                     MambaSampleSmem* sm) {
-    // ── CE backward: dlogits = (softmax - onehot)/B. ──
+    // ── CE bwd: dlogits = (softmax - onehot)/B. ──
     float lmax = -CUDART_INF_F;
     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) lmax = fmaxf(lmax, sm->logits[o]);
     lmax = mb_block_max(lmax, sm->red);
@@ -809,306 +1202,91 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
         sm->logits[o] = (smo - ((o == target) ? 1.0f : 0.0f)) / (float)B;
     }
     __syncthreads();
-    // ── head: logits = hn @ out_w^T + out_b; hn = fn_xhat[last]*norm_w + norm_b. ──
+    // ── head: logits = hn @ out_w^T + out_b ; hn = fn_xhat[last]*norm_w (NO bias). ──
+    const float* xh = &sm->fn_xhat[mb::kSeq - 1][0];
     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
         float dl = sm->logits[o];
         g.out_b[o] += dl;
         float* gwrow = g.out_w + (int64_t)o * mb::kD;
-        const float* xh = &sm->fn_xhat[mb::kSeq - 1][0];
         #pragma unroll 4
-        for (int j = 0; j < mb::kD; ++j) gwrow[j] += dl * (xh[j] * w.norm_w[j] + w.norm_b[j]);
+        for (int j = 0; j < mb::kD; ++j) gwrow[j] += dl * (xh[j] * w.norm_w[j]);
     }
     __syncthreads();
-    // dhn[j] -> dr row 0 (scratch).
+    // dhn[j] = Σ_o dl[o]*out_w[o,j] -> sm->dr row 0.
     for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
         float acc = 0.0f;
         for (int o = 0; o < mb::kPHead; ++o) acc += sm->logits[o] * w.out_w[(int64_t)o * mb::kD + j];
         sm->dr[0][j] = acc;
     }
     __syncthreads();
-    // ── final-norm bwd (single row last): accumulate norm g/b, dx -> dh. ──
+    // ── final RMSNorm bwd (single row last): dw += dy*xhat ; dx -> dh[last]. ──
     for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-        float d = sm->dr[0][j], xh = sm->fn_xhat[mb::kSeq - 1][j];
-        g.norm_b[j] += d; g.norm_w[j] += d * xh;
+        g.norm_w[j] += sm->dr[0][j] * xh[j];
     }
     __syncthreads();
     {
-        const float* dyr = &sm->dr[0][0];
-        const float* xhr = &sm->fn_xhat[mb::kSeq - 1][0];
-        float sda = 0.0f, sdax = 0.0f;
+        float sdax = 0.0f;
         for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-            float dxhat = dyr[j] * w.norm_w[j];
-            sda += dxhat; sdax += dxhat * xhr[j];
+            float dxhat = sm->dr[0][j] * w.norm_w[j]; sdax += dxhat * xh[j];
         }
-        sda = mb_block_sum(sda, sm->red);
         sdax = mb_block_sum(sdax, sm->red);
-        float inv_s = sm->fn_inv[0];
+        float corr = sdax / (float)mb::kD;
+        float rs = sm->fn_r[mb::kSeq - 1];
         for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
-            float dxhat = dyr[j] * w.norm_w[j];
-            float dlast = inv_s * (dxhat - (sda + xhr[j] * sdax) / (float)mb::kD);
+            float dxhat = sm->dr[0][j] * w.norm_w[j];
             for (int s = 0; s < mb::kSeq; ++s) sm->dh[s][j] = 0.0f;
-            sm->dh[mb::kSeq - 1][j] = dlast;
+            sm->dh[mb::kSeq - 1][j] = rs * (dxhat - xh[j] * corr);
         }
         __syncthreads();
     }
-    // dh = grad wrt last layer's OUTPUT [kSeq,d] (only last pos nonzero).
+    // sm->dh = dL/d(final-block output) [kSeq,d], only last pos nonzero.
 
     for (int li = mb::kLayers - 1; li >= 0; --li) {
         const MambaWeights::Layer& L = w.layer[li];
         const MambaGrad::Layer& G = g.layer[li];
         MambaSampleSmem::LayerAct* a = &sm->act[li];
-        float* hin = &sm->layer_in[li][0][0];   // residual x for this layer
-        // (1) out = LN(r) -> dr; accumulate per-layer norm g/b. dr lives in sm->dr.
-        mb_layernorm_bwd(&sm->dh[0][0], &a->ln_xhat[0][0], &a->ln_inv[0],
-                         L.n_w, &sm->dr[0][0], G.n_w, G.n_b, sm->red);
-        // (2) r = y_out + residual(=hin): dy_out = dr ; dx_residual = dr (kept in dr).
-        // (3) out_proj bwd: need y_gated = (y_scan + x_main*D)*silu(z). Recompute
-        //     y_gated into adj_b (x_main = silu(conv) into adj_a first).
-        mb_make_x_main(a, &sm->adj_a[0][0]);   // adj_a := x_main
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, c = idx % mb::kDInner;
-            float yv = a->y_scan[s][c] + sm->adj_a[s][c] * L.D[c];
-            sm->adj_b[s][c] = yv * mb_silu(a->z[s][c]);   // adj_b := y_gated
+        // (block input layer_in[li] is read implicitly via the mixer_norm xhat cache;
+        //  the residual flows through sm->dh.)
+        // h2 = h1 + mlp(mlp_norm(h1)). dh2 = sm->dh.
+        //   dh1 = dh2 (residual) + rmsnorm_bwd(swiglu_bwd(dh2)).
+        // recompute h1n = mlp_norm(h1) -> sm->dr (mlp_norm fwd, scratch xhat in wff... use cache).
+        //   We cached mlpn_xhat + mlpn_r, so h1n = mlpn_xhat * mlp_w.
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            sm->dr[s][j] = a->mlpn_xhat[s][j] * L.mlpn_w[j];   // h1n
         }
         __syncthreads();
-        //   dW_out += dy_out^T @ y_gated ; dy_gated = dy_out @ out_w -> adj_a
-        //   (x_main no longer needed from adj_a until the dx_main paths below;
-        //   we re-materialise x_main when needed — but D-skip path needs x_main
-        //   NOW. So compute the gate bwd that consumes x_main BEFORE clobbering
-        //   adj_a. Reorder: do out_proj dW first (reads adj_b only), then gate
-        //   bwd (reads adj_a=x_main, adj_b=y_gated, z), producing dy_scan + dz +
-        //   D-path + dD, THEN overwrite adj_a with dy_gated? No — gate bwd needs
-        //   dy_gated. So compute dy_gated into adj_c (free), keep adj_a=x_main.)
-        {
-            const float* dY = &sm->dr[0][0];        // dy_out [kSeq,d]
-            const float* yg = &sm->adj_b[0][0];     // y_gated [kSeq,d_inner]
-            const int wtot = mb::kD * mb::kDInner;
-            for (int idx = threadIdx.x; idx < wtot; idx += blockDim.x) {
-                const int o = idx / mb::kDInner, c = idx % mb::kDInner;
-                float acc = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * mb::kD + o] * yg[s * mb::kDInner + c];
-                G.out_w[(int64_t)o * mb::kDInner + c] += acc;
-            }
-            __syncthreads();
-            // dy_gated[s,c] = Σ_o dy_out[s,o]*out_w[o,c] -> adj_c.
-            const int xtot = mb::kSeq * mb::kDInner;
-            for (int idx = threadIdx.x; idx < xtot; idx += blockDim.x) {
-                const int s = idx / mb::kDInner, c = idx % mb::kDInner;
-                float acc = 0.0f;
-                for (int o = 0; o < mb::kD; ++o) acc += dY[s * mb::kD + o] * L.out_w[(int64_t)o * mb::kDInner + c];
-                sm->adj_c[s][c] = acc;   // adj_c := dy_gated
-            }
-            __syncthreads();
-        }
-        // (4-6) gate+skip bwd. y_gated = y_skip*silu(z); y_skip = y_scan + x_main*D.
-        //   sz = silu(z); dy_skip = dy_gated*sz; dsz = dy_gated*y_skip; dz = dsz*silu'(z).
-        //   dy_scan = dy_skip ; dx_main(D-path) = dy_skip*D ; dD += Σ dy_skip*x_main.
-        //   Layout: adj_a = x_main, adj_b = y_gated, adj_c = dy_gated.
-        //   Write dz into adj_b (y_gated consumed here), dy_scan into... we need
-        //   dy_scan for the scan bwd AND we still need x_main (adj_a) for the scan
-        //   bwd's dx and for dD. Put dy_scan into dr-region? dr is [kSeq,d] too
-        //   small. Reuse a->y_scan as dy_scan (forward y_scan consumed: scan bwd
-        //   recomputes its own forward). So dy_scan -> a->y_scan (in place).
-        //   dD accumulation: owner = channel c (loops s).
-        for (int c = threadIdx.x; c < mb::kDInner; c += blockDim.x) {
-            float dDc = 0.0f;
-            #pragma unroll
-            for (int s = 0; s < mb::kSeq; ++s) {
-                float sz = mb_silu(a->z[s][c]);
-                float xm = sm->adj_a[s][c];               // x_main
-                float yskip = a->y_scan[s][c] + xm * L.D[c];
-                float dyg = sm->adj_c[s][c];              // dy_gated
-                float dyskip = dyg * sz;
-                float dsz = dyg * yskip;
-                sm->adj_b[s][c] = dsz * mb_silu_grad(a->z[s][c]);   // adj_b := dz
-                dDc += dyskip * xm;
-                // dx_main (D-path) accumulated into adj_a IN PLACE? adj_a currently
-                // holds x_main, still needed (this same loop reads it per s). After
-                // the s-loop for this c we can overwrite. Stash D-path into a->y_scan
-                // alongside dy_scan? dy_scan needs the value dyskip too. We need BOTH
-                // dy_scan (for scan bwd) and dx_main_D. Put dy_scan -> a->y_scan,
-                // and accumulate dx_main_D into dt_pre-region? dt_pre needed by scan
-                // bwd. Cleanest: scan bwd's dx output is SET into adj_a; the D-path
-                // must be ADDED after. So save dx_main_D now into adj_c (dy_gated
-                // consumed): adj_c := dx_main_D.
-                a->y_scan[s][c] = dyskip;                  // a->y_scan := dy_scan
-                sm->adj_c[s][c] = dyskip * L.D[c];         // adj_c := dx_main_D
-            }
-            g.layer[li].D[c] += dDc;
+        // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n (sm->adj_a row d-wide... use sm->wff? need [kSeq,d]).
+        //   route dh1n -> sm->fn_xhat (free now: head done) [kSeq,d].
+        mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+        // rmsnorm_mlp bwd: dh1_mlpnorm = rmsnorm_bwd(dh1n) ; dh1 = dh2 + dh1_mlpnorm.
+        //   dh1n in sm->fn_xhat; xhat = mlpn_xhat; out dh1_mlpnorm -> sm->dr.
+        mb_rmsnorm_bwd(&sm->fn_xhat[0][0], &a->mlpn_xhat[0][0], &a->mlpn_r[0], L.mlpn_w,
+                       &sm->dr[0][0], G.mlpn_w, sm->red, mb::kD);
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            sm->dh[s][j] += sm->dr[s][j];   // dh1 = dh2(residual) + mlp_norm path
         }
         __syncthreads();
-        // (7) selective scan bwd. Inputs: x_main must be re-materialised (adj_a was
-        //   x_main but we just overwrote it? NO — we wrote adj_b=dz and adj_c=
-        //   dx_main_D, adj_a is UNTOUCHED = x_main). dy_scan = a->y_scan.
-        //   Zero dBmat/dCmat first. Outputs: dx_main_scan SET into a fresh buffer;
-        //   we route it to dt_pre-region? dt_pre still needed (scan bwd reads it).
-        //   Use adj_a? adj_a = x_main needed by scan bwd. So dx_main_scan -> a
-        //   temporary: reuse the LayerAct x_main_raw? x_main_raw needed by conv bwd
-        //   (step 11). Reuse z? z needed? after dz computed, z's forward value still
-        //   read by scan bwd? NO — scan bwd does not read z. But mb_make_x_main /
-        //   silu_grad(conv) at step 11 needs conv, not z. z forward is consumed
-        //   (dz done). So dx_main_scan -> a->z (in place, z forward free).
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kState; idx += blockDim.x) {
-            sm->dBmat[idx / mb::kState][idx % mb::kState] = 0.0f;
-            sm->dCmat[idx / mb::kState][idx % mb::kState] = 0.0f;
+        // h1 = x + mixer(mixer_norm(x)). dh1 = sm->dh.
+        //   dx = dh1 (residual) + rmsnorm_bwd(mixer_bwd(dh1)).
+        // recompute xn = mixer_norm(hin) -> sm->dr (xhat * mix_w).
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            sm->dr[s][j] = a->mixn_xhat[s][j] * L.mixn_w[j];   // xn
         }
         __syncthreads();
-        mb_scan_bwd(L.A_log, &sm->adj_a[0][0], a, &a->y_scan[0][0],
-                    &a->z[0][0],          // dx_main_scan SET -> a->z
-                    &a->dt_pre[0][0],     // ddt_pre SET -> a->dt_pre (in place; scan
-                                          //   bwd reads dt_pre via mb_softplus BEFORE
-                                          //   writing ddt_pre per (t,j)? It reads then
-                                          //   writes the SAME (t,j) — read happens in
-                                          //   the forward-recompute pass + the
-                                          //   softplus' uses dt_pre; the WRITE is the
-                                          //   last op per (t,j). But the recompute
-                                          //   pass for OTHER t reads dt_pre too. Since
-                                          //   one thread owns channel j and processes
-                                          //   ALL t in its recompute BEFORE the reverse
-                                          //   pass writes any ddt_pre[*,j], the in-place
-                                          //   write is safe per channel.)
-                    &sm->dBmat[0][0], &sm->dCmat[0][0], G.A_log, sm->red);
-        // dx_main accumulator: combine D-path (adj_c) + scan-path (a->z). Put the
-        // running dx_main into adj_a (x_main no longer needed after scan bwd).
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, c = idx % mb::kDInner;
-            sm->adj_a[s][c] = sm->adj_c[s][c] + a->z[s][c];   // dx_main = D-path + scan-path
+        // mixer bwd: dmix_out = dh1 (sm->dh) ; xn in sm->dr ; out dxn -> sm->fn_xhat.
+        mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+        // rmsnorm_mix bwd: dx_mixnorm = rmsnorm_bwd(dxn) ; dx = dh1 + dx_mixnorm.
+        mb_rmsnorm_bwd(&sm->fn_xhat[0][0], &a->mixn_xhat[0][0], &a->mixn_r[0], L.mixn_w,
+                       &sm->dr[0][0], G.mixn_w, sm->red, mb::kD);
+        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+            const int s = idx / mb::kD, j = idx % mb::kD;
+            sm->dh[s][j] += sm->dr[s][j];   // dx = dh1(residual) + mixer_norm path
         }
         __syncthreads();
-        // (8) dt_proj bwd: dt_pre = dt_proj(dt_raw)+bias. ddt_pre = a->dt_pre.
-        //   dW_dt += ddt_pre^T @ dt_raw ; db_dt += Σ ddt_pre ; ddt_raw = ddt_pre @ dt_proj_w.
-        //   dt_raw must be recomputed: dt_raw = (x_proj(x_main))[:, :dt_rank]. But
-        //   x_main = silu(conv) (we lost adj_a=x_main -> now dx_main). Re-materialise
-        //   x_main into adj_b? adj_b currently = dz (needed at step 12 for dxz). So
-        //   recompute dt_raw into dbc[:, :dt_rank] using x_main re-made into a temp.
-        //   We have no free [kSeq,d_inner] buffer (adj_a=dx_main, adj_b=dz, adj_c
-        //   =dx_main_D done -> FREE!). adj_c is free now. Re-make x_main -> adj_c.
-        mb_make_x_main(a, &sm->adj_c[0][0]);   // adj_c := x_main (recomputed)
-        // dt_raw = (x_main @ x_proj_w[:dt_rank]^T) -> dbc[:, :dt_rank].
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDtRank; idx += blockDim.x) {
-            const int s = idx / mb::kDtRank, o = idx % mb::kDtRank;
-            const float* xr = &sm->adj_c[s][0];   // x_main
-            const float* Wr = L.x_proj_w + (int64_t)o * mb::kDInner;
-            float acc = 0.0f;
-            #pragma unroll
-            for (int k = 0; k < mb::kDInner; ++k) acc += xr[k] * Wr[k];
-            sm->dbc[s][o] = acc;   // dt_raw in dbc[:, :dt_rank] (scratch)
-        }
-        __syncthreads();
-        // dt_proj bwd. ddt_raw -> a fresh [kSeq,dt_rank]; stash in dr[:, :dt_rank]
-        // (dr=[kSeq,d], dt_rank=8<=d). dr's dx_residual is [kSeq,d] full — STILL
-        // NEEDED at step 13. dt_rank=8 occupies dr[:, :8], colliding with the
-        // residual. So put ddt_raw into the TAIL of dbc (dbc width=40, dt_raw uses
-        // [0,8); B/C grads go elsewhere). Actually dx_dbc = cat[ddt_raw,dB,dC] is
-        // assembled into dbc next — so write ddt_raw straight into dbc[:, :dt_rank]
-        // AFTER consuming dt_raw. But dW_dt needs dt_raw while computing — order:
-        // compute dW_dt + db_dt (reads ddt_pre=a->dt_pre, dt_raw=dbc[:,:8]), then
-        // ddt_raw (reads ddt_pre + dt_proj_w) overwriting dbc[:,:8].
-        {
-            const float* dY = &a->dt_pre[0][0];   // ddt_pre [kSeq,d_inner]
-            // dW_dt [d_inner, dt_rank]; db_dt [d_inner].
-            const int wtot = mb::kDInner * mb::kDtRank;
-            for (int idx = threadIdx.x; idx < wtot; idx += blockDim.x) {
-                const int o = idx / mb::kDtRank, i = idx % mb::kDtRank;
-                float acc = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * mb::kDInner + o] * sm->dbc[s][i];
-                G.dt_proj_w[(int64_t)o * mb::kDtRank + i] += acc;
-            }
-            for (int o = threadIdx.x; o < mb::kDInner; o += blockDim.x) {
-                float acc = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * mb::kDInner + o];
-                G.dt_proj_b[o] += acc;
-            }
-            __syncthreads();
-            // ddt_raw[s,i] = Σ_o ddt_pre[s,o]*dt_proj_w[o,i] -> dbc[:, :dt_rank].
-            for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDtRank; idx += blockDim.x) {
-                const int s = idx / mb::kDtRank, i = idx % mb::kDtRank;
-                float acc = 0.0f;
-                for (int o = 0; o < mb::kDInner; ++o) acc += dY[s * mb::kDInner + o] * L.dt_proj_w[(int64_t)o * mb::kDtRank + i];
-                sm->dbc[s][i] = acc;   // ddt_raw -> dbc[:, :dt_rank]
-            }
-            __syncthreads();
-        }
-        // (9) assemble dx_dbc = cat[ddt_raw, dBmat, dCmat] into dbc (ddt_raw already
-        //   in dbc[:, :dt_rank]; place dB,dC after).
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kState; idx += blockDim.x) {
-            const int s = idx / mb::kState, k = idx % mb::kState;
-            sm->dbc[s][mb::kDtRank + k] = sm->dBmat[s][k];
-            sm->dbc[s][mb::kDtRank + mb::kState + k] = sm->dCmat[s][k];
-        }
-        __syncthreads();
-        //   x_proj bwd: dW_xproj += dx_dbc^T @ x_main ; dx_main(x_proj path) =
-        //   dx_dbc @ x_proj_w  -> ADD into the dx_main accumulator (adj_a). x_main
-        //   = adj_c (still valid).
-        {
-            const float* dY = &sm->dbc[0][0];     // dx_dbc [kSeq,40]
-            const float* X = &sm->adj_c[0][0];    // x_main [kSeq,d_inner]
-            const int wtot = mb::kDbc * mb::kDInner;
-            for (int idx = threadIdx.x; idx < wtot; idx += blockDim.x) {
-                const int o = idx / mb::kDInner, i = idx % mb::kDInner;
-                float acc = 0.0f;
-                #pragma unroll
-                for (int s = 0; s < mb::kSeq; ++s) acc += dY[s * mb::kDbc + o] * X[s * mb::kDInner + i];
-                G.x_proj_w[(int64_t)o * mb::kDInner + i] += acc;
-            }
-            __syncthreads();
-            // dx_main += dx_dbc @ x_proj_w (ADD into adj_a).
-            const int xtot = mb::kSeq * mb::kDInner;
-            for (int idx = threadIdx.x; idx < xtot; idx += blockDim.x) {
-                const int s = idx / mb::kDInner, i = idx % mb::kDInner;
-                float acc = 0.0f;
-                for (int o = 0; o < mb::kDbc; ++o) acc += dY[s * mb::kDbc + o] * L.x_proj_w[(int64_t)o * mb::kDInner + i];
-                sm->adj_a[s][i] += acc;   // dx_main += x_proj path
-            }
-            __syncthreads();
-        }
-        // (10-11) dx_main complete (adj_a). dconv = dx_main * silu'(conv) -> adj_c
-        //   (x_main no longer needed). conv1d bwd: dx_main_raw + dW_conv + db_conv.
-        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
-            const int s = idx / mb::kDInner, c = idx % mb::kDInner;
-            sm->adj_c[s][c] = sm->adj_a[s][c] * mb_silu_grad(a->conv[s][c]);   // dconv
-        }
-        __syncthreads();
-        //   conv bwd: dx -> adj_a (dx_main_raw); reads dconv=adj_c, in=x_main_raw.
-        mb_conv1d_bwd(&sm->adj_c[0][0], &a->x_main_raw[0][0], L.conv_w,
-                      G.conv_w, G.conv_b, &sm->adj_a[0][0]);   // adj_a := dx_main_raw
-        // (12) dxz = cat[dx_main_raw, dz] (adj_a | adj_b). in_proj bwd: dW_in +=
-        //   dxz^T @ hin ; dx_inproj = dxz @ in_w.  in_w is [2*d_inner, d]; rows
-        //   [0,d_inner) pair with x_main_raw, [d_inner,2di) with z.
-        //   dx (=dx_inproj + dx_residual) goes to the previous layer's dh.
-        {
-            // dW_in: rows 0..d_inner-1 from dx_main_raw(adj_a), d_inner..2di-1 from dz(adj_b).
-            const int half = mb::kDInner;
-            for (int o = threadIdx.x; o < 2 * mb::kDInner; o += blockDim.x) {
-                const float* dyo = (o < half) ? &sm->adj_a[0][0] : &sm->adj_b[0][0];
-                const int oo = (o < half) ? o : (o - half);
-                for (int i = 0; i < mb::kD; ++i) {
-                    float acc = 0.0f;
-                    #pragma unroll
-                    for (int s = 0; s < mb::kSeq; ++s)
-                        acc += dyo[s * mb::kDInner + oo] * hin[s * mb::kD + i];
-                    G.in_w[(int64_t)o * mb::kD + i] += acc;
-                }
-            }
-            __syncthreads();
-            // dx_inproj[s,i] = Σ_{o<d_inner} dx_main_raw[s,o]*in_w[o,i]
-            //               + Σ_{o<d_inner} dz[s,o]*in_w[d_inner+o,i]
-            //   then + dx_residual (sm->dr). Write into dh for the previous layer.
-            for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
-                const int s = idx / mb::kD, i = idx % mb::kD;
-                float acc = 0.0f;
-                for (int o = 0; o < mb::kDInner; ++o) {
-                    acc += sm->adj_a[s][o] * L.in_w[(int64_t)o * mb::kD + i];
-                    acc += sm->adj_b[s][o] * L.in_w[(int64_t)(mb::kDInner + o) * mb::kD + i];
-                }
-                sm->dh[s][i] = acc + sm->dr[s][i];   // (13) dx = in_proj path + residual
-            }
-            __syncthreads();
-        }
-        // dh now = grad wrt the previous layer's output (or the embedding for li=0).
+        // sm->dh now = grad wrt the previous block's output (or the embedding for li=0).
     }
 
     // ── embedding backward: dh = grad wrt h0 [kSeq,d]. ──

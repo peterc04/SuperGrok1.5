@@ -173,7 +173,7 @@ mamba_rebase_state(const FusedOptState& s, int64_t off) {
 //   [0 .. nCTA*total)              : per-CTA grad partials (cta-major)
 //   [nCTA*total .. nCTA*total+nCTA): per-CTA loss partials (NLL sum per slice)
 //   [.. +1)                        : the reduced scalar loss (loss/B) the host reads
-// total == kMambaTotalElems == 259425.
+// total == kMambaTotalElems (593713 for the Mamba-3 toy; mamba3_layout.cuh).
 struct MambaTokenCtx {
     const int* tokens;   // [B, kSeq] int32 token ids in [0, kVocab)
     const int* targets;  // [B]       int32 target ids in [0, kPHead)
@@ -505,15 +505,18 @@ __host__ __device__ __forceinline__ int64_t mb_tc_sg2_floats(int nCTA) {
     return (int64_t)nCTA * mb_sg2_ws_stride_floats() + 1;
 }
 __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA) {
-    return mb_tc_acts_floats(T)
-         + (int64_t)nCTA * mbtc::mb_tile_scratch_floats()
-         + (int64_t)nCTA * mbtc::kPartElems
-         + nCTA + 1
-         + mb_tc_dw_part_floats()                       // split-K dW partials (G>1)
-         + mb_tc_opt_reduce_floats(nCTA)                // STAGED-opt (Prodigy) reduce slots
-         + mb_tc_looksam_floats()                       // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
-         + mb_tc_muon_floats(nCTA)                      // STAGED-opt (Muon) NS per-matrix scratch
-         + mb_tc_sg2_floats(nCTA)                       // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
+    (void)T;
+    // MAMBA-3 scalar design: the per-CTA partial is the FULL grad [total] (not the
+    // acts + tile-scratch + dW-split + non-GEMM-partial of the old wgmma Fork-B).
+    // Layout order MUST match the kernel's pointer derivations:
+    //   [nCTA*total | loss(nCTA) | loss_out(1) | opt_reduce(2nCTA+1) |
+    //    sam_backup+sam_grad(2*total) | muon | sg2 (| profiler)].
+    return (int64_t)nCTA * kMambaTotalElems          // per-CTA FULL grad partial
+         + nCTA + 1                                  // loss slots + reduced loss
+         + mb_tc_opt_reduce_floats(nCTA)             // STAGED-opt (Prodigy) reduce slots
+         + mb_tc_looksam_floats()                    // SAM 2nd-bwd scratch [sam_backup|sam_grad]
+         + mb_tc_muon_floats(nCTA)                   // Muon NS per-matrix scratch
+         + mb_tc_sg2_floats(nCTA)                    // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
 #if SG_MB_TC_PROFILE
          + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
 #endif
@@ -527,37 +530,40 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
                           MambaTokenCtx tok,
                           float* __restrict__ grad,
                           float lr, int step, FusedOptState st) {
-    __shared__ MbTcSmem sm;
+    // MAMBA-3 design: the "TC" megakernel runs the VALIDATED scalar per-sample
+    // fwd+bwd (model_stage_mamba3.cuh, mb_forward_sample/mb_backward_sample —
+    // matched to the fp64 oracle to ~2e-6) batch-parallel into a per-CTA FULL-grad
+    // partial, then a deterministic ascending-CTA reduce + the canonical optimizer
+    // tail (incl. the SAM 2nd backward for looksam/SG/SG2). The Mamba-3 mixer is
+    // scan-dominated (the projections are a tiny share of the wall), so the scalar
+    // engine IS the production path; the wgmma-projection dW machinery is bypassed.
+    // The per-sample MambaSampleSmem (~227 KB) lives in DYNAMIC smem (opt-in by the
+    // launcher), exactly like the scalar Mamba megakernel.
+    extern __shared__ char mamba_tc_smem_raw[];
+    MambaSampleSmem& sm = *reinterpret_cast<MambaSampleSmem*>(mamba_tc_smem_raw);
     GridBarrier bar = ctx.barrier();
-    // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); ONLY they route
-    // through the out-of-line shims (one shared frame). Single-pass cells now
-    // use the inline bodies (the original noinline was unconditional and taxed
-    // them ~5.7 KB of callee spill; campaign C2 scopes it).
     constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
                                   Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
+    (void)kSamCoupled;
     const int cta = blockIdx.x;
     const int nCTA = (int)ctx.n_ctas;
     const int B = tok.B;
     const int T = B * mb::kSeq;
+    (void)T;
 
-    // Workspace partition.
+    // Workspace partition. The per-CTA partial is the FULL grad [total] (scalar
+    // design), NOT the dW-output-stationary split + non-GEMM partial. acts/scratch/
+    // dw_part are unused on this path (kept zero-width in mb_tc_workspace_floats).
     float* ws = tok.workspace;
-    const int64_t acts_f = mb_tc_acts_floats(T);
-    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
-    float* scratch_base = ws + acts_f;
-    const int64_t scratch_per = mbtc::mb_tile_scratch_floats();
-    float* part_base = scratch_base + (int64_t)nCTA * scratch_per;
-    float* loss_part = part_base + (int64_t)nCTA * mbtc::kPartElems;
-    float* loss_out  = loss_part + nCTA;
-    // Split-K dW partials (G>1): the (gt,kc) 64×N partial tiles, carved AFTER the
-    // loss slot (matches mb_tc_workspace_floats's term order). G==1 → dw_part unused.
-    float* dw_part   = loss_out + 1;
-    const int kDwG   = mbtc::kMbDwSplitK;
+    const int64_t total_p = kMambaTotalElems;
+    float* part_base = ws;                                  // [nCTA * total]
+    float* loss_part = part_base + (int64_t)nCTA * total_p; // [nCTA]
+    float* loss_out  = loss_part + nCTA;                    // [1]
+    float* dw_part   = loss_out + 1;                        // unused (kept for layout parity)
+    (void)dw_part;
     // STAGED-opt (Prodigy P2.6) cross-CTA reduce slots: [r slots | s slots | reduced d]
-    // = 2*nCTA+1, carved AFTER the split-K dW partials (matches mb_tc_workspace_floats's
-    // term order). Unused by every non-Prodigy tail (their P3 never touches it), so this
-    // pointer derivation leaves those cells byte-identical.
-    float* opt_reduce = dw_part + mb_tc_dw_part_floats();
+    // = 2*nCTA+1. Carved after the loss slot (dw_part is zero-width here).
+    float* opt_reduce = loss_out + 1;
     // LookSAM SAM 2nd-backward scratch, carved AFTER the Prodigy reduce slots (mamba has
     // NO Muon region — unlike the decoder/vit twins — so this follows opt_reduce; term
     // order matches mb_tc_workspace_floats). Carving it here keeps every prior region's
@@ -594,84 +600,57 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     long long _pt = 0;
 #endif
 
-    mbtc::MbActs acts = mbtc::mb_acts_bind(acts_base, T);
-    mbtc::MbTileScratch sc = mbtc::mb_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
-    float* my_part = part_base + (int64_t)cta * mbtc::kPartElems;
-    mbtc::MbPartial part = mbtc::mb_partial_bind(my_part);
-
+    float* my_part = part_base + (int64_t)cta * total_p;   // this CTA's FULL grad partial
     MambaWeights w = mb_bind(params);
+    MambaGrad g = mb_bind_grad(my_part);
 
-    // ── P0: zero this CTA's non-GEMM grad partial + loss slot. ──
-    for (int64_t i = threadIdx.x; i < mbtc::kPartElems; i += blockDim.x) my_part[i] = 0.0f;
+    // ── P0: zero this CTA's FULL grad partial + loss slot. ──
+    for (int64_t i = threadIdx.x; i < total_p; i += blockDim.x) my_part[i] = 0.0f;
     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
     bar.sync();   // B0
 
-    // ── P1: sample-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
-    //    kTileM rows; fwd (→ acts X, NLL) then bwd (→ acts dY, dh0, partial). ──
-    const int nrows_tile = mbtc::kTileM;
-    const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
-    float nll_acc = 0.0f;
-    for (int ti = cta; ti < n_tiles; ti += nCTA) {
-        const int g0 = ti * nrows_tile;
-        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+    // ── P1: batch-parallel fwd+bwd (scalar per-sample). Fixed contiguous slice
+    //    [b0,b1) for this CTA; the whole CTA cooperates on ONE sample at a time. ──
+    {
+        const int base = B / nCTA, rem = B % nCTA;
+        const int b0 = cta * base + (cta < rem ? cta : rem);
+        const int cnt = base + (cta < rem ? 1 : 0);
+        const int b1 = b0 + cnt;
+        __shared__ int tok_s[mb::kSeq];
+        __shared__ int tgt_s;
+        float nll_acc = 0.0f;
         SG_MBTC_PROF_TIC(_pt);
-        float nll;
-        if constexpr (kSamCoupled)
-            nll = mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
-                                                   tok.targets, sm.sA, sm.sB, sm.red);
-        else
-            nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                          sm.sA, sm.sB, sm.red);
+        for (int b = b0; b < b1; ++b) {
+            if (threadIdx.x < mb::kSeq) tok_s[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+            if (threadIdx.x == 0) tgt_s = tok.targets[b];
+            __syncthreads();
+            float nll = mb_forward_sample(w, tok_s, tgt_s, &sm);
+            mb_backward_sample(w, g, tok_s, tgt_s, B, &sm);
+            if (threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) loss_part[cta] = nll_acc;
         SG_MBTC_PROF_ACC(0, _pt);
-        SG_MBTC_PROF_TIC(_pt);
-        if constexpr (kSamCoupled)
-            mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
-                                              tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
-        else
-            mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
-                                     sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
-        SG_MBTC_PROF_ACC(1, _pt);
-        if (threadIdx.x == 0) nll_acc += nll;
-        __syncthreads();
     }
-    if (threadIdx.x == 0) loss_part[cta] = nll_acc;
-    bar.sync();   // B1: all acts (X + dY + dh0) + partials complete
+    bar.sync();   // B1: all CTA full-grad partials + loss slots complete
     SG_MBTC_PROF_TIC(_pt);
 
-    // ── P2: assemble all 28 grads. 8 projection dW output-stationary (gt %
-    //    nCTA), dt_proj.bias, non-GEMM partial-reduce, embedding owner-scan. ──
-    if (threadIdx.x == 0) mbtc::mbtc_build_dw_specs(acts, T, sm.spec);
-    __syncthreads();
-    mbtc::MbDwSpec* spec = sm.spec;
-    const int n_dw = mbtc::mbtc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
-    SG_MBTC_PROF_TIC(_pt);
-#if !SG_MBTC_BYPASS_DW_GEMM
-    if (kDwG > 1) {
-        // SPLIT-K (multi-CTA tiling): fan (n_dw·G) (tile,chunk) partials over the
-        // grid so the ~73% idle SMs do work; deterministic ascending-chunk reduce.
-        for (int item = cta; item < n_dw * kDwG; item += nCTA) {
-            const int gt = item / kDwG, kc = item % kDwG;
-            mbtc::mbtc_dw_run_tile_splitk<SG_TUNED_TILE_N>(spec, gt, kc, kDwG, dw_part, sm.sA, sm.sB);
+    // ── P2: deterministic cross-CTA reduce of the full-grad partial (work-steal
+    //    per-tensor; ascending CTA index → deterministic). ──
+    {
+        __shared__ int task_slot;
+        TaskQueue q = ctx.queue();
+        for (int t = q.next_block(&task_slot); t < kMambaNumTensors;
+             t = q.next_block(&task_slot)) {
+            const int n = kMambaSizes[t];
+            const int64_t off = (int64_t)kMambaOffsets[t];
+            for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                float acc = 0.0f;
+                for (int c = 0; c < nCTA; ++c) acc += part_base[(int64_t)c * total_p + off + i];
+                grad[off + i] = acc;
+            }
         }
-        bar.sync();   // all (gt,kc) partials complete before the reduce reads them
-        mbtc::mbtc_dw_reduce_splitk<SG_TUNED_TILE_N>(spec, n_dw, kDwG, dw_part, grad, cta, nCTA);
-    } else {
-        for (int gt = cta; gt < n_dw; gt += nCTA)
-            mbtc::mbtc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
     }
-#else
-    (void)n_dw; (void)dw_part; (void)kDwG;
-#endif
-    SG_MBTC_PROF_ACC(4, _pt);          // P2-a: projection dW GEMMs (K=T)
-    SG_MBTC_PROF_TIC(_pt);
-    mbtc::mbtc_dw_biases(spec, grad, cta, nCTA);
-    mbtc::mbtc_partial_reduce(part_base, grad, nCTA, cta);
-    SG_MBTC_PROF_ACC(5, _pt);          // P2-b: biases + non-GEMM partial reduce
-    SG_MBTC_PROF_TIC(_pt);
-#if !SG_MBTC_BYPASS_EMBED_SCAN
-    mbtc::mbtc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
-#endif
-    SG_MBTC_PROF_ACC(6, _pt);          // P2-c: embedding owner-scan (O(vocab·T))
     // Loss reduce (fp64 ordered) by CTA 0.
     if (cta == 0 && threadIdx.x == 0) {
         double s = 0.0;
@@ -679,7 +658,7 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         *tok.loss_out = (float)(s / (double)B);
     }
     (void)loss_out;
-    SG_MBTC_PROF_ACC(2, _pt);          // close P2 (dW GEMM + reduce + embed + loss)
+    SG_MBTC_PROF_ACC(2, _pt);          // close P2 (full-grad reduce + loss)
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
     SG_MBTC_PROF_TIC(_pt);             // open P3 (optimizer tail)
 
@@ -749,7 +728,7 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
                     const float gv = grad[e0 + i];
                     tsum += gv * gv;
                 }
-                float* red = sm.red;
+                float* red = &sm.adj_a[0][0];   // 256-wide tree-reduce scratch (sm.red is only 64)
                 red[threadIdx.x] = tsum;
                 __syncthreads();
                 for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -780,42 +759,43 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
                 }
             }
             bar.sync();   // B2.4c: all params perturbed before the 2nd forward reads them
-            // (c) SECOND fwd+bwd at the perturbed weights → g_sam in `sam_grad`. Mirror
-            //     P1 + P2 EXACTLY, but: re-zero the per-CTA non-GEMM partial (it
-            //     accumulates), do NOT write the loss (keep the first-pass loss), and
-            //     assemble into `sam_grad` (NOT `grad`). `w` wraps `params` (now
-            //     perturbed) so the tile fns read the perturbed weights with no re-bind.
-            for (int64_t i = threadIdx.x; i < mbtc::kPartElems; i += blockDim.x) my_part[i] = 0.0f;
+            // (c) SECOND fwd+bwd at the perturbed weights → g_sam in `sam_grad`. Same
+            //     scalar batch-parallel P1+P2 as the first pass, but: re-zero the
+            //     per-CTA full-grad partial, do NOT write the loss, reduce into
+            //     `sam_grad` (NOT `grad`). `w`/`g` already wrap params(perturbed)/my_part.
+            for (int64_t i = threadIdx.x; i < total_p; i += blockDim.x) my_part[i] = 0.0f;
             bar.sync();   // B2.4d: partials cleared before the 2nd backward accumulates
-            for (int ti = cta; ti < n_tiles; ti += nCTA) {
-                const int g0 = ti * nrows_tile;
-                const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
-                mbtc::mbtc_forward_tile_outlined(w, g0, nrows, acts, sc, tok.tokens,
-                                                 tok.targets, sm.sA, sm.sB, sm.red);
-                mbtc::mbtc_backward_tile_outlined(w, g0, nrows, B, acts, sc, part, tok.tokens,
-                                                  tok.targets, sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
-                __syncthreads();
-            }
-            bar.sync();   // B2.4e: all 2nd-pass acts (X + dY + dh0) + partials complete
-            // Re-build the dW specs from the 2nd-pass acts (dY adjoints changed).
-            if (threadIdx.x == 0) mbtc::mbtc_build_dw_specs(acts, T, sm.spec);
-            __syncthreads();
-            mbtc::MbDwSpec* spec2 = sm.spec;
-            const int n_dw2 = mbtc::mbtc_dw_total_tiles<SG_TUNED_TILE_N>(spec2);
-            if (kDwG > 1) {
-                for (int item = cta; item < n_dw2 * kDwG; item += nCTA) {
-                    const int gt = item / kDwG, kc = item % kDwG;
-                    mbtc::mbtc_dw_run_tile_splitk<SG_TUNED_TILE_N>(spec2, gt, kc, kDwG, dw_part, sm.sA, sm.sB);
+            {
+                const int base = B / nCTA, rem = B % nCTA;
+                const int b0 = cta * base + (cta < rem ? cta : rem);
+                const int cnt = base + (cta < rem ? 1 : 0);
+                const int b1 = b0 + cnt;
+                __shared__ int tok_s2[mb::kSeq];
+                __shared__ int tgt_s2;
+                for (int b = b0; b < b1; ++b) {
+                    if (threadIdx.x < mb::kSeq) tok_s2[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+                    if (threadIdx.x == 0) tgt_s2 = tok.targets[b];
+                    __syncthreads();
+                    (void)mb_forward_sample(w, tok_s2, tgt_s2, &sm);
+                    mb_backward_sample(w, g, tok_s2, tgt_s2, B, &sm);
+                    __syncthreads();
                 }
-                bar.sync();
-                mbtc::mbtc_dw_reduce_splitk<SG_TUNED_TILE_N>(spec2, n_dw2, kDwG, dw_part, sam_grad, cta, nCTA);
-            } else {
-                for (int gt = cta; gt < n_dw2; gt += nCTA)
-                    mbtc::mbtc_dw_run_tile<SG_TUNED_TILE_N>(spec2, gt, sam_grad, sm.sA, sm.sB);
             }
-            mbtc::mbtc_dw_biases(spec2, sam_grad, cta, nCTA);
-            mbtc::mbtc_partial_reduce(part_base, sam_grad, nCTA, cta);
-            mbtc::mbtc_embed_owner_scan(acts, tok.tokens, T, sam_grad, cta, nCTA);
+            bar.sync();   // B2.4e: all 2nd-pass full-grad partials complete
+            {
+                __shared__ int task_slot_s;
+                TaskQueue qs = ctx.queue();
+                for (int t = qs.next_block(&task_slot_s); t < kMambaNumTensors;
+                     t = qs.next_block(&task_slot_s)) {
+                    const int n = kMambaSizes[t];
+                    const int64_t off = (int64_t)kMambaOffsets[t];
+                    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                        float acc = 0.0f;
+                        for (int c = 0; c < nCTA; ++c) acc += part_base[(int64_t)c * total_p + off + i];
+                        sam_grad[off + i] = acc;
+                    }
+                }
+            }
             bar.sync();   // B2.4f: g_sam fully assembled in sam_grad
             // (d) WRITE the SAM side-channel (into the persistent state slice) + restore p.
             //     LookSAM → sam_dir = g_sam − g; SuperGrok11/15/SuperGrok2 → sharpness =
@@ -868,8 +848,8 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
             const float gv = grad[e0 + i];
             tsum += gv * gv;
         }
-        // Block reduction via the smem the TC GEMM already owns (sm.red, fp32).
-        float* red = sm.red;
+        // Block reduction via a 256-wide MambaSampleSmem field (sm.red is only 64).
+        float* red = &sm.adj_a[0][0];
         red[threadIdx.x] = tsum;
         __syncthreads();
         for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -1233,13 +1213,18 @@ template <OptId Opt>
 int mb_tc_launched_nctas(int dev, int ncta_cap) {
     int n_sms = 0;
     if (cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+    // MAMBA-3: the per-sample MambaSampleSmem (~227 KB) is DYNAMIC smem → one
+    // block/SM (occ=1) by design. Query occ with the REAL dynamic-smem request
+    // (and opt in first, else the query assumes the 48 KB static default).
+    const int dyn_smem = (int)kMambaSmemBytes;
+    cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
     int occ = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, (const void*)&fused_mamba_megakernel_tc<Opt>, SG_MB_TC_MEGA_BLOCK, 0) != cudaSuccess)
+            &occ, (const void*)&fused_mamba_megakernel_tc<Opt>, SG_MB_TC_MEGA_BLOCK, dyn_smem) != cudaSuccess)
         return 0;
     if (occ < 1) return 0;
-    unsigned waves = (SG_MBTC_MIN_BLOCKS_PER_SM >= 2 && occ > 1) ? (unsigned)occ : 1u;
-    unsigned launch_ctas = (unsigned)n_sms * waves;
+    unsigned launch_ctas = (unsigned)n_sms;   // one CTA/SM (smem-bound)
     if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
     return (int)launch_ctas;
 }
@@ -1256,45 +1241,33 @@ cudaError_t launch_fused_mamba_megakernel_tc(
     err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
     if (err != cudaSuccess) return err;
 
+    // MAMBA-3: DYNAMIC smem opt-in (the per-sample MambaSampleSmem ~227 KB). Three
+    // mandatory steps (cudaFuncSetAttribute + dyn_smem in the occ query + dyn_smem
+    // at <<<>>>); one block/SM by design (occ=1, smem-bound).
+    const int dyn_smem = (int)kMambaSmemBytes;
+    err = cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
+    if (err != cudaSuccess) return err;
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &occ, (const void*)&fused_mamba_megakernel_tc<Opt>, SG_MB_TC_MEGA_BLOCK,
-        /*dynamicSMemBytes=*/0);
+        /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
 
-    // OCCUPANCY-FILL: at min-blocks≥2 the kernel is built ≤128 reg/thread so `occ`
-    // CTAs co-reside per SM. Launch occ·n_sms CTAs (one full residency set) so the
-    // co-resident CTAs hide each other's HBM latency across the scan/conv/LN phases
-    // that run fully exposed at occ=1 — the persistent grid barrier rendezvous is
-    // over the LAUNCHED count and occ·n_sms are guaranteed simultaneously resident,
-    // so it stays hang-free. Determinism is per fixed launched nCTA (ascending-CTA
-    // reduce). At min-blocks==1 (shipped default) occ==1 → identical to before.
-    unsigned waves = (SG_MBTC_MIN_BLOCKS_PER_SM >= 2 && occ > 1) ? (unsigned)occ : 1u;
-    unsigned launch_ctas = (unsigned)n_sms * waves;
+    unsigned launch_ctas = (unsigned)n_sms;   // one CTA/SM (smem-bound); deterministic per fixed nCTA
     if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
     ctx.n_ctas = launch_ctas;
-    // B%16: the dW K-loop contracts K=T=B·8 in 16-step atoms. It ALSO guarantees
-    // FULL tiles (T%kTileM==0 for kTileM∈{64,128}), which the projection GEMMs
-    // REQUIRE — they process a compile-time M-extent of kTileM rows (kAtomsM
-    // atoms), NOT the runtime `nrows`; a partial final tile would feed garbage
-    // pad rows to the wgmma while the scalar scan/conv loops process only nsamp.
-    // (A future relaxation to B%2 would satisfy the K-atom reason but silently
-    // break partial tiles — keep B%16.)
+    // B%16 kept (the gate truncates B to a multiple of 16; the scalar per-sample
+    // path needs no tile alignment but the contract upstream assumes B%16).
     if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
-    // SPLIT-K dW (G>1) needs equal 16-aligned K-chunks: G must divide k_steps_total
-    // = T/16 = B·kSeq/16 = B/2 (kSeq=8). With B%16==0, B/2%4==0, so G∈{1,2,4} are
-    // always legal; a larger/odd G that doesn't divide B/2 would silently DROP the
-    // remainder k-steps from every dW (a correctness bug) — REFUSE loudly instead.
-    if (mbtc::kMbDwSplitK > 1 && (((int64_t)tok.B * mb::kSeq / wgs::kWgmmaAtomK) % mbtc::kMbDwSplitK) != 0)
-        return cudaErrorInvalidValue;
 
     if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     dim3 grid(launch_ctas), block(SG_MB_TC_MEGA_BLOCK);
-    fused_mamba_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
+    fused_mamba_megakernel_tc<Opt><<<grid, block, dyn_smem, stream>>>(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
