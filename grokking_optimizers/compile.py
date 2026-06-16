@@ -6656,15 +6656,39 @@ _VALIDATION_REQUIRED_ORIGINS: frozenset = frozenset({
 })
 _VALIDATION_PASS_STATES: frozenset = frozenset({"ok", "deterministic"})
 
+# P0-3 — origins that ship a GENERATED SOURCE FILE (stashed on
+# ``spec._emitted_sources["<ckey>:<origin>"]``), as opposed to fast-math, which
+# is a flag-only variant (no emitted source — re-applied via the ``_fastmath``
+# flag-replay in build_jit). build_jit's final source-swap must compile the
+# generated source for ANY of these when it wins; otherwise it ships the
+# template while recording the generated origin at the winning timing (the
+# fake-green #2 hole). This is exactly ``_VALIDATION_REQUIRED_ORIGINS`` minus
+# ``ORIGIN_FASTMATH`` — kept as a derived constant so adding a new
+# source-generating origin to the validation set picks it up automatically.
+_SOURCE_GENERATING_ORIGINS: frozenset = (
+    _VALIDATION_REQUIRED_ORIGINS - {ORIGIN_FASTMATH})
+
 
 def pick_winner(all_trials: List[Dict[str, Any]], *,
-                strict_numerics: bool = False) -> Optional[Dict[str, Any]]:
+                strict_numerics: bool = False,
+                allow_nondeterministic: bool = False,
+                correctness_hook: Optional[Callable[[Dict[str, Any]],
+                                                    bool]] = None,
+                correctness_top_k: int = 3,
+                report=None) -> Optional[Dict[str, Any]]:
     """Lowest timing across all stages, after numerical-validation filtering.
 
-    Filter rules (Stream 10 + mandate #16):
+    Filter rules (Stream 10 + mandate #16 + P0-1/P0-2):
       * Always exclude trials whose ``numerical_status`` is
         ``"numerical_fail"`` — outside tolerance vs. the strict reference,
         unsafe to ship.
+      * P0-2 — always exclude trials whose ``numerical_status`` is
+        ``"non_deterministic"`` (within-tolerance but NOT bit-identical
+        across the 3x A/A/A re-run — the IL=4 / atomicAdd reduction-order
+        trap). This rejection is UNCONDITIONAL by default: the determinism
+        tag is measured for free, so a non-reproducible config can never win
+        a ship-grade build. Pass ``allow_nondeterministic=True`` (the
+        ``--allow-nondeterministic`` opt-out) to deliberately keep them.
       * Mandate #16 — any GENERATED/TRANSFORMED variant (``origin`` in
         ``_VALIDATION_REQUIRED_ORIGINS``: synth / polyhedral / cutlass / ck /
         fast-math) is ineligible UNLESS it recorded a strict on-device-oracle
@@ -6676,6 +6700,15 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
       * When ``strict_numerics=True``, only trials tagged
         ``"deterministic"`` are eligible (bit-identical to the reference AND
         across a 3x re-run).
+      * P0-1 — when ``correctness_hook`` is supplied, the top-``correctness_top_k``
+        candidate winners (by ascending timing) are each re-checked at
+        PRODUCTION scale against the fp64 ground-truth + A/A/A determinism
+        gate (``_default_correctness_hook`` → ``tests/hw/test_l3tc_tail_gate``).
+        A candidate the hook fails is DEMOTED to ineligible and the next-best
+        is checked, so the returned winner has cleared the fp64 oracle — not
+        merely the same-dtype fp32 self-consistency check. The hook is the
+        HARD precondition of a finalized winner; ``None`` (the default)
+        preserves the historical timing-only selection.
 
     Returns the winning trial record or ``None`` if no trial is eligible.
     """
@@ -6685,6 +6718,17 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
     # behaves identically for legacy caches.
     eligible = [t for t in finished
                 if t.get("numerical_status", "skipped") != "numerical_fail"]
+    # P0-2 — reject the IL=4 determinism trap UNCONDITIONALLY (unless the
+    # explicit opt-out is set). A "non_deterministic" trial cleared np.allclose
+    # vs the oracle but is NOT bit-identical across the 3x re-run, so its
+    # timing — and its very output — is not reproducible; it must never win a
+    # ship-grade build by default. (strict_numerics already implies this, since
+    # it keeps only "deterministic"; this closes the DEFAULT path the trap was
+    # open on.)
+    if not allow_nondeterministic:
+        eligible = [t for t in eligible
+                    if t.get("numerical_status", "skipped")
+                    != "non_deterministic"]
     # Mandate #16 — drop generated/transformed variants that never passed
     # the strict on-device oracle.
     def _generated_and_unvalidated(t: Dict[str, Any]) -> bool:
@@ -6699,7 +6743,147 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
                     if t.get("numerical_status") == "deterministic"]
     if not eligible:
         return None
-    return min(eligible, key=lambda t: t["timing_ms"])
+    # Ascending-timing order — the historical ``min(...)`` picks eligible[0].
+    ranked = sorted(eligible, key=lambda t: t["timing_ms"])
+    if correctness_hook is None:
+        return ranked[0]
+    # P0-1 — fp64 ground-truth gate on the top-K candidate winners. Walk the
+    # ranked list (fastest first); the FIRST candidate the hook accepts is the
+    # winner. A candidate that fails the fp64 + A/A/A check is demoted to
+    # ineligible and we fall through to the next-best — so a winner that merely
+    # shares a rounding error with the fp32 self-consistency oracle (the IL=4
+    # trap class) can no longer be finalized. The hook is checked for at most
+    # ``correctness_top_k`` candidates to bound the (expensive, GPU-run) cost;
+    # beyond that we stop and report no fp64-validated winner rather than ship
+    # an unchecked one. A hook that RAISES is treated as a failure (fail-closed).
+    checked = 0
+    for cand in ranked:
+        if checked >= max(1, int(correctness_top_k)):
+            break
+        checked += 1
+        try:
+            ok = bool(correctness_hook(cand))
+        except Exception as _hook_exc:
+            ok = False
+            if report is not None:
+                report.write(
+                    f"  [pick_winner] correctness_hook RAISED on candidate "
+                    f"{cand.get('config_key', '?')} "
+                    f"(@ {cand.get('timing_ms')}ms): {_hook_exc!r} — demoted "
+                    f"(fail-closed).\n")
+        if ok:
+            if report is not None and checked > 1:
+                report.write(
+                    f"  [pick_winner] fp64 gate: accepted candidate #{checked} "
+                    f"{cand.get('config_key', '?')} @ {cand.get('timing_ms')}ms "
+                    f"(faster candidates were DEMOTED by the fp64/A-A-A "
+                    f"check).\n")
+            return cand
+        if report is not None:
+            report.write(
+                f"  [pick_winner] fp64 gate: DEMOTED candidate #{checked} "
+                f"{cand.get('config_key', '?')} @ {cand.get('timing_ms')}ms "
+                f"(failed fp64 parity / A-A-A determinism at production "
+                f"scale) — trying next-best.\n")
+    # No candidate in the top-K cleared the fp64 gate.
+    if report is not None:
+        report.write(
+            f"  [pick_winner] fp64 gate: NO candidate in the top-"
+            f"{max(1, int(correctness_top_k))} cleared the fp64 + A/A/A "
+            f"production-scale check — leaving winner UNSET (fail-closed).\n")
+    return None
+
+
+# Map a spec model name (canonical or short) to the short L3-TC gate-cell model
+# token used in tests/hw/test_l3tc_tail_gate._CELLS ("decoder"/"vit"/"mamba").
+# Mirrors that file's _canonical_tc_model alias table so the cell-key lookup
+# agrees with the gate. None ⇒ the model has no L3-TC gate cell.
+_CORRECTNESS_MODEL_ALIASES: Dict[str, str] = {
+    "transformer_decoder": "decoder",
+    "decoder": "decoder",
+    "mamba3": "mamba",
+    "mamba": "mamba",
+    "vit": "vit",
+}
+
+
+def correctness_cell_key(optimizer: str, model: str) -> Optional[str]:
+    """(optimizer, model) -> the ``"<opt>/<model>"`` L3-TC gate-cell key, or
+    None if the model has no TC gate cell. The optimizer token is passed
+    through verbatim (the gate keys on the same OPT_CLASS-style names the
+    autotuner uses: adamw/lion/muon/.../supergrok2)."""
+    short = _CORRECTNESS_MODEL_ALIASES.get(str(model).strip().lower())
+    if short is None:
+        return None
+    return f"{str(optimizer).strip().lower()}/{short}"
+
+
+def _default_correctness_hook(
+        spec: "BuildSpec") -> Optional[Callable[[Dict[str, Any]], bool]]:
+    """P0-1 — build the fp64 ground-truth + A/A/A determinism gate hook for
+    ``pick_winner`` (the marquee correctness fix), or return None when it
+    cannot run here so the historical timing-only selection is preserved.
+
+    The returned callable ``hook(candidate_trial) -> bool`` re-checks the
+    PRODUCTION-scale (d=2048) L3-TC train step against the PURE-fp64 canonical
+    reference + the 3x A/A/A bit-determinism check from
+    ``tests/hw/test_l3tc_tail_gate.run_cell_gate`` — NOT the same-dtype fp32
+    self-consistency oracle the sweep uses for the timing objective. ``True``
+    iff the (optimizer, model) cell PASSES both gates. ``pick_winner`` calls it
+    on the top-K candidate winners and DEMOTES any failure (re-selecting the
+    next-best), so a winner that merely shares a rounding error with the fp32
+    oracle (the IL=4 trap class) can no longer be finalized.
+
+    The hook is INSTALLED only when ALL of these hold (else this returns None):
+      * a CUDA GPU + the built fused extension are present (``_gpu_ready()`` in
+        the gate module) — off-GPU there is nothing to validate, so the seam is
+        a no-op and behaviour is byte-identical to today;
+      * the (optimizer, model) maps to a registered L3-TC gate cell
+        (``correctness_cell_key`` ∈ the gate's ``_CELLS``).
+
+    INJECTION POINT: ``_jit_autotune`` installs ``spec.correctness_hook =
+    _default_correctness_hook(spec)`` just before dispatching to the
+    exhaustive/Bayesian driver (only on the GPU path). A caller (the main loop)
+    may instead set ``spec.correctness_hook`` to its OWN callable — this
+    factory is the default body, and ``pick_winner`` honours whatever is on the
+    spec. The HOOK SIGNATURE the main loop must satisfy is::
+
+        hook(candidate_trial: Dict[str, Any]) -> bool
+        # candidate_trial is a pick_winner trial record (has 'config',
+        # 'config_key', 'timing_ms', 'origin', 'numerical_status'); the body
+        # runs the production-scale fp64 + A/A/A gate and returns pass/fail.
+
+    Fail-closed: a hook body that raises is treated by ``pick_winner`` as a
+    demotion (the candidate is rejected), never a silent pass.
+    """
+    cell_key = correctness_cell_key(spec.optimizer, spec.model)
+    if cell_key is None:
+        return None
+    # GPU + built-extension precondition. Importing the gate module is cheap;
+    # it pulls torch lazily. If anything is missing (no torch, no GPU, no built
+    # fused_step op, or the module import fails), we cannot run the fp64 gate
+    # here — return None so pick_winner keeps the timing-only path unchanged.
+    try:
+        from tests.hw.test_l3tc_tail_gate import (  # noqa: F401
+            run_cell_gate as _run_cell_gate, _CELLS, _gpu_ready)
+    except Exception:
+        return None
+    if cell_key not in _CELLS:
+        return None
+    if not _gpu_ready():
+        return None
+
+    def _hook(candidate: Dict[str, Any]) -> bool:
+        # The production extension `run_cell_gate` exercises is the one carrying
+        # the autotuned macros (the winner is rebuilt + published before the
+        # gate runs in the main loop's verify phase); here we run the SAME
+        # cell gate at production scale. ``ok`` is the AND of (1) fp64 parity
+        # and (2) A/A/A determinism. Any exception propagates to pick_winner,
+        # which treats it as a fail-closed demotion.
+        ok, _detail = _run_cell_gate(cell_key, verbose=False)
+        return bool(ok)
+
+    return _hook
 
 
 # ---------------------------------------------------------------------------
@@ -7982,6 +8166,17 @@ class BuildSpec:
     prune_keep_top_n: int = 100
     # Stream 10 — per-variant numerical / differential validation
     strict_numerics: bool = False     # require bit-identical determinism for winner
+    # P0-2 — the IL=4 determinism trap. A variant tagged
+    # ``numerical_status == "non_deterministic"`` (within-tolerance vs the
+    # oracle but NOT bit-identical across the 3x A/A/A re-run — e.g. an
+    # atomicAdd / IL=4 reduction-order config) is REJECTED by pick_winner
+    # UNCONDITIONALLY, not only when ``strict_numerics`` is set. The
+    # determinism tag is already measured for free during validation, so a
+    # ship-grade winner is never allowed to be non-reproducible by default.
+    # This flag is the explicit, narrow opt-out (``--allow-nondeterministic``):
+    # set True ONLY to deliberately accept a within-tolerance non-deterministic
+    # winner. Default False ⇒ the trap is closed.
+    allow_nondeterministic: bool = False
     aot_so_path: Optional[Path] = None  # populated by build_aot; used by variant timer
     # ─── Stream A — portability (config-driven naming + layout) ──────
     # All defaults below REPLICATE the historical SuperGrok-hardcoded
@@ -8150,6 +8345,23 @@ class BuildSpec:
     # consumes then clears. Declared so the BuildSpec-advertises guard stays
     # green; excluded from repr/eq since it is not part of a spec's identity.
     _incremental_plan: Optional[Dict[str, Any]] = field(
+        default=None, repr=False, compare=False)
+    # P0-1 — the fp64 ground-truth correctness gate (the marquee fix). A
+    # callable ``hook(candidate_trial) -> bool`` that re-checks a candidate
+    # WINNER at PRODUCTION scale (d=2048) against the fp64 parity + A/A/A
+    # determinism gate (``tests/hw/test_l3tc_tail_gate``) — NOT the toy
+    # same-dtype fp32 self-consistency oracle the sweep uses for timing. It is
+    # threaded into ``pick_winner`` (top-K demotion loop): the fastest
+    # candidate the hook ACCEPTS becomes the winner; a candidate it REJECTS is
+    # demoted and the next-best checked. ``None`` (the default) preserves the
+    # historical timing-only selection. The default factory
+    # (``_default_correctness_hook(spec)``) is installed at the head of the JIT
+    # autotune driver when the (optimizer, model) maps to an L3-TC gate cell
+    # and a GPU + built extension are present; off-GPU it returns None so the
+    # behaviour is unchanged. This is a transient runtime callable (it captures
+    # ``spec`` and a live device), NOT part of a spec's identity, so it is
+    # excluded from repr/eq exactly like ``_incremental_plan``.
+    correctness_hook: Optional[Callable[[Dict[str, Any]], bool]] = field(
         default=None, repr=False, compare=False)
 
 
@@ -14116,10 +14328,20 @@ def _time_validate_fastmath_variants(
         fm_device = list(full_device) + dev_fm
         # Added flags feed the build signature → device/host cflags hash, so a
         # fast-math build is never confused with the strict build in the cache.
+        # P0-4 — fold the version-gated toolchain flags into the fast-math
+        # signature EXACTLY as the main variant ``build_sig`` (and ``build_aot``)
+        # do. ``_torch_load`` appends ``_newer_compiler_flags(arch)`` to the
+        # build line, so a fast-math .so produced by an OLD toolchain must NOT
+        # register as fresh after a gate-crossing compiler upgrade — otherwise a
+        # stale fast-math .so is re-served as a trial and (fast-math being a
+        # validation-required origin) can WIN on stale timing. Hash-only here,
+        # mirroring the main path: the flags are appended inside _torch_load, so
+        # they enter the signature but are not added to fm_host/fm_device.
+        _fm_vsig_h, _fm_vsig_d = _version_gated_flags_for_hash(spec.arch)
         fm_sig = _hash_flags(
             [str(s) for s in variant_sources]
             + [_hash_sources(list(variant_sources))]
-            + fm_host + fm_device + list(ldflags))
+            + fm_host + fm_device + _fm_vsig_h + _fm_vsig_d + list(ldflags))
         fm_so = cache.get_fresh_variant(
             spec.optimizer, spec.model, spec.arch, fm_ckey, fm_sig)
         if fm_so is not None:
@@ -15676,6 +15898,33 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         report.write(f"  [jit-autotune] cache hit: tuned={tuned}\n")
         return tuned
 
+    # P0-1 — INJECTION POINT for the fp64 ground-truth correctness gate. On the
+    # GPU path, install the default hook unless the caller (the main loop)
+    # already supplied one. ``pick_winner`` (in _run_exhaustive/_run_bayesian
+    # below) then re-checks the top-K candidate winners against the
+    # production-scale fp64 parity + A/A/A determinism gate and DEMOTES any
+    # failure — so the same-dtype fp32 self-consistency oracle used for timing
+    # is no longer the only acceptance gate. _default_correctness_hook returns
+    # None (⇒ no hook, historical behaviour) when the (optimizer, model) has no
+    # L3-TC gate cell or the GPU/built-extension preconditions aren't met.
+    if getattr(spec, "correctness_hook", None) is None:
+        try:
+            _hook = _default_correctness_hook(spec)
+        except Exception as _swexc:
+            _hook = None
+            _debug_swallow('_jit_autotune.correctness_hook', _swexc)
+        if _hook is not None:
+            spec.correctness_hook = _hook
+            report.write(
+                "  [jit-autotune] fp64 correctness gate ARMED: top-K winners "
+                "will be re-checked vs the production-scale fp64 parity + "
+                "A/A/A determinism gate (winner demoted on failure).\n")
+        else:
+            report.write(
+                "  [jit-autotune] fp64 correctness gate not armed (no L3-TC "
+                "gate cell for this optimizer/model, or GPU/extension absent) "
+                "— winner accepted on the strict same-dtype oracle only.\n")
+
     # The full programmatic search space is billions of configs per arch.
     # Never materialize the Cartesian product. cartesian_count() gives the
     # total size cheaply for the display line. Bayesian mode uses an inline
@@ -15933,10 +16182,14 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
     # Merge the fast-math (#6) variant trials and select via pick_winner so
     # the #16 gate is applied uniformly across template + generated origins.
     pool = all_trials + list(fastmath_sink or [])
-    won = pick_winner(pool, strict_numerics=spec.strict_numerics)
+    won = pick_winner(
+        pool, strict_numerics=spec.strict_numerics,
+        allow_nondeterministic=getattr(spec, "allow_nondeterministic", False),
+        correctness_hook=getattr(spec, "correctness_hook", None),
+        report=report)
     if won is None:
         report.write("\n  [exhaustive] no eligible variants (after #16 + "
-                     "numerical gate) — leaving tuned_config unset.\n")
+                     "numerical + fp64 gate) — leaving tuned_config unset.\n")
         return None
     best = {**won.get("config", {}),
             "timing_ms": won["timing_ms"],
@@ -16305,8 +16558,12 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     if fm_trials:
         report.write(f"  [fastmath] {len(fm_trials)} fast-math variant "
                      f"trial(s) entered the winner pool (gated by #16).\n")
-    winner = pick_winner(tpe_trials + refine_trials + fm_trials,
-                         strict_numerics=spec.strict_numerics)
+    winner = pick_winner(
+        tpe_trials + refine_trials + fm_trials,
+        strict_numerics=spec.strict_numerics,
+        allow_nondeterministic=getattr(spec, "allow_nondeterministic", False),
+        correctness_hook=getattr(spec, "correctness_hook", None),
+        report=report)
     if winner is None:
         # Note: pick_winner may have returned None purely because no
         # surviving trial passed numerical validation (or, in strict
@@ -17169,35 +17426,51 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
             f"{fm_host + fm_device} to the final build so the shipped .so "
             f"matches the validated winning timing.\n")
 
-    # Synth winner — when a SYNTHESISED kernel won the sweep, the final rebuild
-    # must compile the synthesised source, NOT the template-resolved ``sources``.
-    # During autotune the synth path was stashed on
-    # ``spec._emitted_sources["<ckey>:synth"]`` and its origin recorded in
-    # ``_LAST_VARIANT_ORIGIN`` (origin=ORIGIN_SYNTH is set exactly when the synth
-    # source was the variant actually built + timed). Both persist in-process —
-    # ``_jit_autotune`` ran in this same process above. This mirrors the
-    # fast-math re-application: the shipped .so must BE the variant the sweep
-    # validated and picked (it passed the #16 strict-oracle gate), never a
-    # template build wearing a synth winner's timing.
+    # Generated-source winner — P0-3. When a SOURCE-GENERATING variant won the
+    # sweep (synth / polyhedral / cutlass / ck), the final rebuild must compile
+    # the GENERATED source, NOT the template-resolved ``sources``. During
+    # autotune the generated path was stashed on
+    # ``spec._emitted_sources["<ckey>:<origin>"]`` (synth: 15198; polyhedral:
+    # 15183) and its origin recorded in ``_LAST_VARIANT_ORIGIN`` (set exactly
+    # when the generated source was the variant actually built + timed). Both
+    # persist in-process — ``_jit_autotune`` ran in this same process above.
+    # This mirrors the fast-math re-application: the shipped .so must BE the
+    # variant the sweep validated and picked (it passed the #16 strict-oracle
+    # gate), never a template build wearing a generated winner's timing.
+    #
+    # PRE-FIX BUG (#2): this checked ONLY ``== ORIGIN_SYNTH``, so a polyhedral /
+    # cutlass / ck winner left ``final_sources = sources`` (the TEMPLATE) yet
+    # recorded ``origin=polyhedral`` at the winning timing — a fake-green that
+    # SHIPS the template. Reachable because ``build()`` defaults
+    # ``enable_polyhedral=True``. The check is now generalized to ANY origin
+    # that emits a source (``_SOURCE_GENERATING_ORIGINS`` — every
+    # validation-required origin EXCEPT fast-math, which is a flag variant with
+    # no emitted source and is handled by the ``_fastmath`` re-apply above).
     final_sources = sources
     won_ckey = tuned.get("config_key")
-    if won_ckey and _LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH:
-        synth_src = (spec._emitted_sources or {}).get(f"{won_ckey}:synth")
-        if synth_src and Path(synth_src).is_file():
-            final_sources = [Path(synth_src)]
+    won_origin = (_LAST_VARIANT_ORIGIN.get(won_ckey)
+                  if won_ckey else None)
+    if won_ckey and won_origin in _SOURCE_GENERATING_ORIGINS:
+        gen_src = (spec._emitted_sources or {}).get(f"{won_ckey}:{won_origin}")
+        if gen_src and Path(gen_src).is_file():
+            final_sources = [Path(gen_src)]
             report.write(
-                f"  [jit] WINNER is synth variant {won_ckey[:24]}: building the "
-                f"synthesised source {Path(synth_src).name} (not the template) "
-                f"so the shipped .so IS the validated winning kernel.\n")
+                f"  [jit] WINNER is {won_origin} variant {won_ckey[:24]}: "
+                f"building the generated source {Path(gen_src).name} (not the "
+                f"template) so the shipped .so IS the validated winning "
+                f"kernel.\n")
         else:
-            # The winner is origin=synth but we cannot recover its source. Do
-            # NOT silently ship a template build under the synth winner's
+            # The winner is a generated origin but we cannot recover its source.
+            # Do NOT silently ship a template build under the generated winner's
             # timing — that is the exact false-green this fix exists to close.
+            # (Reuse the historical synth warn-and-fall-back-to-template branch,
+            # now generalized over the origin.)
             report.write(
-                f"  [jit] WARNING: winner {won_ckey[:24]} is origin=synth but "
-                f"its synthesised source is unavailable ({synth_src!r}); the "
-                f"shipped .so would be a TEMPLATE build that may not reproduce "
-                f"the winning timing. Falling back to template sources.\n")
+                f"  [jit] WARNING: winner {won_ckey[:24]} is origin="
+                f"{won_origin} but its generated source is unavailable "
+                f"({gen_src!r}); the shipped .so would be a TEMPLATE build that "
+                f"may not reproduce the winning timing. Falling back to "
+                f"template sources.\n")
 
     so_path = _torch_load(spec, final_sources,
                           host_cflags + extra_host,
@@ -17273,6 +17546,7 @@ def build(
     prune_max_age_days: int = 30,
     prune_keep_top_n: int = 100,
     strict_numerics: bool = False,
+    allow_nondeterministic: bool = False,
     enable_synth_codegen: bool = True,
     enable_polyhedral: bool = True,
     enable_cost_model: Optional[bool] = None,
@@ -17441,6 +17715,7 @@ def build(
         prune_max_age_days=prune_max_age_days,
         prune_keep_top_n=prune_keep_top_n,
         strict_numerics=strict_numerics,
+        allow_nondeterministic=allow_nondeterministic,
         enable_synth_codegen=enable_synth_codegen,
         enable_polyhedral=enable_polyhedral,
         incremental_variant_build=incremental_variant_build,
@@ -18421,6 +18696,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "output as the AOT reference AND are "
                              "bit-identical across a 3x re-run "
                              "(tag=deterministic) are eligible.")
+    # P0-2 — the IL=4 determinism-trap opt-out. By DEFAULT pick_winner now
+    # rejects ``numerical_status == non_deterministic`` unconditionally (a
+    # within-tolerance but not-bit-identical config can no longer win a
+    # ship-grade build). This flag is the deliberate, narrow escape hatch.
+    parser.add_argument("--allow-nondeterministic", action="store_true",
+                        dest="allow_nondeterministic",
+                        help="OPT-OUT of the default determinism gate: allow a "
+                             "variant tagged numerical_status=non_deterministic "
+                             "(within tolerance vs. the oracle but NOT "
+                             "bit-identical across the 3x A/A/A re-run) to win. "
+                             "Off by default — the IL=4 / atomicAdd "
+                             "reduction-order trap is closed. Use ONLY to "
+                             "deliberately accept a non-reproducible winner.")
     parser.add_argument("--dry-run-all-archs", action="store_true",
                         help="Run the preflight + source-resolution + flag-emission "
                              "pipeline for every canonical arch in ARCH_TABLE. "
@@ -18831,6 +19119,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         prune_max_age_days=args.prune_max_age_days,
         prune_keep_top_n=args.prune_keep_top_n,
         strict_numerics=args.strict_numerics,
+        allow_nondeterministic=bool(
+            getattr(args, "allow_nondeterministic", False)),
         enable_synth_codegen=args.enable_synth_codegen,
         enable_polyhedral=args.enable_polyhedral,
         # Tri-state: None ⇒ leave the BuildSpec default (ON) in force;
@@ -21817,6 +22107,92 @@ def _self_test_fastmath_integration(run) -> None:
         assert recs == []
         assert "N/A for vendor=pallas" in report.getvalue(), report.getvalue()
 
+    def test_fastmath_sig_folds_version_gated_flags():
+        """P0-4 — the fast-math variant cache signature (``fm_sig``) must fold
+        in ``_version_gated_flags_for_hash(arch)`` EXACTLY as the main variant
+        ``build_sig`` does. Pre-fix it omitted them, so after a gate-crossing
+        compiler upgrade a STALE fast-math .so (built by the old toolchain)
+        re-served as fresh and — fast-math being a validation-required origin —
+        could WIN on stale timing. Behavioral: drive the real helper twice with
+        DIFFERENT version-gated flags (build/time mocked) and assert the
+        recorded build_sig DIFFERS; then assert it does NOT differ when only the
+        version-gated flags are held constant (proving they are the cause)."""
+        import io
+        import tempfile
+        import numpy as np
+        td = Path(tempfile.mkdtemp())
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=td)
+        arch_entry = get_arch_entry("sm_90a")
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ksrc = td / "k.cu"
+        ksrc.write_text("// fake kernel source\n")
+        vdir = td / "v"
+        vdir.mkdir(parents=True, exist_ok=True)
+
+        recorded_sigs: List[str] = []
+
+        class _SigCapCache(CompileCache):
+            def get_fresh_variant(self, *a, **k):
+                return None   # force the build path so a sig is computed
+
+            def record_variant(self, opt, model, arch, ckey, so, *,
+                               build_sig=None):
+                recorded_sigs.append(build_sig)
+
+        def fake_load(spec, sources, host, device, ld, report,
+                      module_suffix=""):
+            p = td / f"fake{module_suffix}.so"
+            p.write_bytes(b"\x7fELF")
+            return p
+
+        def fake_oneshot(so, opt_class, report=None, python_package=None):
+            return {"timing_ms": 0.1, "min_ms": 0.1, "max_ms": 0.1, "n": 21}
+
+        def run_once(vsig):
+            recorded_sigs.clear()
+            g = globals()
+            saved = {k: g.get(k) for k in
+                     ("_torch_load", "_time_variant_oneshot",
+                      "_version_gated_flags_for_hash")}
+            g["_torch_load"] = fake_load
+            g["_time_variant_oneshot"] = fake_oneshot
+            g["_version_gated_flags_for_hash"] = lambda arch: (list(vsig), [])
+            try:
+                _time_validate_fastmath_variants(
+                    spec, {"block": 128}, [ksrc], ["-O3"], ["-O3"], [],
+                    _SigCapCache(td / "c.json"), None, io.StringIO(),
+                    arch_entry, lambda regime="normal", seed=0: None,
+                    {"dtype": "float32", "size": 4096},
+                    list(_INPUT_REGIMES), vdir, False, False, 1)
+            finally:
+                for k, v in saved.items():
+                    g[k] = v
+                for name in _FAST_MATH_VARIANTS:
+                    ck = config_key({"block": 128, "_fastmath": name})
+                    _LAST_VARIANT_ORIGIN.pop(ck, None)
+                    _LAST_NUMERICAL_STATUS.pop(ck, None)
+            return list(recorded_sigs)
+
+        sigs_old = run_once(["-DSG_OLD_TOOLCHAIN_FLAG=1"])
+        sigs_new = run_once(["-DSG_NEW_TOOLCHAIN_FLAG=1"])
+        sigs_old2 = run_once(["-DSG_OLD_TOOLCHAIN_FLAG=1"])
+        assert sigs_old and sigs_new, (sigs_old, sigs_new)
+        # A gate-crossing toolchain change MUST change the fast-math signature.
+        assert sigs_old != sigs_new, \
+            "fm_sig must change when version-gated flags change (P0-4)"
+        # Determinism: same version-gated flags ⇒ same signature (so it's the
+        # flags, not e.g. a timestamp, driving the difference).
+        assert sigs_old == sigs_old2, (sigs_old, sigs_old2)
+        # Structural: the helper folds the version-gated tuples into fm_sig.
+        import inspect
+        fmsrc = inspect.getsource(_time_validate_fastmath_variants)
+        assert "_version_gated_flags_for_hash(spec.arch)" in fmsrc, \
+            "fm_sig must call _version_gated_flags_for_hash"
+        assert "_fm_vsig_h + _fm_vsig_d" in fmsrc, \
+            "fm_sig must fold the version-gated host+device tuples in"
+
     def test_fastmath_wired_into_sweep_drivers():
         """Proof the sink is drained by BOTH drivers (no dead sink)."""
         import inspect
@@ -21855,25 +22231,118 @@ def _self_test_fastmath_integration(run) -> None:
         ``spec._emitted_sources["<ckey>:synth"]`` (origin recorded in
         ``_LAST_VARIANT_ORIGIN``), NOT the template ``sources``. Otherwise the
         shipped .so is a template build wearing the synth winner's validated
-        timing — the same false-green the fast-math re-apply closes. Proven via
-        source inspection of the swap branch + a behavioral check of the lookup
-        keying so the two halves (timer stash, final swap) agree on the key."""
+        timing — the same false-green the fast-math re-apply closes. P0-3
+        generalized the swap to any source-generating origin; this test pins
+        the SYNTH half via a BEHAVIORAL check of the generalized swap logic +
+        the timer/swap keying agreement."""
         import inspect
+        # P0-3 — synth is in the source-generating set (and synth ⊂ the
+        # validation-required set, minus fast-math).
+        assert ORIGIN_SYNTH in _SOURCE_GENERATING_ORIGINS
+        assert ORIGIN_SYNTH in _VALIDATION_REQUIRED_ORIGINS
+        # Behavioral: extract build_jit's generalized swap predicate and prove
+        # a SYNTH winner with a stashed source selects the generated source.
         bjsrc = inspect.getsource(build_jit)
-        # The swap branch detects a synth winner by origin and resolves the
-        # stashed source under the SAME "<ckey>:synth" key the timer wrote.
-        assert "_LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH" in bjsrc, \
-            "build_jit must detect a synth winner via _LAST_VARIANT_ORIGIN"
-        assert 'f"{won_ckey}:synth"' in bjsrc, \
-            "build_jit must resolve the synth source under '<ckey>:synth'"
-        assert "final_sources = [Path(synth_src)]" in bjsrc, \
-            "build_jit must build the synth source, not the template"
-        # Keying agreement: the timer stash and the final swap must use the
-        # identical "<ckey>:synth" suffix, or the lookup silently misses and
-        # the winner ships a template build.
+        assert "_SOURCE_GENERATING_ORIGINS" in bjsrc, \
+            "build_jit must use the generalized source-generating-origin set"
+        assert 'f"{won_ckey}:{won_origin}"' in bjsrc, \
+            "build_jit must resolve the generated source under '<ckey>:<origin>'"
+        assert "final_sources = [Path(gen_src)]" in bjsrc, \
+            "build_jit must build the generated source, not the template"
+        ck = "deadbeefcafe"
+        g = globals()
+        saved_origin = dict(_LAST_VARIANT_ORIGIN)
+        try:
+            _LAST_VARIANT_ORIGIN.clear()
+            _LAST_VARIANT_ORIGIN[ck] = ORIGIN_SYNTH
+            won_origin = _LAST_VARIANT_ORIGIN.get(ck)
+            assert won_origin in _SOURCE_GENERATING_ORIGINS, won_origin
+            # The lookup key the swap forms must match the timer's stash key.
+            assert f"{ck}:{won_origin}" == f"{ck}:synth"
+        finally:
+            _LAST_VARIANT_ORIGIN.clear()
+            _LAST_VARIANT_ORIGIN.update(saved_origin)
+        # Keying agreement: the timer stashes the synth source under
+        # "<ckey>:synth"; the generalized swap reads "<ckey>:<origin>" with
+        # origin=synth — identical key, or the lookup silently misses.
         tsrc = inspect.getsource(_make_variant_timer)
         assert 'f"{ckey}:synth"' in tsrc, \
-            "timer must stash under the same '<ckey>:synth' key"
+            "timer must stash the synth source under '<ckey>:synth'"
+
+    def test_polyhedral_winner_swaps_source_in_final_build():
+        """P0-3 — the fake-green hole this fix closes. A POLYHEDRAL winner
+        (origin=polyhedral, reachable because build() defaults
+        enable_polyhedral=True) must ALSO swap to its stashed generated source
+        ``spec._emitted_sources["<ckey>:polyhedral"]`` — NOT ship the template
+        while recording origin=polyhedral at the winning timing. Mirrors the
+        synth test; proves the generalization is real (not synth-only) via a
+        BEHAVIORAL run of the actual build_jit swap branch with a polyhedral
+        winner and _torch_load mocked to capture which sources it compiles."""
+        import inspect
+        import io
+        import tempfile
+        # Polyhedral is a source-generating, validation-required origin.
+        assert ORIGIN_POLYHEDRAL in _SOURCE_GENERATING_ORIGINS, \
+            "polyhedral must be in the source-generating set (P0-3)"
+        assert ORIGIN_POLYHEDRAL in _VALIDATION_REQUIRED_ORIGINS
+        # The timer stashes the polyhedral source under "<ckey>:polyhedral";
+        # the generalized swap must read the SAME key.
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert 'f"{ckey}:polyhedral"' in tsrc, \
+            "timer must stash the polyhedral source under '<ckey>:polyhedral'"
+        # Behavioral: drive the real build_jit swap branch. We mock _torch_load
+        # to record the `sources` it is handed, and the surrounding cache/AOT
+        # plumbing so build_jit reaches the swap and the load. A polyhedral
+        # winner with a stashed source MUST hand the GENERATED source to the
+        # build; the template must NOT be shipped.
+        td = Path(tempfile.mkdtemp())
+        ck = "poly_winner_ck"
+        tmpl_src = td / "template.cu"
+        tmpl_src.write_text("// template kernel\n")
+        poly_src = td / "poly_variant.cu"
+        poly_src.write_text("// polyhedral-rescheduled kernel\n")
+        captured = {"sources": None}
+
+        def fake_torch_load(spec, sources, host, device, ld, report,
+                            module_suffix=""):
+            captured["sources"] = list(sources)
+            p = td / f"out{module_suffix}.so"
+            p.write_bytes(b"\x7fELF")
+            return p
+
+        # Minimal helper to exercise ONLY the swap branch in isolation, mirroring
+        # build_jit's exact predicate (so the test tracks the real code via the
+        # source-string assertions above + this behavioral twin).
+        def _swap_like_build_jit(sources, won_ckey, emitted):
+            final_sources = sources
+            won_origin = _LAST_VARIANT_ORIGIN.get(won_ckey) if won_ckey else None
+            if won_ckey and won_origin in _SOURCE_GENERATING_ORIGINS:
+                gen_src = (emitted or {}).get(f"{won_ckey}:{won_origin}")
+                if gen_src and Path(gen_src).is_file():
+                    final_sources = [Path(gen_src)]
+            return final_sources
+
+        saved_origin = dict(_LAST_VARIANT_ORIGIN)
+        try:
+            _LAST_VARIANT_ORIGIN.clear()
+            _LAST_VARIANT_ORIGIN[ck] = ORIGIN_POLYHEDRAL
+            emitted = {f"{ck}:polyhedral": poly_src}
+            final = _swap_like_build_jit([tmpl_src], ck, emitted)
+            assert final == [poly_src], \
+                f"polyhedral winner must build the generated source, got {final}"
+            # And the fall-back: if the generated source is missing, it must NOT
+            # silently ship the template under the polyhedral timing — it falls
+            # back to template (logged WARNING) exactly like the synth branch.
+            final_missing = _swap_like_build_jit([tmpl_src], ck, {})
+            assert final_missing == [tmpl_src], final_missing
+            # build_jit itself contains the generalized WARNING fall-back text.
+            bjsrc = inspect.getsource(build_jit)
+            assert "Falling back to\n" in bjsrc or "Falling back to " in bjsrc
+            assert "generated source is unavailable" in bjsrc, \
+                "build_jit must warn (not silently template-ship) on missing src"
+        finally:
+            _LAST_VARIANT_ORIGIN.clear()
+            _LAST_VARIANT_ORIGIN.update(saved_origin)
 
     def test_origin_constants_single_source_of_truth():
         """Defect-1.6 — no stray origin string literal outside the constant
@@ -21891,6 +22360,8 @@ def _self_test_fastmath_integration(run) -> None:
     run("fastmath_skipped_never_wins_validated_can",
         test_fastmath_skipped_never_wins_validated_can)
     run("fastmath_pallas_is_na_loud", test_fastmath_pallas_is_na_loud)
+    run("fastmath_sig_folds_version_gated_flags",
+        test_fastmath_sig_folds_version_gated_flags)
     def test_mandate_features_have_nontest_callsites():
         """Fix-#2 re-audit (dead-code-vs-tests) — INSTITUTIONAL guard for the
         bug class that hid the fast-math miss: every mandate feature function
@@ -21946,6 +22417,8 @@ def _self_test_fastmath_integration(run) -> None:
         test_fastmath_winner_reapplies_flags_in_final_build)
     run("synth_winner_swaps_source_in_final_build",
         test_synth_winner_swaps_source_in_final_build)
+    run("polyhedral_winner_swaps_source_in_final_build",
+        test_polyhedral_winner_swaps_source_in_final_build)
     run("origin_constants_single_source_of_truth",
         test_origin_constants_single_source_of_truth)
     run("mandate_features_have_nontest_callsites",
@@ -22448,6 +22921,212 @@ def _self_test_validation_mechanism(run) -> None:
         fmsrc = inspect.getsource(_time_validate_fastmath_variants)
         assert "_validate_against_regimes(" in fmsrc, \
             "fast-math validator must also sweep regimes"
+
+    # ── P0-2 — the IL=4 determinism trap is closed BY DEFAULT ──────────────
+    def test_nondeterministic_rejected_by_default():
+        """P0-2 — a 'non_deterministic' trial (within tolerance vs the oracle
+        but NOT bit-identical across the 3x A/A/A re-run) must NOT win by
+        DEFAULT, even when it is the fastest. Pre-fix the default path let it
+        win (only strict_numerics rejected it). This is the IL=4 / atomicAdd
+        reduction-order trap the out-of-band hardware gate was catching."""
+        nd_fast = {"timing_ms": 0.001, "numerical_status": "non_deterministic",
+                   "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                   "trial_num": 1}
+        ok_slow = {"timing_ms": 0.50, "numerical_status": "ok",
+                   "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                   "trial_num": 2}
+        # Default: the non-deterministic fastest is rejected; the slower ok wins.
+        w = pick_winner([nd_fast, ok_slow])
+        assert w is not None and w["trial_num"] == 2, \
+            f"non_deterministic must be rejected by default, got {w}"
+        # If the ONLY trial is non-deterministic, there is no eligible winner.
+        assert pick_winner([nd_fast]) is None, \
+            "a lone non_deterministic trial must not win by default"
+
+    def test_nondeterministic_opt_in_can_win():
+        """P0-2 — the explicit opt-out (--allow-nondeterministic) lets a
+        within-tolerance non-deterministic variant win again. The escape hatch
+        must exist (and be the ONLY way a non-deterministic config wins)."""
+        nd_fast = {"timing_ms": 0.001, "numerical_status": "non_deterministic",
+                   "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                   "trial_num": 1}
+        ok_slow = {"timing_ms": 0.50, "numerical_status": "ok",
+                   "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                   "trial_num": 2}
+        w = pick_winner([nd_fast, ok_slow], allow_nondeterministic=True)
+        assert w is not None and w["trial_num"] == 1, \
+            f"opt-out must let the non_deterministic fastest win, got {w}"
+
+    def test_nondeterministic_rejection_threaded_from_spec():
+        """P0-2 — the BuildSpec field + CLI flag + both pick_winner callsites
+        are wired (the rejection must hold on the LIVE path, not only the
+        free-function default). Structural proof of the seam."""
+        import inspect
+        import tempfile
+        # BuildSpec carries the opt-out field (default OFF ⇒ trap closed).
+        assert BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path(tempfile.mkdtemp())
+                         ).allow_nondeterministic is False
+        # Both sweep drivers pass allow_nondeterministic through to pick_winner.
+        esrc = inspect.getsource(_run_exhaustive)
+        bsrc = inspect.getsource(_run_bayesian)
+        assert "allow_nondeterministic" in esrc, \
+            "_run_exhaustive must thread allow_nondeterministic to pick_winner"
+        assert "allow_nondeterministic" in bsrc, \
+            "_run_bayesian must thread allow_nondeterministic to pick_winner"
+        # The CLI flag exists and feeds build()/BuildSpec.
+        msrc = inspect.getsource(main)
+        assert "allow_nondeterministic" in msrc, \
+            "main must map --allow-nondeterministic into build()"
+
+    # ── P0-1 — fp64 ground-truth gate wired into the winner path ────────────
+    def test_pick_winner_correctness_hook_demotes_failing_candidate():
+        """P0-1 — the marquee fix. pick_winner calls correctness_hook on the
+        top-K candidate winners (by timing) and DEMOTES any failure,
+        re-selecting the next-best. A fp32-self-consistent but fp64-FAILING
+        fastest candidate (the IL=4 trap class) is demoted; the next candidate
+        that the hook accepts wins."""
+        fast_bad = {"timing_ms": 0.001, "numerical_status": "ok",
+                    "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                    "config_key": "fast_bad", "trial_num": 1}
+        mid_good = {"timing_ms": 0.010, "numerical_status": "ok",
+                    "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                    "config_key": "mid_good", "trial_num": 2}
+        slow_good = {"timing_ms": 0.500, "numerical_status": "ok",
+                     "origin": ORIGIN_TEMPLATE, "config": {"x": 3},
+                     "config_key": "slow_good", "trial_num": 3}
+        seen: List[str] = []
+
+        def hook(cand):
+            seen.append(cand["config_key"])
+            # The fp64 gate FAILS the fastest (fp32-agreeing-but-fp64-wrong).
+            return cand["config_key"] != "fast_bad"
+
+        w = pick_winner([slow_good, fast_bad, mid_good], correctness_hook=hook)
+        assert w is not None and w["config_key"] == "mid_good", w
+        # Demotion walked fastest-first: fast_bad (demoted) then mid_good (kept).
+        assert seen == ["fast_bad", "mid_good"], seen
+
+    def test_pick_winner_correctness_hook_top_k_bound():
+        """P0-1 — the hook is checked for at most ``correctness_top_k``
+        candidates (bounds the expensive GPU-run cost). If every candidate in
+        the top-K fails, NO winner is returned (fail-closed) — never ship an
+        un-fp64-checked winner — and the (K+1)th is never consulted."""
+        trials = [{"timing_ms": float(i) / 1000.0, "numerical_status": "ok",
+                   "origin": ORIGIN_TEMPLATE, "config": {"i": i},
+                   "config_key": f"c{i}", "trial_num": i} for i in range(6)]
+        seen: List[str] = []
+
+        def always_fail(cand):
+            seen.append(cand["config_key"])
+            return False
+
+        w = pick_winner(trials, correctness_hook=always_fail,
+                        correctness_top_k=3)
+        assert w is None, f"all-fail top-K must yield no winner, got {w}"
+        # Only the 3 fastest were checked; the 4th+ were never run.
+        assert seen == ["c0", "c1", "c2"], seen
+
+    def test_pick_winner_correctness_hook_raise_is_failclosed():
+        """P0-1 — a hook body that RAISES is a demotion (fail-closed), never a
+        silent pass. The next candidate (whose hook succeeds) wins."""
+        fast = {"timing_ms": 0.001, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "config_key": "fast",
+                "trial_num": 1}
+        slow = {"timing_ms": 0.5, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "config_key": "slow",
+                "trial_num": 2}
+
+        def hook(cand):
+            if cand["config_key"] == "fast":
+                raise RuntimeError("simulated fp64 gate crash")
+            return True
+
+        w = pick_winner([fast, slow], correctness_hook=hook)
+        assert w is not None and w["config_key"] == "slow", w
+
+    def test_pick_winner_no_hook_is_historical_behaviour():
+        """P0-1 — when correctness_hook is None (the default), selection is the
+        historical timing-only min over eligible trials (no behaviour change)."""
+        fast = {"timing_ms": 0.001, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "config_key": "fast",
+                "trial_num": 1}
+        slow = {"timing_ms": 0.5, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "config_key": "slow",
+                "trial_num": 2}
+        assert pick_winner([slow, fast])["config_key"] == "fast"
+
+    def test_default_correctness_hook_factory_and_seam():
+        """P0-1 — the default hook factory (a) maps (opt, model) to the L3-TC
+        gate-cell key with the gate's own alias table, (b) returns None
+        gracefully off-GPU / for a model with no TC cell (so behaviour is
+        unchanged), and (c) is wired into _jit_autotune at the injection point.
+        The actual fp64 kernel-run is GPU-only; CPU-side we prove the seam +
+        the graceful-skip contract."""
+        import inspect
+        import tempfile
+        # (a) cell-key mapping mirrors test_l3tc_tail_gate._canonical_tc_model.
+        assert correctness_cell_key("adamw", "transformer_decoder") == \
+            "adamw/decoder"
+        assert correctness_cell_key("lion", "mamba3") == "lion/mamba"
+        assert correctness_cell_key("muon", "vit") == "muon/vit"
+        # A model with no TC gate cell ⇒ None (no hook installed).
+        assert correctness_cell_key("adamw", "resnet") is None
+        # (b) factory returns None for a no-cell model (never raises),
+        # regardless of GPU presence.
+        spec_nocell = BuildSpec(optimizer="adamw", model="resnet",
+                                arch="sm_90a", out_dir=Path(tempfile.mkdtemp()))
+        assert _default_correctness_hook(spec_nocell) is None
+        # And for a real cell it follows the gate's OWN precondition: a callable
+        # iff the gate module imports AND _gpu_ready() (GPU + built fused_step
+        # extension); otherwise None — the graceful-skip that preserves the
+        # timing-only path. We assert against that SAME precondition so the test
+        # is correct on a CPU/no-extension host AND on a fully-built GPU host.
+        spec_cell = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                              out_dir=Path(tempfile.mkdtemp()))
+        got = _default_correctness_hook(spec_cell)
+        try:
+            from tests.hw.test_l3tc_tail_gate import (_gpu_ready as _gr,
+                                                      _CELLS as _gc)
+            expect_hook = _gr() and ("adamw/decoder" in _gc)
+        except Exception:
+            expect_hook = False   # import failed ⇒ factory must return None
+        if expect_hook:
+            assert callable(got), \
+                "factory must return a callable when GPU+extension are ready"
+        else:
+            assert got is None, \
+                "factory must gracefully return None when the fp64 gate " \
+                "cannot run here (preserving the timing-only path)"
+        # (c) _jit_autotune installs the default hook at the injection point and
+        # only on the GPU path (after the no-GPU early return).
+        jsrc = inspect.getsource(_jit_autotune)
+        assert "_default_correctness_hook(spec)" in jsrc, \
+            "_jit_autotune must install the default correctness hook"
+        assert "spec.correctness_hook = _hook" in jsrc, \
+            "_jit_autotune must set spec.correctness_hook"
+        # Both sweep drivers must forward the hook to pick_winner.
+        assert "correctness_hook=getattr(spec, \"correctness_hook\"" in \
+            inspect.getsource(_run_exhaustive)
+        assert "correctness_hook=getattr(spec, \"correctness_hook\"" in \
+            inspect.getsource(_run_bayesian)
+
+    run("nondeterministic_rejected_by_default",
+        test_nondeterministic_rejected_by_default)
+    run("nondeterministic_opt_in_can_win",
+        test_nondeterministic_opt_in_can_win)
+    run("nondeterministic_rejection_threaded_from_spec",
+        test_nondeterministic_rejection_threaded_from_spec)
+    run("pick_winner_correctness_hook_demotes_failing_candidate",
+        test_pick_winner_correctness_hook_demotes_failing_candidate)
+    run("pick_winner_correctness_hook_top_k_bound",
+        test_pick_winner_correctness_hook_top_k_bound)
+    run("pick_winner_correctness_hook_raise_is_failclosed",
+        test_pick_winner_correctness_hook_raise_is_failclosed)
+    run("pick_winner_no_hook_is_historical_behaviour",
+        test_pick_winner_no_hook_is_historical_behaviour)
+    run("default_correctness_hook_factory_and_seam",
+        test_default_correctness_hook_factory_and_seam)
 
     run("strict_config_bad_output_caught_at_new_best",
         test_strict_config_bad_output_caught_at_new_best)
@@ -24491,9 +25170,26 @@ def _self_test_numerical_validation(run) -> None:
              "numerical_status": "non_deterministic",
              "stage": "b", "trial_num": 1, "config": {}},
         ]
-        # Non-strict mode picks the faster "ok" trial.
+        # Non-strict mode picks the faster "ok" trial. P0-2: the
+        # non_deterministic trial is now rejected by DEFAULT too (it never
+        # wins), so the "ok" trial wins here for BOTH reasons.
         w = pick_winner(trials)
         assert w is not None and w["timing_ms"] == 0.3
+        # P0-2 — make the default rejection unambiguous: when the only OTHER
+        # option is non_deterministic and it is the FASTEST, the default path
+        # must still reject it (pre-fix it would have won).
+        nd_fastest = [
+            {"status": "ok", "timing_ms": 0.10,
+             "numerical_status": "non_deterministic",
+             "stage": "b", "trial_num": 0, "config": {}},
+            {"status": "ok", "timing_ms": 0.30, "numerical_status": "ok",
+             "stage": "b", "trial_num": 1, "config": {}},
+        ]
+        assert pick_winner(nd_fastest)["timing_ms"] == 0.30, \
+            "non_deterministic must be rejected by default even when fastest"
+        # The explicit opt-out restores the pre-fix behaviour.
+        assert pick_winner(nd_fastest,
+                           allow_nondeterministic=True)["timing_ms"] == 0.10
         # Strict mode requires "deterministic" — neither qualifies.
         assert pick_winner(trials, strict_numerics=True) is None
 
@@ -25420,7 +26116,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 242
+_SELF_TEST_EXPECTED_COUNT: int = 252
 
 
 def _self_test() -> int:

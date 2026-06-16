@@ -75,6 +75,17 @@ arbiter (cf. the IL=4 reject). Root-cause IN PROGRESS (static diff vs the workin
 suspects = transpose-scratch sizing/indexing, the patch_proj `kind==1` gather `trow=si·kSeq+(1+p)`,
 or the ring bounds for ViT's two weight kinds). The fix + re-gate is queued; ViT dW stays scalar
 until it's IMA-clean AND fp64-gate-green at d=2048.
+**RESOLVED (round 2, 2026-06-16):** root-cause = the ViT port copied the decoder's pointer-carve chain
+(sam_backup→sam_grad→sg2_ws_base) but DROPPED the decoder's `#if BENCH_LAYOUT` gate, so at bench
+(`kVitStagedOptScratch=false`) the carve advanced `2·kVitTotalElems` (~808 MB) past where the gated host
+sizer reserved → the transpose write overran → IMA. 2-line fix (gate the advances on
+`kVitStagedOptScratch`). Re-gate @ d=2048/B=1024 (3 seeds): **IMA GONE** (STAGE=1 runs), but **REVERT
+STANDS** — (a) only **+4.5%** (5777→5527 ms): ViT @ 0.18% roofline is NOT dW-bound; its step is dominated
+by the NON-GEMM surface (head-CE/LN/attn), so dW staging barely moves it; (b) **fp64+A/A/A gate-RED on
+supergrok2/vit (all 3 seeds; 10/11 vit cells pass).** FEED-FORWARD (bigger than the bug): ViT-maxing ≠
+decoder-maxing → attack the NON-GEMM surface, and wire the ViT per-phase profiler (latent `g_vit_prof`
+6-slot, unwired in vit_bench) FIRST so the relevance gate flags low-share levers like this one before we
+build them. SG2/vit parity mechanism deferred (low priority — the lever is wrong for ViT regardless).
 
 ## compile.py audit (2026-06-16) — see COMPILE_AUDIT.md
 11-agent line-by-line audit of the autotuner. Backbone + correctness-gate machinery are
