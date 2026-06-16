@@ -60,4 +60,28 @@ compile.py vs regular nvcc @ d=2048 (adamw/decoder, `20013f7`): **A→B = +0.43%
 ## Track E — dW contiguous-layout staging: **KEEP +2.05× — the campaign's first major structural win** (2026-06-16)
 The Track-E redirect lever (after the P0 pipelining revert). `SG_TUNED_DEC_DW_STAGE=1` (Option B, contiguous-layout): a cheap grid-cooperative pre-transpose writes each weight's dY/X **once per step** into K-contiguous scratch → the dW reuses the proven `kRingAsync` cp.async ring (the −14.2% fwd/dX win) instead of the scalar transposed-strided gather. **Measured @ d=2048/B=16384, 3 seeds:** stage=0/sk=1 scalar **1889.8 ms** → stage=1/sk=1 contiguous **920.7 ms = 2.05× faster**; vs production stage=0/sk=2 (1925.5 ms) = **2.09×**. Roofline **2.08% → 4.35% (doubled)**. **fp64 PARITY + A/A/A GATE GREEN: 11/11 decoder cells × seeds {42,7,123}.** Production default set to **stage=1, splitk=1** — **SUPERSEDES the Track-C split-K=2 KEEP** (split-K was a scalar-dW grid-fill mitigation; with fast staging the single-CTA dW wins). **Mechanism validated:** the dW was staging-bound (~97% staging) → fixing the *staging* (not pipelining the MMA, the reverted P0) was the lever. **KEY REFRAME: the megakernel's ~2% roofline was a STAGING artifact, not a hardware ceiling.** Next: the same fix on ViT dW (even more staging-dominated → likely a bigger win) + Mamba.
 
+## Track E — ViT dW contiguous-staging twin: **REVERT (runtime IMA)** (2026-06-16)
+The verbatim twin of the decoder dW 2× win, ported to the ViT megakernel (`SG_TUNED_VIT_DW_STAGE=1`).
+Authored CPU-only: nvcc codegen EXIT 0 for all configs, **byte-identical PTX when OFF** (proven to
+the decoder's standard), parity/AAA-by-construction (pure bf16 copy). But because the ViT engine
+(`tc_gemm_block_unpipelined`) was **fully unpipelined**, the port had to ALSO carry in the entire
+cp.async ring (`VitGmemTileSrcA/B`, `kVitTcStages`) + the grid-cooperative transpose pre-pass — far
+more surface than the decoder fix (which only built gmem-src structs over scratch to engage the
+*existing* ring). **GATE CAUGHT IT:** at d=2048/B=1024 the candidate (`STAGE=1`) throws `CUDA error:
+illegal memory access`; baseline (`STAGE=0`) runs clean (5744.9 ms, 0.185% roofline). REVERTED on the
+main tree (default restored to `STAGE=0/SPLITK=4`); decoder dW KEEP untouched. **Lesson reaffirmed:**
+CPU codegen-clean + byte-identical-when-OFF is necessary, NOT sufficient — the runtime gate is the
+arbiter (cf. the IL=4 reject). Root-cause IN PROGRESS (static diff vs the working decoder; prime
+suspects = transpose-scratch sizing/indexing, the patch_proj `kind==1` gather `trow=si·kSeq+(1+p)`,
+or the ring bounds for ViT's two weight kinds). The fix + re-gate is queued; ViT dW stays scalar
+until it's IMA-clean AND fp64-gate-green at d=2048.
+
+## compile.py audit (2026-06-16) — see COMPILE_AUDIT.md
+11-agent line-by-line audit of the autotuner. Backbone + correctness-gate machinery are
+production-grade; the gaps are P0-correctness (fp64 oracle not wired; polyhedral/cutlass/ck winners
+mislabel the template = fake-green; IL=4 non-determinism can win by default; fast-math cache drops
+version flags) + P1-maximality (CLI defaults the 7 powerful layers OFF; objective is raw-ms not
+%-roofline [#24]; #23 tiered-spill doesn't react to parsed spill bytes) + the Level-2 superopt is
+~70% scaffold. Fix plan + priorities in COMPILE_AUDIT.md.
+
 *Maintained going forward: every future apply→gate→verdict lands here with its measured numbers + the mechanistic why.*

@@ -2111,16 +2111,17 @@ def _sm90_full_space() -> Dict[str, Any]:
             # prod_regs / cons_regs => setmaxnreg targets for the producer /
             # consumer warp-groups of the warp-specialized sm_90 paths (the
             # fused megakernel's §3.4 split AND tile_pipeline.cuh share these
-            # tokens). Defaults 32 / 200 match the fused megakernel's prior
-            # literals (byte-identical untuned build, verified via nvcc -E).
-            # Multiples of 8 (setmaxnreg granularity); the producer wants few
-            # regs, the consumer holds the fp32 accumulator + addressing. Kept
-            # past the first-three codegen window. The scanner already sees both
-            # tokens (tile_pipeline.cuh) so they are LIVE; registering the dims
-            # is what makes the autotuner actually sweep them.
-            _dim("prod_regs", "int", [32, 24, 40, 48, 56],
+            # tokens). First values 40 / 232 == the fused megakernel's in-header
+            # #ifndef defaults (SG_TUNED_PROD_REGS 40, SG_TUNED_CONS_REGS 232), so
+            # the untuned (no-JSON) build is byte-identical to the committed kernel.
+            # (Audit 2026-06-16 corrected a prior 32/200 first-value that did NOT
+            # match the kernel — verified vs csrc grep.) Multiples of 8 (setmaxnreg
+            # granularity); the producer wants few regs, the consumer holds the fp32
+            # accumulator + addressing. The scanner already sees both tokens
+            # (tile_pipeline.cuh) so they are LIVE; registering the dims sweeps them.
+            _dim("prod_regs", "int", [40, 24, 32, 48, 56],
                  "SG_TUNED_PROD_REGS", ["device"]),
-            _dim("cons_regs", "int", [200, 168, 184, 216, 232, 240],
+            _dim("cons_regs", "int", [232, 168, 184, 200, 216, 240],
                  "SG_TUNED_CONS_REGS", ["device"]),
             # === RISKY (needs-parity) fused-megakernel launch dims ===========
             # mega_block / grad_tile are consumed by the L3 fused megakernels
@@ -2170,7 +2171,7 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "SG_TUNED_TILE_M", ["device"]),
             _dim("tile_n", "int", [128, 64, 256],
                  "SG_TUNED_TILE_N", ["device"]),
-            _dim("dec_dw_splitk", "int", [4, 1, 2, 8],
+            _dim("dec_dw_splitk", "int", [1, 2, 4, 8],
                  "SG_TUNED_DEC_DW_SPLITK", ["device"]),
             _dim("vit_dw_splitk", "int", [4, 1, 2, 8],
                  "SG_TUNED_VIT_DW_SPLITK", ["device"]),
