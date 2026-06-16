@@ -5830,16 +5830,27 @@ def _multi_fidelity_prune_decision(
     signal, the prediction is non-finite, or the optimistic bound is
     inside the keep band. NEVER raises.
     """
+    # Cheap, comprehension-independent guards FIRST so cold-start / short
+    # windows and non-finite predictions skip the O(n) finite-list build
+    # below. Every guard returns the identical (False, None), so reordering
+    # them ahead of the build is bit-identical to the original.
+    if not (math.isfinite(ms_pred) and math.isfinite(sigma_pred)):
+        return False, None
+    # If the raw window itself has < 8 samples then the finite-filtered list
+    # certainly does (filtering only removes elements) — short-circuit before
+    # materializing it. Guarded so a non-sized iterable still works.
+    if hasattr(measured_ms, "__len__") and len(measured_ms) < 8:
+        return False, None
     try:
         finite = [float(m) for m in measured_ms
                   if isinstance(m, (int, float)) and math.isfinite(float(m))]
     except TypeError:
         return False, None
     # Need a non-trivial empirical distribution before a quantile means
-    # anything — fewer than 8 points and we keep (measure) everything.
+    # anything — fewer than 8 points and we keep (measure) everything. (The
+    # raw-window guard above only catches windows that are short to begin with;
+    # a long window with many non-finite entries still falls through to here.)
     if len(finite) < 8:
-        return False, None
-    if not (math.isfinite(ms_pred) and math.isfinite(sigma_pred)):
         return False, None
     q = min(0.99, max(0.5, float(quantile)))
     m = max(1.0, float(margin))
@@ -7107,7 +7118,7 @@ class CompileCache:
                     else:
                         ser_entries[k] = e
                 serialized["entries"] = ser_entries
-            payload = json.dumps(serialized, indent=2, sort_keys=True)
+            payload = json.dumps(serialized, separators=(",", ":"), sort_keys=True)
 
             wrote = False
             last_exc: Optional[BaseException] = None
@@ -14647,6 +14658,15 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 ref_state["oracle_unavailable"] = True
                 return None
 
+    # Perf — _hash_sources(sources) walks the transitive #include closure and
+    # sha256s every file, which is identical on every trial whose variant
+    # sources are the unchanged base ``sources`` (the common path: poly/synth
+    # codegen OFF). Compute it ONCE per sweep here and reuse it inside the
+    # timer closure; only the poly/synth branch (which REPLACES the source
+    # list) recomputes. The reused value is the same hash a per-trial call
+    # would produce, so build_sig / variant-cache keys are byte-identical.
+    _base_sources_hash = _hash_sources(list(sources))
+
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
 
@@ -14830,12 +14850,17 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # without modifying the timer's return shape. With the flag
         # OFF (the default), this branch is a no-op.
         variant_sources = list(sources)
+        # Track whether the source LIST was replaced (poly/synth codegen). When
+        # it was NOT (the default common path), the precomputed _base_sources_hash
+        # is reused below instead of re-walking the include closure per trial.
+        _sources_replaced = False
         # Mandate #20 — when the polyhedral hook produced a real transformed
         # source, BUILD it (not the template) and only then stamp the origin,
         # mirroring the synth path below. The strict on-device oracle (#16/#20)
         # then validates a transformation that was actually compiled + run.
         if poly_source is not None:
             variant_sources = [poly_source]
+            _sources_replaced = True
             _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
             spec._emitted_sources[f"{ckey}:polyhedral"] = poly_source
             report.write(
@@ -14858,6 +14883,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # the synthesised file. The existing _torch_load
                     # call below picks this list up unchanged.
                     variant_sources = [synth_path]
+                    _sources_replaced = True
                     # Mandate #16 — this variant is GENERATED; tag its origin
                     # so pick_winner requires a strict-oracle PASS before it
                     # can win (never ships an unvalidated synth kernel).
@@ -14881,9 +14907,13 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # toolchain must not register as fresh. The flags are appended inside
         # _torch_load (not added to full_host/full_device here) so we only hash.
         _vsig_h, _vsig_d = _version_gated_flags_for_hash(spec.arch)
+        # Reuse the once-per-sweep base-sources hash on the common path; only the
+        # poly/synth branch (which replaced variant_sources) re-walks the closure.
+        _vsrc_hash = (_hash_sources(list(variant_sources))
+                      if _sources_replaced else _base_sources_hash)
         build_sig = _hash_flags(
             [str(s) for s in variant_sources]
-            + [_hash_sources(list(variant_sources))]
+            + [_vsrc_hash]
             + full_host + full_device + _vsig_h + _vsig_d + list(ldflags))
         variant_so = cache.get_fresh_variant(
             spec.optimizer, spec.model, spec.arch, ckey, build_sig)
@@ -15423,11 +15453,14 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         "n_rejected":  0,
         "n_total":     0,
         # Stream C.2 — multi-fidelity cheap-proxy gate bookkeeping. The
-        # rolling list of MEASURED timings feeds the distributional
+        # rolling window of MEASURED timings feeds the distributional
         # quantile the proxy gates against; mf_rejected / mf_total are
         # the proxy's own independent rejection budget (separate from the
-        # absolute-threshold gate's n_rejected / n_total).
-        "measured_ms": [],
+        # absolute-threshold gate's n_rejected / n_total). A bounded deque
+        # keeps the most-recent 2000 in append order with O(1) append+discard
+        # (was a list + O(n) ``del _meas[:len-2000]`` slice once the window
+        # filled); iteration order — and thus the quantile — is identical.
+        "measured_ms": collections.deque(maxlen=2000),
         "mf_rejected": 0,
         "mf_total":    0,
     }
@@ -15749,10 +15782,12 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                 # distribution of MEASURED timings. Bounded (keep the most
                 # recent window) so a very long sweep can't grow it without
                 # limit; the quantile is robust to the trimming.
-                _meas = cost_model_state.setdefault("measured_ms", [])
+                # Bounded deque (maxlen=2000) auto-discards the oldest in O(1);
+                # the setdefault fallback matches the init type so a state dict
+                # built elsewhere still gets a bounded window.
+                _meas = cost_model_state.setdefault(
+                    "measured_ms", collections.deque(maxlen=2000))
                 _meas.append(tms_f)
-                if len(_meas) > 2000:
-                    del _meas[:len(_meas) - 2000]
                 # Mandate #14 — count MEASURED trials (the cold-start floor
                 # for pruning reads this) and log prediction error vs measured
                 # so model miscalibration is observable.
