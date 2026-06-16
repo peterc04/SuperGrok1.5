@@ -2826,6 +2826,63 @@ def _transitive_include_set(paths: List[Path]) -> List[Path]:
     return sorted(h for h in acc if h not in inputs)
 
 
+# Per-TU cache of the ``SG_TUNED_*`` tokens reachable in a TU's body + its
+# transitive #include closure. Keyed by (TU mtime_ns, max closure-header mtime_ns)
+# so editing the TU OR any header it reaches evicts the line — the same
+# mtime-invalidation discipline as ``_INCLUDE_WALK_CACHE`` / ``_hash_sources``.
+# Used by the incremental-build planner to attribute a changed macro to exactly
+# the TUs whose object can depend on it (a macro absent from a TU's whole
+# preprocessed input cannot change that TU's .o), which is the single-cell
+# source-scoping lever (a decoder-only macro leaves the vit/mamba launcher
+# objects provably reusable). Computed once per TU per sweep, not per variant.
+_TU_TUNED_MACRO_CLOSURE_CACHE: Dict[str, Tuple[Tuple[int, int], frozenset]] = {}
+_SG_TUNED_TOKEN_RE = re.compile(r"SG_TUNED_[A-Za-z0-9_]+")
+
+
+def _tu_closure_tuned_macros(tu: Path, roots: List[Path]) -> Optional[frozenset]:
+    """Return the frozenset of ``SG_TUNED_*`` tokens appearing anywhere in
+    ``tu``'s body or its transitive #include closure.
+
+    Returns ``None`` if any file in the closure is unreadable (so the caller
+    cannot prove attribution and must fall back to a full build). Result is
+    mtime-memoized across variants within a sweep.
+    """
+    try:
+        tu_mtime = tu.stat().st_mtime_ns
+    except OSError:
+        return None
+    headers = _walk_includes_one(tu, roots)
+    # Fold the closure's freshness into the key: the max header mtime captures
+    # any header edit; the include-set itself is already mtime-tracked by
+    # _walk_includes_one (an edit that adds/removes an #include bumps the TU or
+    # header mtime, which changes this key).
+    hdr_mtime = 0
+    for h in headers:
+        try:
+            m = h.stat().st_mtime_ns
+        except OSError:
+            return None
+        if m > hdr_mtime:
+            hdr_mtime = m
+    key = str(tu)
+    cached = _TU_TUNED_MACRO_CLOSURE_CACHE.get(key)
+    if cached is not None and cached[0] == (tu_mtime, hdr_mtime):
+        return cached[1]
+    toks: set = set()
+    try:
+        toks |= set(_SG_TUNED_TOKEN_RE.findall(tu.read_text(errors="ignore")))
+    except OSError:
+        return None
+    for h in headers:
+        try:
+            toks |= set(_SG_TUNED_TOKEN_RE.findall(h.read_text(errors="ignore")))
+        except OSError:
+            return None
+    result = frozenset(toks)
+    _TU_TUNED_MACRO_CLOSURE_CACHE[key] = ((tu_mtime, hdr_mtime), result)
+    return result
+
+
 def _hash_sources(paths: List[Path]) -> str:
     h = hashlib.sha256()
     # P0.1 — hash the TUs AND their transitive repo-relative #include closure so
@@ -9764,6 +9821,46 @@ def _owns_extension_module_tu(path: Path) -> bool:
         return False
 
 
+# Cache: does a TU's body emit a ``PYBIND11_MODULE(...)`` (i.e. a
+# ``PyInit_<TORCH_EXTENSION_NAME>`` export)? Such a TU's object hard-codes the
+# module name torch's ``load()`` passed as ``TORCH_EXTENSION_NAME`` AT THE TIME
+# IT WAS COMPILED. A variant build uses a DIFFERENT module name (the per-config
+# ``module_suffix``), so reusing a PYBIND-owning object from a different-named
+# build links a ``.so`` whose only ``PyInit_*`` symbol is the OLD name →
+# ``ImportError: dynamic module does not define module export function
+# (PyInit_<new_name>)``. The incremental-build planner therefore must ALWAYS
+# RECOMPILE such a TU (never reuse it), so its ``PyInit_`` matches the variant's
+# module name. Keyed by (path, mtime_ns). Note: in the shared ``_ops``-style
+# 6-TU set this is ``bindings.cpp`` (``PYBIND11_MODULE(SG_OPS_PYMODULE …)`` where
+# ``SG_OPS_PYMODULE = TORCH_EXTENSION_NAME``); the ``*_real_adamw_tc.cu`` cells
+# that own their OWN module are already excluded from the set by
+# ``_owns_extension_module_tu``, so they never reach the planner.
+_TU_EMITS_PYINIT_CACHE: Dict[str, Tuple[int, bool]] = {}
+
+
+def _tu_emits_pyinit_module(path: Path) -> bool:
+    """True if ``path``'s body defines a ``PYBIND11_MODULE`` (and hence a
+    ``PyInit_<TORCH_EXTENSION_NAME>`` export whose name is baked in at compile
+    time). Such a TU must always be recompiled per-variant, never object-reused.
+    Conservative: on any read error returns True (force recompile — the safe
+    direction, since a wrongly-reused PyInit TU breaks the dlopen)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return True
+    key = str(path)
+    cached = _TU_EMITS_PYINIT_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns:
+        return cached[1]
+    try:
+        txt = path.read_text(errors="ignore")
+        emits = "PYBIND11_MODULE(" in txt
+    except OSError:
+        emits = True
+    _TU_EMITS_PYINIT_CACHE[key] = (st.st_mtime_ns, emits)
+    return emits
+
+
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
     """Resolve the per-build source file list.
 
@@ -14587,42 +14684,73 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     return None
         if not changed_macros:
             return None  # nothing macro-specific to be incremental about
-        # Map each changed macro to the TU(s) whose SOURCE TEXT reads it. A
-        # header-defined macro can be read transitively, so a TU that #includes
-        # a header reading the macro must also be treated as affected; to stay
-        # SAFE we treat a macro as ambiguous (→ full build) if it appears in any
-        # header (.cuh/.h/.hpp) we cannot attribute to a specific TU.
+        # Map each changed macro to the TU(s) whose PREPROCESSED INPUT reads it.
+        # A changed SG_TUNED_* macro affects a TU's object iff the macro token
+        # appears anywhere in {TU body ∪ its transitive #include closure} — a
+        # header-defined macro IS read by a TU that (transitively) #includes the
+        # header, but is NOT read by a sibling TU whose own closure never reaches
+        # that header. We compute each TU's closure with the same mtime-memoized
+        # walker _hash_sources uses, so the attribution is exact and matches the
+        # freshness hash. This is a strict superset of the old body-only check
+        # (closure ⊇ body) and is the single-cell-source-scoping lever: e.g. a
+        # decoder-exclusive macro (SG_TUNED_DEC_GEMM_INTERLEAVE) lives only in the
+        # decoder launcher's closure, so the vit/mamba launcher objects are
+        # PROVABLY unaffected and their prebuilt AOT .o link in unchanged — the
+        # dispatch-table symbols (fused_wired_cells.inc references every model's
+        # real launcher) all still resolve because the .o IS linked, just not
+        # recompiled. SAFE by construction: a macro absent from a TU's entire
+        # preprocessed input cannot change that TU's object.
         exts_tu = {".cu", ".cpp", ".cc", ".cxx", ".hip", ".c"}
+        _roots = _include_search_roots()
         affected: set = set()
+        # Per-TU read-set of changed macros (body + transitive include closure),
+        # via the mtime-memoized _tu_closure_tuned_macros (computed once per TU
+        # per sweep, NOT per variant — the per-variant cost is set lookups, not
+        # ~90 header reads). A macro found in NO TU's closure is genuinely
+        # unattributable (read via a path the include walker can't see) → fall
+        # back to a full build.
+        _located: set = set()
         for src in variant_sources:
             p = Path(src)
             if p.suffix not in exts_tu:
                 continue
-            try:
-                txt = p.read_text(errors="ignore")
-            except OSError:
-                return None  # can't read a source — can't prove the plan
-            if any(mac in txt for mac in changed_macros):
+            tu_macros = _tu_closure_tuned_macros(p, _roots)
+            if tu_macros is None:
+                # Unreadable TU/header in the closure — can't prove the plan.
+                return None
+            hit = {mac for mac in changed_macros if mac in tu_macros}
+            if hit:
                 affected.add(p)
-        # If a changed macro is NOT found in ANY TU body, it is (likely)
-        # header-driven and read transitively by an unknown set of TUs — we
-        # cannot prove which objects are unchanged, so fall back.
-        tu_text = []
-        for src in variant_sources:
-            p = Path(src)
-            if p.suffix in exts_tu:
-                try:
-                    tu_text.append(p.read_text(errors="ignore"))
-                except OSError:
-                    return None
-        joined = "\n".join(tu_text)
+                _located |= hit
+        # If a changed macro is read by NO TU's closure, it is read via a path the
+        # include walker cannot attribute (e.g. a compiler-injected or out-of-tree
+        # header) — we cannot prove which objects are unchanged, so fall back.
         for mac in changed_macros:
-            if mac not in joined:
-                report.write("    [incremental] macro %s not located in any "
-                             "TU body (header-driven?) — full build.\n" % mac)
+            if mac not in _located:
+                report.write("    [incremental] macro %s not located in any TU "
+                             "closure (unattributable) — full build.\n" % mac)
                 return None
         tu_sources = [Path(s) for s in variant_sources
                       if Path(s).suffix in exts_tu]
+        # A PYBIND-module-owning TU (bindings.cpp) bakes PyInit_<TORCH_EXTENSION_
+        # NAME> into its object. The variant build uses a DIFFERENT module name
+        # (per-config module_suffix) than the AOT base whose object we'd reuse, so
+        # a reused PYBIND object exports the WRONG PyInit_ and the variant .so
+        # fails to import ("does not define module export function PyInit_<name>")
+        # — torch then falls back to a full build, so the incremental attempt is
+        # PURE WASTE. Force every PYBIND-owning TU into the recompiled set so its
+        # PyInit_ matches the variant module name; the costly sibling-model
+        # megakernel objects (the real target of reuse) still link from cache.
+        _pyinit_forced = 0
+        for p in tu_sources:
+            if p not in affected and _tu_emits_pyinit_module(p):
+                affected.add(p)
+                _pyinit_forced += 1
+        if _pyinit_forced:
+            report.write("    [incremental] forcing recompile of %d PYBIND-"
+                         "module TU(s) (PyInit_ is module-name-specific; a reused "
+                         "object would break the variant .so import).\n"
+                         % _pyinit_forced)
         unchanged = [p for p in tu_sources if p not in affected]
         # No savings if everything (or nothing) is affected.
         if not affected or not unchanged:
@@ -14638,12 +14766,30 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             return None
         reuse_objs: List[Path] = []
         for p in unchanged:
-            obj = aot_build_dir / (p.stem + ".o")
-            if not obj.is_file():
-                # ninja sometimes suffixes objects differently; require the
-                # exact <stem>.o — if absent, we cannot prove reuse → fall back.
-                report.write("    [incremental] AOT object %s missing — full "
-                             "build.\n" % obj.name)
+            # Mirror torch.utils.cpp_extension's object-naming EXACTLY: a CUDA
+            # source (.cu/.cuh) under a with_cuda build compiles to
+            # ``<stem>.cuda.o`` (the disambiguation it uses so a foo.cpp and
+            # foo.cu don't collide); every other TU compiles to ``<stem>.o``.
+            # The old lookup only tried ``<stem>.o``, so it NEVER found the
+            # ``.cuda.o`` object for the model launcher TUs (.cu) and silently
+            # fell back to a full build — defeating the whole incremental lever.
+            # Try the cpp_extension-correct name first, then the bare ``.o`` as a
+            # fallback for host TUs / older torch, requiring an exact on-disk hit.
+            _is_cuda_tu = p.suffix in (".cu", ".cuh")
+            _cands = ([p.stem + ".cuda.o", p.stem + ".o"] if _is_cuda_tu
+                      else [p.stem + ".o", p.stem + ".cuda.o"])
+            obj = None
+            for _cand in _cands:
+                _o = aot_build_dir / _cand
+                if _o.is_file():
+                    obj = _o
+                    break
+            if obj is None:
+                # No prebuilt object under either naming — cannot prove reuse,
+                # so fall back to a full build (never reuse on doubt).
+                report.write("    [incremental] AOT object for %s missing "
+                             "(tried %s) — full build.\n"
+                             % (p.name, ", ".join(_cands)))
                 return None
             reuse_objs.append(obj)
         report.write("    [incremental] recompiling %d/%d TU(s) carrying %s; "

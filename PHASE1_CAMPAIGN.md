@@ -241,6 +241,48 @@ finding, not a failed-gate revert.
   O(n²)→O(n) and the ~85× host-identity memoization) were both verified byte/bit-identical by
   differential test before keeping.
 
+### compile.py track — BROAD cycle (features + behavior + perf), candidate list `.opt_candidates_broad.json`
+
+Gate per candidate: self-test stays **236/6** (CPU-only) AND, for build-cost candidates, a GPU
+build that imports + dlopens + a spot gate passes + a MEASURED build-time delta. Self-test held
+236/6 (identical drift-guard set) at every step of every round below.
+
+**BROAD round 1 — `compile-01-singlecell-source-scoping` (rank-1 flagship): KEEP** — commit `<r1>`.
+The incremental-variant-build feature (`--incremental-variant-build`, the documented build-throughput
+lever) was **completely non-functional** — every incremental attempt fell back to a full build — for
+TWO latent bugs that single-cell scoping uncovered, plus it didn't scope across models at all. Fixed
+all three in `_plan_incremental_build` + two new mtime-memoized helpers:
+  1. **Transitive-closure macro attribution** (`_tu_closure_tuned_macros`, mtime-keyed): a changed
+     `SG_TUNED_*` macro affects a TU iff the token appears in {TU body ∪ its transitive `#include`
+     closure}. The OLD check only scanned the TU **body**, so a header-driven macro (every GEMM/tile
+     macro) matched NO TU body and the planner bailed to a full build. The closure check is a strict
+     superset (closure ⊇ body) and is the single-cell-scoping lever: a decoder-only macro
+     (`SG_TUNED_DEC_GEMM_INTERLEAVE`, `SG_TUNED_CONS_REGS`, …) lives only in the decoder launcher's
+     closure → the vit/mamba launcher objects are PROVABLY unaffected and reuse from cache. Shared
+     macros (`SG_TUNED_TILE_M/_N`, `MEGA_BLOCK`, `GEMM_IMPL`) correctly mark ALL model launchers
+     (no unsafe reuse). 7/7 attribution unit-tests pass; the dispatch-symbol coupling (9815-9826) is
+     preserved because the sibling `.o` IS linked, just not recompiled.
+  2. **`.cuda.o` object-suffix resolution**: torch's cpp_extension names CUDA objects `<stem>.cuda.o`
+     (host `.cpp` → `<stem>.o`). The OLD reuse lookup only tried `<stem>.o`, so it NEVER found the
+     launcher objects (all `.cu`) and bailed. Now mirrors torch's exact naming (CUDA-first, `.o`
+     fallback).
+  3. **PYBIND force-recompile** (`_tu_emits_pyinit_module`): `bindings.cpp` owns
+     `PYBIND11_MODULE(…)` → its object hard-codes `PyInit_<TORCH_EXTENSION_NAME>` at compile time.
+     A variant build uses a different module name (per-config `module_suffix`), so reusing the base's
+     `bindings.o` linked a `.so` exporting the WRONG `PyInit_` → `ImportError: does not define module
+     export function` → full-build fallback (pure waste). Now any PYBIND-owning TU is always
+     recompiled so its `PyInit_` matches the variant; the costly sibling-model megakernel objects
+     (the real reuse target) still link from cache.
+  - Per-variant planner cost: optimized from ~760 ms (re-reading ~90 headers/variant) to **~0.8 ms**
+    via the mtime-memoized closure-token cache (computed once per TU per sweep).
+  - **GPU validation (H100, real disk, fresh `_torch_load` AOT objects, decoder GEMM variant):**
+    incremental build (recompile bindings + decoder launcher, reuse dispatch + vit + mamba + sg2
+    objects) = **159.4 s**, **dlopens OK** (all symbols: `fused_step`, `sg2_fused_step`, …) vs a clean
+    full variant build = **406.4 s** → **2.55× faster, 247 s saved per variant**. The incremental
+    fallback-to-full-build path is intact (coverage/correctness never at risk; verified it correctly
+    falls back on a stale/mismatched AOT dir during diagnosis). Flag is opt-in (off by default), so
+    the shipped `_ops`/`setup.py` build is byte-unchanged.
+
 ---
 
 ## 4. Autotuner (compile.py) — status
