@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# PYTORCH_NVCC hook — cache + auto-thread nvcc for ALL torch builds.
+#
+# torch resolves the compile-rule nvcc from $PYTORCH_NVCC (cpp_extension.py L2308),
+# used by BOTH the JIT bench path (tuning/*_bench.py -> load()) AND the AOT _ops build
+# (setup.py -> BuildExtension), since both funnel through _write_ninja_file. So pointing
+# PYTORCH_NVCC at this wrapper caches + threads every CUDA compile in the project.
+#
+#  * sccache caches the device compile (cu -> cubin) — the expensive ~200s/TU part —
+#    keyed on the preprocessed source + flags. CUDA-native; verified 100% hit and
+#    --threads-safe (no non-cacheable fallback).
+#  * nvcc --threads 0  => nvcc auto-detects the machine's CPU count and parallelizes the
+#    per-gencode / compile phases (replaces the old fixed, ignored NVCC_THREADS=8).
+#
+# Only ACTUAL compiles are cached + threaded; version/probe invocations (nvcc --version,
+# -v, dependency generation) pass straight through to the real nvcc untouched.
+set -euo pipefail
+REAL=/usr/local/cuda/bin/nvcc
+SCC="$(command -v sccache 2>/dev/null || true)"
+for a in "$@"; do
+  case "$a" in
+    -c|--compile)
+      if [[ -n "$SCC" ]]; then
+        exec "$SCC" "$REAL" --threads 0 "$@"
+      fi
+      exec "$REAL" --threads 0 "$@"   # graceful degrade: still thread if sccache absent
+      ;;
+  esac
+done
+exec "$REAL" "$@"

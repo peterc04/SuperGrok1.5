@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# CXX hook — route the host C++ compile through ccache.
+# Must be a SINGLE-TOKEN absolute path: torch runs `which "$CXX"` (cpp_extension.py L311)
+# with the whole CXX string as one arg, so "ccache g++" fails there. A wrapper script path
+# resolves cleanly, and its basename contains "g++" so torch's compiler-name gate (L315) and
+# the COLLECT_GCC ABI probe (L322) both accept it.
+exec ccache g++ "$@"

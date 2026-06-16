@@ -34,6 +34,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Caching + auto-threaded nvcc + ninja: source the fast-build env if present so a plain
+# ./build.sh gets the device(sccache)/host(ccache) compile cache + nvcc --threads 0 for free.
+if [[ -f .fast_build_env.sh ]]; then
+  # shellcheck disable=SC1091
+  source .fast_build_env.sh
+fi
+
 DEBUG=0
 PROFILE=0
 PACKAGE=0
