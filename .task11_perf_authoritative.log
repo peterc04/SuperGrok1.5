@@ -1,0 +1,20 @@
+=== TASK #11 AUTHORITATIVE pass: per-seed-RESEEDED inputs, seeds {42,7,123}, B=4096, reps=7 ===
+Tue Jun 16 13:50:45 UTC 2026
+
+[nvcc-baseline] ===== variant A: regular-nvcc (vanilla flags, split-K=4) =====
+[nvcc-baseline][A] split-K=4 fast_math=True
+[nvcc-baseline][A] nvcc flags: -O3 -std=c++17 --expt-relaxed-constexpr --use_fast_math -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90a,code=compute_90a -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_BENCH_LAYOUT=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_TUNED_DEC_DW_SPLITK=4
+VARIANT {"variant": "A", "desc": "regular-nvcc (vanilla flags, split-K=4)", "split_k": 4, "fast_math": true, "d": 2048, "B": 4096, "total_params": 101134435, "build_s": 0.4, "per_seed_median_ms": {"42": 500.6098, "7": 500.4868, "123": 500.2979}, "per_seed_walls_ms": {"42": [500.9458, 500.4351, 500.3951, 500.6098, 501.0657, 500.3968, 501.2903], "7": [499.1151, 500.4868, 500.0871, 501.1557, 500.6814, 499.9321, 501.1244], "123": [501.9077, 501.093, 499.977, 499.6756, 499.9184, 500.7689, 500.2979]}, "across_seed_median_ms": 500.4868, "achieved_tf_s": 19.785, "pct_roofline": 2.001}
+
+[nvcc-baseline] ===== variant B: compile.py-default (augmented flags, split-K=4) =====
+[nvcc-baseline][B] split-K=4 fast_math=True
+[nvcc-baseline][B] nvcc flags: -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -Xptxas --register-usage-level=10 -Xptxas --def-load-cache=ca -Xptxas --def-store-cache=wb --threads 8 --diag-suppress=20012,20013 --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90a,code=compute_90a -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_BENCH_LAYOUT=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_TUNED_DEC_DW_SPLITK=4
+VARIANT {"variant": "B", "desc": "compile.py-default (augmented flags, split-K=4)", "split_k": 4, "fast_math": true, "d": 2048, "B": 4096, "total_params": 101134435, "build_s": 0.5, "per_seed_median_ms": {"42": 502.6339, "7": 502.8962, "123": 502.4025}, "per_seed_walls_ms": {"42": [503.539, 502.591, 503.6214, 502.1685, 502.6339, 503.7753, 502.0759], "7": [502.972, 503.0962, 502.0936, 502.3556, 502.8311, 502.8962, 502.9049], "123": [502.4025, 503.4141, 502.0187, 501.6676, 503.0871, 501.3987, 502.801]}, "across_seed_median_ms": 502.6339, "achieved_tf_s": 19.701, "pct_roofline": 1.992}
+
+[nvcc-baseline] ===== variant C: compile.py-tuned (augmented flags, split-K=2) =====
+[nvcc-baseline][C] split-K=2 fast_math=True
+[nvcc-baseline][C] nvcc flags: -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -Xptxas --register-usage-level=10 -Xptxas --def-load-cache=ca -Xptxas --def-store-cache=wb --threads 8 --diag-suppress=20012,20013 --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90a,code=compute_90a -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_BENCH_LAYOUT=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_TUNED_DEC_DW_SPLITK=2
+VARIANT {"variant": "C", "desc": "compile.py-tuned (augmented flags, split-K=2)", "split_k": 2, "fast_math": true, "d": 2048, "B": 4096, "total_params": 101134435, "build_s": 0.5, "per_seed_median_ms": {"42": 492.1337, "7": 492.1426, "123": 492.1614}, "per_seed_walls_ms": {"42": [492.1337, 491.8222, 492.7806, 490.612, 492.028, 493.6363, 492.5791], "7": [492.9313, 492.0922, 490.8053, 492.1426, 492.6276, 490.8155, 492.7232], "123": [492.1614, 491.0114, 493.5917, 491.2793, 491.9543, 492.2763, 492.2073]}, "across_seed_median_ms": 492.1426, "achieved_tf_s": 20.121, "pct_roofline": 2.034}
+DELTAS {"A_to_B_pipeline_flags_pct": 0.429, "B_to_C_autotuner_pct": -2.087, "A_to_C_total_pct": -1.667}
+=== EXIT 0 ===
+Tue Jun 16 13:57:43 UTC 2026

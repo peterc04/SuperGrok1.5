@@ -501,6 +501,61 @@ drift-guards only; 33/33 fp64 gate; production build green). See
 - **#11 validation:** tuned-vs-default + vs-regular-nvcc, meaningful only at d=2048 scale
   (toy d=128 is physics-inert — autotuner correctly found no win there).
 
+### #11 result — compile.py vs regular nvcc @ the d=2048 roofline (adamw/decoder)
+
+The owner's "see the real difference" three-point test, at the d=2048 GPT-2-XL-scale
+roofline build for the `adamw/decoder` cell (101.1M-param decoder TU, `SG_DEC_BENCH_LAYOUT=1`
+→ the `_DEC_BENCH_D=2048` layout branch; `B=4096`, seeds {42,7,123}, H100 sm_90a, CUDA 12.4).
+Driven by `scripts/nvcc_baseline.py --bench-d2048`: it builds the SAME single decoder cell TU
+(`csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu`) three ways and times its `tc_train_step`
+(same path as `tuning/decoder_bench.py`), so the ONLY differences across A/B/C are (1) the nvcc
+flag set and (2) the dW split-K macro. fast-math is held identical (`--use_fast_math` ON in all
+three — production B uses it, see setup.py), so **A→B isolates exactly compile.py's ptxas-tuning
+flags**, not a numerics confound.
+
+| Variant | Build flags | dW split-K | 3-seed median step-ms | TF/s | % of 989 roofline |
+|---|---|---|---|---|---|
+| **A — regular nvcc** | vanilla: `-O3 --use_fast_math --expt-relaxed-constexpr -arch=sm_90a` + structural -D only | 4 | **500.49** | 19.79 | 2.00% |
+| **B — compile.py default** | augmented: `NVCC_DEVICE_BASE` + ptxas tuning (`--register-usage-level=10`, `--def-load-cache=ca`, `--def-store-cache=wb`, `--extra-device-vectorization`, `-Xfatbin -compress-all`, `--opt-level=3`, …) | 4 | **502.63** | 19.70 | 1.99% |
+| **C — compile.py tuned** | augmented flags + the tuned knob (in-source default, commit `a625227`) | 2 | **492.14** | 20.12 | 2.03% |
+
+**Deltas (negative = faster):**
+- **A→B = +0.43%** — compile.py's compilation-pipeline benefit (the ptxas-tuning flags). HONEST
+  finding: **neutral / very-slightly-negative** at this megakernel + scale. The
+  register-usage-level / def-cache / vectorization knobs buy nothing here (within timing noise,
+  per-seed spread <0.15%) — the decoder megakernel is smem/occupancy-bound, not ptxas-codegen-
+  bound, so the extra ptxas freedom doesn't move the critical path. This is the genuinely-new
+  number the kernel-track hadn't measured; it is small.
+- **B→C = −2.09%** — the autotuner's knob benefit (dW split-K 4→2). The real win, and it agrees
+  with the kernel-track's independent −2.5% split-K finding (different B/timing run; here −2.09%).
+- **A→C = −1.67%** — total compile.py-vs-vanilla-nvcc, dominated entirely by the autotuner knob
+  (B→C); the flag pipeline (A→B) contributes ~0.
+
+Two independent passes (DB.measure input-seed-42 repeats, then genuinely per-seed-reseeded
+inputs reps=7) agreed within ~0.1 ms on all three variants, so the deltas are robust (not a
+one-seed fluke). TAKEAWAY: at the d=2048 decoder roofline the headline "compile.py vs nvcc" win
+is **−1.67%**, and it is **the autotuner's split-K knob, not the ptxas-tuning compile flags** —
+the flags are inert here. (Raw timing log: `.task11_perf_authoritative.log`.)
+
+**Correctness — fp64 33-cell parity gate (adamw/decoder), the gate run against a real binary
+built at EACH variant's flag-set + split-K (not argued, measured):**
+- **C** (production, split-K=2, augmented flags): PASS at seeds {42, 7, 123} — `max|Δp|=1.2e-7`,
+  state m=2.5e-7 / v=9.5e-7, A/A/A determinism bit-exact. (This is the shipped production `_ops`.)
+- **B** (split-K=4, augmented flags, full production `_ops` rebuilt via `./build.sh`): PASS at
+  seeds {42, 7, 123} — `max|Δp|`=1.196e-7/1.199e-7/1.201e-7, A/A/A bit-exact at each.
+- **A** (split-K=4, vanilla nvcc flags, full `_ops` built by `nvcc_baseline.py`): PASS at seed 42 —
+  `max|Δp|=1.199e-7` rel 2.84e-8, state m=2.595e-7/v=9.75e-7, A/A/A bit-exact. (split-K is an
+  order-stable ascending-chunk reduce → parity + A/A/A hold for any G; the ptxas-tuning flags are
+  codegen-only; fast-math identical across all three — so A is numerically the same as B, as the
+  identical Δp confirms.)
+All three builds are fp64-parity-green. The tree is left in the tuned **C** state (split-K=2,
+source byte-identical to commit `a625227`; production `_ops` rebuilt to C).
+
+NOTE for re-runs: `scripts/nvcc_baseline.py`'s vanilla full-`_ops` gencode was corrected to emit
+the embedded PTX for `compute_90a` (was plain `compute_90`, which makes ptxas reject the vit TU's
+`wgmma.*` — "not supported on .target 'sm_90'"). sm_90a is the only target this megakernel
+supports.
+
 ---
 
 ## 5. Pre-race optimizer hyperparameter tuning (for the RACE)  — QUEUED (run at end)
