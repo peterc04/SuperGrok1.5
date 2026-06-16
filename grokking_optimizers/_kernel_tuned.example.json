@@ -1,0 +1,61 @@
+{
+  "_meta": {
+    "compile_py_version_hash": "example0000",
+    "last_arch": "sm_90",
+    "last_optimizer": "supergrok2",
+    "source": "grokking_optimizers.compile.build_jit",
+    "timestamp": "2026-01-01T00:00:00 (illustrative; real exports stamp now())"
+  },
+  "sm_90": {
+    "_macros": {
+      "cluster_shape": "SG_TUNED_CLUSTER_SHAPE",
+      "cons_regs": "SG_TUNED_CONS_REGS",
+      "dec_dw_splitk": "SG_TUNED_DEC_DW_SPLITK",
+      "mb_dw_splitk": "SG_TUNED_MB_DW_SPLITK",
+      "mega_block": "SG_TUNED_MEGA_BLOCK",
+      "prod_regs": "SG_TUNED_PROD_REGS",
+      "tile_m": "SG_TUNED_TILE_M",
+      "tile_n": "SG_TUNED_TILE_N",
+      "vit_dw_splitk": "SG_TUNED_VIT_DW_SPLITK"
+    },
+    "decoder": {
+      "adamw": {
+        "cluster_shape": [
+          2,
+          1,
+          1
+        ],
+        "cons_regs": 232,
+        "dec_dw_splitk": 4,
+        "maxrregcount": 64,
+        "mega_block": 128,
+        "model": "decoder",
+        "prod_regs": 40,
+        "tile_m": 128,
+        "tile_n": 64
+      }
+    },
+    "mamba": {
+      "supergrok2": {
+        "maxrregcount": 128,
+        "mb_dw_splitk": 8,
+        "mega_block": 512,
+        "model": "mamba",
+        "tile_m": 256,
+        "tile_n": 128
+      }
+    },
+    "vit": {
+      "muon": {
+        "cons_regs": 224,
+        "maxrregcount": 0,
+        "mega_block": 256,
+        "model": "vit",
+        "prod_regs": 48,
+        "tile_m": 64,
+        "tile_n": 128,
+        "vit_dw_splitk": 2
+      }
+    }
+  }
+}

@@ -11,18 +11,31 @@ Run:  python -m tuning.test_build_injection
 Covers:
   1. TU path -> optimizer mapping, incl. the ambiguous-TU policy
      (launcher / mega cell -> opt; bindings / model TUs / common -> NONE).
-  2. Per-source nvcc flag computation (block/vec/unroll/async_depth +
-     maxrregcount; maxrregcount==0 omitted; absent/ambiguous -> []).
+  2. Per-source nvcc flag computation over the LIVE sm_90 SAFE floor
+     (mega_block / tile_m / tile_n / {dec,vit,mb}_dw_splitk / prod_regs /
+     cons_regs as -DSG_TUNED_* macros, + maxrregcount as a real
+     --maxrregcount ptxas flag; maxrregcount==0 omitted; absent/ambiguous
+     -> []). The OLD dead block/vec/unroll/async_depth macros (guards in the
+     DELETED eager kernels/sm_90/*_sm90.cuh headers) are no longer in the
+     floor — see the LIVE-MACRO AUDIT header in _tuned_inject.py.
   3. build.ninja rewrite: the right CUDA edges get a per-statement
      cuda_post_cflags override carrying the FULL flag list (base preserved),
      and unrelated edges (.cpp, model .cu) get nothing.
   4. export_winner read-merge-write round-trip (atomic JSON, only the safe
      per-TU dims persisted, sibling winners survive).
   5. Drift guard: the MACROS source-of-truth macro names + defaults match the
-     committed kernel header (adamw_sm90.cuh #ifndef SG_TUNED_*).
+     #ifndef SG_TUNED_* guards in the committed device tree (the LIVE csrc/
+     headers: megakernel_common.cuh, wgmma.cuh, the per-model
+     model_stage_*_tc.cuh split-K guards, and tile_pipeline.cuh's
+     prod/cons reg caps — the eager adamw_sm90.cuh header was deleted).
 
 These assertions are the executable contract; setup.py is NOT imported (it
 runs setup() at import time and probes torch/CUDA — not importable here).
+
+The macro names/defaults below are RE-BASELINED to the live MACROS table in
+_tuned_inject.py (the single source of truth). They must stay in lockstep with
+it: a rename/default change there should make the matching assertion here fail,
+so this file keeps catching inject/consume drift.
 """
 
 from __future__ import annotations
@@ -53,6 +66,14 @@ ti = _load_inject()
 
 # --------------------------------------------------------------------------
 # Tiny assert harness (no pytest dependency required).
+#
+# Standalone (`python tuning/test_build_injection.py` / `main()`): a failed
+# check is ACCUMULATED in _FAILURES and main() exits non-zero at the end, so a
+# single run reports every drift at once. Under pytest (PYTEST_CURRENT_TEST set
+# while a test runs): a failed check RAISES immediately so the per-test result
+# is a real PASS/FAIL — otherwise pytest would green-wash a wrong assertion that
+# does not happen to throw (the dead-macro versions of tests 2/3/6 did exactly
+# that before this re-baseline). Either way the contract genuinely catches drift.
 # --------------------------------------------------------------------------
 _FAILURES = []
 
@@ -62,6 +83,8 @@ def check(cond, msg):
         return
     _FAILURES.append(msg)
     print(f"  FAIL: {msg}")
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise AssertionError(msg)
 
 
 def eq(got, exp, msg):
@@ -103,14 +126,26 @@ def test_source_to_optimizer():
 # 2. Per-source nvcc flag computation.
 # --------------------------------------------------------------------------
 def _sample_tuned():
+    """A flat-schema sample winner JSON using the LIVE sm_90 SAFE-floor dims.
+
+    Each optimizer carries a distinct ``mega_block`` (the launch-bounds block,
+    the lead identifying dim) plus tile_m/tile_n and a model-appropriate dW
+    split-K factor and the prod/cons register caps, so the mapping tests can
+    tell two optimizers' flag lists apart. maxrregcount stays the ptxas-flag
+    dim (0 => emit nothing). Kept FLAT ({arch: {opt: combo}}) on purpose to
+    also exercise the backward-compat reader path; the per-model nested shape
+    is covered by test_export_merge_roundtrip.
+    """
     return {
         "sm_90": {
-            "adamw": {"block": 128, "vec": 2, "unroll": 4,
-                      "async_depth": 3, "maxrregcount": 64, "model": "decoder"},
-            "muon": {"block": 256, "vec": 4, "unroll": 1,
-                     "async_depth": 2, "maxrregcount": 0, "model": "vit"},
-            "supergrok2": {"block": 512, "vec": 8, "unroll": 2,
-                           "async_depth": 4, "maxrregcount": 128},
+            "adamw": {"mega_block": 128, "tile_m": 128, "tile_n": 64,
+                      "dec_dw_splitk": 4, "prod_regs": 40, "cons_regs": 232,
+                      "maxrregcount": 64, "model": "decoder"},
+            "muon": {"mega_block": 256, "tile_m": 64, "tile_n": 128,
+                     "vit_dw_splitk": 2, "prod_regs": 48, "cons_regs": 224,
+                     "maxrregcount": 0, "model": "vit"},
+            "supergrok2": {"mega_block": 512, "tile_m": 256, "tile_n": 128,
+                           "mb_dw_splitk": 8, "maxrregcount": 128},
         },
         "_meta": {"source": "test"},
     }
@@ -118,17 +153,21 @@ def _sample_tuned():
 
 def test_flag_computation():
     tuned = _sample_tuned()
-    # adamw: all five dims, maxrregcount>0 emitted. arch passed as internal
-    # "sm_90a" must still resolve via canonicalization to the "sm_90" key.
+    # adamw: its SAFE-floor dims emitted in _EMIT_ORDER (mega_block, tile_m,
+    # tile_n, dec_dw_splitk, prod_regs, cons_regs), then maxrregcount>0 as a
+    # real ptxas flag. arch passed as internal "sm_90a" must still resolve via
+    # canonicalization to the "sm_90" key.
     eq(ti.source_extra_nvcc_flags("adamw", tuned, "sm_90a"),
-       ["-DSG_TUNED_BLOCK_SIZE=128", "-DSG_TUNED_VEC_WIDTH=2",
-        "-DSG_TUNED_UNROLL=4", "-DSG_TUNED_ASYNC_DEPTH=3",
+       ["-DSG_TUNED_MEGA_BLOCK=128", "-DSG_TUNED_TILE_M=128",
+        "-DSG_TUNED_TILE_N=64", "-DSG_TUNED_DEC_DW_SPLITK=4",
+        "-DSG_TUNED_PROD_REGS=40", "-DSG_TUNED_CONS_REGS=232",
         "--maxrregcount=64"],
        "adamw flags (sm_90a canonicalizes to sm_90)")
     # muon: maxrregcount==0 -> OMITTED (nvcc default register allocator).
     eq(ti.source_extra_nvcc_flags("muon", tuned, "sm_90"),
-       ["-DSG_TUNED_BLOCK_SIZE=256", "-DSG_TUNED_VEC_WIDTH=4",
-        "-DSG_TUNED_UNROLL=1", "-DSG_TUNED_ASYNC_DEPTH=2"],
+       ["-DSG_TUNED_MEGA_BLOCK=256", "-DSG_TUNED_TILE_M=64",
+        "-DSG_TUNED_TILE_N=128", "-DSG_TUNED_VIT_DW_SPLITK=2",
+        "-DSG_TUNED_PROD_REGS=48", "-DSG_TUNED_CONS_REGS=224"],
        "muon flags (maxrregcount=0 omitted)")
     # ambiguous TU (optimizer None) -> [].
     eq(ti.source_extra_nvcc_flags(None, tuned, "sm_90"), [],
@@ -156,12 +195,14 @@ def test_compute_source_flags_mapping():
         "csrc/backends/cuda/sm_90/launch_lion.cu",        # lion: not in JSON
     ]
     m = ti.compute_source_flags(srcs, tuned, "sm_90")
-    # adamw launcher gets adamw's block.
+    # adamw launcher gets adamw's mega_block (the lead SAFE-floor dim).
     eq(m.get("csrc/backends/cuda/sm_90/launch_adamw.cu", [None])[0],
-       "-DSG_TUNED_BLOCK_SIZE=128", "adamw launcher -> adamw block")
-    # supergrok2 mega cell gets supergrok2's block (512).
+       "-DSG_TUNED_MEGA_BLOCK=128", "adamw launcher -> adamw mega_block")
+    # supergrok2 mega cell gets supergrok2's mega_block (512). (Flat sample
+    # schema => model is ignored, so the vit cell still resolves supergrok2.)
     eq(m.get("csrc/fused/sm_90/mega_vit_supergrok2.cu", [None])[0],
-       "-DSG_TUNED_BLOCK_SIZE=512", "supergrok2 mega cell -> supergrok2 block")
+       "-DSG_TUNED_MEGA_BLOCK=512",
+       "supergrok2 mega cell -> supergrok2 mega_block")
     # unrelated .cpp, model .cu, and untuned lion are absent from the map.
     check("csrc/bindings/dispatch.cpp" not in m,
           "dispatch.cpp must get NO flags")
@@ -234,11 +275,13 @@ def test_ninja_rewrite():
         check("--use_fast_math" in ln and "compute_90a" in ln,
               f"base flags preserved in override: {ln!r}")
 
-    # adamw override present with its values + maxrregcount.
-    check(re.search(r"SG_TUNED_BLOCK_SIZE=128.*--maxrregcount=64", text)
-          is not None, "adamw override has block=128 and --maxrregcount=64")
+    # adamw override present with its values + maxrregcount (mega_block precedes
+    # maxrregcount in the deterministic emit order).
+    check(re.search(r"SG_TUNED_MEGA_BLOCK=128.*--maxrregcount=64", text)
+          is not None,
+          "adamw override has mega_block=128 and --maxrregcount=64")
     # muon override present, NO maxrregcount (0 omitted).
-    muon_ov = [ln for ln in overrides if "SG_TUNED_BLOCK_SIZE=256" in ln]
+    muon_ov = [ln for ln in overrides if "SG_TUNED_MEGA_BLOCK=256" in ln]
     eq(len(muon_ov), 1, "muon override present")
     check("--maxrregcount" not in muon_ov[0],
           "muon override omits --maxrregcount (was 0)")
@@ -283,14 +326,17 @@ def test_export_merge_roundtrip():
 
     ok1 = ti.export_winner(
         "adamw", "decoder", "sm_90a",
-        {"block": 128, "vec": 2, "unroll": 4, "async_depth": 3,
-         "maxrregcount": 64, "timing_ms": 1.23, "config_key": "deadbeef",
-         "cluster_shape": (2, 1, 1)},  # tuple dim must NOT be persisted.
+        {"mega_block": 128, "tile_m": 128, "tile_n": 64, "dec_dw_splitk": 4,
+         "prod_regs": 40, "cons_regs": 232, "maxrregcount": 64,
+         "timing_ms": 1.23, "config_key": "deadbeef",
+         # tuple dim w/ NO macro_map => must NOT persist (the extra-dim path
+         # only persists dims named in the producer-derived _macros map).
+         "cluster_shape": (2, 1, 1)},
         path=jp)
     check(ok1, "export_winner adamw returned True")
     ok2 = ti.export_winner(
         "muon", "vit", "sm_90",
-        {"block": 256, "vec": 4, "unroll": 1, "async_depth": 2,
+        {"mega_block": 256, "tile_m": 64, "tile_n": 128, "vit_dw_splitk": 2,
          "maxrregcount": 0},
         path=jp)
     check(ok2, "export_winner muon returned True")
@@ -303,21 +349,25 @@ def test_export_merge_roundtrip():
           and "muon" in data["sm_90"].get("vit", {}),
           "both adamw(decoder) and muon(vit) winners present after merge")
     # only the safe per-TU dims (+ model provenance) persisted; internal
-    # autotuner keys and tuple dims dropped.
+    # autotuner keys and (map-less) tuple dims dropped.
     a = data["sm_90"]["decoder"]["adamw"]
-    eq(a["block"], 128, "adamw block persisted")
+    eq(a["mega_block"], 128, "adamw mega_block persisted")
+    eq(a["tile_m"], 128, "adamw tile_m persisted")
+    eq(a["dec_dw_splitk"], 4, "adamw dec_dw_splitk persisted")
     eq(a["maxrregcount"], 64, "adamw maxrregcount persisted")
     eq(a.get("model"), "decoder", "adamw model provenance persisted")
     check("timing_ms" not in a, "timing_ms NOT persisted")
     check("config_key" not in a, "config_key NOT persisted")
-    check("cluster_shape" not in a, "cluster_shape (tuple) NOT persisted")
+    check("cluster_shape" not in a,
+          "cluster_shape (tuple, no macro_map) NOT persisted")
     # _meta present.
     check("_meta" in data and "timestamp" in data["_meta"],
           "_meta with timestamp present")
 
     # load_tuned reads it back identically (nested per-model shape, #12).
     rt = ti.load_tuned(jp)
-    eq(rt["sm_90"]["vit"]["muon"]["vec"], 4, "load_tuned round-trips muon vec")
+    eq(rt["sm_90"]["vit"]["muon"]["tile_n"], 128,
+       "load_tuned round-trips muon tile_n")
 
     # export_winner must NEVER raise / must return False on a bad path,
     # never propagate (fail-closed). Use a path whose "directory" is actually
@@ -327,32 +377,61 @@ def test_export_merge_roundtrip():
     afile = os.path.join(d, "a_regular_file")
     with open(afile, "w", encoding="utf-8") as fh:
         fh.write("x")
-    bad = ti.export_winner("adamw", "decoder", "sm_90", {"block": 1},
+    bad = ti.export_winner("adamw", "decoder", "sm_90", {"mega_block": 1},
                            path=os.path.join(afile, "sub", "_k.json"))
     check(bad is False, "export_winner on unwritable path returns False")
 
 
 # --------------------------------------------------------------------------
-# 5. Drift guard: MACROS source-of-truth vs the committed kernel header.
+# 5. Drift guard: MACROS source-of-truth vs the LIVE committed kernel headers.
+#
+# The eager grokking_optimizers/kernels/sm_90/*_sm90.cuh headers (whose guards
+# were SG_TUNED_BLOCK_SIZE/VEC_WIDTH/UNROLL/ASYNC_DEPTH) were DELETED; the macros
+# the committed kernels actually read now live in csrc/. This scans the LIVE
+# headers that carry each floor macro's `#ifndef SG_TUNED_X / #define SG_TUNED_X
+# N` guard (the file:line set documented next to MACROS in _tuned_inject.py) and
+# asserts every macro in header_default_macros() is #defined there with the
+# matching default — so a kernel renaming/redefaulting a guard, or the MACROS
+# table drifting from the headers, fails HERE (silent -D no-ops / missed guards).
 # --------------------------------------------------------------------------
+# Headers in include-priority order: the substrate (wgmma.cuh) and the
+# common/pipeline headers are #included first, so when a macro is multiply
+# #ifndef'd (e.g. SG_TUNED_TILE_M is also re-guarded =64 in the mamba TC stage)
+# the FIRST default seen wins — exactly what the MACROS table records.
+_DRIFT_HEADERS = (
+    os.path.join("csrc", "backends", "cuda", "sm_90", "wgmma.cuh"),
+    os.path.join("csrc", "backends", "cuda", "sm_90", "tile_pipeline.cuh"),
+    os.path.join("csrc", "fused", "megakernel_common.cuh"),
+    os.path.join("csrc", "fused", "sm_90", "model_stage_decoder_tc.cuh"),
+    os.path.join("csrc", "fused", "sm_90", "model_stage_vit_tc.cuh"),
+    os.path.join("csrc", "fused", "sm_90", "model_stage_mamba_tc.cuh"),
+)
+
+
 def test_macro_drift_against_header():
-    header = os.path.join(_REPO_ROOT, "grokking_optimizers", "kernels",
-                          "sm_90", "adamw_sm90.cuh")
-    if not os.path.isfile(header):
-        print("  SKIP: adamw_sm90.cuh not found (drift check skipped)")
-        return
-    text = open(header, encoding="utf-8").read()
-    # Parse `#define SG_TUNED_X <int>` guarded by `#ifndef SG_TUNED_X`.
+    # Parse `#define SG_TUNED_X <int>` across the live floor headers; first
+    # definition per macro wins (include order above).
     parsed = {}
-    for m in re.finditer(r"#define\s+(SG_TUNED_[A-Z0-9_]+)\s+(\d+)", text):
-        parsed[m.group(1)] = int(m.group(2))
-    expected = ti.header_default_macros()  # {macro: default}
+    seen_any = False
+    for rel in _DRIFT_HEADERS:
+        header = os.path.join(_REPO_ROOT, rel)
+        if not os.path.isfile(header):
+            continue
+        seen_any = True
+        text = open(header, encoding="utf-8").read()
+        for m in re.finditer(r"#define\s+(SG_TUNED_[A-Z0-9_]+)\s+(\d+)", text):
+            parsed.setdefault(m.group(1), int(m.group(2)))
+    if not seen_any:
+        print("  SKIP: no live SG_TUNED floor headers found under csrc/ "
+              "(drift check skipped)")
+        return
+    expected = ti.header_default_macros()  # {macro: default} (kind=='macro')
     for macro, default in expected.items():
         check(macro in parsed,
-              f"macro {macro} from MACROS is #defined in adamw_sm90.cuh")
+              f"macro {macro} from MACROS is #defined in a live csrc/ header")
         if macro in parsed:
             eq(parsed[macro], default,
-               f"{macro} default in header matches MACROS table")
+               f"{macro} default in the committed header matches MACROS table")
 
 
 # --------------------------------------------------------------------------
@@ -454,9 +533,9 @@ def test_torch_integration_real_ninja_writer():
     eq(len(overrides), 2,
        "2 override lines injected into torch's real build.ninja "
        "(adamw + muon .cu edges)")
-    check(any("SG_TUNED_BLOCK_SIZE=128" in ln for ln in overrides),
+    check(any("SG_TUNED_MEGA_BLOCK=128" in ln for ln in overrides),
           "adamw override present in torch's real build.ninja")
-    check(any("SG_TUNED_BLOCK_SIZE=256" in ln for ln in overrides),
+    check(any("SG_TUNED_MEGA_BLOCK=256" in ln for ln in overrides),
           "muon override present in torch's real build.ninja")
     for ln in overrides:
         check("--use_fast_math" in ln and "compute_90a" in ln,

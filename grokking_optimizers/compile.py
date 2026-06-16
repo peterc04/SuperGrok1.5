@@ -1282,6 +1282,37 @@ _LIVE_TUNING_DIMS: frozenset = frozenset({
 # byte-identical to the depth-4 build yet forced a fresh (wasted) compile.
 _ASYNC_DEPTH_MAX: int = 4
 
+# Dims whose macro reshapes a tensor-core / GEMM mainloop (stage count, warp
+# interleave, software-pipeline depth). They route through the tensor-core
+# timing path — i.e. they are PTX-shaping knobs that change the wgmma/mma
+# schedule rather than a plain elementwise launch geometry. A consumer that
+# wants only the GEMM-tile-relevant device flags (e.g. a tensor-core micro-
+# benchmark harness) can intersect a config against this set. ``maxrregcount``
+# is intentionally NOT here: it is a global register cap, not a tile-shape knob.
+# _GEMM_TILE_DIM_NAMES — the set of tuning dims whose macros are read ONLY by
+# the real TC GEMM/tile path (so a config varying any of them must be timed on
+# the real TC step, not the cheap opt.step() timer). Defined canonically next to
+# _config_touches_gemm_tile_dim (search "_GEMM_TILE_DIM_NAMES: frozenset"); it
+# deliberately EXCLUDES cheap-timer-visible dims like block/vec/unroll.
+
+# Bare-compiler-flag tuning dims (``macro=None``): the value is emitted as a
+# real ptxas/llvm flag (e.g. ``--maxrregcount=N``, ``-Xptxas --opt-level=N``)
+# rather than a ``-DSG_TUNED_*`` macro, so it ALWAYS reshapes codegen and is
+# never auto-pinned as dead. ``resolve_extra_nvcc_flags`` matches on the dim
+# name to know which flag to emit.
+_PTXAS_FLAG_DIMS: frozenset = frozenset({
+    "maxrregcount", "opt_level", "allow_expensive_opts",
+})
+
+# Suggested 2-point on/off sweep for PROMOTING an auto-discovered boolean knob
+# to an actually-swept dim. NOTE: auto-derived dims are no longer swept blindly
+# — :func:`_auto_derived_dims` PINS each discovered ``#ifndef SG_TUNED_X`` knob
+# to its in-source ``#define`` default (a blanket [2,1] probe broke knobs with a
+# single-legal-value static_assert, e.g. SG_TUNED_VIT_TILE_M=1088). This list is
+# kept only as the conventional value set to copy when a maintainer adds an
+# explicit ``_dim(...)`` to sweep a genuinely on/off knob.
+_AUTO_DERIVED_DIM_VALUES: List[int] = [2, 1]
+
 
 _KERNEL_MACRO_CACHE: Optional[frozenset] = None
 
@@ -1317,6 +1348,171 @@ def _kernel_source_macros() -> frozenset:
                     continue
     _KERNEL_MACRO_CACHE = frozenset(found)
     return _KERNEL_MACRO_CACHE
+
+
+_KERNEL_IFNDEF_CACHE: Optional[frozenset] = None
+_KERNEL_IFNDEF_DEFAULTS_CACHE: Optional[Dict[str, str]] = None
+
+
+def _scan_kernel_ifndef() -> None:
+    """Scan the committed kernel trees ONCE for every ``#ifndef SG_TUNED_X``
+    guard AND the ``#define SG_TUNED_X <default>`` that immediately follows it,
+    populating both module caches (memoized; a cheap no-op once warm).
+
+    A tunable kernel wraps its default in::
+
+        #ifndef SG_TUNED_FOO
+        #define SG_TUNED_FOO <default>
+        #endif
+
+    so the autotuner can override the default with ``-DSG_TUNED_FOO=VAL``. We
+    record the guard token (so the search-space builder can AUTO-ADD a dim for a
+    newly-exposed knob with zero edits here) AND its in-source default (so an
+    auto-derived knob is PINNED to a byte-identical value rather than blindly
+    swept — a blanket sweep can violate a kernel ``static_assert``, e.g.
+    ``SG_TUNED_VIT_TILE_M`` has a single legal value). Pure ``//`` comment lines
+    are skipped so a commented-out guard doesn't inflate the space. Leaves both
+    caches empty-but-set when no source tree is visible (installed wheel).
+    """
+    global _KERNEL_IFNDEF_CACHE, _KERNEL_IFNDEF_DEFAULTS_CACHE
+    if _KERNEL_IFNDEF_CACHE is not None:
+        return
+    import re as _re
+    roots = [REPO_ROOT / "csrc", REPO_ROOT / "grokking_optimizers" / "kernels"]
+    # Anchored at line start (after optional whitespace): ``#ifndef SG_TUNED_X``.
+    ifndef_pat = _re.compile(r"^\s*#\s*ifndef\s+(SG_TUNED_[A-Z0-9_]+)")
+    # ``#define SG_TUNED_X <value...>`` — value is the remainder of the line.
+    define_pat = _re.compile(
+        r"^\s*#\s*define\s+(SG_TUNED_[A-Z0-9_]+)\s+(.+?)\s*$")
+    exts = {".cu", ".cuh", ".h", ".hpp", ".hip", ".cpp", ".cc", ".cxx"}
+    found: set = set()
+    defaults: Dict[str, str] = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if p.suffix not in exts:
+                continue
+            try:
+                text = p.read_text(errors="ignore")
+            except OSError:
+                continue
+            lines = text.splitlines()
+            n = len(lines)
+            for i, line in enumerate(lines):
+                if line.lstrip().startswith("//"):
+                    continue  # comment-only line — not a live guard
+                m = ifndef_pat.match(line)
+                if not m:
+                    continue
+                macro = m.group(1)
+                found.add(macro)
+                # Look ahead a few lines for the matching ``#define`` default.
+                for j in range(i + 1, min(i + 4, n)):
+                    dm = define_pat.match(lines[j])
+                    if dm and dm.group(1) == macro:
+                        val = dm.group(2)
+                        for cmark in ("//", "/*"):  # strip a trailing comment
+                            k = val.find(cmark)
+                            if k != -1:
+                                val = val[:k].rstrip()
+                        if val and macro not in defaults:
+                            defaults[macro] = val
+                        break
+    _KERNEL_IFNDEF_CACHE = frozenset(found)
+    _KERNEL_IFNDEF_DEFAULTS_CACHE = defaults
+
+
+def _kernel_ifndef_macros() -> frozenset:
+    """The set of ``#ifndef SG_TUNED_X`` guard tokens the committed kernels
+    expose (see :func:`_scan_kernel_ifndef`). Lets the search-space builder
+    auto-derive a dim for any knob a kernel exposes. Cached; empty when no
+    source tree is visible (installed wheel without kernels/)."""
+    _scan_kernel_ifndef()
+    return _KERNEL_IFNDEF_CACHE if _KERNEL_IFNDEF_CACHE is not None else frozenset()
+
+
+def _kernel_ifndef_defaults() -> Dict[str, str]:
+    """Map each ``#ifndef SG_TUNED_X`` guard to its in-source ``#define``
+    default — the value the kernel uses when the autotuner passes no override.
+    Used to PIN an auto-discovered knob to a byte-identical default instead of
+    blindly sweeping it. Cached; empty when no source tree is visible."""
+    _scan_kernel_ifndef()
+    return dict(_KERNEL_IFNDEF_DEFAULTS_CACHE or {})
+
+
+def _macro_has_explicit_dim(macro: str, dims: List[Dict[str, Any]]) -> bool:
+    """True if ``macro`` (or a derived ``macro_*`` variant, e.g. the
+    per-component ``SG_TUNED_CLUSTER_SHAPE_0`` a tuple dim expands to) is
+    already declared by some hand-written dim in ``dims``."""
+    for d in dims:
+        dm = d.get("macro")
+        if dm and (dm == macro or macro.startswith(dm + "_")):
+            return True
+    return False
+
+
+def _macro_to_dim_name(macro: str) -> str:
+    """Derive a stable dim ``name`` from an ``SG_TUNED_X`` macro token —
+    ``SG_TUNED_PIPE_DEPTH`` -> ``pipe_depth``. Lower-cased, prefix stripped."""
+    base = macro[len("SG_TUNED_"):] if macro.startswith("SG_TUNED_") else macro
+    return base.lower()
+
+
+def _auto_derived_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a PINNED dim for every ``#ifndef SG_TUNED_*`` guard the kernels
+    expose that has NO explicit dim in ``dims``.
+
+    This is the self-configuring half of the search space: a kernel that adds a
+    new ``#ifndef SG_TUNED_FOO`` knob is DISCOVERED here with zero edits, so the
+    space always knows the kernels' full tuning surface (drift-proof) and every
+    knob is registered in ``config_key`` + emittable. Hand-written dims always
+    WIN — they're treated as overrides (richer value lists, custom
+    ``applies_to``/``kind``), so the explicit GEMM/tile/etc. specs in the per-arch
+    builders are unaffected.
+
+    An auto-derived knob is PINNED to its in-source ``#define`` default (a
+    single-value dim → ×1 in the Cartesian product, byte-identical canonical
+    build), NOT blindly swept. A blanket sweep is unsafe: many knobs carry a
+    compile-time ``static_assert`` (e.g. ``SG_TUNED_VIT_TILE_M`` has exactly one
+    legal value, 1088) or are sized constants (``pscan_block=512``) where an
+    arbitrary probe value would fail to compile or waste trial budget. PROMOTING
+    a discovered knob to an actually-swept dim is a deliberate, vetted act — add
+    an explicit ``_dim(name, ..., [hand-checked values], MACRO, ...)`` to the
+    relevant per-arch builder (it wins over this auto entry). A guard whose
+    default can't be read is left to its kernel ``#ifndef`` (discovery-only, no
+    dim added) so we never emit an unvetted ``-D`` value.
+    """
+    guarded = _kernel_ifndef_macros()
+    if not guarded:
+        return []
+    defaults = _kernel_ifndef_defaults()
+    extra: List[Dict[str, Any]] = []
+    seen_names = {d.get("name") for d in dims}
+    for macro in sorted(guarded):
+        if _macro_has_explicit_dim(macro, dims):
+            continue
+        name = _macro_to_dim_name(macro)
+        if name in seen_names:
+            continue
+        raw = defaults.get(macro)
+        if raw is None:
+            continue  # discovery-only: no readable default → don't risk a value
+        try:
+            value: Any = int(raw, 0)  # decimal or 0x…
+            dtype = "int"
+        except (TypeError, ValueError):
+            value, dtype = raw, "enum"  # symbolic default (e.g. an enum token)
+        seen_names.add(name)
+        extra.append(_dim(name, dtype, [value], macro, ["device"]))
+    return extra
+
+
+def _with_auto_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append auto-derived dims (for kernel ``#ifndef`` knobs lacking an
+    explicit spec) to a hand-written dim list, in place, and return it."""
+    dims.extend(_auto_derived_dims(dims))
+    return dims
 
 
 def _is_dead_dim(spec: Dict[str, Any]) -> bool:
@@ -1435,13 +1631,25 @@ def _dead_key_dims() -> frozenset:
 
 
 def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Collapse every DEAD tuning dim to a single pinned default value.
+    """Append auto-derived dims, then collapse every DEAD tuning dim to a
+    single pinned default value.
 
-    The dim object is preserved (so the macro is still emitted and can be
-    revived) but its ``values`` list is truncated to its first entry, removing
-    it from the Cartesian product. Mutates and returns ``dims``. Live dims and
-    Pallas kwargs are untouched.
+    First the search space self-configures: any ``#ifndef SG_TUNED_*`` knob a
+    kernel exposes that lacks an explicit dim gets a default 2-value dim added
+    (:func:`_auto_derived_dims`). Then each DEAD dim — one whose macro no
+    committed kernel reads, so sweeping it just burns compiles on byte-identical
+    binaries — is pinned: its dim object is preserved (so the macro is still
+    emittable and can be revived) but its ``values`` list is truncated to its
+    first entry, removing it from the Cartesian product.
+
+    This is also where confirmed-DEAD dims on the current arch get inerted: a
+    ``-DSG_TUNED_*`` macro dim (block/vec/unroll/async_depth on an arch whose
+    kernels no longer ``#ifndef`` it, plus every never-consumed shape macro) is
+    pinned to one value so it can't waste trial budget — yet the dim stays in
+    the space so a different vendor (e.g. HIP) that DOES consume it still sweeps
+    it. Mutates and returns ``dims``. Live dims and Pallas kwargs are untouched.
     """
+    _with_auto_dims(dims)
     for d in dims:
         if _is_dead_dim(d):
             vals = d.get("values") or []
@@ -1601,6 +1809,14 @@ def _build_cuda_space(arch_key: str,
     dims: List[Dict[str, Any]] = [
         _dim("block", "int", _cuda_block_values(arch_key),
              "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+        # ptxas optimizer knobs (bare flags, macro=None — always LIVE, see
+        # _PTXAS_FLAG_DIMS / resolve_extra_nvcc_flags). Default value first.
+        # Placed in the geometry head (before the high-cardinality
+        # maxrregcount tail) to keep prefilter-discriminating dims early in
+        # the Cartesian iteration.
+        _dim("opt_level", "int", [3, 2], None, ["device"]),
+        _dim("allow_expensive_opts", "bool", [False, True],
+             None, ["device"]),
         _dim("vec", "int", vec_values,
              "SG_TUNED_VEC_WIDTH", ["host", "device"]),
         _dim("unroll", "int", unroll_values,
@@ -1663,6 +1879,19 @@ def _build_cuda_space(arch_key: str,
         dims.append(_dim("tcgen05_variant", "enum",
                          ["tma_a", "tma_b", "mma", "tma_mma"],
                          "SG_TUNED_TCGEN05_VARIANT", ["device"]))
+
+    # NOTE: the L3-TC GEMM-mainloop knobs (dec/mb_gemm_stages,
+    # dec/mb/vit_gemm_interleave, pipe_depth) are DELIBERATELY NOT declared here.
+    # They are consumed only by the sm_90 tensor-core megakernel
+    # (csrc/fused/sm_90/*), so they belong solely to _sm90_full_space (which
+    # sweeps them with vetted value lists). Every OTHER CUDA arch served by this
+    # generic builder is bodyless today (its tuning configs collapse to one
+    # generic binary that reads none of these macros — see
+    # _arches_with_kernel_body), so sweeping them here only burns compiles on
+    # byte-identical binaries. _auto_derived_dims still DISCOVERS each guard and
+    # PINS it to its in-source default on these arches (×1, byte-identical), so
+    # nothing is silently un-tracked; a future Blackwell TC body would add its
+    # own explicit sweep to a per-arch builder, exactly as sm_90 does.
 
     return {
         "dims": _pin_dead_dims(dims),
@@ -1851,6 +2080,19 @@ def _sm90_full_space() -> Dict[str, Any]:
         "dims": _pin_dead_dims([
             _dim("block", "int", list(range(32, 1025, 32)),
                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+            # --- ptxas optimizer knobs (bare compiler flags, macro=None) -----
+            # opt_level tunes ptxas's own PTX optimization (-Xptxas
+            # --opt-level=N); allow_expensive_opts toggles ptxas's expensive
+            # optimization passes. Both are LIVE — they change codegen directly
+            # — so _is_dead_dim keeps them swept (never pinned). Emitted by
+            # resolve_extra_nvcc_flags, matched on the dim name (like
+            # maxrregcount). Default value first so the canonical build matches
+            # the base flag list. Kept adjacent to the geometry head (before the
+            # high-cardinality maxrregcount/cluster_shape tail) so the Cartesian
+            # iteration still reaches vec>1 inside a small prefix window.
+            _dim("opt_level", "int", [3, 2], None, ["device"]),
+            _dim("allow_expensive_opts", "bool", [False, True],
+                 None, ["device"]),
             _dim("vec", "int", [1, 2, 4, 8, 16],
                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
@@ -1951,6 +2193,26 @@ def _sm90_full_space() -> Dict[str, Any]:
             # _ASYNC_DEPTH_MAX (was list(range(1, 17))).
             _dim("async_depth", "int", list(range(1, _ASYNC_DEPTH_MAX + 1)),
                  "SG_TUNED_ASYNC_DEPTH", ["device"]),
+            # --- GEMM-mainloop PTX-shaping knobs ------------------------------
+            # These reshape the wgmma/mma software pipeline (stage count, warp
+            # interleave factor, pipeline depth). Each is auto-pinned by
+            # _pin_dead_dims until the matching kernel exposes its
+            # ``#ifndef SG_TUNED_*`` guard, then auto-activates — so declaring
+            # them here is forward-compatible, not a hardcode that wastes
+            # budget today. Listed in _GEMM_TILE_DIM_NAMES so a tensor-core
+            # timing harness can route them through the TC path.
+            _dim("dec_gemm_stages", "int", [2, 1],
+                 "SG_TUNED_DEC_GEMM_STAGES", ["device"]),
+            _dim("mb_gemm_stages", "int", [2, 1],
+                 "SG_TUNED_MB_GEMM_STAGES", ["device"]),
+            _dim("dec_gemm_interleave", "int", [2, 1, 3, 4],
+                 "SG_TUNED_DEC_GEMM_INTERLEAVE", ["device"]),
+            _dim("mb_gemm_interleave", "int", [2, 1, 3, 4],
+                 "SG_TUNED_MB_GEMM_INTERLEAVE", ["device"]),
+            _dim("vit_gemm_interleave", "int", [2, 1, 3, 4],
+                 "SG_TUNED_VIT_GEMM_INTERLEAVE", ["device"]),
+            _dim("pipe_depth", "int", [2, 3],
+                 "SG_TUNED_PIPE_DEPTH", ["device"]),
         ]),
         "prefilter": {
             "register_pressure_max": 255,
@@ -2923,15 +3185,38 @@ def resolve_extra_nvcc_flags(config: Dict[str, Any],
 
     Currently emits:
       - ``maxrregcount`` -> ``--maxrregcount=N``
+      - ``opt_level`` -> ``-Xptxas --opt-level=N`` (ptxas PTX optimization)
+      - ``allow_expensive_opts`` -> ``-Xptxas
+        --allow-expensive-optimizations=true`` (only when the dim is True)
       - feature macros for arch capabilities (TMA, fp4/fp8, cluster, ...)
       - layout macros for tuned dtypes (e.g. ``fp8_layout=e4m3`` -> ``-DCUDA_FP8_E4M3=1``)
+
+    The ptxas knobs (``macro is None`` bare-flag dims, see ``_PTXAS_FLAG_DIMS``)
+    are emitted as space-separated argv pairs (``-Xptxas`` then the long-form
+    option), matching ``NVCC_DEVICE_BASE``. ptxas honors the LAST ``--opt-level``
+    on its line, so a tuned value cleanly overrides the base ``--opt-level=3``.
     """
     out: List[str] = []
     for spec in dim_specs:
-        if spec.get("macro") is None and spec["name"] == "maxrregcount":
+        if spec.get("macro") is not None:
+            continue
+        name = spec.get("name")
+        if name == "maxrregcount":
             v = config.get("maxrregcount")
             if v is not None:
                 out.append(f"--maxrregcount={int(v)}")
+        elif name == "opt_level":
+            v = config.get("opt_level")
+            if v is not None:
+                out.extend(["-Xptxas", f"--opt-level={int(v)}"])
+        elif name == "allow_expensive_opts":
+            # Only emit on True — the False (default) build stays byte-identical
+            # to today's base flags and never trips older ptxas that lacks the
+            # flag (it's a CUDA 12.5+ option; failed variants are simply dropped
+            # by the autotuner, but skipping the flag on the default avoids that
+            # entirely for the canonical config).
+            if config.get("allow_expensive_opts"):
+                out.extend(["-Xptxas", "--allow-expensive-optimizations=true"])
 
     if arch and arch in ARCH_TABLE:
         entry = get_arch_entry(arch)
@@ -5481,13 +5766,21 @@ def _cost_model_train_from_trials(
 
 
 def _make_pruned_trial_record(config: Dict[str, Any], predicted_ms: float,
-                              *, host: Optional[Dict[str, Any]] = None
+                              *, host: Optional[Dict[str, Any]] = None,
+                              prune_stage: str = "cost_model_threshold",
                               ) -> Dict[str, Any]:
     """Record shape returned by ``_make_variant_timer`` when the cost
     model rejects a candidate before building it. Slots into the same
     pipeline as ``_make_trial_record`` results — ``timing_ms`` is None
     (untimed), ``status`` is ``cost_model_pruned``, and the predicted
-    timing is preserved in ``predicted_timing_ms`` for diagnostics."""
+    timing is preserved in ``predicted_timing_ms`` for diagnostics.
+
+    ``prune_stage`` records WHICH gate pruned the candidate — the
+    absolute ``Nx best`` threshold gate (``cost_model_threshold``) or the
+    cheap multi-fidelity distributional proxy (``multi_fidelity``) — so
+    the report / sidecar can attribute skips per gate. Both gates return
+    the same ``status="cost_model_pruned"`` sentinel so the driver's
+    handling (record as PRUNED, flag the stopper) is uniform."""
     return {
         "stage":                 "tpe",
         "config":                {k: (list(v) if isinstance(v, tuple) else v)
@@ -5500,9 +5793,69 @@ def _make_pruned_trial_record(config: Dict[str, Any], predicted_ms: float,
         "host":                  host,
         "numerical_status":      "skipped",
         "status":                "cost_model_pruned",
+        "prune_stage":           prune_stage,
         "predicted_timing_ms":   float(predicted_ms),
         "recorded_at":           datetime.datetime.now().isoformat(),
     }
+
+
+def _multi_fidelity_prune_decision(
+        ms_pred: float, sigma_pred: float,
+        measured_ms: Iterable[float],
+        *, quantile: float, margin: float,
+) -> Tuple[bool, Optional[float]]:
+    """Cheap-proxy (multi-fidelity) prune decision for one candidate.
+
+    The cheapest possible fidelity: the surrogate's *predicted* timing
+    (no build, no link). Distinct from the absolute ``Nx best``
+    rejection gate — this is a DISTRIBUTIONAL rule. A candidate is
+    eligible to be killed only when its OPTIMISTIC estimate
+    ``ms_pred − sigma_pred`` (the lower confidence bound — what the
+    config could plausibly clock if the model is under-predicting its
+    quality) still lands above ``margin × Q`` where ``Q`` is the
+    ``quantile``-th percentile of the timings MEASURED so far.
+
+    Conservatism, by construction:
+      * Compares the OPTIMISTIC bound, not the mean — a config the model
+        is merely uncertain about (large σ) is never pruned.
+      * Compares against a HIGH quantile of the observed distribution,
+        never against the running best — so a config only slightly worse
+        than typical is never pruned, only ones the model is confident
+        sit in the slow tail.
+      * The ``margin`` (>1) leaves extra headroom so a config the model
+        slightly mis-ranks still earns a real measurement.
+
+    Returns ``(should_prune, quantile_threshold)``. ``should_prune`` is
+    False (and the threshold None) whenever there isn't enough measured
+    signal, the prediction is non-finite, or the optimistic bound is
+    inside the keep band. NEVER raises.
+    """
+    try:
+        finite = [float(m) for m in measured_ms
+                  if isinstance(m, (int, float)) and math.isfinite(float(m))]
+    except TypeError:
+        return False, None
+    # Need a non-trivial empirical distribution before a quantile means
+    # anything — fewer than 8 points and we keep (measure) everything.
+    if len(finite) < 8:
+        return False, None
+    if not (math.isfinite(ms_pred) and math.isfinite(sigma_pred)):
+        return False, None
+    q = min(0.99, max(0.5, float(quantile)))
+    m = max(1.0, float(margin))
+    finite.sort()
+    # Linear-interpolated empirical quantile (no numpy dependency — this
+    # runs in the hot timer path and must stay import-light).
+    pos = q * (len(finite) - 1)
+    lo_i = int(math.floor(pos))
+    hi_i = min(lo_i + 1, len(finite) - 1)
+    frac = pos - lo_i
+    q_thresh = finite[lo_i] + (finite[hi_i] - finite[lo_i]) * frac
+    if not (math.isfinite(q_thresh) and q_thresh > 0):
+        return False, None
+    optimistic = ms_pred - max(0.0, sigma_pred)
+    should_prune = optimistic > (m * q_thresh)
+    return bool(should_prune), float(q_thresh)
 
 
 # ===========================================================================
@@ -7464,15 +7817,51 @@ class BuildSpec:
     enable_polyhedral: bool = False
     config: Dict[str, Any] = field(default_factory=dict)
     # ─── Stream C — learned cost model ────────────────────────────────
-    # OFF by default; toggled by [cost_model].enable in compile_config.toml
-    # or by apply_to_buildspec() when the project config sets it. When
-    # disabled, no featurization / training / inference / rejection
-    # happens — the autotuner is byte-identical to today.
-    enable_cost_model: bool = False
+    # ON by default — the learned surrogate only ever PRUNES the *timing*
+    # of configs it is confident are far worse than the running best; it
+    # never changes which kept config gets validated, so it can never
+    # affect numerical correctness. The per-trial full compile (~5 min)
+    # is the autotune bottleneck, so skipping obviously-bad builds is a
+    # large wall-clock win. Degrades gracefully when its optional deps
+    # (xgboost / scikit-learn) are absent — see CostModel._instantiate_backend,
+    # which falls through to a numpy-only ridge regressor. Set False (or
+    # pass --no-cost-model) to force the byte-identical un-pruned search.
+    enable_cost_model: bool = True
     cost_model_retrain_every: int = 20
     cost_model_rejection_threshold_x: float = 3.0
     cost_model_rejection_max_pct: float = 0.8
     cost_model_uncertainty_method: str = "bootstrap"
+    # ─── Stream C.2 — multi-fidelity pruning ──────────────────────────
+    # A cheap proxy stage that gates which configs reach the expensive
+    # full build+time. The cheap signal is the cost-model surrogate's
+    # *predicted* timing (no build, no link) — the fastest possible
+    # fidelity. Distinct from the absolute ``Nx best`` rejection gate
+    # above: this is a DISTRIBUTIONAL rule that kills configs whose
+    # optimistic (prediction − σ) estimate lands above a high quantile
+    # of the *measured* timings observed so far, so it can prune mid-tail
+    # configs the absolute rule misses while staying conservative — a
+    # config whose lower confidence bound could plausibly beat the
+    # quantile is never pruned. Has its own independent rejection cap and
+    # shares the cost-model cold-start floor. ON by default; never
+    # affects correctness (it only skips TIMING of predicted-bad configs,
+    # never the validation of kept ones). No-op when enable_cost_model is
+    # False (the surrogate is the cheap signal).
+    multi_fidelity: bool = True
+    # Quantile of observed measured timings above which a candidate's
+    # OPTIMISTIC predicted time must land to be eligible for the cheap
+    # proxy kill. 0.75 ⇒ only prune configs the model is confident are
+    # slower than ~75% of everything measured so far.
+    multi_fidelity_quantile: float = 0.75
+    # Safety margin on the quantile gate: the optimistic estimate must
+    # exceed ``margin × quantile_threshold`` (margin > 1) before the
+    # cheap stage prunes. Conservative — leaves headroom so a config the
+    # model slightly mis-ranks can still earn a real measurement.
+    multi_fidelity_margin: float = 1.10
+    # Independent cap on the fraction of trials the multi-fidelity proxy
+    # is allowed to prune (separate budget from the absolute-threshold
+    # gate). Guards against an over-confident surrogate starving the
+    # search of real measurements.
+    multi_fidelity_max_pct: float = 0.5
     # ─── Agent-F2 — flag probe (compile-time flag validation) ────────────
     # When True (default), _device_cflags routes its full output through
     # _validate_flag_set so any flag the installed nvcc/hipcc rejects is
@@ -9002,6 +9391,8 @@ def _dry_run_all_archs(out_dir: Path,
                     getattr(spec, "enable_device_pgo", False)),
                 "enable_cost_model":             bool(
                     getattr(spec, "enable_cost_model", False)),
+                "multi_fidelity":                bool(
+                    getattr(spec, "multi_fidelity", False)),
                 "enable_emitter":                bool(
                     getattr(spec, "enable_emitter", False)),
                 "strict_numerics":               bool(
@@ -13211,7 +13602,19 @@ _TC_REAL_STEP_TU: Dict[str, str] = {
 # reads neither macro — so the real-TC timer is no more sensitive to them than
 # the cheap timer; routing them here would only add a TC rebuild for no signal.
 _GEMM_TILE_DIM_NAMES: frozenset = frozenset({
+    # #12 tile dims — read by model_stage_{decoder,vit,mamba}_tc.cuh.
     "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+    # GEMM mainloop stage / interleave knobs — also read ONLY by the real TC
+    # path (confirmed in model_stage_*_tc.cuh) so the cheap opt.step() timer is
+    # blind to them; a config that varies one is noise unless timed on the real
+    # TC step. (The Wave-1 autotuner merge added these dims; routing them here is
+    # the matching half — block/vec/unroll are deliberately NOT included because
+    # the cheap timer DOES see them.)
+    "dec_gemm_stages", "mb_gemm_stages",
+    "dec_gemm_interleave", "mb_gemm_interleave", "vit_gemm_interleave",
+    # pipe_depth is read by tile_pipeline.cuh (the wgmma SW pipeline), also
+    # invisible to the cheap timer.
+    "pipe_depth",
 })
 
 
@@ -13441,11 +13844,27 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
     Stream C — when ``cost_model_state`` is provided AND
     ``spec.enable_cost_model`` is True, the closure consults the
-    learned cost model before building each variant. Predicted-bad
-    candidates (mean > threshold × best_so_far AND sigma < 20% of mean)
-    are returned as pre-pruned trial records so the autotuner skips
-    them entirely. A cap on the rejection fraction protects against
-    over-confident models excluding the real optimum.
+    learned cost model before building each variant. Two complementary,
+    conservative pruning gates run on the SAME surrogate prediction (the
+    cheap signal — no build, no link):
+
+      1. Absolute-threshold gate — prune when the predicted mean is
+         > ``threshold × best_so_far`` AND the model is confident
+         (0 < σ < 20% of the mean). Its own ``rejection_max_pct`` cap.
+      2. Multi-fidelity proxy gate (``spec.multi_fidelity``) — a cheap
+         distributional gate: prune when the OPTIMISTIC bound
+         (pred − σ) lands above a high quantile of the timings MEASURED
+         so far (× a safety margin). Catches mid-tail configs the
+         absolute rule misses while never pruning a config that could
+         plausibly win. Independent ``multi_fidelity_max_pct`` cap.
+
+    Both return pre-pruned trial records (``status=="cost_model_pruned"``,
+    distinguished by ``prune_stage``) so the driver skips the build+time
+    entirely. NEITHER gate ever affects numerical correctness — they
+    only skip the *timing* of predicted-bad configs, never the
+    validation of kept ones. Both are no-ops below the cost-model
+    cold-start floor (every candidate is measured until the surrogate
+    has locked-clock signal).
     ``cost_model_state`` is a dict of the form::
 
         {
@@ -13453,8 +13872,11 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             "arch_entry":  ArchEntry,
             "stall_info":  Optional[dict],
             "best_so_far": float,         # mutated by the closure
-            "n_rejected":  int,           # mutated by the closure
-            "n_total":     int,           # mutated by the closure
+            "n_rejected":  int,           # absolute-gate rejections
+            "n_total":     int,           # total prediction-evaluated trials
+            "measured_ms": List[float],   # rolling measured-timing window
+            "mf_rejected": int,           # multi-fidelity prunes
+            "mf_total":    int,           # multi-fidelity eligibility checks
             "stopper":     BayesianEarlyStopper | None,
         }
     """
@@ -13693,7 +14115,59 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         cost_model_state["n_total"] = n_total
                         _LAST_NUMERICAL_STATUS[ckey] = "skipped"
                         return _make_pruned_trial_record(
-                            config, predicted_ms=ms_pred)
+                            config, predicted_ms=ms_pred,
+                            prune_stage="cost_model_threshold")
+
+                # ── Stream C.2 — multi-fidelity cheap-proxy gate ────────────
+                # Reuses the SAME (ms_pred, sigma_pred) the surrogate just
+                # produced — the cheap signal is the prediction itself, no
+                # build. Complementary to the absolute ``Nx best`` gate
+                # above: a DISTRIBUTIONAL rule that can kill mid-tail configs
+                # the absolute rule misses, while staying conservative (it
+                # prunes only when the OPTIMISTIC bound pred−σ sits above a
+                # high quantile of the MEASURED timings, with a margin). Its
+                # own independent rejection budget guards the search. No-op
+                # below the cold-start floor (we never reach here when cold).
+                if getattr(spec, "multi_fidelity", False):
+                    mf_prune, q_thresh = _multi_fidelity_prune_decision(
+                        ms_pred, sigma_pred,
+                        cost_model_state.get("measured_ms", ()),
+                        quantile=float(
+                            getattr(spec, "multi_fidelity_quantile", 0.75)
+                            or 0.75),
+                        margin=float(
+                            getattr(spec, "multi_fidelity_margin", 1.10)
+                            or 1.10),
+                    )
+                    if mf_prune:
+                        mf_total = int(
+                            cost_model_state.get("mf_total", 0)) + 1
+                        mf_rejected = int(
+                            cost_model_state.get("mf_rejected", 0))
+                        mf_cap = float(
+                            getattr(spec, "multi_fidelity_max_pct", 0.5)
+                            or 0.5)
+                        # Independent cap: only prune via the cheap proxy
+                        # while doing so keeps the proxy's own rejection
+                        # fraction under its budget. Else measure normally.
+                        if (mf_rejected + 1) / max(1, mf_total) <= mf_cap:
+                            cost_model_state["mf_rejected"] = mf_rejected + 1
+                            cost_model_state["mf_total"] = mf_total
+                            # Count toward n_total so the report's overall
+                            # skip fraction reflects BOTH gates.
+                            cost_model_state["n_total"] = int(
+                                cost_model_state.get("n_total", 0)) + 1
+                            _LAST_NUMERICAL_STATUS[ckey] = "skipped"
+                            report.write(
+                                f"    [multi-fidelity] prune {ckey[:24]} "
+                                f"pred={ms_pred:.4f}ms±{sigma_pred:.4f} "
+                                f"> q{int(getattr(spec, 'multi_fidelity_quantile', 0.75) * 100)}"
+                                f"={q_thresh:.4f}ms (cheap proxy — no build)\n")
+                            return _make_pruned_trial_record(
+                                config, predicted_ms=ms_pred,
+                                prune_stage="multi_fidelity")
+                        cost_model_state["mf_total"] = mf_total
+
                 cost_model_state["n_total"] = int(
                     cost_model_state.get("n_total", 0)) + 1
 
@@ -14313,6 +14787,14 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         "best_so_far": float("inf"),
         "n_rejected":  0,
         "n_total":     0,
+        # Stream C.2 — multi-fidelity cheap-proxy gate bookkeeping. The
+        # rolling list of MEASURED timings feeds the distributional
+        # quantile the proxy gates against; mf_rejected / mf_total are
+        # the proxy's own independent rejection budget (separate from the
+        # absolute-threshold gate's n_rejected / n_total).
+        "measured_ms": [],
+        "mf_rejected": 0,
+        "mf_total":    0,
     }
     # Fix-#2 Defect-1 — sink for the fast-math (#6) variant trials the timer
     # emits on new-best events. Owned here, written by the timer closure,
@@ -14628,6 +15110,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                 if tms_f < float(cost_model_state.get("best_so_far",
                                                       float("inf"))):
                     cost_model_state["best_so_far"] = tms_f
+                # Stream C.2 — feed the multi-fidelity proxy's empirical
+                # distribution of MEASURED timings. Bounded (keep the most
+                # recent window) so a very long sweep can't grow it without
+                # limit; the quantile is robust to the trimming.
+                _meas = cost_model_state.setdefault("measured_ms", [])
+                _meas.append(tms_f)
+                if len(_meas) > 2000:
+                    del _meas[:len(_meas) - 2000]
                 # Mandate #14 — count MEASURED trials (the cold-start floor
                 # for pruning reads this) and log prediction error vs measured
                 # so model miscalibration is observable.
@@ -14760,6 +15250,30 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     report.write(f"  [bayesian] TPE produced {len(tpe_trials)} trials; "
                  f"{n_ok} succeeded. "
                  f"stop_reason={stop_info.get('stop_reason')}\n")
+
+    # Stream C / C.2 — surface how many builds each pruning gate skipped
+    # so the operator can see the wall-clock saved (each skip ≈ one full
+    # ~5-min compile avoided) and confirm neither gate over-pruned past
+    # its cap. Counted from the trial records' prune_stage tag (uniform
+    # whether the gate fired in the TPE or refine driver).
+    if cm_enabled:
+        n_pruned_abs = sum(
+            1 for t in tpe_trials
+            if t.get("status") == "cost_model_pruned"
+            and t.get("prune_stage") == "cost_model_threshold")
+        n_pruned_mf = sum(
+            1 for t in tpe_trials
+            if t.get("status") == "cost_model_pruned"
+            and t.get("prune_stage") == "multi_fidelity")
+        n_eval = max(1, int(cost_model_state.get("n_total", 0)))
+        report.write(
+            f"  [cost-model] pruned {n_pruned_abs + n_pruned_mf} of "
+            f"{n_eval} prediction-evaluated candidates without building "
+            f"(absolute-threshold={n_pruned_abs}, "
+            f"multi-fidelity={n_pruned_mf}); "
+            f"caps: rejection_max_pct={spec.cost_model_rejection_max_pct}, "
+            f"multi_fidelity_max_pct="
+            f"{getattr(spec, 'multi_fidelity_max_pct', 0.5)}\n")
 
     # Stage 2: refine the top-K with ±2-step neighbours.
     # spec.top_k=None ⇒ topk_refine uses elbow detection.
@@ -15769,7 +16283,8 @@ def build(
     strict_numerics: bool = False,
     enable_synth_codegen: bool = True,
     enable_polyhedral: bool = True,
-    enable_cost_model: bool = True,
+    enable_cost_model: Optional[bool] = None,
+    multi_fidelity: Optional[bool] = None,
     auto_install_optional_deps: bool = False,
     cross_host: bool = False,
     cross_host_march: Optional[str] = None,
@@ -15937,17 +16452,21 @@ def build(
         cross_host=cross_host,
         cross_host_march=cross_host_march,
     )
-    # BLOCKER 1 fix — wire the ``enable_cost_model`` kwarg through to the
-    # spec. The field is defined on BuildSpec but not exposed via its
-    # constructor today; we set it after construction so the README
-    # quickstart's ``build(..., enable_cost_model=...)`` call no longer
-    # raises ``TypeError: unexpected keyword argument``. A later
-    # ``apply_to_buildspec`` call may still flip it on via the TOML
-    # ``[cost_model] enable=true`` path, but never off — same semantics as
-    # the other ``enable_*`` toggles.
+    # Wire the ``enable_cost_model`` / ``multi_fidelity`` kwargs through to
+    # the spec. Both are TRI-STATE (``Optional[bool]``): ``None`` (the
+    # default) leaves the BuildSpec field at its dataclass default — which
+    # is now ON for both — so the surrogate prunes obviously-bad builds out
+    # of the box; an explicit ``True`` forces on; an explicit ``False``
+    # forces the byte-identical un-pruned search (the ``--no-cost-model``
+    # CLI flag rides this path). The cost model only PRUNES timing of
+    # predicted-bad configs and never touches correctness, so default-on is
+    # safe. (A later ``apply_to_buildspec`` may still flip cost_model ON via
+    # the TOML ``[cost_model] enable=true`` path, never off.)
     try:
-        if enable_cost_model:
-            spec.enable_cost_model = True
+        if enable_cost_model is not None:
+            spec.enable_cost_model = bool(enable_cost_model)
+        if multi_fidelity is not None:
+            spec.multi_fidelity = bool(multi_fidelity)
     except Exception as _swexc:
         _debug_swallow('build', _swexc)
 
@@ -16913,24 +17432,39 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "<out>/dry_run_<arch>.json. Useful for CI verification "
                              "on hosts without nvcc/hipcc.")
     # Category 3a — surface existing BuildSpec capabilities through the CLI.
-    # BLOCKER 1 — ``--enable-cost-model`` flag mirrors the ``enable_cost_model``
-    # keyword on ``build()``. The README quickstart references this toggle via
-    # ``ENABLE_COST_MODEL`` (line 227 of README.md); making it a real CLI flag
-    # keeps the Python and CLI surfaces in sync.
+    # ``--enable-cost-model`` / ``--no-cost-model`` mirror the
+    # ``enable_cost_model`` keyword on ``build()``. The flag is TRI-STATE:
+    # default ``None`` leaves the BuildSpec dataclass default (now ON) in
+    # force, so the learned surrogate prunes obviously-bad builds out of the
+    # box; ``--no-cost-model`` forces the byte-identical un-pruned search.
     _cm = parser.add_mutually_exclusive_group()
     _cm.add_argument("--enable-cost-model", dest="enable_cost_model",
-                     action="store_true", default=False,
-                     help="Enable the Stream C learned cost model + "
-                          "rejection budget. Predicted-bad configs are "
-                          "skipped without timing them so the autotuner "
-                          "spends its budget on promising candidates. "
-                          "Off by default; opt in here or via "
-                          "``[cost_model] enable=true`` in the project "
-                          "TOML.")
+                     action="store_true", default=None,
+                     help="Force the Stream C learned cost model ON (it is "
+                          "already on by default). Predicted-bad configs are "
+                          "skipped without building/timing them so the "
+                          "autotuner spends its ~5-min-per-build budget on "
+                          "promising candidates.")
     _cm.add_argument("--no-cost-model", dest="enable_cost_model",
                      action="store_false",
-                     help="Force the learned cost model OFF even if a "
-                          "project config tries to enable it.")
+                     help="Force the learned cost model OFF (and with it the "
+                          "multi-fidelity proxy) — the autotune is then "
+                          "byte-identical to an un-pruned exhaustive-by-TPE "
+                          "search. Overrides any project config that enables "
+                          "it.")
+    # ``--multi-fidelity`` / ``--no-multi-fidelity`` gate the cheap-proxy
+    # stage (predicted-time distributional kill) that runs on top of the
+    # cost model. Also tri-state, default ON.
+    _mf = parser.add_mutually_exclusive_group()
+    _mf.add_argument("--multi-fidelity", dest="multi_fidelity",
+                     action="store_true", default=None,
+                     help="Force the multi-fidelity cheap-proxy pruning ON "
+                          "(default). Kills configs the surrogate is "
+                          "confident sit in the slow tail before any build.")
+    _mf.add_argument("--no-multi-fidelity", dest="multi_fidelity",
+                     action="store_false",
+                     help="Disable the multi-fidelity proxy while keeping the "
+                          "absolute-threshold cost-model gate.")
     parser.add_argument("--enable-synth-codegen", action="store_true",
                         help="Enable Stream D OpGraph-based generative codegen "
                              "alongside the Jinja2 template variant. The synth "
@@ -17283,8 +17817,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         strict_numerics=args.strict_numerics,
         enable_synth_codegen=args.enable_synth_codegen,
         enable_polyhedral=args.enable_polyhedral,
-        enable_cost_model=bool(
-            getattr(args, "enable_cost_model", False)),
+        # Tri-state: None ⇒ leave the BuildSpec default (ON) in force;
+        # --no-cost-model / --no-multi-fidelity pass False to force off.
+        enable_cost_model=getattr(args, "enable_cost_model", None),
+        multi_fidelity=getattr(args, "multi_fidelity", None),
         auto_install_optional_deps=bool(
             getattr(args, "auto_install_optional_deps", True)),
         # Mandate #23 — cpu-then-target stage implies a cross-host AOT build
@@ -17554,19 +18090,27 @@ def _self_test_search_space(run) -> None:
         to separate the legitimate all-live space from a pin-regression (the
         four dead macros num_stages / swizzle / warp_specialization / tma carry
         a ~160x product if a pin regressed). #12 added the LIVE L3-TC GEMM/tile
-        dims (tile_m·tile_n·{dec,vit,mb}_dw_splitk = 3·3·4·4·4 = 576x) on top of
-        the launch-dim base (~4.2e9), so the all-live space is now ~2.42e12. The
-        ceiling is recalibrated to 10^13: it admits the all-live space (2.42e12)
-        and still trips on a dead-inflation regression (all-live·160 ≈ 3.9e14).
+        dims (tile_m·tile_n·{dec,vit,mb}_dw_splitk = 3·3·4·4·4 = 576x); the
+        Wave-1 autotuner merge then added the LIVE ptxas optimizer flags
+        (opt_level·allow_expensive_opts = 2·2) and the L3-TC GEMM mainloop knobs
+        (dec/mb_gemm_stages·dec/mb/vit_gemm_interleave·pipe_depth =
+        2·2·4·4·4·2 = 512x), so the all-live sm_90 space is now ~8.26e14. (The
+        5 auto-DISCOVERED knobs — bw_ckpt_stride / gemm_impl / pscan_block /
+        vit_tile_m / wg_count — are PINNED to their in-source #ifndef defaults
+        by _auto_derived_dims, so they are registered/emittable but contribute
+        ×1, NOT a blanket sweep that would trip a static_assert.) The ceiling is
+        recalibrated to 10^16: it admits the all-live space (8.26e14) and still
+        trips on a dead-inflation regression (all-live·160 ≈ 1.32e17).
         Recalibration to admit genuinely-live dims is NOT suppression — no
         coverage is removed (owner rule: every perf constant stays a swept
-        SG_TUNED dim, and these tile macros ARE read by model_stage_*_tc.cuh)."""
+        SG_TUNED dim; the ptxas flags reshape codegen directly and the GEMM
+        macros ARE read by csrc/fused/sm_90/model_stage_*_tc.cuh)."""
         space = load_embedded_search_space()
         count = cartesian_count(space, "sm_90")
-        # Sanity bound — all-live sm_90 space is ~2.4e12 (#12 tile dims);
-        # dead-inflation regression is ~3.9e14.
+        # Sanity bound — all-live sm_90 space is ~8.26e14 (#12 tile dims + the
+        # Wave-1 ptxas/GEMM live dims); dead-inflation regression is ~1.32e17.
         assert count > 1_000_000, f"sm_90 count too small: {count}"
-        assert count < 10**13, f"sm_90 count unreasonably large: {count}"
+        assert count < 10**16, f"sm_90 count unreasonably large: {count}"
         # Iterator yields exactly that many items — verify on a tiny slice.
         it = cartesian(space, "sm_90")
         first_few = list(itertools.islice(it, 5))
@@ -17676,21 +18220,28 @@ def _self_test_search_space(run) -> None:
         arch-appropriate bounds.
 
         Bounds reflect the dead-dim pruning: only the LIVE dims
-        (block/vec/unroll/maxrregcount, plus async_depth/cluster_shape on
-        Hopper+) expand the CUDA/HIP product now — the dead SG_TUNED macros
-        are each pinned to a single value — so most arches' live space is
-        ~10^4..10^7, not the old ~10^6..10^13 dead-inflated range.
+        (block/vec/unroll/maxrregcount + the universally-applicable ptxas
+        optimizer flags opt_level/allow_expensive_opts, plus async_depth/
+        cluster_shape on Hopper+) expand the CUDA/HIP product now — the dead
+        SG_TUNED macros are each pinned to a single value, and L3-TC megakernel
+        knobs auto-DISCOVERED on bodyless arches are pinned to their in-source
+        default (×1) — so most arches' live space is ~10^4..10^7, not the old
+        ~10^6..10^13 dead-inflated range.
 
         sm_90a is the exception: it additionally carries the registered
         warp-launch dims (min_blocks / prod_regs / cons_regs, sm_90-only macros
-        consumed by the *_sm90.cuh launchers + the fused megakernel) AND, since
-        #12, the LIVE L3-TC GEMM/tile dims (tile_m / tile_n / {dec,vit,mb}_dw_
-        splitk — read by model_stage_*_tc.cuh; a 576x product), which lift its
-        all-live space to ~2.42e12. Its ceiling is raised to 10^13 to admit them
-        — that still trips on a dead-dim pin regression (all-live·160 ≈ 3.9e14)
-        so the guard's purpose is intact, and no live coverage is removed (owner
-        rule: every perf constant stays a swept SG_TUNED dim, no hand-tuning).
-        Every OTHER arch keeps the tight 10^8 dead-inflation ceiling."""
+        consumed by the *_sm90.cuh launchers + the fused megakernel), the LIVE
+        L3-TC GEMM/tile dims since #12 (tile_m / tile_n / {dec,vit,mb}_dw_splitk
+        — read by csrc/fused/sm_90/model_stage_*_tc.cuh; a 576x product), AND the
+        Wave-1 autotuner-merge live dims (the ptxas flags + the GEMM mainloop
+        knobs dec/mb_gemm_stages·dec/mb/vit_gemm_interleave·pipe_depth = 512x),
+        which lift its all-live space to ~8.26e14. Its ceiling is raised to 10^16
+        to admit them — that still trips on a dead-dim pin regression
+        (all-live·160 ≈ 1.32e17) so the guard's purpose is intact, and no live
+        coverage is removed (owner rule: every perf constant stays a swept
+        SG_TUNED dim, no hand-tuning). Every OTHER arch keeps the tight 10^8
+        dead-inflation ceiling (the GEMM macros are sm_90-megakernel-only, so on
+        bodyless arches they are discovered-and-pinned, never swept)."""
         space = build_full_search_space()
         all_arches = _canonical_arches()
         assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
@@ -17700,9 +18251,9 @@ def _self_test_search_space(run) -> None:
             vendor = ARCH_TABLE[arch].vendor
             if vendor in ("cuda", "hip"):
                 # sm_90a carries the extra live warp-launch dims + #12 tile dims
-                # (~2.42e12); all other CUDA/HIP arches keep the tight
-                # dead-inflation ceiling.
-                hi = 10**13 if arch == "sm_90a" else 10**8
+                # + the Wave-1 ptxas/GEMM live dims (~8.26e14); all other
+                # CUDA/HIP arches keep the tight dead-inflation ceiling.
+                hi = 10**16 if arch == "sm_90a" else 10**8
                 assert 10_000 <= cnt <= hi, (
                     f"{arch}: count {cnt} out of CUDA/HIP bounds")
             else:  # pallas
@@ -19192,6 +19743,109 @@ def _self_test_cost_model(run) -> None:
             assert abs(ms_before - ms_after) < 1e-6, (ms_before, ms_after)
     run("cost_model_save_load_round_trip",
          test_cost_model_save_load_round_trip)
+
+    def test_cost_model_default_on():
+        """Task 1 — the learned cost model and its multi-fidelity proxy
+        are ON by default on a bare BuildSpec (they only PRUNE timing of
+        predicted-bad configs, never affecting correctness)."""
+        spec = BuildSpec(optimizer="Lion", model="mamba", arch="sm_90a",
+                         out_dir=Path("/tmp/_cm_default_on_probe"))
+        assert spec.enable_cost_model is True, \
+            "enable_cost_model must default ON"
+        assert spec.multi_fidelity is True, \
+            "multi_fidelity must default ON"
+    run("cost_model_default_on", test_cost_model_default_on)
+
+    def test_cost_model_ranks_good_below_bad():
+        """Task 1 unit test — fit the surrogate on ~20 synthetic
+        (config-features → timing_ms) points where timing rises with a
+        single feature, then confirm it ranks a KNOWN-GOOD config (low
+        feature ⇒ fast) strictly BELOW a KNOWN-BAD one (high feature ⇒
+        slow). Backend-agnostic: passes on xgboost / sklearn / the
+        numpy-only ridge fallback alike."""
+        import numpy as np
+        from grokking_optimizers.compile import CostModel
+        rng = np.random.default_rng(0)
+        n, d = 20, 6
+        X = rng.random((n, d)).astype(np.float32)
+        # Monotone-in-feature-0 ground truth: bad configs (f0≈1) clock
+        # ~5x slower than good ones (f0≈0). Tiny noise.
+        y = (1.0 + 4.0 * X[:, 0]
+             + 0.02 * rng.standard_normal(n)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as td:
+            reg = CostModel("sm_90a", Path(td) / "cm.bin",
+                            uncertainty_method="bootstrap")
+            reg.fit(X, y)
+            assert reg.is_warm()
+            good = np.zeros(d, dtype=np.float32)   # f0 = 0 → fast
+            bad = np.zeros(d, dtype=np.float32)
+            bad[0] = 1.0                            # f0 = 1 → slow
+            ms_good, sig_good = reg.predict(good)
+            ms_bad, sig_bad = reg.predict(bad)
+            assert isinstance(ms_good, float) and isinstance(ms_bad, float)
+            assert sig_good >= 0.0 and sig_bad >= 0.0
+            assert ms_good < ms_bad, (
+                f"surrogate must rank good below bad: "
+                f"good={ms_good:.4f} bad={ms_bad:.4f}")
+            sys.stdout.write(
+                f"    [unit] surrogate(backend={reg._backend}): "
+                f"good={ms_good:.4f}ms (sigma={sig_good:.4f}) < "
+                f"bad={ms_bad:.4f}ms (sigma={sig_bad:.4f}) "
+                f"OK\n")
+    run("cost_model_ranks_good_below_bad",
+         test_cost_model_ranks_good_below_bad)
+
+    def test_multi_fidelity_prune_decision():
+        """Task 2 — the cheap-proxy decision is conservative: it prunes a
+        config the model is confident is far above the measured-timing
+        distribution, KEEPS a fast one, KEEPS an uncertain one (large
+        sigma puts the optimistic bound inside the keep band), and KEEPS
+        everything when there's too little measured signal."""
+        from grokking_optimizers.compile import _multi_fidelity_prune_decision
+        # Empirical distribution of measured timings, p75 ≈ 2.0.
+        measured = [1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0, 2.0, 2.0, 2.5]
+        # (a) confident-slow config (pred 5.0, tiny sigma) → PRUNE.
+        prune, q = _multi_fidelity_prune_decision(
+            5.0, 0.05, measured, quantile=0.75, margin=1.10)
+        assert prune is True and q is not None and q > 0, (prune, q)
+        # (b) fast config (pred 0.8) → KEEP (optimistic bound below q).
+        prune, _ = _multi_fidelity_prune_decision(
+            0.8, 0.05, measured, quantile=0.75, margin=1.10)
+        assert prune is False
+        # (c) slow-mean but UNCERTAIN config (pred 5.0, sigma 4.0 ⇒
+        # optimistic bound 1.0) → KEEP (could plausibly win).
+        prune, _ = _multi_fidelity_prune_decision(
+            5.0, 4.0, measured, quantile=0.75, margin=1.10)
+        assert prune is False
+        # (d) too little measured signal (< 8 points) → always KEEP.
+        prune, q = _multi_fidelity_prune_decision(
+            99.0, 0.0, [1.0, 2.0, 3.0], quantile=0.75, margin=1.10)
+        assert prune is False and q is None
+        # (e) non-finite prediction never prunes.
+        prune, _ = _multi_fidelity_prune_decision(
+            float("inf"), 0.0, measured, quantile=0.75, margin=1.10)
+        assert prune is False
+        sys.stdout.write(
+            "    [unit] multi-fidelity gate: prunes confident-slow, keeps "
+            "fast / uncertain / data-starved / non-finite OK\n")
+    run("multi_fidelity_prune_decision",
+         test_multi_fidelity_prune_decision)
+
+    def test_multi_fidelity_cap_logic():
+        """Task 2 — the proxy's independent rejection cap is honoured: an
+        always-prune proxy never exceeds multi_fidelity_max_pct of the
+        candidates it evaluates."""
+        mf_total = 0
+        mf_rejected = 0
+        cap = 0.5
+        for _ in range(100):
+            mf_total += 1
+            if (mf_rejected + 1) / max(1, mf_total) <= cap:
+                mf_rejected += 1
+        # 50% cap ⇒ ~50 of 100 pruned, never materially more.
+        assert mf_rejected <= int(cap * 100) + 1, mf_rejected
+        assert mf_rejected >= int(cap * 100) - 1, mf_rejected
+    run("multi_fidelity_cap_logic", test_multi_fidelity_cap_logic)
 
 
 def _self_test_cache(run) -> None:
@@ -22121,7 +22775,11 @@ def _self_test_codegen(run) -> None:
         except ImportError:
             return  # skip
         from grokking_optimizers import codegen as _cg
-        sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+        # Select the geometry dims the adamw template renders BY NAME (not by
+        # list position) so the test is robust to dim-ordering changes in the
+        # search space — e.g. ptxas-flag dims interleaved with the geometry head.
+        _all = build_full_search_space()["sm_90"]["dims"]
+        sm90_dims = [d for d in _all if d["name"] in ("block", "vec", "unroll")]
         cfg = {d["name"]: d["values"][0] for d in sm90_dims}
         td = Path(tempfile.mkdtemp())
         try:
@@ -22152,7 +22810,11 @@ def _self_test_codegen(run) -> None:
         from grokking_optimizers import codegen as _cg
         td = Path(tempfile.mkdtemp())
         try:
-            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+            # Geometry dims selected by name (order-independent — see
+            # test_codegen_emit_returns_path).
+            _all = build_full_search_space()["sm_90"]["dims"]
+            sm90_dims = [d for d in _all
+                         if d["name"] in ("block", "vec", "unroll")]
             cfg = {d["name"]: d["values"][0] for d in sm90_dims}
             emitted, _ = _cg.emit_variant_source(
                 cfg, sm90_dims, "adamw", "sm_90a", td)
@@ -22204,7 +22866,11 @@ def _self_test_codegen(run) -> None:
             spec = BuildSpec(
                 optimizer="adamw", model="mamba", arch="sm_90a",
                 out_dir=td, enable_emitter=True)
-            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+            # Geometry dims selected by name (order-independent — see
+            # test_codegen_emit_returns_path).
+            _all = build_full_search_space()["sm_90"]["dims"]
+            sm90_dims = [d for d in _all
+                         if d["name"] in ("block", "vec", "unroll")]
             cfg = {d["name"]: d["values"][0] for d in sm90_dims}
             # Device path triggers the emitter and stashes a path.
             flags = _variant_macros(cfg, sm90_dims, "device", spec=spec)
@@ -22623,7 +23289,11 @@ def _self_test_dry_run_all_archs(run) -> None:
                 assert pef.get("enable_polyhedral") is True, pef
 
         with tempfile.TemporaryDirectory() as td2:
-            # Default (no kwargs) → toggles all False in the manifest.
+            # Default (no kwargs) → the dry-run constructs a bare BuildSpec,
+            # so the manifest mirrors the dataclass defaults. The learned
+            # cost model and its multi-fidelity proxy are ON by default
+            # (they only PRUNE timing, never affect correctness); the other
+            # opt-in toggles remain OFF unless a kwarg / TOML turns them on.
             manifests_off = _dry_run_all_archs(Path(td2), config=None)
             for arch, m in manifests_off.items():
                 ef = m.get("enabled_features", {})
@@ -22631,9 +23301,16 @@ def _self_test_dry_run_all_archs(run) -> None:
                     f"{arch}: expected False, got {ef.get('enable_synth_codegen')!r}")
                 assert ef.get("enable_polyhedral") is False, (
                     f"{arch}: expected False, got {ef.get('enable_polyhedral')!r}")
-                # The other toggles in the contract — also False.
+                # Cost model + multi-fidelity default ON (only prune timing).
+                assert ef.get("enable_cost_model") is True, (
+                    f"{arch}: enable_cost_model should default ON, got "
+                    f"{ef.get('enable_cost_model')!r}")
+                assert ef.get("multi_fidelity") is True, (
+                    f"{arch}: multi_fidelity should default ON, got "
+                    f"{ef.get('multi_fidelity')!r}")
+                # The remaining opt-in toggles stay OFF by default.
                 for k in ("enable_runtime_specialization",
-                          "enable_device_pgo", "enable_cost_model",
+                          "enable_device_pgo",
                           "enable_emitter", "strict_numerics"):
                     assert ef.get(k) is False, f"{arch}: {k}={ef.get(k)!r}"
 
@@ -23737,7 +24414,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 238
+_SELF_TEST_EXPECTED_COUNT: int = 242
 
 
 def _self_test() -> int:

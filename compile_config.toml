@@ -1,0 +1,182 @@
+# compile_config.toml — the GROKKING project's autotune / build configuration,
+# made EXPLICIT.
+#
+# WHAT THIS IS
+#   grokking_optimizers/compile.py carries an inlined `_DEFAULT_PROJECT_CONFIG`
+#   that already encodes the SuperGrok project's historical build behaviour. This
+#   file mirrors that default verbatim so the configuration is (a) visible and
+#   version-controlled in one place instead of buried in a 30k-line module, and
+#   (b) a worked reference example of the PORTABLE config schema a foreign project
+#   would drop in to retarget compile.py at its own kernels.
+#
+# HOW IT IS LOADED
+#   compile.load_config() deep-merges, in priority order:
+#       caller --config path  >  ./compile_config.toml (this file, CWD)  >  _DEFAULT_PROJECT_CONFIG
+#   so this file in the repo root is picked up automatically (CWD_CONFIG_NAME =
+#   "compile_config.toml"). Because it reproduces the inlined defaults, a build
+#   with or without it is byte-identical — its job is documentation + proving the
+#   config path, not changing behaviour. apply_to_buildspec() copies the keys
+#   below onto the BuildSpec; sections/keys it does not recognise are merged and
+#   preserved but otherwise ignored (so the documentary [tuned_macros] table at
+#   the end is safe).
+#
+# NOTE ON TYPES: TOML has no null. Keys whose _DEFAULT_PROJECT_CONFIG value is
+#   None (e.g. autotune.max_seconds) are OMITTED here so the merge keeps the
+#   built-in None rather than forcing an invalid literal.
+
+[project]
+name    = "supergrok"
+version = "2.0.0"
+# Prefix prepended to every -D gating macro emitted by _build_macros
+# (e.g. -DSG_BUILD_OPTIMIZER_LION). MUST be a legal C-identifier fragment ending
+# in '_' (apply_to_buildspec warns otherwise).
+macro_prefix = "SG_BUILD_"
+# torch.ops template the numerical-validation subprocesses use to look up the
+# AOT / variant fused step kernel. Placeholders: {opt} {opt_lower} {opt_upper}.
+fused_op_template = "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step"
+# PORTABLE tune-hook (schema-agnostic autotune seam): "pkg.module:fn" with
+#   fn(*, so_path, model, optimizer, arch, regime, seed)
+#       -> {"output": np.ndarray, "elapsed_ms": float}
+# used for BOTH reference capture and variant run+time+validate. The grokking
+# default points at the L3-TC megakernel driver. Empty string disables it (falls
+# back to the torch.op-template numerical path).
+tune_hook = "grokking_optimizers.tune_hook:run"
+# Python package the worker / timing / pgo subprocesses import to resolve the
+# optimizer class (e.g. `from grokking_optimizers import Lion`).
+python_package = "grokking_optimizers"
+# C++ namespace surfaced into the Jinja2 template context as `project_namespace`.
+# Empty string preserves today's templates (none reference it).
+namespace = ""
+
+[sources]
+# Per-vendor device source roots (project_sources appends /<arch> for cuda/hip).
+cuda_root      = "csrc/backends/cuda"
+hip_root       = "csrc/backends/hip"
+pallas_root    = "csrc/backends/pallas"
+algorithms_dir = "csrc/algorithms"
+bindings_dir   = "csrc/bindings"
+# Destination for _write_tuned_configs_header (absolute, or repo-root-relative).
+tuned_header_path = "csrc/algorithms/tuned_configs.h"
+
+[sources.include_paths]
+# Extra -I roots. MUST be a list of strings (apply_to_buildspec type-checks this).
+extra = []
+
+# NDEBUG migration: compile.py's base device flags carry NO project opinion. The
+# grokking project's -DNDEBUG (assert-stripping; de-serializes the WGMMA mainloop)
+# is an explicit, tracked decision recorded HERE and appended to the device flags
+# by _project_device_extra_flags. CUDA_DEBUG strips it in setup.py to restore
+# asserts. A config-less generic build gets no -DNDEBUG.
+[device_cflags]
+extra = ["-DNDEBUG"]
+
+[optimizers]
+# Restricts the CLI choices + which optimizer TUs are built/tuned. Mirrors
+# dispatch.OPTIMIZERS / the inlined default. Empty list => fall back to the full
+# profile list.
+enabled = [
+    "adamw", "lion", "muon", "prodigy", "grokadamw",
+    "grokfast", "looksam", "neuralgrok",
+    "supergrok11", "supergrok15", "supergrok2",
+]
+
+[models]
+# SHORT user-API model names (canonicalize_model maps them to the canonical
+# internal "transformer_decoder" / "mamba3" / "vit" at dispatch boundaries).
+enabled = ["mamba", "decoder", "vit"]
+
+[archs]
+default = "sm_90a"
+# Empty => no allow-list restriction (every arch profile.ARCHS knows is allowed).
+allowed = []
+
+[pgo]
+workload_script = ""
+steps = 1000
+
+[autotune]
+min_improvement = 0.005
+patience = 0
+# max_seconds is None in the inlined default ("no wall-clock cap"); OMITTED here
+# because TOML has no null and the merge must keep that None, not coerce it.
+
+[codegen]
+enable_emitter = false
+template_dir = "grokking_optimizers/templates"
+# Template override map: keys "<opt>" or "<opt>:<arch_or_vendor>"; values are
+# bundled template names or absolute .j2 paths. Empty => historical probe order.
+template_overrides = {}
+
+# Stream D — generative / structural codegen. Master switch OFF => byte-identical
+# to a no-synthesis build.
+[synth_codegen]
+enable = false
+allowed_patterns = [
+    "adamw_update", "fused_adam_grad_norm", "softmax_matmul",
+    "reduce_broadcast", "parallel_scan", "bilevel_fusion",
+]
+max_fusion_depth = 3
+prefer_synth_over_template = false
+
+[runtime_specialization]
+enable = false
+cache_dir = ""
+
+[device_pgo]
+enable = false
+
+[cache]
+auto_prune_after_jit = true
+max_age_days = 30
+keep_top_n = 100
+
+[numerics]
+strict = false
+
+# Stream B — polyhedral / loop-transform scheduling search. OFF by default
+# (libclang + islpy soft deps; multiplies the search space).
+[polyhedral]
+enable = false
+max_schedules_per_template = 16
+allowed_transforms = ["tile", "fuse", "reorder", "vectorize", "parallelize"]
+tile_size_candidates = [16, 32, 64, 128]
+
+# Stream C — learned cost model. Every key OFF / inert by default (strictly
+# additive: omitting this section is byte-identical to disabling it).
+[cost_model]
+enable = false
+retrain_every = 20
+rejection_threshold_x = 3.0
+rejection_max_pct = 0.8
+uncertainty_method = "bootstrap"
+
+# --------------------------------------------------------------------------
+# DOCUMENTARY — the LIVE sm_90 tuned-macro floor.
+#
+# This section is NOT consumed by compile.py (apply_to_buildspec ignores unknown
+# sections — the merge just preserves it). It records, in one human-readable
+# place, the SAFE per-TU floor that the autotuner's winning launch params flow
+# into: each maps an autotuner search-space dim NAME (compile.py `_dim(...,
+# macro=...)`) to the -DSG_TUNED_* macro the committed sm_90 kernels read via a
+# live `#ifndef SG_TUNED_*` guard, plus its in-source default. The AUTHORITATIVE
+# copy lives in grokking_optimizers/_tuned_inject.py::MACROS (the producer/
+# consumer source of truth); this mirror exists so a reader of the project config
+# can see what gets tuned without grepping the device tree. The previous dead set
+# (SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL / ASYNC_DEPTH) guarded the DELETED
+# eager kernels/sm_90/*_sm90.cuh headers and is gone.
+#
+# Format: dim = ["MACRO", default]. maxrregcount is a real ptxas flag
+# (--maxrregcount=N), not a -D macro; 0 means "unset / emit nothing".
+[tuned_macros.macros]
+mega_block    = ["SG_TUNED_MEGA_BLOCK", 256]    # csrc/fused/megakernel_common.cuh
+tile_m        = ["SG_TUNED_TILE_M", 128]        # csrc/backends/cuda/sm_90/wgmma.cuh
+tile_n        = ["SG_TUNED_TILE_N", 128]        # csrc/backends/cuda/sm_90/wgmma.cuh
+dec_dw_splitk = ["SG_TUNED_DEC_DW_SPLITK", 4]   # csrc/fused/sm_90/model_stage_decoder_tc.cuh
+vit_dw_splitk = ["SG_TUNED_VIT_DW_SPLITK", 4]   # csrc/fused/sm_90/model_stage_vit_tc.cuh
+mb_dw_splitk  = ["SG_TUNED_MB_DW_SPLITK", 4]    # csrc/fused/sm_90/model_stage_mamba_tc.cuh
+prod_regs     = ["SG_TUNED_PROD_REGS", 40]      # csrc/backends/cuda/sm_90/tile_pipeline.cuh
+cons_regs     = ["SG_TUNED_CONS_REGS", 232]     # csrc/backends/cuda/sm_90/tile_pipeline.cuh
+
+[tuned_macros.flags]
+# ptxas codegen flag (no -D macro). 0 == unset == nvcc's own register allocator.
+maxrregcount = ["--maxrregcount", 0]
