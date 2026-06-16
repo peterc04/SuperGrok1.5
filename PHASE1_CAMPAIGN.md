@@ -410,6 +410,36 @@ at d=2048). Net decoder win this cycle: **−2.5%** (515.4→502.6 ms, 19.2→19
 (swizzle, S=3 ring, larger N) are either blocked by design invariants (static_assert ≤2 stages, no
 wgmma_n256) or parity-unsafe (swizzle re-stage), per `.opt_candidates_broad.json` dropped-list.
 
+**VIT model-track.** Probe: `SG_TUNED_VIT_DW_SPLITK` 4→2 (mirror the decoder win) @ d=2048/B=1024 →
+**5704 ms vs 5759 baseline = −1.0%, but WITHIN ViT's ±1.7% per-seed noise** (seed 7 flat: 5742 vs 5738)
+→ **NEUTRAL**, not a reliable-on-3-seeds win. ViT at d=2048 is 0.185% of roofline and the bottleneck is
+NOT the dW GEMM — it's the seq=17 / TILE_M=1088 head-CE + LN + attention (non-GEMM), exactly what
+VIT_TC_001 (head-CE vocab-tiling + out_w smem cache) targets. That candidate is a real kernel edit (not
+a `-D` toggle) and the ViT bench is ~5.8 s/step (≈25-40 min per build+gate cycle), so it is the highest-
+headroom REMAINING lever but was not landed this session (deferred — see "remaining" below). ViT GEMM-tile
+levers are roofline-inert like the decoder's.
+
+**MAMBA model-track.** Cannot run at the d=2048 roofline scale — the Mamba-3 TC megakernel allocates the
+per-sample `MambaSampleSmem` as DYNAMIC smem (cudaFuncSetAttribute), and that struct's max-fitting d under
+the H100 227 KB cap is **~d=142** (d=128 = 215,844 B fits; the smem grows with d_inner/d_ff/n_heads). So
+mamba's roofline stays at production d=128 (221.6 ms, 0.03% — scan-dominated, tiny GEMM FLOPs). No d=2048
+kernel-opt cycling is possible; the scan-megakernel perf-optimization is a separate (non-roofline) workstream.
+
+### KERNEL-TRACK CONVERGED SUMMARY (this session)
+- **1 KEPT win**: decoder DW split-K 4→2, **−2.5%** at d=2048 (515.4→502.6 ms, 19.2→19.7 TF/s), commit
+  `a625227`, fp64 gate 33/33 @ seed42 + A/A/A 14/14. The production `_ops` ships this.
+- **Ledger**: decoder split-K=8 SKIP(+2.6%) · split-K=2 KEEP(−2.5%) · IL=4 REJECT(A/A/A determinism fail)
+  · vec4 NEUTRAL(P3 tail <1% of step) · TILE_N=64 SKIP(+51%) · TILE_M=256 SKIP(+27.7%) → decoder STOP
+  (3-consecutive not-positive). ViT split-K=2 NEUTRAL. = **1 KEEP / 1 REJECT / 5 SKIP-or-NEUTRAL**.
+- **Two structural findings**: (a) at d=2048 the model GEMM (P1 fwd/bwd + P2 dW) dominates and the
+  optimizer P3 tail is <1% → the entire optimizer-track candidate family (elemwise-011/018, sg2-002/009/020)
+  is roofline-inert (vec4 empirically NEUTRAL); (b) the decoder GEMM is already well-tuned (split-K was the
+  only mis-set default) — the remaining big levers are design-locked (S≤2 stages, no wgmma_n256) or
+  parity-unsafe (swizzle).
+- **Remaining (future cycles)**: VIT_TC_001 head-CE kernel edit (the real ViT lever, slow bench); the
+  SG2-stage micro-opts (sg2-002 g_sorted double-pass, sg2-009 HCA unroll, sg2-020 GRU vec4 I/O) — parity-
+  gateable but only timeable at the physics-inert d=128 (no SG2 d=2048 bench TU exists), so low ROI.
+
 **RESUME-2 (2026-06-16, after 2nd socket death) — production-gate the 2 decoder wins.** On resume,
 the working tree held an UNCOMMITTED in-flight state from the dead prev agent: a CONCURRENT rogue
 `./build.sh` (a "BISECT build: split-K=2 ALONE, IL reverted to 2 — is split-K=2 determinism-safe?")
