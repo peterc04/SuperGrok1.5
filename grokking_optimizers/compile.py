@@ -9794,6 +9794,13 @@ def _auto_discover_sources(root: Path, vendor: str,
     return found
 
 
+# Cache: (path -> (mtime_ns, owns_own_pybind_module)). Memoizes the
+# ``read_text`` scan in ``_owns_extension_module_tu`` (which ``_resolve_sources``
+# runs over every fused cell .cu on every — per-variant — call). mtime-keyed so
+# a file edit invalidates exactly its line.
+_OWNS_EXT_MODULE_CACHE: Dict[str, Tuple[int, bool]] = {}
+
+
 def _owns_extension_module_tu(path: Path) -> bool:
     """True if ``path`` is a standalone-JIT TU that must NOT be linked into a
     shared ``_ops``-style module: it defines its OWN pybind module via
@@ -9808,6 +9815,12 @@ def _owns_extension_module_tu(path: Path) -> bool:
     ``mega_decoder_real_adamw_tc.cu``, whose header explicitly states "No
     setup.py glob change"). Limited to CUDA ``.cu`` — the HIP cell TUs use the
     ``SG_GFX942_DEVICE_TU`` guard, not their own pybind module.
+
+    The content check ``read_text`` is mtime-memoized: ``_resolve_sources`` calls
+    this for EVERY ``.cu`` in ``csrc/fused/<arch>/`` on every invocation (and that
+    function runs per-variant inside the incremental-build planner), so re-reading
+    ~30 cell sources each time dominated its cost (~16 ms/call). The result only
+    changes when the file's text changes, which bumps its mtime.
     """
     name = path.name
     if name.endswith("_selftest.cu") or "_overlay" in name:
@@ -9815,10 +9828,20 @@ def _owns_extension_module_tu(path: Path) -> bool:
     if path.suffix != ".cu":
         return False
     try:
-        return "PYBIND11_MODULE(TORCH_EXTENSION_NAME" in path.read_text(
+        st = path.stat()
+    except OSError:
+        return False
+    key = str(path)
+    cached = _OWNS_EXT_MODULE_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns:
+        return cached[1]
+    try:
+        owns = "PYBIND11_MODULE(TORCH_EXTENSION_NAME" in path.read_text(
             errors="ignore")
     except OSError:
         return False
+    _OWNS_EXT_MODULE_CACHE[key] = (st.st_mtime_ns, owns)
+    return owns
 
 
 # Cache: does a TU's body emit a ``PYBIND11_MODULE(...)`` (i.e. a
