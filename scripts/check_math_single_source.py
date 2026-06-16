@@ -69,18 +69,13 @@ OPTS = [
 # fail on drift, forcing a deliberate --update-manifest (the same acknowledgement
 # discipline as the canonical-math hashes).
 BINDINGS_CPP = "csrc/bindings/bindings.cpp"
-BINDING_FUNCS = (
-    "supergrok11_fused_step",
-    "supergrok15_fused_step",
-    "supergrok2_batched_step",
-    "supergrok2_prepare_and_batched_step",
-    "grokadamw_fused_step",
-    "grokfast_fused_ema_adam_step",
-    "lion_fused_step",
-    "muon_fused_step",
-    "neuralgrok_fused_step",
-    "prodigy_fused_step",
-)
+# [Task #10] The eager per-op pybind entrypoints (<opt>_fused_step) were REMOVED —
+# production routes through the unified fused_step / sg2_fused_step ABI, which is
+# not a drop-in for the per-function-body hash mechanism. So BINDING_FUNCS is now
+# empty (and binding_regions in the manifest is correspondingly {}). The boundary
+# guards / bias-correction / argument plumbing those bindings owned now live in the
+# megakernel + its launchers; their math is covered by the canonical-header hashes.
+BINDING_FUNCS = ()
 
 
 def _canonical_header(opt: str) -> str:
@@ -211,9 +206,10 @@ def _consumer_headers() -> list:
     re-inlining it. Excludes the canonical algorithms/*.h (which own the math)
     and the gfx942/TPU re-expressions (sanctioned transcriptions, guarded by the
     content-hash manifest)."""
-    consumers = [f"grokking_optimizers/kernels/sm_90/{opt}_sm90.cuh"
-                 for opt in OPTS]
-    consumers.append("csrc/fused/sm_90/opt_components.cuh")
+    # [Task #10] the per-op kernels/sm_90/<opt>_sm90.cuh consumers were removed;
+    # opt_components.cuh (the fused megakernel optimizer tail) is the surviving
+    # includable CUDA consumer that must obtain the Adam math by call.
+    consumers = ["csrc/fused/sm_90/opt_components.cuh"]
     return consumers
 
 
@@ -334,24 +330,12 @@ def check(structural_only: bool = False) -> list:
     """Return a list of failure strings (empty = OK)."""
     failures = []
 
-    # (1) structural single-source: per-op MUST #include the canonical header.
-    for opt in OPTS:
-        rel = f"grokking_optimizers/kernels/sm_90/{opt}_sm90.cuh"
-        perop = _read(rel)
-        if not perop:
-            # A missing/renamed consumer would otherwise silently DISABLE drift
-            # detection for this optimizer (the old `if perop and ...` guard
-            # skipped absent files). Fail loudly instead.
-            failures.append(
-                f"[structural] expected consumer {rel} is missing/empty — "
-                f"drift detection for '{opt}' would be silently disabled. "
-                f"Restore the file or update OPTS.")
-            continue
-        if _canonical_header(opt) not in perop:
-            failures.append(
-                f"[structural] kernels/sm_90/{opt}_sm90.cuh does NOT #include "
-                f"the canonical {_canonical_header(opt)} (reimplementation → "
-                f"drift). Make it #include the canonical header.")
+    # (1) [Task #10] The eager per-op kernels/sm_90/<opt>_sm90.cuh consumers were
+    # REMOVED (production is now a pure L3-TC megakernel, or hard-fail). Single-
+    # source is enforced instead by (1a) the fused-consumer structural check
+    # (opt_components.cuh #includes AND calls every canonical apply symbol), (1b)
+    # the re-inline scan, and the canonical-math manifest hashes below — not by
+    # per-op header inclusion. The old per-op loop is therefore intentionally gone.
     # (1a) fused-consumer structural hardening (WS-F5): the single fused
     # optimizer-tail consumer MUST #include every consumed optimizer's canonical
     # header AND call its apply symbol. FAIL LOUDLY if the consumer is

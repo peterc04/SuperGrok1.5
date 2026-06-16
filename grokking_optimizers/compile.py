@@ -22163,22 +22163,26 @@ def _self_test_silent_degradation(run) -> None:
             assert "-DSG_TUNED_CLUSTER_SHAPE_VOLUME=4" in flags
             assert not any("=2,2,1" in f for f in flags), (
                 "tuple must not emit a comma-valued -D (nvcc rejects it)")
-            # (c) legacy map-LESS JSON still loads + emits the SAFE floor.
-            legacy = {"sm_90": {"adamw": {"block": 256, "vec": 2, "unroll": 1,
-                                          "async_depth": 2, "maxrregcount": 0,
+            # (c) legacy map-LESS JSON still loads + emits the SAFE floor. [Task #10]
+            # block/vec/unroll/async_depth were dropped from the floor (only the
+            # now-deleted eager headers read them; no committed kernel does) — use a
+            # LIVE floor dim (mega_block / tile_m) so this still exercises the real
+            # silent-degradation contract.
+            legacy = {"sm_90": {"adamw": {"mega_block": 256, "tile_m": 128,
+                                          "maxrregcount": 0,
                                           "model": "mamba"}}}
             lflags = inject.source_extra_nvcc_flags("adamw", legacy, "sm_90a")
-            assert "-DSG_TUNED_BLOCK_SIZE=256" in lflags
+            assert "-DSG_TUNED_MEGA_BLOCK=256" in lflags
             assert all("CLUSTER_SHAPE" not in f for f in lflags), (
                 "legacy JSON has no extra dims to emit")
             # (d) a winner dim with no macro mapping is ignored (no crash). The
             # OLD flat shape is still READ via backward-compat (no model key).
-            unmapped = {"sm_90": {"adamw": {"block": 64, "vec": 1, "unroll": 1,
+            unmapped = {"sm_90": {"adamw": {"mega_block": 64,
                                             "mystery_dim": "x", "model": "m"}}}
             assert not inject._arch_block_is_nested(unmapped["sm_90"]), (
                 "legacy flat fixture must read as flat (backward-compat)")
             uflags = inject.source_extra_nvcc_flags("adamw", unmapped, "sm_90a")
-            assert "-DSG_TUNED_BLOCK_SIZE=64" in uflags
+            assert "-DSG_TUNED_MEGA_BLOCK=64" in uflags
             assert all("mystery" not in f.lower() for f in uflags), (
                 "unmapped dim must be ignored, not emitted")
             # (e) #12 per-model: tuning the SAME optimizer on a SECOND model must
@@ -22212,17 +22216,22 @@ def _self_test_silent_degradation(run) -> None:
             assert "-DSG_TUNED_TILE_M=64" in cell_map[
                 "csrc/fused/sm_90/mega_vit_adamw.cu"]
             # (f) migrating an existing OLD-flat JSON upgrades it in place,
-            # preserving each flat entry under its provenance model.
+            # preserving each flat entry under its provenance model. The legacy
+            # muon entry keeps its (now-dropped-from-floor [Task #10]) 'block' dim
+            # VERBATIM — migration must be non-destructive of a user's existing
+            # tuned JSON — while a freshly export_winner'd entry persists a LIVE
+            # floor dim (mega_block; a non-floor dim like the old 'block' is
+            # dropped by the exporter, so it would not round-trip).
             jp3 = str(Path(td) / "_kernel_tuned_legacy.json")
             with open(jp3, "w", encoding="utf-8") as fh:
                 json.dump({"sm_90": {"muon": {"block": 200, "vec": 4,
                                               "model": "decoder"}}}, fh)
             assert inject.export_winner("lion", "mamba", "sm_90a",
-                                        {"block": 33}, path=jp3)
+                                        {"mega_block": 33}, path=jp3)
             mg = inject.load_tuned(jp3)
             assert inject._arch_block_is_nested(mg["sm_90"]), "migrated to nested"
             assert mg["sm_90"]["decoder"]["muon"]["block"] == 200, mg["sm_90"]
-            assert mg["sm_90"]["mamba"]["lion"]["block"] == 33
+            assert mg["sm_90"]["mamba"]["lion"]["mega_block"] == 33
             sys.stdout.write(
                 f"    [dim-roundtrip] persisted cluster_shape={entry['cluster_shape']} "
                 f"wgmma_shape={entry['wgmma_shape']!r}; consumer emitted "
@@ -22856,30 +22865,19 @@ def _self_test_kernel_headers(run) -> None:
     PALLAS_DIR = REPO_ROOT / "csrc" / "backends" / "pallas"
 
     def test_elementwise_headers():
-        # Post-migration contract: grokking_optimizers/kernels/ is now the SINGLE
-        # canonical kernel tree (the placeholder scaffolding was replaced by the
-        # production sm_90 device kernels). The sm_90 headers therefore expose the
-        # production API — namespace sg::sm90 and the <opt>_kernel launchers — not
-        # the old placeholder `<opt>_update` / `namespace grokking` convention. The
-        # gfx942 headers remain ATen+rocBLAS (host-compiler routed); see their
-        # AMDGCN-asm-status banner. The vendor-neutral per-element math lives in
-        # csrc/algorithms/<opt>.h (included by each launcher).
-        sm90_dir = KERNEL_DIR / "sm_90"
+        # [Task #10] The eager sm_90 per-op device kernels (kernels/sm_90/<opt>_sm90.cuh)
+        # were REMOVED — production is the pure L3-TC fused megakernel (no standalone
+        # per-op sm_90 launchers). The surviving per-op surfaces are the gfx942 (ROCm,
+        # paused) headers and the vendor-neutral per-element math in
+        # csrc/algorithms/<opt>.h (included by every backend).
         gfx942_dir = KERNEL_DIR / "gfx942"
         algo_dir = REPO_ROOT / "csrc" / "algorithms"
         for opt in ("adamw", "lion", "grokfast", "grokadamw"):
-            sm = sm90_dir / f"{opt}_sm90.cuh"
             gfx = gfx942_dir / f"{opt}_gfx942.hip.hpp"
             algo = algo_dir / f"{opt}.h"
-            assert sm.is_file(), f"Missing {sm}"
             assert gfx.is_file(), f"Missing {gfx}"
             assert algo.is_file(), f"Missing {algo}"
-            sm_src = _read_kernel(sm)
             algo_src = _read_kernel(algo)
-            # Production sm_90 header: real launcher kernel + production namespace.
-            assert f"{opt}_kernel(" in sm_src, f"{opt}_sm90.cuh missing {opt}_kernel launcher"
-            assert "namespace sg" in sm_src, f"{opt}_sm90.cuh missing namespace sg::sm90"
-            assert "__global__" in sm_src, f"{opt}_sm90.cuh has no __global__ kernels"
             # Per-element math is in the vendor-neutral algorithm header. The
             # step entry point is named <opt>_step / <opt>_update / <opt>_*_step
             # (e.g. grokfast exposes grokfast_fused_step + grokfast_ema_step).
@@ -22888,19 +22886,11 @@ def _self_test_kernel_headers(run) -> None:
                 f"csrc/algorithms/{opt}.h missing per-element step"
 
     def test_model_headers():
-        # Post-migration contract: the sm_90 model headers are the production
-        # device kernels (templated per-layer forward/backward + __global__
-        # launchers), so they expose cudaError_t entry points and real kernels
-        # rather than the old placeholder size-helper tokens. gfx942/tpu remain
-        # as before.
-        for fname in ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh",
-                      "vit_sm90.cuh"):
-            p = KERNEL_DIR / "sm_90" / fname
-            assert p.is_file(), f"Missing {p}"
-            src = _read_kernel(p)
-            assert "__global__" in src, f"{fname} has no __global__ kernels"
-            assert "namespace sg" in src, f"{fname} missing namespace sg::sm90"
-            assert "cudaError_t" in src, f"{fname} missing cudaError_t entry points"
+        # [Task #10] The eager sm_90 model device-kernel headers (transformer_decoder_
+        # sm90.cuh / mamba3_sm90.cuh / vit_sm90.cuh) were REMOVED — the production
+        # sm_90 model forward/backward now lives in the fused megakernel + its
+        # model_stage_*_tc.cuh stages, not standalone per-model headers. The gfx942
+        # (paused) model headers and the shared pallas _pallas_models.py remain.
         for model, arch, fname in [
             ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
             ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
@@ -22918,26 +22908,23 @@ def _self_test_kernel_headers(run) -> None:
             assert tok in pm_src.lower(), f"_pallas_models.py missing {tok}"
 
     def test_optimizer_model_cross():
-        sm90_dir = KERNEL_DIR / "sm_90"
+        # [Task #10] the sm_90 eager per-op + per-model headers (and common_sm90.cuh)
+        # were removed; the cross-product now verifies the surviving gfx942 (paused)
+        # headers + the pallas TPU single source.
         gfx942_dir = KERNEL_DIR / "gfx942"
         opts = ("adamw", "lion", "grokfast", "grokadamw")
-        models_sm90 = ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh", "vit_sm90.cuh")
         models_gfx = ("transformer_decoder_gfx942.hip.hpp", "mamba3_gfx942.hip.hpp",
                       "vit_gfx942.hip.hpp")
         for opt in opts:
-            assert (sm90_dir / f"{opt}_sm90.cuh").is_file()
             assert (gfx942_dir / f"{opt}_gfx942.hip.hpp").is_file()
             # TPU: canonical per-opt launcher in pallas (the kernels/tpu/<opt>_tpu
             # duplicate was deleted in Phase 7 WS1).
             assert (PALLAS_DIR / f"launch_{opt}.py").is_file()
-        for m in models_sm90:
-            assert (sm90_dir / m).is_file()
         for m in models_gfx:
             assert (gfx942_dir / m).is_file()
         # TPU models + shared kernels: the canonical pallas single source.
         assert (PALLAS_DIR / "_pallas_models.py").is_file()
         assert (PALLAS_DIR / "_pallas_kernels.py").is_file()
-        assert (sm90_dir / "common_sm90.cuh").is_file()
         assert (gfx942_dir / "common_gfx942.hip.hpp").is_file()
 
     run("elementwise_headers", test_elementwise_headers)
