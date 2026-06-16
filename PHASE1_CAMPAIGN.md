@@ -124,6 +124,103 @@ failed the gate; STOP-on-3-consecutive-reverts never triggered (skips of false-p
 already-done survivors are not reverts). All four kept edits are bit-neutral host-side
 autotuner hoists — no kernel-codegen, cache-key, or search-trajectory change.
 
+**compile.py track — round 2** (re-audit via 3 read-only Explore swarms over the timer/
+early-stop, cache/build, and cost-model/codegen regions; baseline + final tally both
+**236 passed / 6 failed**, identical pre-existing #10-aftermath drift-guard set). Commit
+`8e25a11`.
+
+| # | candidate id | verdict | reason |
+|---|---|---|---|
+| 1 | progress-window-deque | **KEEP** | `progress_state["window"]` (per-trial ETA telemetry) was a `list` + `if len>20: pop(0)` (O(n) front-shift) at the 2 timer-closure append sites (l.14262/15029). Switched both init sites (l.15443/16105) to `collections.deque(maxlen=20)` and dropped the manual trims. The window is **write-only** (grep: only `.append`/`len`/`pop(0)`, never iterated or sliced anywhere in the file), so it's bit/trajectory-neutral; pop(0)→O(1) auto-discard. |
+| 2 | ei-window-trailing-slice | **KEEP** | `BayesianEarlyStopper.should_stop()` built the EI rolling mean via `list(self._improvement_window)[-patience:]` (l.6052), copying the **entire UNBOUNDED** `_improvement_window` deque (l.5972) every poll. Switched to `itertools.islice(reversed(dq), patience)` + `recent.reverse()` (touches only the trailing `patience` items, then restores ascending order). fp sum is over the identical sequence in identical order ⇒ bit-identical EI estimate; verified equal across 800 window×patience cases. Distinct from the round-1-rejected `early-stop-window-slice-cache` (that proposed caching across polls; this changes only the slice mechanism). |
+| 3 | featurize-config-values-of-redundant-lists | **SKIP** | Same false premise as round-1's rejected `featurize-config-dim-index`: `_values_of` is called 3× (vec/unroll/num_stages, l.5233/5242/5251), each a **distinct** dim, each **once** — no repeated lookup to hoist. |
+| 4 | host-history-json-dedup-redundant-dumps | **SKIP** | Premise false: l.7239 serializes `mem_hh` entries, l.7241 serializes `disk_hh` entries — **different object sets**, no entry is `json.dumps`'d twice. Also capped at `_MAX_HOST_HISTORY`. No-op. |
+| 5 | variant-macros-fallback-redundant-resolvers | **SKIP** | The double-resolver call (l.13800-13802) is the **backward-compat fallback** reached only when `arch is None or arch∉ARCH_TABLE`; the production path returns early at l.13794-13798. Dead in production — zero measurable effect. |
+| 6 | emit-variant-source-context-redundant-arch-entry | **SKIP** | `get_arch_entry` is a bare `ARCH_TABLE[arch]` dict lookup (l.1143), already O(1); the 2nd call at l.26292 saves one dict hit per *unique variant source* (file-cached, not per-trial). Below the noise floor. |
+| 7 | cache-get-redundant-v3-defaults-loop | **SKIP** | The defensive `_V3_DEFAULTS` setdefault loop in `CompileCache.get()` (l.7260-7262) is 5 dict ops per call, intentionally hardening stale-v2 entries; `get()` is per-cache-entry-per-build, not a tight per-trial loop. Negligible; skipping the loop would weaken the defensive guarantee. |
+
+**Round-2 result: 2 KEEP (1,2), 5 SKIP (3,4,5,6,7), 0 REVERT.** Both kept edits are
+bit-neutral host-side trailing-window O(n)→O(1) hoists (the round-1 `measured-ms-window-algo`
+deque swap was a *different* buffer, `_meas` at l.15461; these two are `progress_state["window"]`
+and the EI `_improvement_window`). 5 skips were false-premise (3,4), production-dead (5), or
+sub-noise (6,7) — none are reverts, so the 3-consecutive-not-positive counter stands at 0.
+
+**compile.py track — round 3** (re-audit via 3 read-only Explore swarms over the CostModel
+numerics, the per-config search-driver loop, and file-I/O/include-graph regions; baseline +
+final tally both **236 passed / 6 failed**, identical drift-guard set). Commit `c8ee2e5`.
+The search-driver-loop region (run_bayesian/run_exhaustive/prefilter/config_key/topk_refine/
+MultiGPUTimingPool) came back **DRY** — loop-invariants already hoisted, `config_key` calls all
+load-bearing, membership lists too small to warrant sets.
+
+| # | candidate id | verdict | reason |
+|---|---|---|---|
+| 1 | trial-summary-incremental-update | **KEEP** | `CompileCache.record_trial()` (l.7424) called `_read_trial_log_summary()` after EVERY appended trial, re-scanning the whole growing `.jsonl` sidecar ⇒ **O(n²)** I/O over a sweep (10k trials ≈ 50M line re-parses). Added `_roll_trial_log_summary()` + a per-sidecar `(size, n_trials, best_ms)` accumulator that rolls forward in O(1) on the monotonic-append fast path and **falls back to a full re-scan on any file-size mismatch** (first touch / restart / external write) ⇒ provably identical to the legacy scan, preserving the documented restart-robustness. Shared per-trial predicate `_trial_eligible_ms()` guarantees bit-identity. **Differential test: 701 checks (fast path + restart + concurrent external write), 0 mismatches.** Highest-value find of the campaign. |
+| 2 | multi-fidelity-double-float-conversion | **KEEP** | `_multi_fidelity_prune_decision` (l.5845) built `[float(m) for m in measured_ms if isinstance(...) and isfinite(float(m))]` — converting each element **twice**. Walrus `isfinite(fm := float(m))` binds it once; identical values + identical filtering ⇒ bit-identical finite list (verified across 2000 mixed bool/inf/nan/str inputs). Prune decision unchanged. Micro but zero-risk, in the per-trial pruning path. |
+| 3 | costmodel-predict-scalar-extraction | **SKIP** | `.flat[0]`→`[0]` at l.5557/5564/5574. The `.flat[0]` cost is sub-nanosecond noise dwarfed by the `model.predict()` inference it follows, and `.flat[0]` is *more* shape-robust (handles 0-d / (1,1) returns). Sub-noise + reduces robustness — not a win. |
+| 4 | linear-ridge-regressor-bias-column-concat | **SKIP** | `np.hstack([X,ones])`→`np.concatenate(...,axis=1)` at l.5681/5700. `hstack` is a thin wrapper over `concatenate`; the wrapper cost is negligible vs the following `X_aug.T @ X_aug` solve, and this is the *fallback* ridge regressor (only when xgboost/sklearn absent), called once per **retrain**, not per-trial. Below noise floor + cold path. |
+| 5 | search-driver-loop-region | **SKIP (DRY)** | Full audit of `_run_bayesian`/`_run_exhaustive`/`ss_prefilter`/`compile_feasibility_check`/`resolve_macros`/`config_key`/`topk_refine`/`MultiGPUTimingPool`: prefilter `check` closure built once before the loop (l.3125); `dim_names`/`dim_value_sets` hoisted (l.6345); `config_key` computed once per config and its multiple call-sites are distinct load-bearing consumers; `topk_refine` `seen_keys` already a set built once; worker linear scans only on rare dead-worker bounce. Nothing hoistable remains. |
+
+**Round-3 result: 2 KEEP (1,2), 3 SKIP (3,4,5), 0 REVERT.** One high-value algorithmic win
+(O(n²)→O(n) sidecar summary) plus one zero-risk micro; the remaining candidates were sub-noise
+(3,4) or a confirmed-dry region (5). Still 0 reverts ⇒ 3-consecutive counter stays at 0.
+
+**compile.py track — round 4** (re-audit via 3 read-only Explore swarms over the previously-
+untouched regions: codegen/template/variant-enumeration, build-orchestration + TimingWorker +
+arch/search-space, and Pallas/polyhedral; baseline + final tally both **236 passed / 6 failed**,
+identical drift-guard set). Commit `311e0eb`. The codegen, build-orchestration, and arch/macro-
+scan regions came back **largely DRY** with extensive already-memoized confirmations
+(`_BUNDLED_TEMPLATES`, `_KERNEL_MACRO_CACHE`, `_KERNEL_IFNDEF_CACHE`, `_DEAD_KEY_DIMS_CACHE`,
+`_TC_REAL_STEP_MOD_CACHE`, cutlass/CK `seen_keys` dedup, `_GEMM_TILE_DIM_NAMES` frozenset).
+
+| # | candidate id | verdict | reason |
+|---|---|---|---|
+| 1 | host-identity-memoize | **KEEP** | `_current_host()` (cache provenance; called **per-trial** in `_run_exhaustive` l.15700 + `_pallas_autotune` l.16248, plus ~12 other sites) measured **~100 µs/call** — the `import jax` + `jax.__version__` resolution alone is ~60 µs (jax 0.4.38 lazy-attr). All identity fields (platform/python/torch/cuda/hip/jax/ncpus) are **process-invariant**; only `recorded_at` changes per call. Split the invariant probe into a once-per-process `_HOST_IDENTITY_CACHE`, merge a fresh timestamp each call. **Key order + values preserved exactly ⇒ returned dict and any `json.dumps` of it are BYTE-IDENTICAL** to the legacy per-call probe (verified). Measured **~100 µs → 1.17 µs/call (~85×)**. Substantive: removes the dominant cost of every host-provenance capture. |
+| 2 | hoist-synth-dtype-triple-outside-per-node-loop | **SKIP** | `synthesize_kernel`'s per-node emit calls re-call `_synth_dtype_triple(dtype,is_hip)` (~2-4-entry dict lookups). Hoisting needs threading pre-computed values through 6 emit-fn signatures (added optional params) for O(1) lookups that are already sub-nanosecond; synth runs per-(opt,arch,dtype,pattern), not per-trial. Sub-noise + API churn — same class as round-1's dropped `state_bind_fusion`. |
+| 3 | tc-model-alias-dict-hoist | **SKIP** | `_canonical_tc_model` (l.14094) rebuilds a **2-element** dict literal per call. Real per-call rebuild but ~100 ns, called per-variant immediately before a seconds-long TC JIT build. Below the noise floor — same class as round-1's dropped `mbtc-load-local-const`. |
+| 4 | tc-flags-keep-macros-hoist | **SKIP** | `_tc_relevant_device_flags` (l.14127) rebuilds a **5-element** tuple per call. Hoisting to a module frozenset is a clean hygiene tweak (O(n)→O(1) membership over n=5) but immeasurable vs the surrounding TC build. Sub-noise. |
+| 5 | polyhedral-enumerate-generators | **SKIP** | `enumerate_schedules` (l.27431/27433) materializes `tile_choices`/`vec_choices` then early-exits at `max_schedules`. The proposed generator fix is **incorrect**: `vec_choices` is **re-iterated** per (tile,perm,par) (l.27445), so a one-shot generator would be exhausted after the first pass ⇒ would CHANGE the yielded schedule set (not bit-neutral). The lists are also bounded (~hundreds, n=2-4 axes — the "65k/2 MB" estimate conflates iteration count with list size), and this is the opt-in polyhedral path (once per source file). Risky + conditional + overstated. |
+
+**Round-4 result: 1 KEEP (1), 4 SKIP (2,3,4,5), 0 REVERT.** One substantive win (the ~85×
+host-identity memoization on a per-trial helper). The other candidates were sub-noise
+constant-literal rebuilds (2,3,4 — the same class round 1 explicitly dropped) or a risky/
+overstated conditional opt with an incorrect proposed fix (5). 0 reverts ⇒ counter stays at 0.
+
+**compile.py track — round 5 (DRY-WELL CONFIRMATION)** — both a directed hypothesis-driven
+probe (repeated inline `import jax/torch` → cached, ~0.1 µs; other `_read_trial_log_records`
+sites → `_collect_sibling_trials` is called **once** before the Bayesian loop, not per-trial,
+so no second O(n²); no remaining per-trial subprocess/file-regrowth pattern) AND an independent
+read-only sweep returned **DRY WELL — no substantive bit-neutral opt remains**. The remaining
+expensive operations are each (a) fundamentally required (timing-elbow sort, config hashing,
+the variant `.so` build that dominates ~all wall time), (b) feature-gated (cost-model featurize,
+polyhedral/synth), (c) already memoized (`_VERSION_GATED_FLAGS_CACHE`, `_HOST_IDENTITY_CACHE`,
+`_KERNEL_MACRO_CACHE`, `_KERNEL_IFNDEF_CACHE`, `_DEAD_KEY_DIMS_CACHE`, `_TC_REAL_STEP_MOD_CACHE`,
+`_BUNDLED_TEMPLATES`, `_base_sources_hash` hoisted once/sweep), or (d) bounded
+(`pick_winner` O(n), `topk_refine` O(k·d) k≤50, `_multi_fidelity_prune` over `deque(maxlen=2000)`,
+`MultiGPUTimingPool` dispatch with O(1) live-checks, host_history ≤ `_MAX_HOST_HISTORY`). No new
+candidate to ratchet.
+
+### Loop termination — compile.py track
+
+**STOP REASON: DRY WELL** (criterion (a) — the expected terminus). Round 5 surfaced no
+genuinely-new substantive bit-neutral candidate; only the sub-noise constant-rebuild class
+(consistently and correctly rejected since round 1) and already-memoized code remain. The
+3-consecutive-not-positive counter (criterion (b)) **never fired** — across rounds 2–5 there
+were **0 REVERTs** and every SKIP was a verified false-premise / production-dead / sub-noise
+finding, not a failed-gate revert.
+
+**Campaign cumulative (rounds 1–5):**
+- **Round 1:** 4 KEEP (json-indent, build-sig-hash-hoist, measured-ms deque, multi-fidelity guard reorder), 6 SKIP, 0 REVERT — commit `e3b9b71`.
+- **Round 2:** 2 KEEP (progress-window deque, EI trailing-slice), 5 SKIP, 0 REVERT — commit `8e25a11`.
+- **Round 3:** 2 KEEP (**O(n²)→O(n)** trial-summary roll, multi-fidelity float-dedup), 3 SKIP, 0 REVERT — commit `c8ee2e5`.
+- **Round 4:** 1 KEEP (**~85×** host-identity memoize), 4 SKIP, 0 REVERT — commit `311e0eb`.
+- **Round 5:** DRY WELL — 0 candidates, loop terminates.
+- **Totals: 9 KEEP, 0 REVERT, 20 SKIP across 5 rounds.** Self-test held at **236 passed / 6 failed**
+  (identical pre-existing #10-aftermath drift-guard set) at every step. All kept edits are
+  bit-neutral host-side autotuner speed/quality hoists — no kernel-codegen, cache-key,
+  build-signature, or search-trajectory change. The two highest-value wins (the sidecar-summary
+  O(n²)→O(n) and the ~85× host-identity memoization) were both verified byte/bit-identical by
+  differential test before keeping.
+
 ---
 
 ## 4. Autotuner (compile.py) — status
