@@ -1,0 +1,70 @@
+# examples/autotune_demo/compile_config.toml
+# ===========================================================================
+# Project config that points grokking_optimizers/compile.py at the NAIVE
+# tiled-GEMM autotune demo with ZERO grokking assumptions. The key names here
+# match EXACTLY what compile.py's loader reads (verified against
+# _DEFAULT_PROJECT_CONFIG / apply_to_buildspec):
+#   - load_config()        merges this over _DEFAULT_PROJECT_CONFIG
+#   - apply_to_buildspec() copies [project]/[sources]/... onto the BuildSpec
+#   - resolve_macros()     emits the -DSG_TUNED_* flags for each search config
+#
+# The demo driver run_autotune.py loads THIS file with compile.C.load_config()
+# and the search space with compile.C.get_search_space(), then drives
+# compile.py's real search (cartesian) + macro injection (resolve_macros /
+# resolve_extra_nvcc_flags) + correctness gate (_compare_outputs, fp32
+# TOLERANCES) + min-elapsed_ms winner selection. See run_autotune.py's header
+# and RESULT.md for WHY the driver path is used instead of `python -m
+# grokking_optimizers.compile` end-to-end (compile.py's _validate() still
+# hard-rejects any optimizer name outside the grokking profile — the
+# documented "Gap 3" — so a foreign project cannot pass _validate; the driver
+# uses every OTHER part of compile.py unchanged).
+# ===========================================================================
+
+[project]
+name    = "autotune_demo_gemm"
+version = "0.1.0"
+
+# Macro namespace for compile.py's _build_macros gating flags. We deliberately
+# reuse the SG_ prefix so the GEMM knobs are emitted as -DSG_TUNED_TILE_* —
+# the same SG_TUNED_* family the production megakernel uses — driving home the
+# contrast: same tool, same macro shape, but a NAIVE baseline.
+macro_prefix = "SG_BUILD_"
+
+# PORTABLE tune-hook — the schema-agnostic autotune seam. compile.py's
+# _hook_capture resolves this as "pkg.module:fn" (rsplit on ':'), imports it,
+# and calls fn(*, so_path, model, optimizer, arch, regime, seed) ->
+# {"output": np.ndarray, "elapsed_ms": float} in a FRESH subprocess
+# (cwd = repo root). The repo-root-relative dotted form is the robust one.
+tune_hook = "examples.autotune_demo.tune_hook:run"
+
+# This project has no Python package to import an optimizer class from; the
+# tune_hook is the entire numerical+timing seam.
+python_package = "examples.autotune_demo"
+namespace = ""
+
+[sources]
+# CUDA source root for the demo. The single TU is gemm_kernel.cu. (The driver
+# compiles this TU directly with torch.utils.cpp_extension.load, the same
+# builder compile.py's _torch_load uses; this key documents the source root
+# and is what compile.py's _resolve_sources would consult.)
+cuda_root = "examples/autotune_demo"
+
+[sources.include_paths]
+extra = []
+
+[optimizers]
+# Opaque pass-through label for the generic seam (a GEMM has no optimizer).
+enabled = ["gemm"]
+
+[models]
+# Opaque pass-through label for the generic seam (a GEMM has no model).
+enabled = ["gemm"]
+
+[archs]
+default = "sm_90a"
+allowed = []
+
+[numerics]
+# fp32 GEMM: the driver gates each variant against the strict reference build
+# with compile.py's _compare_outputs() using TOLERANCES["fp32"] = (1e-5, 1e-6).
+strict = false

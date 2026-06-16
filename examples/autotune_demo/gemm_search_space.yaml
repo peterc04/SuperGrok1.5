@@ -1,0 +1,46 @@
+# examples/autotune_demo/gemm_search_space.yaml
+# ===========================================================================
+# The --search-space for the naive-GEMM autotune demo, in the exact schema
+# compile.py's get_search_space()/load_yaml() parses: a top-level arch key
+# whose "dims" is a list of {name, type, values, macro, applies_to} dicts —
+# the SAME shape compile.py's own _dim(...) emits (see compile.py
+# build_full_search_space). The demo driver (run_autotune.py) loads this with
+# compile.C.get_search_space(), enumerates it with compile.C.cartesian(),
+# and turns each config into -DSG_TUNED_* nvcc flags with
+# compile.C.resolve_macros() — i.e. the REAL compile.py machinery.
+#
+# LEGALITY: every (TILE_M,TILE_N,TILE_K,BLOCK) combination this Cartesian
+# product can produce is a COMPILABLE, CORRECT config for gemm_kernel.cu —
+# the kernel's static_asserts require BLOCK | TILE_M*TILE_N and the shared
+# tile <= 48KB, and all combos below satisfy both (verified on-device before
+# the search). The naive in-source default (16/16/16/256) is the FIRST value
+# of each dim, so the "default" config is a member of the space.
+# Grid trimmed to 4x3x2x1 = 24 configs so a full sweep finishes in a few
+# minutes on an H100 (even while sharing the GPU with another process). BLOCK
+# is fixed at 256 (the cleanest REG_TILE divisor across these tiles); the
+# naive in-source default (tile_m=tile_n=tile_k=16, block=256) is the FIRST
+# member of every dim and so is a member of the product. Widen tile_n to
+# [16,32,64,128] / add block=128 / tile_k=64 to explore the full 96-config
+# space — all are legal+correct (see the on-device pre-flight in RESULT.md).
+sm_90a:
+  dims:
+    - name: tile_m
+      type: int
+      values: [16, 32, 64, 128]
+      macro: SG_TUNED_TILE_M
+      applies_to: [device]
+    - name: tile_n
+      type: int
+      values: [16, 64, 128]
+      macro: SG_TUNED_TILE_N
+      applies_to: [device]
+    - name: tile_k
+      type: int
+      values: [16, 32]
+      macro: SG_TUNED_TILE_K
+      applies_to: [device]
+    - name: block
+      type: int
+      values: [256]
+      macro: SG_TUNED_BLOCK
+      applies_to: [device]
