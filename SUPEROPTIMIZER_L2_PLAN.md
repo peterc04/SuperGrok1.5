@@ -185,11 +185,18 @@ The fp64 gate (A2) runs *in-loop* for generating origins; the hardware gate
 ## 8. Sequencing vs. the in-flight work (status map RESOLVED)
 
 The concrete near-term path is now fixed:
-1. **A2 (fp64-oracle-in-loop)** — the cheapest *real* win and the prerequisite for trusting any
-   generated winner. It builds on the already-real source-swap + #16 gate via the `correctness_hook`
-   seam (L6853, present from the af9b720 P0 batch). CPU-gateable (compile.py `--self-test`); touches
-   only compile.py (no overlap with the decoder files the PIPE=2 gate owns, nor the audit-fixes diff).
-   **This is the first thing to land for #27.**
+1. **A2 (fp64-oracle-in-loop) — ALREADY LANDED (af9b720), verified by code read.** The selection side
+   is complete: `_default_correctness_hook` (L7213) builds the fp64-parity + A/A/A gate via
+   `run_cell_gate`, `_jit_autotune` installs it on the GPU path (L7236), and `pick_winner`'s P0-1 path
+   (L6926-6959) re-checks the top-K candidates against it — demote-and-fall-through, fail-closed — so a
+   winner that merely shares an fp32 rounding error with the strict oracle (the IL=4 trap) can't be
+   finalized. The #16 gate (L6882) already makes generated origins ineligible without a strict-oracle
+   PASS. **Remaining A2 gap is Phase-C-coupled, not standalone:** the hook runs `run_cell_gate(cell_key)`
+   against the *currently-built* `_ops` (L7269 comment), so for a truly *synthesized* candidate the
+   candidate's generated source must be rebuilt+published *before* the hook fires (today only the final
+   winner is rebuilt in the verify phase). That per-candidate rebuild-before-fp64-gate is wired in C0,
+   when generated candidates first exist — there are none today, so A2 is correct as-is for the
+   flag/macro path that actually ships.
 2. **A1 (max the primitive)** completes as the #22 tournaments resolve — the PIPE=2-vs-PIPE=1/S=4 gate
    (in flight) fixes the maximal decoder primitive; ViT B1 (#29) is the bigger lever next.
 3. **Phase B (CuTe calibration probe)** — authorable any time; informs whether synthesis aims at the
