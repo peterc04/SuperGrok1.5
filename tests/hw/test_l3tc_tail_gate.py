@@ -680,11 +680,18 @@ def _sg_pure_fp64_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, d
 
 
 def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
-                      loss, p_after, total, named0, cache, verbose):
+                      loss, p_after, total, named0, cache, verbose,
+                      sg11_warmup_state=None):
     """Dedicated SuperGrok11/15 gate: validate the kernel vs the CANONICAL fp64 math its
     apply_optimizer<SG> calls (ref_sg11_step/ref_sg15_step + ref_sg_phi_forward), plus the
     SAM 2nd backward (sharpness) vs the PURE-fp64 oracle (RE-ANCHOR task #10). Returns
-    (ok, detail)."""
+    (ok, detail).
+
+    sg11_warmup_state — None for the cold single-step gate (m=v=0 going in, step=1). For
+    the warm-up gate (test_sg11_gate_warmup_catches_momentum_bug) it is a tuple
+    (m_start, v_start, p_start, t_step): the post-warmup start-of-step state captured
+    BEFORE the gated step, so the reference's cos(grad, MOMENTUM) gate + Adam tail use the
+    exact same nonzero momentum the kernel's st.exp_avg holds at gate time."""
     import math
     import torch
     from grokking_optimizers.dispatch import _opt_scalars_from, fused_train_step
@@ -761,29 +768,45 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     # ── (1a)+(1b) apply tail: params + m/v vs the canonical fp64 ref (ref_sg{11,15}_step) with
     # the kernel's grad + the kernel's mu + the per-tensor gate. The kernel's apply consumes
     # mu=k_mu (the precompute output) — so the reference uses k_mu too (the apply MATH is what
-    # (1a/1b) isolate; (B) already validated mu separately). m/v start at 0 (zero-init cache).
+    # (1a/1b) isolate; (B) already validated mu separately).
+    #   * Start-of-step state (m/v going INTO this step): at step 1 the cache is zero-init, so
+    #     m_start=v_start=0. Under a WARM-UP (sg11_warmup_state passed in) the m/v slices are the
+    #     post-warmup state captured BEFORE this gated step — exactly the kernel's st.exp_avg/
+    #     exp_avg_sq at gate time.
+    #   * SG11 gate = sigmoid(gate_temp·cos(grad, MOMENTUM)) — the 2nd cosine operand is the
+    #     START-OF-STEP momentum (m_start), the canonical sg11_finalize_gate signal, NOT mu.
     p_ref = torch.empty(total, device=dev, dtype=torch.float64)
     m_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
     v_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
     p_before_t = torch.cat([p.data.reshape(-1).double() for _, p in named_ref])
+    ws = sg11_warmup_state            # None (cold step 1) or (m_start, v_start, p_start, t_step)
+    m_start_all = ws[0] if ws is not None else None
+    v_start_all = ws[1] if ws is not None else None
+    p_start_all = ws[2] if ws is not None else None
+    t_step = ws[3] if ws is not None else 1
     for (n_, o, k, sh) in layout:
         gt = grad[o:o + k].double()
         mut = k_mu[o:o + k].double()
-        pt = p_before_t[o:o + k]
+        pt = (p_start_all[o:o + k].double() if p_start_all is not None
+              else p_before_t[o:o + k])
         zt = torch.zeros(k, dtype=torch.float64, device=dev)
+        m0 = m_start_all[o:o + k].double() if m_start_all is not None else zt
+        v0 = v_start_all[o:o + k].double() if v_start_all is not None else zt
         if opt == "supergrok11":
-            # per-tensor gate (the kernel's P2.45 finalizer sg11_finalize_gate):
-            # cos = <g,mu>/sqrt(|g|²|mu|²+1e-12); gate = sigmoid(gate_temp·cos).
-            num = (gt * mut).sum()
-            den = torch.sqrt((gt * gt).sum() * (mut * mut).sum() + 1e-12)
+            # per-tensor gate (the kernel's finalizer sg11_finalize_gate):
+            # cos = <g,m_start>/sqrt(|g|²|m_start|²+1e-12); gate = sigmoid(gate_temp·cos).
+            # The 2nd operand is the START-OF-STEP MOMENTUM (m0), NOT mu — the canonical
+            # cos(grad,momentum) signal. At cold step 1 m0=0 ⇒ cos=0 ⇒ gate=0.5.
+            num = (gt * m0).sum()
+            den = torch.sqrt((gt * gt).sum() * (m0 * m0).sum() + 1e-12)
             cos_t = float(num / den) if den > 0 else 0.0
             gate_t = 1.0 / (1.0 + math.exp(-gate_temp * cos_t))
-            pn, mn, vn = ref_sg11_step(pt, gt, zt, zt, mut, gate=gate_t, alpha=alpha,
-                                       lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
+            pn, mn, vn = ref_sg11_step(pt, gt, m0, v0, mut, gate=gate_t, alpha=alpha,
+                                       lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=t_step)
         else:
-            pn, mn, vn = ref_sg15_step(pt, gt, zt, zt, mut, gate_global=gate_global,
+            pn, mn, vn = ref_sg15_step(pt, gt, m0, v0, mut, gate_global=gate_global,
                                        alpha_base=alpha, alpha_max=alpha_max, lr=lr,
-                                       beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
+                                       beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=t_step)
         p_ref[o:o + k] = pn; m_ref_f[o:o + k] = mn; v_ref_f[o:o + k] = vn
 
     def _rel(a, b):
@@ -794,6 +817,14 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     param_tol = spec.get("param_tol", 1e-4)
     param_ok = param_rel < param_tol
     state_ok = (m_rel < 1e-4 and v_rel < 1e-4)
+    # WARM-UP MODE: the sharpness (A) PURE-fp64 oracle is built against a FRESH-init
+    # model (start-of-run params), but the kernel's sharpness here was produced at the
+    # WARMED params — so (A) is not a meaningful comparison under warm-up (the gate's
+    # cos(grad,momentum) fix is validated by (1a)/(1b)/(B), which DO use the warmed
+    # start-of-step state; B uses the kernel's OWN sharpness). So (A) is informational
+    # under warm-up and the (2) A/A/A is owned by the warm-up caller (which re-runs the
+    # whole warm-up+gated sequence 3×, not a cold step-1 rebuild).
+    warmup_mode = sg11_warmup_state is not None
     if verbose:
         print(f"  (1a) params vs canonical SG: max-rel={param_rel:.3e} (tol {param_tol:.0e}) "
               f"{'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
@@ -801,11 +832,18 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
               f"{'OK' if state_ok else 'FAIL'}", flush=True)
         print(f"  (A) sharpness vs PURE-fp64 2nd backward: rel={sharp_rel:.3e} "
               f"(tol {sharp_tol:.0e}, bf16-TC vs ground-truth fp64 floor) "
-              f"{'OK' if sharp_ok else 'FAIL'}", flush=True)
+              f"{'OK' if sharp_ok else ('INFO(warmup)' if warmup_mode else 'FAIL')}",
+              flush=True)
         print(f"  (B) mu vs rescale·phi(g,sharpness): rel={mu_rel:.3e} (tol {mu_tol:.0e}) "
               f"{'OK' if mu_ok else 'FAIL'}  [rescale={float(rescale):.3g} alpha={alpha:.3g} "
               f"gate_global={gate_global:.3g}]", flush=True)
-    tail_ok = param_ok and state_ok and sharp_ok and mu_ok
+    # The gate-momentum fix is carried by (1a)+(1b)+(B). Under warm-up, (A) is
+    # informational (fresh-model oracle vs warmed kernel) and the A/A/A (2) is the
+    # caller's; the cold single-step gate keeps the full (A)+(2) teeth.
+    tail_ok = param_ok and state_ok and mu_ok and (sharp_ok or warmup_mode)
+    if warmup_mode:
+        return (tail_ok, dict(param_rel=param_rel, sharp_rel=sharp_rel, mu_rel=mu_rel,
+                              m_rel=m_rel, v_rel=v_rel, loss=loss))
 
     # ── (2) A/A/A determinism: re-run the production step 3× from the SAME init.
     def _one():
@@ -839,6 +877,186 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
     ok = tail_ok and det_ok
     return ok, dict(param_rel=param_rel, sharp_rel=sharp_rel, mu_rel=mu_rel,
                     loss=loss, det=det_ok)
+
+
+def run_sg11_warmup_gate(cell_key, warmup_steps=2, verbose=True):
+    """WARM-UP SG11 gate — the divergence-exercising check the cold single-step gate is
+    BLIND to (in the worst case mu≈0 ∧ momentum=0 at step 1 ⇒ cos(grad,mu)==cos(grad,
+    momentum)==gate(0.5) — the two formulations COINCIDE). After ≥1 warm-up step BOTH
+    mu≠0 AND momentum (exp_avg)≠0, so the BUGGY cos(grad,mu) gate and the CANONICAL
+    cos(grad,momentum) gate genuinely differ.
+
+    Runs `warmup_steps` real L3-TC steps (shared state_cache so exp_avg accumulates),
+    captures the start-of-step m/v/p going INTO the gated step (= the kernel's
+    st.exp_avg/exp_avg_sq/params at gate time), then runs the gated step and validates
+    the kernel vs the CORRECTED cos(grad,momentum) reference (_run_sg_cell_gate with
+    sg11_warmup_state). Returns (ok, detail). detail carries:
+      * gate_div — max |gate_momentum − gate_mu| over tensors (>0 proves the warm-up
+        exercises the divergence the bug lives in; the OLD kernel computes the gate_mu
+        column and must FAIL this corrected reference).
+      * mom_norm — the start-of-step momentum L2 norm (must be ≫0 — a live warm-up)."""
+    import math
+    from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
+                                              canonicalize_model, fused_train_step,
+                                              _opt_scalars_from)
+    spec = _CELLS[cell_key]
+    model, opt = spec["model"], spec["opt"]
+    assert opt == "supergrok11", f"{cell_key}: warmup gate is SG11-only"
+    g, c, m, data, dev = _build_cell(model)
+    canon = canonicalize_model(model)
+    assert has_l3_real(canon, opt), f"{cell_key}: not L3-REAL"
+    assert gemm_impl_for_cell(canon, opt, "bf16") == "wgmma", f"{cell_key}: not wgmma"
+    tx, ty = data[0], data[1]
+    # Build the live optimizer with a LARGE meta-net rescale so the gate-dependent
+    # smart_grad term (1−gate)·alpha·mu, mu=rescale·phi, is well ABOVE the param
+    # tolerance (1e-4). With the default rescale=0.1 the mu term is too small to move
+    # params measurably, so a wrong gate (cos(grad,mu) vs cos(grad,momentum)) hides
+    # under the tolerance even when the gates diverge by ~0.8 — the param check would
+    # falsely PASS the OLD kernel. A big rescale makes the gate genuinely load-bearing.
+    import torch as _t
+    opt_obj = spec["factory"](g, m.parameters(), c)
+    with _t.no_grad():
+        opt_obj.meta_net.rescale.fill_(2.0)
+    opt_obj._weights_dirty = True
+    named0 = [(n, p) for n, p in m.named_parameters() if p.requires_grad]
+    total = sum(p.numel() for _, p in named0)
+
+    def _flat_params():
+        out = torch.empty(total, device=dev); o = 0
+        for _, p in named0:
+            k = p.numel(); out[o:o + k].copy_(p.data.reshape(-1)); o += k
+        return out
+
+    # ── WARM-UP: run `warmup_steps` real steps so exp_avg (momentum) becomes nonzero.
+    cache = {}
+    for s in range(1, warmup_steps + 1):
+        fused_train_step(canon, opt, m, opt_obj, tx, ty, state_cache=cache,
+                         step=s, return_grad=False, gemm_impl="wgmma")
+
+    # Start-of-step state going INTO the gated step (= the kernel's st.exp_avg/
+    # exp_avg_sq/params at gate time): the cache m/v slices + the live (warmed) params.
+    kstate = cache[canon]["state"]
+    m_start = kstate[0:total].clone()
+    v_start = kstate[total:2 * total].clone()
+    p_start = _flat_params()
+    mom_norm = float(m_start.norm())
+    t_step = warmup_steps + 1
+
+    # ── GATED step (step = warmup_steps+1) on the SAME cache (so it reads the warmed
+    # momentum), capturing the TC-reduced grad + post-step params (the kernel's gate
+    # now uses cos(grad, m_start)).
+    loss, grad = fused_train_step(canon, opt, m, opt_obj, tx, ty, state_cache=cache,
+                                  step=t_step, return_grad=True, gemm_impl="wgmma")
+    p_after = _flat_params()
+
+    # ── (A)/(B) THE DIRECT GATE SURFACE — recover the kernel's ACTUAL per-tensor gate
+    # and compare it to BOTH formulations. This is the load-bearing instrument: the
+    # post-Adam params and even the m-state are heavily damped (β1·m0 + 0.1·smart_grad,
+    # then v-normalized), so a wrong gate is washed out below the 1e-4 param/state
+    # tolerance even when the two gate FORMULATIONS differ by ~0.8. The gate itself is
+    # NOT damped, so recovering it exposes the bug cleanly.
+    #
+    # The kernel wrote k_m = β1·m0 + (1−β1)·smart_grad with smart_grad = g + (1−gate)·
+    # alpha·mu and a per-TENSOR scalar gate. So smart_grad_kernel = (k_m − β1·m0)/(1−β1),
+    # and (1−gate)·alpha = <smart_grad_kernel − g, mu> / <mu, mu> (least-squares over the
+    # tensor since gate is one scalar). gate_kernel = 1 − that/alpha. Compare to:
+    #   gate_momentum = sigmoid(gate_temp·cos(grad, m0))   — CANONICAL (FIXED kernel)
+    #   gate_mu       = sigmoid(gate_temp·cos(grad, k_mu)) — BUGGY     (OLD kernel)
+    scalars = _opt_scalars_from(opt_obj, t_step)
+    gate_temp = float(scalars.get("gate_temp", 5.0))
+    alpha = float(scalars["alpha"]); beta1 = float(scalars["beta1"])
+    k_mu = kstate[2 * total:3 * total]
+    k_m = kstate[0:total]
+    off = 0; gate_div = 0.0
+    err_vs_momentum = 0.0   # |gate_kernel − gate_momentum|  → ~0 for FIXED, large for OLD
+    err_vs_mu = 0.0         # |gate_kernel − gate_mu|        → ~0 for OLD,   large for FIXED
+    for n_, p in named0:
+        k = p.numel()
+        gt = grad[off:off + k].double()
+        mut = k_mu[off:off + k].double()
+        m0 = m_start[off:off + k].double()
+        km = k_m[off:off + k].double()
+        m0b = m_start[off:off + k].double()
+        def _gate(b):
+            num = (gt * b).sum()
+            den = torch.sqrt((gt * gt).sum() * (b * b).sum() + 1e-12)
+            cos = float(num / den) if den > 0 else 0.0
+            return 1.0 / (1.0 + math.exp(-gate_temp * cos))
+        g_mom = _gate(m0); g_mu = _gate(mut)
+        gate_div = max(gate_div, abs(g_mom - g_mu))
+        # Recover the kernel's gate from the m-state (per-tensor least-squares).
+        sg_k = (km - beta1 * m0b) / (1.0 - beta1)
+        denom = float((mut * mut).sum())
+        if denom > 1e-20 and alpha > 1e-12:
+            one_minus_gate = float(((sg_k - gt) * mut).sum()) / (denom * alpha)
+            gate_kernel = 1.0 - one_minus_gate
+            err_vs_momentum = max(err_vs_momentum, abs(gate_kernel - g_mom))
+            err_vs_mu = max(err_vs_mu, abs(gate_kernel - g_mu))
+        off += k
+
+    # ── Validate the FIXED kernel vs the CORRECTED cos(grad,momentum) reference, with
+    # the warmed start-of-step state threaded through (m0=m_start, gate uses momentum).
+    ok, detail = _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon,
+                                   opt_obj, grad, loss, p_after, total, named0, cache,
+                                   verbose, sg11_warmup_state=(m_start, v_start, p_start, t_step))
+    detail["gate_div"] = gate_div
+    detail["mom_norm"] = mom_norm
+    detail["gate_err_vs_momentum"] = err_vs_momentum
+    detail["gate_err_vs_mu"] = err_vs_mu
+    # (A)/(B) VERDICT on the direct gate surface: the kernel's recovered gate must match
+    # the CANONICAL cos(grad,momentum) (FIXED) and NOT the buggy cos(grad,mu) (OLD).
+    # The recovery sg_k=(k_m−β1·m0)/(1−β1) amplifies the bf16 m-state floor by 1/(1−β1)
+    # (≈10×), so the FIXED kernel lands at err_vs_momentum≈1e-4..1e-3 — a few×1e-3 floor.
+    # The OLD kernel sits at err_vs_momentum≈0.74..0.92 (and err_vs_mu≈1e-3). The two
+    # regimes are separated by ~3 orders of magnitude, so generous bands (1e-2 / 1e-1)
+    # give a robust, floor-tolerant verdict with no risk of a flip either way.
+    gate_ok = (err_vs_momentum < 1e-2) and (err_vs_mu > 1e-1)
+
+    # ── (D) A/A/A determinism on the WARM-UP path: re-run the full warmup+gated
+    # sequence 3× from the SAME init; the gated-step params + mu must be bit-identical.
+    def _one_warm():
+        g2, c2, m2, data2, dev2 = _build_cell(model)
+        tx2, ty2 = data2[0], data2[1]
+        opt2 = spec["factory"](g2, m2.parameters(), c2)
+        with _t.no_grad():
+            opt2.meta_net.rescale.fill_(2.0)
+        opt2._weights_dirty = True
+        cc = {}
+        for s in range(1, warmup_steps + 1):
+            fused_train_step(canon, opt, m2, opt2, tx2, ty2, state_cache=cc,
+                             step=s, return_grad=False, gemm_impl="wgmma")
+        L, G = fused_train_step(canon, opt, m2, opt2, tx2, ty2, state_cache=cc,
+                                step=t_step, return_grad=True, gemm_impl="wgmma")
+        P = torch.empty(total, device=dev2); o = 0
+        for _, p in m2.named_parameters():
+            if p.requires_grad:
+                k = p.numel(); P[o:o + k].copy_(p.data.reshape(-1)); o += k
+        MU = cc[canon]["state"][2 * total:3 * total].clone()
+        return L, G.clone(), P, MU
+    LA, GA, PA, MA = _one_warm(); LB, GB, PB, MB = _one_warm()
+    det_ok = (LA == LB and torch.equal(GA, GB) and torch.equal(PA, PB)
+              and torch.equal(MA, MB))
+    detail["det"] = det_ok
+
+    if verbose:
+        print(f"  (WARMUP) steps={warmup_steps} mom_norm={mom_norm:.4e} "
+              f"gate_div(momentum vs mu)={gate_div:.4e} "
+              f"{'OK(divergent)' if gate_div > 1e-4 else 'WARN(coincident!)'}", flush=True)
+        print(f"  (A/B) recovered-gate: |gate_kernel−gate_momentum|={err_vs_momentum:.4e} "
+              f"(want <1e-2 → matches CANONICAL) |gate_kernel−gate_mu|={err_vs_mu:.4e} "
+              f"(want >1e-1 → NOT the bug) {'OK(cos grad,momentum)' if gate_ok else 'FAIL'}",
+              flush=True)
+        print(f"  (D) A/A/A determinism (warmup path): loss {LA:.6f}/{LB:.6f}  "
+              f"param-eq={torch.equal(PA, PB)} mu-eq={torch.equal(MA, MB)} "
+              f"{'OK' if det_ok else 'FAIL'}", flush=True)
+    # The warm-up MUST exercise the divergence (else (A) old-kernel-fails is vacuous).
+    assert mom_norm > 1e-6, f"{cell_key}: warm-up momentum ~0 — exp_avg did not accumulate"
+    assert gate_div > 1e-4, (
+        f"{cell_key}: cos(grad,momentum) and cos(grad,mu) gates COINCIDE "
+        f"(div={gate_div:.2e}) — the warm-up does not exercise the bug; the (A) "
+        f"old-kernel-fails demonstration would be vacuous. Strengthen the warm-up.")
+    detail["gate_ok"] = gate_ok
+    return (ok and det_ok and gate_ok), detail
 
 
 def run_cell_gate(cell_key, verbose=True):
@@ -1258,10 +1476,27 @@ def test_l3tc_cell_gate(cell):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell", default="", help="single cell e.g. lion/decoder")
+    ap.add_argument("--sg11-warmup", action="store_true",
+                    help="run the SG11 WARM-UP gate (cos(grad,momentum) divergence) "
+                         "for the supergrok11 cells instead of the cold step-1 gate")
+    ap.add_argument("--warmup-steps", type=int, default=2,
+                    help="number of warm-up steps before the gated step (default 2)")
     args = ap.parse_args()
     if not _gpu_ready():
         print("SKIP: no built extension / GPU", flush=True)
         return
+    if args.sg11_warmup:
+        cells = ([args.cell] if args.cell
+                 else [k for k in _CELLS if _CELLS[k]["opt"] == "supergrok11"])
+        n_ok = 0
+        for cell in cells:
+            print(f"[l3tc-gate WARMUP] {cell}", flush=True)
+            ok, _ = run_sg11_warmup_gate(cell, warmup_steps=args.warmup_steps,
+                                         verbose=True)
+            print(f"  => {'PASS' if ok else 'FAIL'}\n", flush=True)
+            n_ok += int(ok)
+        print(f"[l3tc-gate WARMUP] {n_ok}/{len(cells)} SG11 cells passed", flush=True)
+        sys.exit(0 if n_ok == len(cells) else 1)
     cells = [args.cell] if args.cell else list(_CELLS)
     n_ok = 0
     for cell in cells:

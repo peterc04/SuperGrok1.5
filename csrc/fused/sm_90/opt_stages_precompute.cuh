@@ -469,15 +469,17 @@ __device__ inline void muon_ns_combine_phase(int64_t numel,
 //
 //   mu(T)   — per ELEMENT: mu[idx] = rescale * sg11_phi_forward(grad[idx],
 //             sharpness[idx], ...). Per-TENSOR weight set (W1,b1,W2,b2).
-//   gate(T) — per TENSOR: cosine of (grad, mu) over THIS tensor, block tree
+//   gate(T) — per TENSOR: cosine of (grad, MOMENTUM) over THIS tensor, block tree
 //             (block_reduce_sum_f32, primitives.cuh:125). NO cross-CTA, NO atomic.
+//             The 2nd cosine operand is the START-OF-STEP momentum (st.exp_avg),
+//             NOT mu — the canonical SG11 signal (supergrok11.h:22-29,64).
 //
-// gate FORMULA — the CANONICAL sg11_finalize_gate (algorithms/supergrok11.h).
-// compute_cosine_gate_fused (supergrok11_sm90.cuh) computes
-//   num=Σ sg·mu; den_g=Σ sg·sg; den_m=Σ mu·mu;
+// gate FORMULA — the CANONICAL sg11_finalize_gate (algorithms/supergrok11.h), fed
+// the cos(grad, momentum) accumulators from the canonical sg11_sweep_a_step:
+//   num=Σ g·m; den_g=Σ g·g; den_m=Σ m·m;   (m = start-of-step momentum/exp_avg)
 //   cos  = num / sqrt(den_g*den_m + 1e-12);
 //   gate = sigmoid(gate_temp · cos)
-// with sg == grad here. The cosine SIGNAL is what distinguishes SG11 from SG15's
+// The cosine SIGNAL is what distinguishes SG11 from SG15's
 // sigmoid-of-accuracy gate; only the FINAL squashing is the sigmoid, using the
 // plumbed gate_temp (the historical impl did a bare clamp and IGNORED gate_temp —
 // now corrected in lock-step across the canonical, per-op, this stage, the python
@@ -506,8 +508,12 @@ __device__ __forceinline__ void sg_stage_phi_weights(
     __syncthreads();
 }
 
-// SG11 per-tensor body: write mu(T) to global, barrier, compute the per-tensor
-// gate(T) = sigmoid(gate_temp · cos(grad, mu)) (reading the mu just written).
+// SG11 per-tensor body: write mu(T) to global AND compute the per-tensor
+// gate(T) = sigmoid(gate_temp · cos(grad, MOMENTUM)) — the canonical SG11 gate
+// SIGNAL (supergrok11.h:22-29, sg11_finalize_gate:64). The cosine's 2nd operand
+// is the START-OF-STEP momentum (exp_avg) the caller passes in, NOT the mu just
+// written: SG11's gate is cos_sim(grad, momentum), distinct from SG15's host
+// accuracy scalar. mu is STILL written here (the apply tail's smart_grad reads it).
 // Returns the gate on EVERY thread (broadcast through the reduction smem) so the
 // caller binds st.gate before apply_optimizer<SuperGrok11>. The phi weights are
 // already in SMEM (sW1/sb1/sW2 from sg_stage_phi_weights). `off`/`n` is the
@@ -518,32 +524,28 @@ __device__ inline float sg11_precompute_mu_and_gate_for_tensor(
         float* __restrict__ mu_blob,
         const float* __restrict__ grad,
         const float* __restrict__ sharpness,
+        const float* __restrict__ momentum,
         const float* sW1, const float* sb1, const float* sW2,
         float b2, float rescale,
         int64_t off, int n, float gate_temp) {
-    // mu(T): canonical meta-net forward (supergrok11.h:37-55) * rescale
-    // (supergrok11_sm90.cuh:130), written to global mu_blob.
+    // Fused mu(T) write + gate(T) cosine accumulation, routed through the CANONICAL
+    // sg11_sweep_a_step (algorithms/supergrok11.h:88-105 — the single source for
+    // Sweep A): for each element it writes mu_out[gi]=rescale·phi(g,sharpness) and
+    // accumulates the cos(grad, momentum) reductions
+    //   num += g·m;  den_g += g·g;  den_m += m·m  (m = start-of-step exp_avg).
+    // mu(T) = canonical meta-net forward (supergrok11.h:37-55) · rescale
+    // (supergrok11_sm90.cuh:130). momentum is an INPUT indexed by gi (each thread
+    // its OWN i=threadIdx.x stride indices), so no __syncthreads() is needed before
+    // the reduction (the OLD form read the just-written mu_blob and DID need one;
+    // reading the momentum input instead removes that dependency).
+    float num = 0.0f, den_g = 0.0f, den_m = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const int64_t gi = off + i;
         const float g = grad[gi];
         const float s = sharpness[gi];
-        const float phi = algo::sg11_phi_forward<H>(g, s, sW1, sb1, sW2, b2);
-        mu_blob[gi] = rescale * phi;
-    }
-    // Barrier: every thread's mu writes for THIS tensor must be visible to the
-    // gate reduction below (same block, so __syncthreads suffices — block-scope
-    // visibility, no grid barrier).
-    __syncthreads();
-    // gate(T): sigmoid(gate_temp · cos(grad, mu)), block tree. sg == grad (alpha=0
-    // path, bindings.cpp:1408). gate_temp is the plumbed gate_temperature.
-    float num = 0.0f, den_g = 0.0f, den_m = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int64_t gi = off + i;
-        const float sg = grad[gi];
-        const float u  = mu_blob[gi];
-        num   += sg * u;
-        den_g += sg * sg;
-        den_m += u  * u;
+        const float mu_val = rescale * algo::sg11_phi_forward<H>(g, s, sW1, sb1, sW2, b2);
+        algo::sg11_sweep_a_step<float>(
+            mu_blob, grad, sharpness, momentum, mu_val, gi, num, den_g, den_m);
     }
     // Deterministic block reductions (fixed thread count). Three separate trees
     // (the live host fn does three independent .sum()s — same shape).
@@ -554,7 +556,8 @@ __device__ inline float sg11_precompute_mu_and_gate_for_tensor(
     den_m = prim::block_reduce_sum_f32(den_m);
     // Canonical finalizer (sg11_finalize_gate, algorithms/supergrok11.h):
     //   cos = num / sqrt(den_g*den_m + 1e-12); gate = sigmoid(gate_temp · cos).
-    // Same single source compute_cosine_gate_fused calls — no re-inlined math.
+    // num/den_g/den_m are the cos(grad, MOMENTUM) accumulators from sg11_sweep_a_step
+    // above — the same single source compute_cosine_gate_fused calls, no re-inlined math.
     return algo::sg11_finalize_gate(num, den_g, den_m, gate_temp);
 }
 

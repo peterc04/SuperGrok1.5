@@ -1156,8 +1156,11 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
             if constexpr (Opt == OptId::SuperGrok11) {
                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
                                                            : st.sg_phi_b2;
+                // st.exp_avg = start-of-step momentum (base ptr, indexed by off+i) —
+                // the gate's 2nd cosine operand: sigmoid(gate_temp·cos(grad,momentum)).
+                // Precompute runs BEFORE the apply (sg11_sweep_b_step) writes exp_avg.
                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
-                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
+                    st.mu, grad, st.sharpness, st.exp_avg, sg_sW1, sg_sb1, sg_sW2,
                     b2, st.sg_rescale, off, n, st.gate_temp);
                 ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
                 __syncthreads();         // mu(T) fully written + gate broadcast before apply

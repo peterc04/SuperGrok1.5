@@ -200,6 +200,48 @@ _REINLINE_PATTERNS = [
     re.compile(r"/\s*bc1\s*\)\s*/\s*\(\s*sqrtf\s*\(.*?/\s*bc2"),
 ]
 
+# ---------------------------------------------------------------------------
+# SG11 cosine-GATE re-inline detection (drift guard for the cos(grad,momentum)
+# signal).
+#
+# The SG11 gate's cosine reduction — num+=g·m; den_g+=g·g; den_m+=m·m — is the
+# canonical Sweep A (algorithms/supergrok11.h::sg11_sweep_a_step). The L3-TC staged
+# precompute (csrc/fused/sm_90/opt_stages_precompute.cuh) MUST obtain it by CALLING
+# sg11_sweep_a_step, never by re-inlining the per-element accumulation in its own
+# loop. A re-inlined reduction is EXACTLY how the historical cos(grad,mu) bug crept
+# in (the loop hard-coded `den_m += u*u` with u=mu, no momentum operand). So we scan
+# the precompute consumer for a loop-body `den_m += <x>*<x>` / `den_g += <x>*<x>`
+# accumulation; any match FAILS — the cosine math must come from the canonical call.
+# (The local `float num=0, den_g=0, den_m=0;` declarations + the three
+# block_reduce_sum_f32(...) finalizers are NOT accumulations and do not match.)
+_COSINE_REINLINE_PATTERNS = [
+    re.compile(r"\bden_m\s*\+=\s*[\w.\[\]]+\s*\*"),
+    re.compile(r"\bden_g\s*\+=\s*[\w.\[\]]+\s*\*"),
+]
+
+
+def _cosine_consumer_headers() -> list:
+    """Headers that compute the SG11 cosine gate and MUST route the reduction
+    through the canonical sg11_sweep_a_step (never re-inline it)."""
+    return ["csrc/fused/sm_90/opt_stages_precompute.cuh"]
+
+
+def scan_reinlined_cosine(path: str) -> list:
+    """Return list of (lineno, pattern, line) for a re-inlined SG11 cosine-gate
+    reduction in `path` (comments stripped first, so the doc lines that DESCRIBE
+    the canonical `den_m += m·m` are ignored)."""
+    body = _read(path)
+    if not body:
+        return []
+    hits = []
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        code = re.sub(r"//.*$", "", raw)
+        for pat in _COSINE_REINLINE_PATTERNS:
+            if pat.search(code):
+                hits.append((lineno, pat.pattern, raw.strip()))
+                break
+    return hits
+
 
 def _consumer_headers() -> list:
     """Includable CUDA consumers that MUST obtain the Adam math by call, not by
@@ -408,6 +450,24 @@ def check(structural_only: bool = False) -> list:
                 f"(matched /{pat}/): `{line}`. This expression MUST come from a "
                 f"call into csrc/algorithms/<opt>.h (e.g. <opt>_step / "
                 f"<opt>_adam_tail), not be re-typed in the consumer.")
+
+    # (1c) SG11 cosine-gate re-inline detection: the staged precompute consumer MUST
+    # obtain the cos(grad,momentum) reduction from the canonical sg11_sweep_a_step,
+    # never re-inline `den_m += x*x` in its own loop (the path the cos(grad,mu) bug
+    # took). Also assert it #includes the canonical supergrok11.h.
+    for path in _cosine_consumer_headers():
+        if _canonical_header("supergrok11") not in _read(path):
+            failures.append(
+                f"[structural] {path} does NOT #include the canonical "
+                f"{_canonical_header('supergrok11')} (the SG11 cosine gate would "
+                f"reimplement the reduction → drift). Add the #include.")
+        for lineno, pat, line in scan_reinlined_cosine(path):
+            failures.append(
+                f"[cosine-re-inline] {path}:{lineno} re-inlines the SG11 cosine-gate "
+                f"reduction (matched /{pat}/): `{line}`. The cos(grad,MOMENTUM) "
+                f"accumulation MUST come from a call into algo::sg11_sweep_a_step "
+                f"(csrc/algorithms/supergrok11.h), not be re-typed in the consumer "
+                f"(re-inlining is exactly how the cos(grad,mu) bug crept in).")
 
     if structural_only:
         return failures

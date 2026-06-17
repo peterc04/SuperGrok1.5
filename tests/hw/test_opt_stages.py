@@ -198,49 +198,48 @@ def _sg11_mu_mirror(grad, sharpness, W1, b1, W2, b2, rescale):
     return (rescale * out).reshape(grad.shape)
 
 
-def _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0):
+def _sg11_gate_mirror_fp32(grad, momentum, gate_temp=5.0):
     """Mirror sg11_precompute_mu_and_gate_for_tensor's finalizer (== compute_cosine_
     gate_fused == sg11_finalize_gate, algorithms/supergrok11.h) in fp32 with the
-    block-tree reduction shape. sg == grad (the alpha=0 mu_metanet makes smart_grad
-    == grad). Returns gate = sigmoid(gate_temp * cos(grad, mu)) (the cosine SIGNAL
-    squashed by the temperature-scaled sigmoid, NOT a bare clamp)."""
+    block-tree reduction shape. The canonical SG11 gate SIGNAL is cos(grad,
+    MOMENTUM) (supergrok11.h:22-29,64 — the 2nd operand is the start-of-step
+    exp_avg, NOT mu; that distinguishes SG11 from the buggy cos(grad,mu)). Returns
+    gate = sigmoid(gate_temp * cos(grad, momentum)) (the cosine SIGNAL squashed by
+    the temperature-scaled sigmoid, NOT a bare clamp)."""
     g = _f32(grad).flatten()
-    u = _f32(mu).flatten()
-    num = _block_tree_sum_fp32(g * u)
+    m = _f32(momentum).flatten()
+    num = _block_tree_sum_fp32(g * m)
     den_g = _block_tree_sum_fp32(g * g)
-    den_m = _block_tree_sum_fp32(u * u)
+    den_m = _block_tree_sum_fp32(m * m)
     denom = math.sqrt(den_g * den_m + 1e-12)
     cos = (num / denom) if denom > 0.0 else 0.0
     return 1.0 / (1.0 + math.exp(-gate_temp * cos))
 
 
-def _sg11_gate_oracle_fp64(grad, mu, gate_temp=5.0):
-    """fp64 gate oracle: sigmoid(gate_temp * <g,mu>/sqrt(|g|^2 |mu|^2 + 1e-12))."""
+def _sg11_gate_oracle_fp64(grad, momentum, gate_temp=5.0):
+    """fp64 gate oracle: sigmoid(gate_temp * <g,m>/sqrt(|g|^2 |m|^2 + 1e-12)),
+    m == the start-of-step MOMENTUM (exp_avg) — the canonical cos(grad,momentum)
+    SIGNAL (supergrok11.h:29,64), NOT the co-wrong cos(grad,mu)."""
     g = _f64(grad).flatten()
-    u = _f64(mu).flatten()
-    num = float((g * u).sum())
+    m = _f64(momentum).flatten()
+    num = float((g * m).sum())
     den_g = float((g * g).sum())
-    den_m = float((u * u).sum())
+    den_m = float((m * m).sum())
     denom = math.sqrt(den_g * den_m + 1e-12)
     cos = (num / denom) if denom > 0.0 else 0.0
     return 1.0 / (1.0 + math.exp(-gate_temp * cos))
 
 
 def test_sg11_cosine_gate_matches_fp64_oracle():
-    """Per-tensor sigmoid-of-cosine gate (block tree) vs the fp64 oracle."""
+    """Per-tensor sigmoid-of-cos(grad, MOMENTUM) gate (block tree) vs the fp64
+    oracle. The cosine's 2nd operand is the start-of-step momentum (exp_avg), the
+    canonical SG11 signal — NOT mu."""
     torch.manual_seed(2)
-    H = 32
-    W1 = torch.randn(H * 2, dtype=torch.float64) * 0.1
-    b1 = torch.randn(H, dtype=torch.float64) * 0.1
-    W2 = torch.randn(H, dtype=torch.float64) * 0.1
-    b2 = 0.05
-    rescale = 0.7
     for sh in [(513,), (32, 24), (2000,)]:
         grad = torch.randn(*sh, dtype=torch.float64) * 0.3
-        sharp = (torch.randn(*sh, dtype=torch.float64) * 0.2).abs()
-        mu = _sg11_mu_mirror(grad, sharp, W1, b1, W2, b2, rescale)
-        gate_stage = _sg11_gate_mirror_fp32(grad, mu)
-        gate_oracle = _sg11_gate_oracle_fp64(grad, mu)
+        momentum = torch.randn(*sh, dtype=torch.float64) * 0.25
+        gate_stage = _sg11_gate_mirror_fp32(grad, momentum)
+        gate_oracle = _sg11_gate_oracle_fp64(grad, momentum)
         assert math.isclose(gate_stage, gate_oracle, rel_tol=1e-4, abs_tol=1e-6), (
             f"sg11 gate {gate_stage} vs oracle {gate_oracle} shape={sh}")
         assert 0.0 <= gate_stage <= 1.0
@@ -254,29 +253,31 @@ def test_sg11_gate_applies_gate_temp():
     1 for a positive cosine (a bare clamp would be temperature-invariant)."""
     torch.manual_seed(3)
     grad = torch.randn(400, dtype=torch.float64)
-    mu = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)  # positive cos
+    # 2nd cosine operand = MOMENTUM (canonical SG11), correlated with grad ⇒ cos>0.
+    momentum = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)
     # (a) gate == sigmoid(gate_temp*cos), and DIFFERS from the bare clamped cosine.
-    g = _f64(grad).flatten(); u = _f64(mu).flatten()
-    cos = float((g * u).sum()) / math.sqrt(
-        float((g * g).sum()) * float((u * u).sum()) + 1e-12)
+    g = _f64(grad).flatten(); m = _f64(momentum).flatten()
+    cos = float((g * m).sum()) / math.sqrt(
+        float((g * g).sum()) * float((m * m).sum()) + 1e-12)
     clamped_cos = min(max(cos, 0.0), 1.0)
-    gate5 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0)
+    gate5 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=5.0)
     assert math.isclose(gate5, 1.0 / (1.0 + math.exp(-5.0 * cos)),
                         rel_tol=1e-4, abs_tol=1e-6)
     assert not math.isclose(gate5, clamped_cos, rel_tol=1e-3, abs_tol=1e-3)
     # (b) temperature is genuinely consumed: higher temp ⇒ gate closer to 1 (cos>0).
-    gate1 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=1.0)
-    gate20 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=20.0)
+    gate1 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=1.0)
+    gate20 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=20.0)
     assert gate1 < gate5 < gate20
 
 
-def _sg11_mu_and_gate_for_tensor(grad_T, sharp_T, W1, b1, W2, b2, rescale):
+def _sg11_mu_and_gate_for_tensor(grad_T, sharp_T, mom_T, W1, b1, W2, b2, rescale):
     """Mirror sg11_precompute_mu_and_gate_for_tensor: the PER-TENSOR fused body
-    that writes mu(T) then computes gate(T). Returns (mu_T, gate_T). This is the
-    single-drain Design B body — it sees ONLY tensor T (off/n slice), so its gate
-    cannot depend on any other tensor's mu."""
+    that writes mu(T) then computes gate(T)=sigmoid(gate_temp·cos(grad_T, mom_T)).
+    Returns (mu_T, gate_T). This is the single-drain Design B body — it sees ONLY
+    tensor T (off/n slice), so its gate cannot depend on any other tensor's slice.
+    The gate's 2nd operand is the start-of-step momentum mom_T (canonical), not mu."""
     mu_T = _sg11_mu_mirror(grad_T, sharp_T, W1, b1, W2, b2, rescale)
-    gate_T = _sg11_gate_mirror_fp32(grad_T, mu_T)
+    gate_T = _sg11_gate_mirror_fp32(grad_T, mom_T)
     return mu_T, gate_T
 
 
@@ -298,17 +299,19 @@ def test_sg11_gate_is_per_tensor_not_cross_tensor():
     # Tensor T plus several OTHER tensors that share the meta-net weights.
     gT = torch.randn(321, dtype=torch.float64) * 0.4
     sT = (torch.randn(321, dtype=torch.float64)).abs()
+    mT = torch.randn(321, dtype=torch.float64) * 0.3   # start-of-step momentum slice
     others = [
-        (torch.randn(k, dtype=torch.float64), (torch.randn(k, dtype=torch.float64)).abs())
+        (torch.randn(k, dtype=torch.float64), (torch.randn(k, dtype=torch.float64)).abs(),
+         torch.randn(k, dtype=torch.float64))
         for k in (64, 999, 128)
     ]
     # gate(T) computed by the per-tensor body, with T alone.
-    _, gate_alone = _sg11_mu_and_gate_for_tensor(gT, sT, W1, b1, W2, b2, rescale)
+    _, gate_alone = _sg11_mu_and_gate_for_tensor(gT, sT, mT, W1, b1, W2, b2, rescale)
     # gate(T) computed by the same per-tensor body AFTER processing the others
     # (the body only ever sees T's slice; the others change nothing for T).
-    for go, so in others:
-        _sg11_mu_and_gate_for_tensor(go, so, W1, b1, W2, b2, rescale)
-    _, gate_after = _sg11_mu_and_gate_for_tensor(gT, sT, W1, b1, W2, b2, rescale)
+    for go, so, mo in others:
+        _sg11_mu_and_gate_for_tensor(go, so, mo, W1, b1, W2, b2, rescale)
+    _, gate_after = _sg11_mu_and_gate_for_tensor(gT, sT, mT, W1, b1, W2, b2, rescale)
     assert gate_alone == gate_after, (
         "SG11 gate(T) must be independent of other tensors — the no-barrier "
         "single-drain design depends on this per-tensor independence.")
