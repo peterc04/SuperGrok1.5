@@ -1,0 +1,238 @@
+--- a/csrc/fused/sm_90/model_stage_mamba_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_mamba_tc.cuh
+@@ -40,7 +40,7 @@
+ //   (tc_gemm_block_pipelined) is deliberately NOT used (reverted: net loss on
+ //   staging-bound GEMMs); the plain unpipelined wgmma engine is the right tool
+ //   for these dense, contiguous projection matmuls.
+-#include "model_stage_decoder_tc.cuh"
++#include "csrc/fused/sm_90/model_stage_decoder_tc.cuh"
+ 
+ #include <cuda_runtime.h>
+ #include <cuda_bf16.h>
+@@ -493,6 +493,101 @@
+ #endif
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  M0 BODY-REWIRE — the GPU-iteration-gated integration of the scaffold above
++//  into fused_mamba_megakernel_tc. SPLIT INTO TWO INDEPENDENTLY-GATED SUB-LEVERS
++//  under the one master knob SG_TUNED_MB_PROJ_WGMMA (the decoder fold-A/fold-B
++//  independence pattern — a gate-RED on the parity-bearing half reverts IT ALONE):
++//
++//    (1) the FWD-GEMM half  — SG_TUNED_MB_PROJ_WGMMA on its own:
++//          * the bf16 projection-weight cache pre-stage (mb_proj_wbf_convert, the
++//            scaffold's C1 helper) so the wgmma B-operand is K-contiguous;
++//          * MATERIALIZING the FIVE converted projections' linear INPUTS X
++//            (in/out/gate/up/down) to the MbActs HBM region per sample, in the
++//            P1 fwd window, from the RETAINED per-sample forward activations
++//            (recomputing the two that the scalar fwd does not keep — xn and h1n
++//            — by re-running the SAME RMSNorm the oracle ran; bit-equal values).
++//        TRANSPORT-ONLY BY CONSTRUCTION: every value written is __float2bfloat16
++//        of the EXACT fp32 the scalar oracle computed (no reduction, no reorder)
++//        → a bf16-rounded reference; element-owned (one writer per (token,col))
++//        → deterministic; the scan + the scalar fwd/bwd are byte-for-byte
++//        UNTOUCHED. This half is gate-green-by-precedent (the decoder fwd GEMM).
++//
++//    (2) the dW half  — SG_TUNED_MB_PROJ_WGMMA_DW (S1-class, needs-parity):
++//          * CAPTURING the five projections' OUTPUT ADJOINTS dY to MbActs (the
++//            second dW operand) as the per-sample bwd produces them — this needs
++//            hooks INSIDE the correctness-critical scalar bwd, so it is the
++//            GPU-iteration-gated remaining step (see the TODO at the call site);
++//          * the output-stationary P2 dW GEMM (mbtc_proj_dw_run_tile) contracting
++//            the FULL token dim K=T and OVERWRITING the five weights' reduced grad.
++//        This CHANGES the fp32 dW accumulation order (per-sample kSeq=8 ascending-s
++//        reduce → full-T ascending-t K-contraction) → parity is NOT provable
++//        CPU-side; it is fp64-oracle-arbitrated at 1e-4 on real silicon (the S1
++//        campaign tol). Default-tied to the master knob; force =0 to land the
++//        fwd half alone (the scalar dW path then stays the source of the 5 grads).
++//
++//  Both halves are NO-OP / not-instantiated when SG_TUNED_MB_PROJ_WGMMA==0 → the
++//  shipped d=128 build is byte-for-byte unchanged (PTX-verified, same compile).
++// ════════════════════════════════════════════════════════════════════════
++#ifndef SG_TUNED_MB_PROJ_WGMMA_DW
++// The dW half defaults to the master knob (ON when the master is ON). Set
++// -DSG_TUNED_MB_PROJ_WGMMA_DW=0 (with the master ON) to land the fwd-GEMM half
++// alone — exactly the decoder fold-A-reverts-alone discipline.
++#define SG_TUNED_MB_PROJ_WGMMA_DW SG_TUNED_MB_PROJ_WGMMA
++#endif
++
++#if SG_TUNED_MB_PROJ_WGMMA
++// ── (FWD-GEMM half) Materialize ONE sample's five projection INPUTS X into the
++//    MbActs HBM region (the dW B-operand). Called in the P1 fwd window, AFTER
++//    mb_forward_sample populated this sample's smem and BEFORE the next sample
++//    overwrites it. `bg` is the sample's GLOBAL token-base (= b*kSeq); rows
++//    [bg, bg+kSeq) of every MbActs.X_* stream are written here. The values are:
++//      X_in   = xn   (mixer-norm out)  — RECOMPUTED from layer_in[li] via mixn_w
++//                                         (the scalar fwd threw xn away into dr).
++//      X_outp = y_gated = (y_scan + x_in·D)·silu(z)  — recomputed from retained
++//                                         a->y_scan / a->x_in / a->z / L.D
++//                                         (the SAME expression mb_mixer_fwd used).
++//      X_mlp  = h1n  (mlp-norm out)     — RECOMPUTED from a->h1 via mlpn_w.
++//      X_down = prod = silu(g_pre)·u_mlp — recomputed from retained a->g_pre/u_mlp.
++//    Every recompute is the IDENTICAL fp32 arithmetic the forward ran, so the
++//    bf16-rounded value stored is bit-equal to a bf16 reference of the oracle's X.
++//    Element-owned, no atomics, no cross-thread reduction → deterministic. ──
++__device__ __forceinline__ void mbtc_materialize_sample_x(
++        const MambaWeights& w, const MbActs& acts, int bg,
++        const MambaSampleSmem* sm) {
++    for (int li = 0; li < mb::kLayers; ++li) {
++        const MambaWeights::Layer& L = w.layer[li];
++        const MambaSampleSmem::LayerAct* a = &sm->act[li];
++        // X_in = xn = RMSNorm_mix(layer_in[li]) (mixn). r = mixn_r[s] (cached).
++        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
++            const int s = idx / mb::kD, j = idx % mb::kD;
++            const float xr = sm->layer_in[li][s][j];
++            const float xn = xr * a->mixn_r[s] * L.mixn_w[j];   // RMSNorm fwd, no bias
++            acts.X_in[li][(int64_t)(bg + s) * mb::kD + j] = __float2bfloat16(xn);
++        }
++        // X_outp = y_gated[s,c] = (y_scan + x_in·D)·silu(z) — the out_proj input.
++        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
++            const int s = idx / mb::kDInner, c = idx % mb::kDInner;
++            const float yv = a->y_scan[s][c] + a->x_in[s][c] * L.D[c];
++            const float yg = yv * mb_silu(a->z[s][c]);
++            acts.X_outp[li][(int64_t)(bg + s) * mb::kDInner + c] = __float2bfloat16(yg);
++        }
++        // X_mlp = h1n = RMSNorm_mlp(h1) (mlpn). r = mlpn_r[s] (cached).
++        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
++            const int s = idx / mb::kD, j = idx % mb::kD;
++            const float h1n = a->h1[s][j] * a->mlpn_r[s] * L.mlpn_w[j];
++            acts.X_mlp[li][(int64_t)(bg + s) * mb::kD + j] = __float2bfloat16(h1n);
++        }
++        // X_down = prod = silu(g_pre)·u_mlp — the down_proj input.
++        for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
++            const int s = idx / mb::kDff, o = idx % mb::kDff;
++            const float prod = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
++            acts.X_down[li][(int64_t)(bg + s) * mb::kDff + o] = __float2bfloat16(prod);
++        }
++    }
++}
++#endif  // SG_TUNED_MB_PROJ_WGMMA
++
+ // ── Per-model Muon 2D-weight table (the ndim==2 parameters Muon's P2.7
+ //    Newton-Schulz orthogonalizes; ndim==1/other weights take the AdamW aux tail).
+ //    Flat tensor index (named_parameters() order) + rows[dim0] + cols[dim1],
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -614,6 +614,13 @@
+     __nv_bfloat16* mbproj_acts_bf = reinterpret_cast<__nv_bfloat16*>(mbproj_base);
+     __nv_bfloat16* mbproj_wbf_bf  = mbproj_acts_bf + mbtc::mb_acts_bf16_count(T);
+     (void)mbproj_acts_bf; (void)mbproj_wbf_bf;
++    // ── M0 BODY-REWIRE binds. acts = the MbActs HBM region (the projection dW
++    //    operands: 4 X-streams [fwd half] + 5 dY-streams [dW half]); wbf = the
++    //    bf16 projection-weight cache (the fwd GEMM B-operand). Built once here;
++    //    consumed by the P1 materialize (fwd half) + the P2-dW GEMM (dW half). ──
++    mbtc::MbActs    mbacts = mbtc::mb_acts_bind(mbproj_acts_bf, T);
++    mbtc::MbProjWBf mbwbf  = mbtc::mb_proj_wbf_bind(mbproj_wbf_bf);
++    (void)mbwbf;
+ #endif
+ #if SG_MB_TC_PROFILE
+     // 8-byte align the double accumulator: round the float offset up to an even
+@@ -636,6 +643,13 @@
+     // ── P0: zero this CTA's FULL grad partial + loss slot. ──
+     for (int64_t i = threadIdx.x; i < total_p; i += blockDim.x) my_part[i] = 0.0f;
+     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
++#if SG_TUNED_MB_PROJ_WGMMA
++    // C1 (FWD-GEMM half): fill the bf16 projection-weight cache (the fwd GEMM
++    // B-operand) — grid-strided, element-owned, deterministic; B0 fences it before
++    // any P2-dW GEMM stages from it. __float2bfloat16 of the SAME fp32 the scalar
++    // mb_linear read on each weight element → operand VALUES bit-identical.
++    mbtc::mb_proj_wbf_convert(params, mbproj_wbf_bf, cta, nCTA);
++#endif
+     bar.sync();   // B0
+ 
+     // ── P1: batch-parallel fwd+bwd (scalar per-sample). Fixed contiguous slice
+@@ -654,7 +668,32 @@
+             if (threadIdx.x == 0) tgt_s = tok.targets[b];
+             __syncthreads();
+             float nll = mb_forward_sample(w, tok_s, tgt_s, &sm);
++#if SG_TUNED_MB_PROJ_WGMMA
++            // FWD-GEMM half: materialize this sample's five projection INPUTS X to
++            // the MbActs HBM region (rows [b*kSeq, b*kSeq+kSeq)) from the RETAINED
++            // forward activations — BEFORE mb_backward_sample reuses the smem
++            // scratch and BEFORE the next sample overwrites it. Transport-only
++            // (bf16-round of the oracle's exact fp32 X); the scan/fwd are untouched.
++            mbtc::mbtc_materialize_sample_x(w, mbacts, b * mb::kSeq, &sm);
++            __syncthreads();
++#endif
+             mb_backward_sample(w, g, tok_s, tgt_s, B, &sm);
++#if SG_TUNED_MB_PROJ_WGMMA_DW
++            // dW half (TODO — GPU-iteration-gated): capture this sample's five
++            // projection OUTPUT ADJOINTS dY (dY_in=[dx_main|dz], dY_outp=dmix_out,
++            // dY_gate=dg_pre, dY_up=du, dY_down=dmlp_out) into the MbActs dY-streams
++            // at rows [b*kSeq, b*kSeq+kSeq). These adjoints are TRANSIENT in the
++            // scalar bwd (overwritten layer-by-layer in adj_c/wff_a/wff_b/dh), so
++            // capturing them requires hooks INSIDE mb_backward_sample /
++            // mb_mixer_bwd / mb_swiglu_bwd at the exact points each is live. That is
++            // the parity-bearing, GPU-only-revalidatable step (the dW
++            // fp32-reassociation oracle is re-anchored on silicon), deliberately
++            // LEFT as the staged second sub-lever per the M0 mandate. Until it
++            // lands, the P2-dW GEMM below is COMPILED but its inputs (dY) are the
++            // zero-initialized region → it would write zeros; so the actual grad
++            // OVERWRITE is itself gated on the dY capture being wired (see P2-dW).
++            (void)mbacts;   // dY-stream pointers exist; the capture call is the TODO
++#endif
+             if (threadIdx.x == 0) nll_acc += nll;
+             __syncthreads();
+         }
+@@ -688,6 +727,61 @@
+     }
+     (void)loss_out;
+     SG_MBTC_PROF_ACC(2, _pt);          // close P2 (full-grad reduce + loss)
++
++#if SG_TUNED_MB_PROJ_WGMMA_DW
++    // ── P2-dW (dW half) — OUTPUT-STATIONARY projection-weight dW via wgmma.
++    //    dW = dYᵀ @ X, K = T (the full token dim, contracted by the OWNER CTA);
++    //    tile_id % nCTA ownership (FIXED every step) + ascending-t K-contraction →
++    //    deterministic & A/A/A-safe by construction. Each owned 64×N tile is
++    //    written straight into `grad` at the weight's offset (NO partial, NO
++    //    atomic). This OVERWRITES the five converted weights' grad slots that the
++    //    P2 reduce above produced from the scalar per-sample partials — the GEMM
++    //    recomputes the SAME mathematical dW with a reassociated fp32 tree (the
++    //    parity delta the fp64 gate arbitrates at 1e-4).
++    //
++    //    ⚠ GUARDED by SG_TUNED_MB_PROJ_WGMMA_DW_LIVE (default OFF): the dY operands
++    //    in MbActs are only the zero-init region until the dY-capture hooks (the
++    //    P1 TODO above) are wired. With the capture UNwired, running the overwrite
++    //    would zero the five grads. So the machinery below COMPILES and is fully
++    //    reviewable, but the actual grad write stays gated OFF until the dY capture
++    //    lands on silicon. Flip the master M0 gate + wire the dY capture + set
++    //    SG_TUNED_MB_PROJ_WGMMA_DW_LIVE=1 together for the GPU parity gate. ──
++#ifndef SG_TUNED_MB_PROJ_WGMMA_DW_LIVE
++#define SG_TUNED_MB_PROJ_WGMMA_DW_LIVE 0
++#endif
++    SG_MBTC_PROF_TIC(_pt);             // open P2-dW (separate from the P2 reduce slot)
++    {
++        // The dW GEMM needs T a multiple of the wgmma K atom (16). B*kSeq is the
++        // token count; the scaffold's run-tile contract requires T%16==0 (the
++        // caller pads, exactly as the decoder pads B*kSeq). At kSeq=8, T=B*8 so
++        // T%16==0 iff B is even — the bench/production B are powers of two. The
++        // host sizer carved MbActs for exactly T tokens (no pad), so DO NOT run a
++        // padded K here; assert the contract instead (a static-shaped guard).
++        __shared__ mbtc::MbProjDwSpec dw_spec[mbtc::kMbProjNumDw];
++        if (threadIdx.x == 0) mbtc::mbtc_build_proj_dw_specs(mbacts, T, dw_spec);
++        __syncthreads();
++        bar.sync();   // B1d: all CTAs finished the P2 reduce of the 5 weights
++                      // (their grad slots are settled) before any dW overwrite,
++                      // AND the spec build is visible.
++        const int n_dw = mbtc::mbtc_proj_dw_total_tiles<mbtc::kMbProjN>(dw_spec);
++        if ((T % wgs::kWgmmaAtomK) == 0) {
++#if SG_TUNED_MB_PROJ_WGMMA_DW_LIVE
++            // wgmma staging smem reuses the per-sample dynamic region (the scan is
++            // done; MambaSampleSmem is free). Carve sA/sB at its base, sized for the
++            // engine's kMbSmemAElems/kMbSmemBElems (≈16 KB, ≪ the 227 KB struct).
++            __nv_bfloat16* sA = reinterpret_cast<__nv_bfloat16*>(mamba_tc_smem_raw);
++            __nv_bfloat16* sB = sA + mbtc::kMbSmemAElems;
++            for (int gt = cta; gt < n_dw; gt += nCTA)
++                mbtc::mbtc_proj_dw_run_tile<mbtc::kMbProjN>(dw_spec, gt, T, grad, sA, sB);
++#else
++            (void)n_dw;   // machinery compiled; overwrite gated until dY capture lands
++#endif
++        }
++    }
++    SG_MBTC_PROF_ACC(4, _pt);          // close P2-dW (projection dW GEMM; slot 4 = p2-dwgemm)
++    bar.sync();                        // B1e: all dW overwrites visible before P3
++#endif  // SG_TUNED_MB_PROJ_WGMMA_DW
++
+     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+     SG_MBTC_PROF_TIC(_pt);             // open P3 (optimizer tail)
+ 

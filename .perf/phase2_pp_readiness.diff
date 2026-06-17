@@ -1,0 +1,1102 @@
+diff --git a/.phase2/RUNBOOK.md b/.phase2/RUNBOOK.md
+index 1103cd3..004bc4f 100644
+--- a/.phase2/RUNBOOK.md
++++ b/.phase2/RUNBOOK.md
+@@ -62,11 +62,35 @@ PYTHONPATH=. python -m pytest tests/hw/test_tp_loopback.py -q -s
+ 
+ ## 2. PP=2 loopback gate — `tests/hw/test_pp2_loopback_determinism.py`  [NEW, GPU, ~8 min]
+ 
++**PREREQUISITES (all CPU-authored; must ALL be present before this gate compiles):**
++* **PP-1** — the REGENERATED patch 0001 (template `<Llo,Lhi>` + `#define
++  SG_DECTC_LAYER_RANGE 2` on both inline tiles + the `_outlined` wrappers;
++  `dh_in`/`dh_out` appended AFTER the existing `pipeBars=nullptr` so the
++  positional production call sites stay valid). The old 2026-06-12 value-1 patch
++  is dead — it does not apply to the live 2595-line header.
++* **PP-3 EDIT A** — the shared `dec_tc_bind_workspace()` helper (single-source
++  carve macro) in `fused_decoder_megakernel.cuh`. PTX-VERIFIED byte-identical for
++  the single-GPU `<OptId::AdamW>` production kernel.
++* **PP-2 / PP-3 EDIT B / PP-5** — the regenerated `pp_stage_decoder_tc.cuh` kernel
++  bodies: both kernels carve via the shared helper, bind+fill the bf16 weight
++  cache (`dectc_wbf_convert` in P0 fenced by B0 — the fwd kernel gained a
++  GridBarrier + its launcher now zeroes the barrier slots), and thread `wb` as the
++  2nd positional tile arg with `pipeBars=nullptr` + `dh_in`/`dh_out` on the tail.
++
+ ```bash
++# PREFLIGHT — the patch must apply cleanly to the LIVE header (the test SKIPS
++# loudly on a stale/drifted tree; this catches it before the ~4-min JIT build):
++git apply --check .phase2/patches/0001-dectc-layer-range-pp.patch
++
+ # REQUIRED FIRST (tracked-file change shipped as a patch, lane discipline):
+ git apply .phase2/patches/0001-dectc-layer-range-pp.patch
+-# sanity: production cell still compiles + PTX-identity claim spot-check
+-#   (optional, ~2 min): see REPORT §"PP patch" for the exact nvcc -ptx diff cmd.
++
++# PTX-IDENTITY (the dormancy contract; CPU, ~2 min): the production decoder kernel
++# is byte-identical pre/post PP-1 + PP-3-EDIT-A. Re-prove on the GPU box —
++#   nvcc -ptx -gencode arch=compute_90a,code=sm_90a -DSG_TUNED_GEMM_IMPL=1, force
++#   <OptId::AdamW>, orig-header tree vs patched tree; sha256 must match. (Verified
++#   in-worktree 2026-06-17, nvcc 12.4: identical under SG_TUNED_DEC_DW_STAGE OFF and
++#   ON — the carve is a MACRO expanded inline, no function boundary to perturb it.)
+ 
+ PYTHONPATH=. python -m pytest tests/hw/test_pp2_loopback_determinism.py -q -s
+ ```
+diff --git a/.phase2/patches/0001-dectc-layer-range-pp.patch b/.phase2/patches/0001-dectc-layer-range-pp.patch
+index c26e656..302986b 100644
+--- a/.phase2/patches/0001-dectc-layer-range-pp.patch
++++ b/.phase2/patches/0001-dectc-layer-range-pp.patch
+@@ -1,157 +1,157 @@
+ PP layer-range parametrization of the decoder TC tile functions (#25 phase-2, Lane C)
++REGENERATED 2026-06-17 against the LIVE csrc/fused/sm_90/model_stage_decoder_tc.cuh
++(2595 lines). The 2026-06-12 version is DEAD: it anchored at :724 and assumed the
++pre-cp.async-ring tile signatures; the live tiles are at :1508/:1747 and take a
++non-defaulted `const DecWBf& wb` 2nd positional + a trailing `unsigned long long*
++pipeBars=nullptr`. This patch KEEPS both and APPENDS the boundary adjoints after them.
+ 
+-WHAT: dectc_forward_tile / dectc_backward_tile gain `template <int Llo = 0,
+-int Lhi = dec::kLayers>` + fp32 boundary-adjoint args (dh_in/dh_out, default
+-nullptr), realizing the design §4.1 PP stage cut:
+-  * Llo>0  skips the embedding (X_in[Llo] = upstream stage's handoff in acts)
+-           and writes the final running adjoint to dh_out (fp32 [T,d]) instead
+-           of the bf16 dh0;
+-  * Lhi<kLayers skips head/CE (returns 0 NLL; the boundary layer's n2 output
+-           goes to X_in[Lhi] via the existing li+1<kLayers branch) and seeds
+-           the backward's running adjoint from dh_in (fp32 [T,d]).
+-The fp32 dh carrier is bit-preserving: in the fused path the inter-layer
+-adjoint never rounds to bf16, so a PP stage composition can be BIT-IDENTICAL
+-to the single-launch kernel (gated by tests/hw/test_pp2_loopback_determinism.py).
++WHAT: dectc_forward_tile / dectc_backward_tile (and their _outlined wrappers) gain
++`template <int Llo = 0, int Lhi = dec::kLayers>` + fp32 boundary-adjoint args
++(dh_in/dh_out, default nullptr, appended AFTER pipeBars=nullptr), realizing the
++design §4.1 PP stage cut:
++  * Llo>0  skips the embedding (X_in[Llo] = upstream stage's fwd handoff in acts)
++           and writes the final running adjoint to dh_out (fp32 [T,d]) instead of
++           the bf16 dh0;
++  * Lhi<kLayers skips head/CE (returns 0 NLL; the boundary layer's n2 output goes
++           to X_in[Lhi] via the existing li+1<kLayers branch) and seeds the
++           backward's running adjoint scratch.dh from dh_in (fp32 [T,d]).
++The fp32 dh carrier is bit-preserving: in the fused path the inter-layer adjoint
++never rounds to bf16, so a PP stage composition can be BIT-IDENTICAL to the
++single-launch kernel (gated by tests/hw/test_pp2_loopback_determinism.py).
+ 
+-DEFAULT-INSTANTIATION IDENTITY (design §1.2 discipline): every existing call
+-site compiles unchanged (all-defaulted template params); PTX of the production
+-<OptId::AdamW> wgmma megakernel instantiation was diffed patched-vs-unpatched
+-on 2026-06-12: 16,543 lines each, sole delta = one `mov.u32 %r3655, 0;`
+-scheduled one line earlier (same instruction, same register — scheduling
+-jitter, zero semantic delta). SG_DECTC_LAYER_RANGE 1 is the patch-presence
+-marker pp_stage_decoder_tc.cuh #errors on and the PP tests skip-loudly on.
++DEFAULT-INSTANTIATION IDENTITY (design §1.2 discipline): every existing call site
++compiles unchanged (all-defaulted template params + the dh_in/dh_out tail defaults;
++production's positional `..., red, pipeBars` calls stay valid), and the if-constexpr
++branches fold to the original single-stage body. PTX of the production <OptId::AdamW>
++wgmma megakernel instantiation was diffed orig-header-tree vs patched-tree on
++2026-06-17 (nvcc 12.4, -gencode arch=compute_90a,code=sm_90a, -DSG_TUNED_GEMM_IMPL=1):
++sha256 BYTE-IDENTICAL under SG_TUNED_DEC_DW_STAGE both OFF (default) and ON. This
++patch composes with PP-3 EDIT A (the shared dec_tc_bind_workspace carve macro in
++fused_decoder_megakernel.cuh) — that refactor is ALSO PTX byte-identical, proven
++the same way. SG_DECTC_LAYER_RANGE is bumped to 2 (versioned patch-presence marker;
++pp_stage_decoder_tc.cuh #errors on <2 and the PP test skips loudly on <2 or on a
++git-apply-check failure).
+ 
+-APPLY:  git apply .phase2/patches/0001-dectc-layer-range-pp.patch
+-VERIFY: nvcc-compile mega_decoder_real_adamw_tc.cu (proven 2026-06-12, shadow
+-        tree) + the PTX diff above; then run the PP runbook entries.
++APPLY:    git apply --check .phase2/patches/0001-dectc-layer-range-pp.patch   # preflight
++          git apply         .phase2/patches/0001-dectc-layer-range-pp.patch
++VERIFY:   re-prove the nvcc -ptx <OptId::AdamW> byte-identity (orig vs patched tree)
++          on the GPU box; then run the PP runbook entry (.phase2/RUNBOOK.md §2).
+ 
+---- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh	2026-06-12 10:12:39.363653799 +0000
+-+++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh	2026-06-12 19:21:46.536364890 +0000
+-@@ -724,24 +724,39 @@
++diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++index d907183..0a778f6 100644
++--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++@@ -1505,14 +1505,35 @@ __device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq
+  //  BIASES (in/out/ff0/ff2) are folded in fp32 at these points (the oracle adds
+  //  them in fp32 after the bf16 matmul); LN β + head out_b were already applied.
+  // ════════════════════════════════════════════════════════════════════════
+-+// ── PP LAYER-RANGE parametrization (design §4.1, task #25 phase-2): the tile
+-+//    runs layers [Llo, Lhi). The defaults <0, kLayers> fold every gate below to
+-+//    the historical single-stage body (byte-identical math; the symbol gains
+-+//    template mangling only). A PP stage instantiates a sub-range: Llo>0 skips
+-+//    the embedding (X_in[Llo] is the upstream stage's handoff, already in acts);
+-+//    Lhi<kLayers skips head/CE (the boundary layer writes X_in[Lhi] — the fwd
+-+//    handoff — via the existing li+1<kLayers branch) and contributes 0 NLL.
+-+//    SG_DECTC_LAYER_RANGE is the patch-presence marker pp_stage_decoder_tc.cuh
+-+//    and the PP tests gate on (loud #error / skip when unpatched).
+-+#define SG_DECTC_LAYER_RANGE 1
+++// PP-1 (phase-2 layer-range): SG_DECTC_LAYER_RANGE is the versioned patch-
+++// presence marker pp_stage_decoder_tc.cuh #errors on and the PP tests gate on.
+++// Value 2 = the regenerated (live-header) layer-range patch (template<Llo,Lhi>
+++// + dh_in/dh_out boundary adjoints AFTER pipeBars). A stale value-1 tree is
+++// detectable (the PP #if<2 gate + the test's _patch_version regex fire loudly).
+++#ifndef SG_DECTC_LAYER_RANGE
+++#define SG_DECTC_LAYER_RANGE 2
+++#endif
+++// Template params Llo/Lhi default to the full [0,kLayers) range, so EVERY
+++// existing call site (production megakernel :848/:857/:1060/:1062 inline tiles
+++// + the _outlined wrappers) compiles unchanged and the if-constexpr branches
+++// fold to the original single-stage body → PTX byte-identical (PTX-verified).
+++// dh_in/dh_out are appended AFTER the existing pipeBars=nullptr trailing arg so
+++// the positional production call sites (..., red, pipeBars) stay valid.
+ +template <int Llo = 0, int Lhi = dec::kLayers>
+  __device__ float dectc_forward_tile(
+-         const DecWeights& w, int g0, int nrows, const DecActs& acts,
++         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+          const DecTileScratch& sc, const int* __restrict__ tok_ids,
+          const int* __restrict__ tgt_ids,
+-         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+-+    static_assert(0 <= Llo && Llo < Lhi && Lhi <= dec::kLayers,
+-+                  "dectc_forward_tile: [Llo,Lhi) must be a non-empty layer range");
++         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++-        unsigned long long* pipeBars = nullptr) {
+++        unsigned long long* pipeBars = nullptr,
+++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
+++    static_assert(Llo >= 0 && Lhi <= dec::kLayers && Llo < Lhi, "dectc_forward_tile: bad layer range");
+++    (void)dh_in; (void)dh_out;   // fwd uses the X_in[Llo] handoff (in acts); dh_* are bwd carriers
+      const int nsamp = nrows / dec::kSeq;
+--    // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+--    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+--        const int r = idx / dec::kD, j = idx % dec::kD;
+--        const int g = g0 + r;
+--        const int tid = tok_ids[g];
+--        const int sp = g % dec::kSeq;            // position within the sample
+--        float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
+--        acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
++     // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+++    //    Only the FIRST stage (Llo==0) owns the embedding; later stages read
+++    //    X_in[Llo] from the upstream stage's fwd handoff (already in acts).
+ +    if constexpr (Llo == 0) {
+-+        // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+-+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+-+            const int r = idx / dec::kD, j = idx % dec::kD;
+-+            const int g = g0 + r;
+-+            const int tid = tok_ids[g];
+-+            const int sp = g % dec::kSeq;            // position within the sample
+-+            float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
+-+            acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
+-+        }
+-+        __syncthreads();
++     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
++         const int r = idx / dec::kD, j = idx % dec::kD;
++         const int g = g0 + r;
++@@ -1522,8 +1543,9 @@ __device__ float dectc_forward_tile(
++         acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
+      }
+--    __syncthreads();
++     __syncthreads();
+++    }
+  
+ -    for (int li = 0; li < dec::kLayers; ++li) {
+ +    for (int li = Llo; li < Lhi; ++li) {
+          const DecWeights::Layer& L = w.layer[li];
+          const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+          // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+-@@ -819,8 +834,14 @@
+-         }
++@@ -1602,7 +1624,12 @@ __device__ float dectc_forward_tile(
+      }
+  
+--    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
++     // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
+ -    //    finalin holds the last-layer n2 output [nrows,d] fp32. ──
+-+    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only —
+-+    //    LAST STAGE ONLY (Lhi==kLayers). A non-final PP stage's boundary output
+-+    //    went to X_in[Lhi] above; it has no head and contributes 0 NLL. ──
+++    //    finalin holds the last-layer n2 output [nrows,d] fp32. Only the LAST
+++    //    stage (Lhi==kLayers) runs head+CE; earlier stages handed off via the
+++    //    li+1<kLayers branch above (X_in[Lhi]) and return 0 NLL. ──
+ +    if constexpr (Lhi != dec::kLayers) {
+-+        (void)nsamp; (void)tgt_ids;
+ +        return 0.0f;
+ +    } else {
+-+    //    finalin holds the last-layer n2 output [nrows,d] fp32.
+      float nll_acc = 0.0f;
+      for (int si = 0; si < nsamp; ++si) {
+          const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+-@@ -866,6 +887,7 @@
++@@ -1648,6 +1675,7 @@ __device__ float dectc_forward_tile(
+          __syncthreads();
+      }
+      return nll_acc;
+-+    }  // if constexpr (Lhi == dec::kLayers)
+++    }   // end if constexpr (Lhi == kLayers)
+  }
+  
+  // Attention BACKWARD over a tile (the oracle's 3-pass form, tile-batched).
+-@@ -962,11 +984,23 @@
++@@ -1744,12 +1772,15 @@ __device__ __forceinline__ void dectc_attn_bwd_tile(
+  //  buffer `work2` (caller passes both, each [nrows×dff]); dh (running adjoint)
+  //  is the dedicated scratch.dh.
+  // ════════════════════════════════════════════════════════════════════════
+-+// PP LAYER-RANGE (design §4.1): runs layers [Lhi-1 .. Llo] backward. Defaults
+-+// reproduce the historical body. A non-LAST stage (Lhi<kLayers) starts its
+-+// running adjoint from `dh_in` — the DOWNSTREAM stage's fp32 [T,d] boundary
+-+// handoff (grad wrt this stage's last n2 output; fp32 carrier preserves bits —
+-+// in the fused path this value never rounds to bf16). A non-FIRST stage
+-+// (Llo>0) writes its final running adjoint to `dh_out` (fp32 [T,d]) instead of
+-+// the bf16 dh0 embedding adjoint.
+ +template <int Llo = 0, int Lhi = dec::kLayers>
+  __device__ void dectc_backward_tile(
+-         const DecWeights& w, int g0, int nrows, int B, const DecActs& acts,
++         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+          const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+          float* __restrict__ lnvec, float* __restrict__ work2,
+--        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+-+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+-+        const float* __restrict__ dh_in = nullptr,
+-+        float* __restrict__ dh_out = nullptr) {
+-+    static_assert(0 <= Llo && Llo < Lhi && Lhi <= dec::kLayers,
+-+                  "dectc_backward_tile: [Llo,Lhi) must be a non-empty layer range");
++         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++-        unsigned long long* pipeBars = nullptr) {
+++        unsigned long long* pipeBars = nullptr,
+++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
+++    static_assert(Llo >= 0 && Lhi <= dec::kLayers && Llo < Lhi, "dectc_backward_tile: bad layer range");
+      const int nsamp = nrows / dec::kSeq;
+      // LN-vec partial slots (dense order; see kLnVecTensorIdx).
+      float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+-@@ -982,7 +1016,16 @@
+- 
++@@ -1766,6 +1797,15 @@ __device__ void dectc_backward_tile(
+      // ── CE bwd (per sample): dlogits = (softmax - onehot)/B, overwrite logits.
+      //    head bwd: dY_logits[si] = dlogits (the head dW operand); dhn = dlogits@out_w.
+--    //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others). ──
+-+    //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others).
+-+    //    LAST STAGE ONLY — a non-last PP stage seeds sc.dh from dh_in instead. ──
++     //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others). ──
+++    //    Only the LAST stage (Lhi==kLayers) seeds from CE; earlier stages seed the
+++    //    running adjoint scratch.dh from the DOWNSTREAM stage's fp32 boundary
+++    //    adjoint dh_in [nrows,d] (bit-preserving — the fused path never rounds the
+++    //    inter-layer adjoint to bf16, so a PP composition is bit-identical). ──
+ +    if constexpr (Lhi != dec::kLayers) {
+-+        // PP: the running adjoint starts from the downstream stage's fp32
+-+        // boundary handoff (grad wrt X_in[Lhi]'s pre-bf16 fp32 value).
+ +        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+ +            sc.dh[idx] = dh_in[(int64_t)g0 * dec::kD + idx];
+ +        __syncthreads();
+-+        (void)B; (void)tgt_ids;
+ +    } else {
+      // First zero scratch.dh for the whole tile (only last positions get grad).
+      for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+      __syncthreads();
+-@@ -1042,12 +1085,13 @@
++@@ -1825,12 +1865,14 @@ __device__ void dectc_backward_tile(
+              __syncthreads();
+          }
+      }
+ -    // scratch.dh now = grad wrt last-layer output [nrows,d] (only last positions nonzero).
+-+    }  // if constexpr (Lhi == dec::kLayers)
+-+    // scratch.dh now = grad wrt this stage's last-layer output [nrows,d].
+++    }   // end if constexpr (Lhi == kLayers) CE-seed / else dh_in-seed
+++    // scratch.dh now = grad wrt the stage's top-layer output [nrows,d]
+++    // (last stage: only last positions nonzero from CE; earlier stages: dense from dh_in).
+  
+      // ── per-layer backward (reverse). dh is the running adjoint (grad wrt the
+      //    layer's n2 output). All fwd intermediates are in scratch/DecActs (NO
+@@ -161,7 +161,7 @@ VERIFY: nvcc-compile mega_decoder_real_adamw_tc.cu (proven 2026-06-12, shadow
+          const DecWeights::Layer& L = w.layer[li];
+          // n2 bwd: dh → dr2 (work fp32), accumulate n2 γ/β. xhat=n2x[li], inv=n2i[li].
+          dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+-@@ -1109,11 +1153,20 @@
++@@ -1892,10 +1934,18 @@ __device__ void dectc_backward_tile(
+          __syncthreads();
+      }
+  
+@@ -169,21 +169,54 @@ VERIFY: nvcc-compile mega_decoder_real_adamw_tc.cu (proven 2026-06-12, shadow
+ -    //    tok/pos owner-scan (P2) reads dh0 by global token row. ──
+ -    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+ -        acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
+--    __syncthreads();
+++    // ── embedding bwd: dh = grad wrt the stage's bottom-layer input [nrows,d].
+++    //    FIRST stage (Llo==0): write dh0 acts (bf16); the tok/pos owner-scan (P2)
+++    //    reads dh0 by global token row. Earlier (non-first) stages write the fp32
+++    //    boundary adjoint dh_out [nrows,d] for the UPSTREAM stage (bit-preserving;
+++    //    no bf16 round → bit-identical PP composition). ──
+ +    if constexpr (Llo == 0) {
+-+        // ── embedding bwd: dh = grad wrt h0 [nrows,d]. Write dh0 acts (bf16);
+-+        //    the tok/pos owner-scan (P2) reads dh0 by global token row. ──
+ +        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+ +            acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
+-+        __syncthreads();
+ +    } else {
+-+        // PP: hand the running adjoint UP to the upstream stage in fp32 — the
+-+        // bit-preserving carrier (bf16 would round the boundary adjoint and
+-+        // break the stage-composition bit-exactness gate).
+ +        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+ +            dh_out[(int64_t)g0 * dec::kD + idx] = sc.dh[idx];
+-+        __syncthreads();
+ +    }
++     __syncthreads();
++ }
++ 
++@@ -1913,21 +1963,31 @@ __device__ void dectc_backward_tile(
++ //  Math identical; warpgroup-uniform call (whole CTA enters/exits together) so
++ //  the wgmma fence/commit/wait choreography inside is well-formed.
++ // ════════════════════════════════════════════════════════════════════════
+++// PP-1: mirror the template + <Llo,Lhi> forwarding onto the _outlined wrappers
+++// (the PRODUCTION megakernel is their ONLY caller, at :848/:857/:1060/:1062,
+++// positionally with `..., red, pipeBars`). The defaulted Llo/Lhi keep those
+++// production call sites valid AND fold to the original single-stage body →
+++// the _outlined PTX is byte-identical (PTX-verified). PP itself calls the
+++// inline tiles directly (not these wrappers).
+++template <int Llo = 0, int Lhi = dec::kLayers>
++ __device__ __noinline__ float dectc_forward_tile_outlined(
++         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
++         const DecTileScratch& sc, const int* __restrict__ tok_ids,
++         const int* __restrict__ tgt_ids,
++         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++-        unsigned long long* pipeBars = nullptr) {
++-    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red, pipeBars);
+++        unsigned long long* pipeBars = nullptr,
+++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
+++    return dectc_forward_tile<Llo, Lhi>(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red, pipeBars, dh_in, dh_out);
++ }
+++template <int Llo = 0, int Lhi = dec::kLayers>
++ __device__ __noinline__ void dectc_backward_tile_outlined(
++         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
++         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
++         float* __restrict__ lnvec, float* __restrict__ work2,
++         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++-        unsigned long long* pipeBars = nullptr) {
++-    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red, pipeBars);
+++        unsigned long long* pipeBars = nullptr,
+++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
+++    dectc_backward_tile<Llo, Lhi>(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red, pipeBars, dh_in, dh_out);
+  }
+  
+  // ════════════════════════════════════════════════════════════════════════
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index 12132e6..85a8bac 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -654,6 +654,152 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
+                                               //   every offset is byte-identical to before)
+ }
+ 
++// ── SHARED WORKSPACE BIND (PP-3 EDIT A) ─────────────────────────────────────
++// SINGLE source of the decoder-TC per-CTA workspace partition. The production
++// megakernel AND both PP-stage kernels (pp_stage_decoder_tc.cuh) derive EVERY
++// workspace offset from THIS one carve text — so the embed-vs-wbf aliasing class
++// (the PP bwd carve that omitted dec_wbf_floats() and aliased embed_row_start
++// over the bf16 weight cache) cannot recur: there is exactly ONE carve to drift.
++//
++// BYTE-IDENTITY MECHANISM: the carve is a MACRO (SG_DEC_TC_CARVE) that declares
++// the carve locals term-for-term. The production kernel EXPANDS it inline, so its
++// PTX is byte-identical to the former hand-written carve BY CONSTRUCTION (the
++// preprocessor emits the IDENTICAL tokens — no function boundary, so nvptx's
++// constant-fold + dead-member DCE behave exactly as before; PTX-verified byte-
++// identical). The typed helper dec_tc_bind_workspace() ALSO expands the SAME
++// macro and packs the result into DecTcWorkspace for the PP kernels (whose
++// byte-match to production is verified by the Gate-5 PP=2 bit-exact A/A/A assert,
++// not a PTX diff). A return-by-value/out-param helper was tried first and is
++// NOT byte-identical here (nvcc 12.4): returning the carve across a function
++// boundary keeps the otherwise-DCE'able staged-opt pointers live and loses the
++// owner-scan's +(kVocab+1) addressing fold (~9 benign SASS deltas). The macro is
++// the mechanism that keeps production byte-identical while still single-sourcing
++// the carve.
++//
++// NOTE: kDwG (= dectc::kDecDwSplitK) and `w = dec_bind(params)` are NOT part of
++// this carve — they are NOT workspace-pointer derivations (kDwG is a layout
++// const, w wraps the PARAM blob, not the workspace). Callers keep them as locals.
++//
++// SG_DEC_TC_CARVE(ws_, T_, B_, nCTA_): declares the carve LOCALS (acts_base ..
++// wbf_cache, plus embed_perm + the dwt scratch). It does NOT bind acts/sc/wb or
++// my_lnvec (those depend on `cta` and are bound by the caller right after, via
++// the SAME dec_acts_bind / dec_tile_scratch_bind / dec_wbf_bind / lnvec_base +
++// cta*kLnVecElems calls the former inline carve used). The leading underscore
++// names avoid clashing with the caller's own T/B/nCTA.
++#if SG_TUNED_DEC_DW_STAGE
++#  define SG_DEC_TC_CARVE_DWT(embed_perm_, T_)                                  \
++    float* dwt_f = reinterpret_cast<float*>((embed_perm_) + (int64_t)(T_));     \
++    while (((uintptr_t)dwt_f & 0xF) != 0) dwt_f += 1;                           \
++    __nv_bfloat16* dwt_base = dectc::kDecDwTransposeActive                      \
++        ? reinterpret_cast<__nv_bfloat16*>(dwt_f) : nullptr;
++#else
++#  define SG_DEC_TC_CARVE_DWT(embed_perm_, T_)                                  \
++    __nv_bfloat16* dwt_base = nullptr;
++#endif
++
++#if SG_DEC_BENCH_LAYOUT
++// Bench (adamw-only): the four staged-opt regions are gated to 0, so derive the
++// bf16 cache base from the SAME dec_tc_staged_opt_floats aggregate the host carve
++// uses (no reliance on the collapsed sg2_ws_base chain).
++#  define SG_DEC_TC_CARVE_WBF(opt_reduce_, sg2_ws_base_, nCTA_)                 \
++    float* wbf_f = (opt_reduce_) + dec_tc_staged_opt_floats(nCTA_);             \
++    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;                           \
++    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
++#else
++// Production: carve AFTER the (full-size) SG2 region via the existing chain.
++#  define SG_DEC_TC_CARVE_WBF(opt_reduce_, sg2_ws_base_, nCTA_)                 \
++    float* wbf_f = (sg2_ws_base_) + dec_tc_sg2_floats(nCTA_);                   \
++    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;                           \
++    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
++#endif
++
++#define SG_DEC_TC_CARVE(ws_, T_, B_, nCTA_)                                     \
++    const int64_t acts_f = dec_tc_acts_floats((T_), (B_));                      \
++    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws_);           \
++    float* scratch_base = (ws_) + acts_f;                                       \
++    const int64_t scratch_per = dectc::dec_tile_scratch_total_f32();            \
++    float* lnvec_base = scratch_base + (int64_t)(nCTA_) * scratch_per;          \
++    float* loss_part  = lnvec_base + (int64_t)(nCTA_) * dectc::kLnVecElems;     \
++    float* loss_out   = loss_part + (nCTA_);                                    \
++    /* Split-K dW partials (G>1): the (gt,kc) 64xN partial tiles, carved AFTER  \
++       the loss slot (matches dec_tc_workspace_floats's term order). */         \
++    float* dw_part    = loss_out + 1;                                           \
++    /* STAGED-opt cross-CTA reduce slots (Prodigy), AFTER the dW partials. */   \
++    float* opt_reduce = dw_part + dec_tc_dw_part_floats();                      \
++    /* Muon NS per-matrix scratch, AFTER the Prodigy reduce slots. */           \
++    float* muon_base  = opt_reduce + dec_tc_opt_reduce_floats(nCTA_);           \
++    /* LookSAM SAM 2nd-backward scratch, AFTER the Muon scratch. */             \
++    float* sam_backup = muon_base + dec_tc_muon_floats(nCTA_);                  \
++    float* sam_grad   = sam_backup + kDecTotalElems;                            \
++    /* SuperGrok2 meta-net per-CTA scratch, AFTER the LookSAM sam_grad; ALIGN   \
++       to 8 bytes (the per-CTA slice fronts an int64 row_off64 staging array;   \
++       kDecTotalElems is odd so sam_grad+total lands on an odd float offset). */\
++    float* sg2_ws_base = sam_grad + kDecTotalElems;                            \
++    if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;                  \
++    /* bf16 weight pre-stage cache (C1) interposed here; embed lists carve-LAST.\
++       (#if SG_DEC_BENCH_LAYOUT branch via SG_DEC_TC_CARVE_WBF) */              \
++    SG_DEC_TC_CARVE_WBF(opt_reduce, sg2_ws_base, nCTA_)                         \
++    if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1; /* 8-byte align */     \
++    int* embed_row_start = reinterpret_cast<int*>(embed_ws);    /* [V+1] */     \
++    int* embed_perm      = embed_row_start + (dec::kVocab + 1); /* [T] */       \
++    /* CONTIGUOUS-TRANSPOSE dW scratch (SG_TUNED_DEC_DW_STAGE); #if-guarded so  \
++       the scalar default emits ZERO extra carve code (PTX byte-identical). */  \
++    SG_DEC_TC_CARVE_DWT(embed_perm, T_)                                         \
++    __nv_bfloat16* wbf_cache = reinterpret_cast<__nv_bfloat16*>(wbf_f)
++
++// Pure-pointer aggregate carried to the PP kernels. The large nested binder
++// structs (DecActs/DecTileScratch/DecWBf) are NOT members — the caller re-binds
++// them from these bases via the SAME binder calls, exactly as production does.
++struct DecTcWorkspace {
++    __nv_bfloat16* acts_base;
++    float*         scratch_base;
++    int64_t        scratch_per;
++    float*         lnvec_base;
++    float*         loss_part;
++    float*         loss_out;
++    float*         dw_part;
++    float*         opt_reduce;
++    float*         muon_base;
++    float*         sam_backup;
++    float*         sam_grad;
++    float*         sg2_ws_base;
++    float*         wbf_f;
++    __nv_bfloat16* wbf_cache;
++    int*           embed_row_start;
++    int*           embed_perm;
++    __nv_bfloat16* dwt_base;
++};
++
++// Typed helper for the PP kernels (and any future Par-threaded launcher): expand
++// the ONE carve macro and pack the pointers. PP byte-match to production is
++// verified by the Gate-5 PP=2 bit-exact A/A/A assert (not a PTX diff), so the
++// function-boundary fold differences are immaterial here.
++__device__ __forceinline__ DecTcWorkspace
++dec_tc_bind_workspace(float* ws, int T, int B, int nCTA, int cta) {
++    (void)cta;   // acts/sc/wb/my_lnvec (cta-dependent) are re-bound by the caller
++    SG_DEC_TC_CARVE(ws, T, B, nCTA);
++    DecTcWorkspace W;
++    W.acts_base = acts_base;
++    W.scratch_base = scratch_base;
++    W.scratch_per = scratch_per;
++    W.lnvec_base = lnvec_base;
++    W.loss_part = loss_part;
++    W.loss_out = loss_out;
++    W.dw_part = dw_part;
++    W.opt_reduce = opt_reduce;
++    W.muon_base = muon_base;
++    W.sam_backup = sam_backup;
++    W.sam_grad = sam_grad;
++    W.sg2_ws_base = sg2_ws_base;
++    W.wbf_f = wbf_f;
++    W.wbf_cache = wbf_cache;
++    W.embed_row_start = embed_row_start;
++    W.embed_perm = embed_perm;
++    W.dwt_base = dwt_base;
++    return W;
++}
++// ────────────────────────────────────────────────────────────────────────────
++
+ #ifdef SG_DEC_PROFILE
+ // Diagnostic-only (behind SG_DEC_PROFILE; NEVER on the shipped path — the flag is
+ // set ONLY by the bench/profile TU, default OFF, so the production _ops is byte-
+@@ -701,99 +847,16 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+     const int B = tok.B;
+     const int T = B * dec::kSeq;
+ 
+-    // Workspace partition.
++    // Workspace partition (PP-3 EDIT A): expand the SINGLE carve macro inline.
++    // This emits the IDENTICAL tokens as the former hand-written carve, so the
++    // single-GPU production PTX is byte-identical BY CONSTRUCTION (PTX-verified).
++    // The macro declares acts_base..wbf_cache (+ embed_perm + the dwt scratch);
++    // acts/sc/wb/my_lnvec (cta-dependent) are bound right after, exactly as before.
++    // kDwG and w are NOT workspace-derived → their own locals.
+     float* ws = tok.workspace;
+-    const int64_t acts_f = dec_tc_acts_floats(T, B);
+-    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+-    float* scratch_base = ws + acts_f;
+-    const int64_t scratch_per = dectc::dec_tile_scratch_total_f32();
+-    float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
+-    float* loss_part  = lnvec_base + (int64_t)nCTA * dectc::kLnVecElems;
+-    float* loss_out   = loss_part + nCTA;
+-    // Split-K dW partials (G>1): the (gt,kc) 64×N partial tiles, carved AFTER the
+-    // loss slot (matches dec_tc_workspace_floats's term order). G==1 → dw_part unused.
+-    float* dw_part    = loss_out + 1;
+-    const int kDwG    = dectc::kDecDwSplitK;
+-    // STAGED-opt cross-CTA reduce slots (Prodigy d), carved AFTER the dW partials
+-    // (matches dec_tc_workspace_floats's term order). Unused unless Opt==Prodigy.
+-    float* opt_reduce = dw_part + dec_tc_dw_part_floats();
+-    // Muon NS per-matrix scratch, carved AFTER the Prodigy reduce slots (matches
+-    // dec_tc_workspace_floats's term order — carving it LAST keeps every prior
+-    // region's offset unchanged, so the 5 already-green cells are byte-identical).
+-    // Unused unless Opt==Muon. Layout (mirrors the vit twin):
+-    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kDecMuonMaxNumel)
+-    //   [muon_A (kDecMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+-    float* muon_base = opt_reduce + dec_tc_opt_reduce_floats(nCTA);
+-    // LookSAM SAM 2nd-backward scratch, carved AFTER the Muon scratch (term order
+-    // matches dec_tc_workspace_floats — carving it LAST keeps every prior region's
+-    // offset unchanged, so the already-green cells are byte-identical). Layout:
+-    //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
+-    float* sam_backup = muon_base + dec_tc_muon_floats(nCTA);
+-    float* sam_grad   = sam_backup + kDecTotalElems;
+-    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the LookSAM sam_grad (term
+-    // order matches dec_tc_workspace_floats — carving it LAST keeps every prior
+-    // region's offset unchanged, so the already-green cells are byte-identical).
+-    // Each CTA owns dec_sg2_ws_stride_floats() (row_off64 staging + meta-net scratch).
+-    // ALIGN to 8 bytes (even float offset): the per-CTA slice fronts an int64
+-    // row_off64 staging array; kDecTotalElems is odd so sam_grad+total lands on an
+-    // odd float offset (4-byte) → an int64 read there is a misaligned address. Round
+-    // up to the next even float. The carve term dec_tc_sg2_floats reserves the stride
+-    // per CTA; the +1 alignment slack fits within the acts/scratch headroom (the
+-    // workspace is over-sized) and dec_sg2_ws_stride_floats() is even, so every CTA
+-    // base stays 8-byte aligned. Unused unless Opt==SuperGrok2.
+-    float* sg2_ws_base = sam_grad + kDecTotalElems;
+-    if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
++    SG_DEC_TC_CARVE(ws, T, B, nCTA);
++    const int kDwG = dectc::kDecDwSplitK;
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+-    // Embedding token-list scratch (counting-sort row_start[V+1] + perm[T]), carved
+-    // AFTER the SG2 region (term order matches dec_tc_workspace_floats — carving it
+-    // LAST keeps every prior region's offset unchanged → the green cells' non-embed
+-    // regions are byte-identical). int32 views over the float tail; 8-byte aligned so
+-    // the (future) widening to int is safe. Built in the P1 window (cta 0), consumed
+-    // in P2 — fenced by the already-present B1 barrier (no new barrier).
+-#if SG_DEC_BENCH_LAYOUT
+-    // Bench (adamw-only): the four staged-opt regions are gated to 0, so embed_ws is
+-    // the staged-opt block START (== opt_reduce) plus the aggregate (== 0 here). We
+-    // derive it from the SAME dec_tc_staged_opt_floats aggregate the host carve
+-    // (dec_tc_workspace_floats) uses, so the host size and this offset are provably the
+-    // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
+-    // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
+-    float* wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+-    // 16B-align the bf16 cache base: the cp.async RING streams it in 16-byte
+-    // chunks (gmem source alignment requirement). Bump <= 3 floats, covered by
+-    // dec_tc_workspace_floats' slack term; deterministic (the workspace base is
+-    // >=256B-aligned, so the bump depends only on the carve offsets).
+-    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
+-    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+-#else
+-    // Production: carve AFTER the (full-size) SG2 region via the existing chain
+-    // (the sg2_ws_base align bump + the dec_tc_sg2_floats stride are load-bearing
+-    // for the SG2 int64 row_off64 reads). The bf16 weight pre-stage cache (C1)
+-    // is interposed here; embed lists stay carve-LAST.
+-    float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+-    // 16B-align the bf16 cache base for the cp.async RING (see the bench-branch
+-    // note; bump <= 3 floats, covered by dec_tc_workspace_floats' slack term).
+-    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
+-    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+-#endif
+-    if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
+-    int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
+-    int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
+-    // CONTIGUOUS-TRANSPOSE dW scratch (SG_TUNED_DEC_DW_STAGE=1), carved AFTER the
+-    // embed lists (term order matches dec_tc_workspace_floats — carve-LAST keeps
+-    // every prior region's offset unchanged). #if-guarded (not a runtime ternary)
+-    // so the scalar default emits ZERO extra carve code → the kernel's register
+-    // allocation + PTX are BYTE-IDENTICAL to every shipped build (PTX-verified).
+-    // 16B-align the base: the cp.async ring streams it in 16-byte chunks (gmem
+-    // source alignment). Each transposed ROW is K-contiguous and K is a multiple
+-    // of kWgmmaAtomK=16 (⇒ 8 bf16 = 16B), so once the base is 16B-aligned every
+-    // chunk16 half-offset (mn·8 / N·8 / kbase) is too. Bump ≤ 7 floats (covered
+-    // by dec_tc_workspace_floats' +8 active-only slack term).
+-#if SG_TUNED_DEC_DW_STAGE
+-    float* dwt_f = reinterpret_cast<float*>(embed_perm + (int64_t)T);
+-    while (((uintptr_t)dwt_f & 0xF) != 0) dwt_f += 1;
+-    __nv_bfloat16* dwt_base = dectc::kDecDwTransposeActive
+-        ? reinterpret_cast<__nv_bfloat16*>(dwt_f) : nullptr;
+-#endif
+ 
+     dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
+     dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
+@@ -802,7 +865,6 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+     DecWeights w = dec_bind(params);
+     // bf16 weight pre-stage cache (C1): bound over its workspace carve; FILLED in
+     // P0 below (fenced by B0 before any P1 GEMM stages from it).
+-    __nv_bfloat16* wbf_cache = reinterpret_cast<__nv_bfloat16*>(wbf_f);
+     dectc::DecWBf wb = dectc::dec_wbf_bind(wbf_cache);
+ 
+     // ── P0: zero this CTA's LN-vec partials + loss slot (dW/embed grads are
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index d907183..0a778f6 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -1505,14 +1505,35 @@ __device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq
+ //  BIASES (in/out/ff0/ff2) are folded in fp32 at these points (the oracle adds
+ //  them in fp32 after the bf16 matmul); LN β + head out_b were already applied.
+ // ════════════════════════════════════════════════════════════════════════
++// PP-1 (phase-2 layer-range): SG_DECTC_LAYER_RANGE is the versioned patch-
++// presence marker pp_stage_decoder_tc.cuh #errors on and the PP tests gate on.
++// Value 2 = the regenerated (live-header) layer-range patch (template<Llo,Lhi>
++// + dh_in/dh_out boundary adjoints AFTER pipeBars). A stale value-1 tree is
++// detectable (the PP #if<2 gate + the test's _patch_version regex fire loudly).
++#ifndef SG_DECTC_LAYER_RANGE
++#define SG_DECTC_LAYER_RANGE 2
++#endif
++// Template params Llo/Lhi default to the full [0,kLayers) range, so EVERY
++// existing call site (production megakernel :848/:857/:1060/:1062 inline tiles
++// + the _outlined wrappers) compiles unchanged and the if-constexpr branches
++// fold to the original single-stage body → PTX byte-identical (PTX-verified).
++// dh_in/dh_out are appended AFTER the existing pipeBars=nullptr trailing arg so
++// the positional production call sites (..., red, pipeBars) stay valid.
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ float dectc_forward_tile(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+-        unsigned long long* pipeBars = nullptr) {
++        unsigned long long* pipeBars = nullptr,
++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
++    static_assert(Llo >= 0 && Lhi <= dec::kLayers && Llo < Lhi, "dectc_forward_tile: bad layer range");
++    (void)dh_in; (void)dh_out;   // fwd uses the X_in[Llo] handoff (in acts); dh_* are bwd carriers
+     const int nsamp = nrows / dec::kSeq;
+     // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
++    //    Only the FIRST stage (Llo==0) owns the embedding; later stages read
++    //    X_in[Llo] from the upstream stage's fwd handoff (already in acts).
++    if constexpr (Llo == 0) {
+     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+         const int r = idx / dec::kD, j = idx % dec::kD;
+         const int g = g0 + r;
+@@ -1522,8 +1543,9 @@ __device__ float dectc_forward_tile(
+         acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
+     }
+     __syncthreads();
++    }
+ 
+-    for (int li = 0; li < dec::kLayers; ++li) {
++    for (int li = Llo; li < Lhi; ++li) {
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+@@ -1602,7 +1624,12 @@ __device__ float dectc_forward_tile(
+     }
+ 
+     // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
+-    //    finalin holds the last-layer n2 output [nrows,d] fp32. ──
++    //    finalin holds the last-layer n2 output [nrows,d] fp32. Only the LAST
++    //    stage (Lhi==kLayers) runs head+CE; earlier stages handed off via the
++    //    li+1<kLayers branch above (X_in[Lhi]) and return 0 NLL. ──
++    if constexpr (Lhi != dec::kLayers) {
++        return 0.0f;
++    } else {
+     float nll_acc = 0.0f;
+     for (int si = 0; si < nsamp; ++si) {
+         const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+@@ -1648,6 +1675,7 @@ __device__ float dectc_forward_tile(
+         __syncthreads();
+     }
+     return nll_acc;
++    }   // end if constexpr (Lhi == kLayers)
+ }
+ 
+ // Attention BACKWARD over a tile (the oracle's 3-pass form, tile-batched).
+@@ -1744,12 +1772,15 @@ __device__ __forceinline__ void dectc_attn_bwd_tile(
+ //  buffer `work2` (caller passes both, each [nrows×dff]); dh (running adjoint)
+ //  is the dedicated scratch.dh.
+ // ════════════════════════════════════════════════════════════════════════
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ void dectc_backward_tile(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+-        unsigned long long* pipeBars = nullptr) {
++        unsigned long long* pipeBars = nullptr,
++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
++    static_assert(Llo >= 0 && Lhi <= dec::kLayers && Llo < Lhi, "dectc_backward_tile: bad layer range");
+     const int nsamp = nrows / dec::kSeq;
+     // LN-vec partial slots (dense order; see kLnVecTensorIdx).
+     float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+@@ -1766,6 +1797,15 @@ __device__ void dectc_backward_tile(
+     // ── CE bwd (per sample): dlogits = (softmax - onehot)/B, overwrite logits.
+     //    head bwd: dY_logits[si] = dlogits (the head dW operand); dhn = dlogits@out_w.
+     //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others). ──
++    //    Only the LAST stage (Lhi==kLayers) seeds from CE; earlier stages seed the
++    //    running adjoint scratch.dh from the DOWNSTREAM stage's fp32 boundary
++    //    adjoint dh_in [nrows,d] (bit-preserving — the fused path never rounds the
++    //    inter-layer adjoint to bf16, so a PP composition is bit-identical). ──
++    if constexpr (Lhi != dec::kLayers) {
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            sc.dh[idx] = dh_in[(int64_t)g0 * dec::kD + idx];
++        __syncthreads();
++    } else {
+     // First zero scratch.dh for the whole tile (only last positions get grad).
+     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+     __syncthreads();
+@@ -1825,12 +1865,14 @@ __device__ void dectc_backward_tile(
+             __syncthreads();
+         }
+     }
+-    // scratch.dh now = grad wrt last-layer output [nrows,d] (only last positions nonzero).
++    }   // end if constexpr (Lhi == kLayers) CE-seed / else dh_in-seed
++    // scratch.dh now = grad wrt the stage's top-layer output [nrows,d]
++    // (last stage: only last positions nonzero from CE; earlier stages: dense from dh_in).
+ 
+     // ── per-layer backward (reverse). dh is the running adjoint (grad wrt the
+     //    layer's n2 output). All fwd intermediates are in scratch/DecActs (NO
+     //    recompute). ──
+-    for (int li = dec::kLayers - 1; li >= 0; --li) {
++    for (int li = Lhi - 1; li >= Llo; --li) {
+         const DecWeights::Layer& L = w.layer[li];
+         // n2 bwd: dh → dr2 (work fp32), accumulate n2 γ/β. xhat=n2x[li], inv=n2i[li].
+         dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+@@ -1892,10 +1934,18 @@ __device__ void dectc_backward_tile(
+         __syncthreads();
+     }
+ 
+-    // ── embedding bwd: dh = grad wrt h0 [nrows,d]. Write dh0 acts (bf16); the
+-    //    tok/pos owner-scan (P2) reads dh0 by global token row. ──
+-    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+-        acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
++    // ── embedding bwd: dh = grad wrt the stage's bottom-layer input [nrows,d].
++    //    FIRST stage (Llo==0): write dh0 acts (bf16); the tok/pos owner-scan (P2)
++    //    reads dh0 by global token row. Earlier (non-first) stages write the fp32
++    //    boundary adjoint dh_out [nrows,d] for the UPSTREAM stage (bit-preserving;
++    //    no bf16 round → bit-identical PP composition). ──
++    if constexpr (Llo == 0) {
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
++    } else {
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++            dh_out[(int64_t)g0 * dec::kD + idx] = sc.dh[idx];
++    }
+     __syncthreads();
+ }
+ 
+@@ -1913,21 +1963,31 @@ __device__ void dectc_backward_tile(
+ //  Math identical; warpgroup-uniform call (whole CTA enters/exits together) so
+ //  the wgmma fence/commit/wait choreography inside is well-formed.
+ // ════════════════════════════════════════════════════════════════════════
++// PP-1: mirror the template + <Llo,Lhi> forwarding onto the _outlined wrappers
++// (the PRODUCTION megakernel is their ONLY caller, at :848/:857/:1060/:1062,
++// positionally with `..., red, pipeBars`). The defaulted Llo/Lhi keep those
++// production call sites valid AND fold to the original single-stage body →
++// the _outlined PTX is byte-identical (PTX-verified). PP itself calls the
++// inline tiles directly (not these wrappers).
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ __noinline__ float dectc_forward_tile_outlined(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+-        unsigned long long* pipeBars = nullptr) {
+-    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red, pipeBars);
++        unsigned long long* pipeBars = nullptr,
++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
++    return dectc_forward_tile<Llo, Lhi>(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red, pipeBars, dh_in, dh_out);
+ }
++template <int Llo = 0, int Lhi = dec::kLayers>
+ __device__ __noinline__ void dectc_backward_tile_outlined(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+-        unsigned long long* pipeBars = nullptr) {
+-    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red, pipeBars);
++        unsigned long long* pipeBars = nullptr,
++        const float* __restrict__ dh_in = nullptr, float* __restrict__ dh_out = nullptr) {
++    dectc_backward_tile<Llo, Lhi>(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red, pipeBars, dh_in, dh_out);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+diff --git a/csrc/fused/sm_90/pp_stage_decoder_tc.cuh b/csrc/fused/sm_90/pp_stage_decoder_tc.cuh
+index 9c0917a..c7f0f9f 100644
+--- a/csrc/fused/sm_90/pp_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/pp_stage_decoder_tc.cuh
+@@ -58,12 +58,17 @@
+ #endif
+ #include "csrc/fused/sm_90/fused_decoder_megakernel.cuh"
+ 
+-#ifndef SG_DECTC_LAYER_RANGE
+-#error "pp_stage_decoder_tc.cuh requires the dectc layer-range patch. Apply \
+-.phase2/patches/0001-dectc-layer-range-pp.patch to \
+-csrc/fused/sm_90/model_stage_decoder_tc.cuh first (see .phase2/RUNBOOK.md). \
+-This is a loud gate, not an optional feature — building PP stages against the \
+-unpatched single-stage tile functions would silently run the wrong layers."
++// PP-4: versioned gate. SG_DECTC_LAYER_RANGE must be >= 2 (the regenerated
++// live-header patch: template<Llo,Lhi> + wb 2nd-positional + dh_in/dh_out AFTER
++// pipeBars). A stale value-1 tree (the 2026-06-12 patch) is now caught LOUDLY —
++// building the PP kernels against the old tile signatures would not even type-
++// check (wb missing / dh_* in the pipeBars slot). Not optional; no silent degrade.
++#if !defined(SG_DECTC_LAYER_RANGE) || (SG_DECTC_LAYER_RANGE < 2)
++#error "pp_stage_decoder_tc.cuh requires the REGENERATED dectc layer-range patch \
++(SG_DECTC_LAYER_RANGE >= 2). Apply .phase2/patches/0001-dectc-layer-range-pp.patch \
++to csrc/fused/sm_90/model_stage_decoder_tc.cuh first (see .phase2/RUNBOOK.md). \
++A stale value-1 tree (template tiles WITHOUT the wb 2nd-positional + dh_in/dh_out \
++tail) will not compile these kernels. This is a loud gate, not an optional feature."
+ #endif
+ 
+ namespace sg { namespace fused { namespace sm90 { namespace pp {
+@@ -122,30 +127,42 @@ pp_decoder_stage_fwd_tc(PersistentContext ctx,
+                         DecoderTokenCtx tok) {
+     using S = PPStageSpec<Stage, NumStages>;
+     __shared__ DecTcSmem sm;
++    // PP-5: the fwd kernel needs a GridBarrier (it had none) to fence the
++    // grid-strided, element-owned bf16 weight-cache fill (dectc_wbf_convert) so a
++    // CTA never reads a wb row another CTA is still writing (determinism / A/A/A).
++    GridBarrier bar = ctx.barrier();
+     const int cta = blockIdx.x;
+     const int nCTA = (int)ctx.n_ctas;
+     const int B = tok.B;
+     const int T = B * dec::kSeq;
+ 
+-    // Workspace partition — IDENTICAL carve to the fused TC kernel (shared
+-    // workspace across the stage launches of one step ⇒ identical offsets).
+-    float* ws = tok.workspace;
+-    const int64_t acts_f = dec_tc_acts_floats(T, B);
+-    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+-    float* scratch_base = ws + acts_f;
+-    const int64_t scratch_per = dectc::dec_tile_scratch_total_f32();
+-
+-    dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
+-    dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
++    // PP-3 EDIT B.1: workspace partition via the SHARED helper — byte-matches the
++    // fused TC kernel's carve (and now carries the bf16 weight cache wbf_cache,
++    // which the live tiles stage their GEMM B-operand from). acts/sc are re-bound
++    // from the helper's bases exactly as production does.
++    DecTcWorkspace W = dec_tc_bind_workspace(tok.workspace, T, B, nCTA, cta);
++    dectc::DecActs acts = dectc::dec_acts_bind(W.acts_base, T, B);
++    dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(W.scratch_base + (int64_t)cta * W.scratch_per);
+     DecWeights w = dec_bind(const_cast<float*>(params));
++    __nv_bfloat16* wbf_cache = W.wbf_cache;
++    dectc::DecWBf wb = dectc::dec_wbf_bind(wbf_cache);
++
++    // PP-2/PP-5: fill the bf16 weight cache in P0 (grid-strided, element-owned,
++    // deterministic) then fence with B0 BEFORE any tile stages a GEMM from it —
++    // mirrors the fused kernel's P0 C1 fill + B0 (fused_decoder_megakernel :814+:818).
++    dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
++    bar.sync();   // B0: bf16 weight cache complete before any P1 GEMM stages from it
+ 
+     const int nrows_tile = dectc::kTileM;
+     const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
+     for (int ti = cta; ti < n_tiles; ti += nCTA) {
+         const int g0 = ti * nrows_tile;
+         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
++        // PP-2: wb is the 2nd positional arg; pipeBars=nullptr (non-PIPE PP path);
++        // dh_in/dh_out unused by fwd (tail defaults).
+         (void)dectc::dectc_forward_tile<S::kLlo, S::kLhi>(
+-            w, g0, nrows, acts, sc, tok.tokens, tok.targets, sm.sA, sm.sB, sm.red);
++            w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets, sm.sA, sm.sB, sm.red,
++            /*pipeBars=*/nullptr);
+         __syncthreads();
+     }
+ }
+@@ -179,34 +196,34 @@ pp_decoder_stage_bwd_tc(PersistentContext ctx,
+     const int B = tok.B;
+     const int T = B * dec::kSeq;
+ 
+-    // Workspace partition — byte-identical carve to fused_decoder_megakernel_tc
+-    // (same helpers, same order) so the loopback can share one workspace with
+-    // identical region addresses (dw_part slot bases included).
+-    float* ws = tok.workspace;
+-    const int64_t acts_f = dec_tc_acts_floats(T, B);
+-    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+-    float* scratch_base = ws + acts_f;
+-    const int64_t scratch_per = dectc::dec_tile_scratch_total_f32();
+-    float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
+-    float* loss_part  = lnvec_base + (int64_t)nCTA * dectc::kLnVecElems;
+-    float* loss_out   = loss_part + nCTA;
+-    float* dw_part    = loss_out + 1;
++    // PP-3 EDIT B.2: workspace partition via the SHARED helper. The OLD carve
++    // here computed embed_ws_base = dw_part + dw_part_floats() + staged_opt_floats()
++    // and OMITTED dec_wbf_floats() — so embed_row_start/embed_perm ALIASED the bf16
++    // weight cache region (corrupting the stage-0 embedding owner-scan) AND there was
++    // no wbf_cache/wb at all (every GEMM B-operand read uninitialized workspace). The
++    // helper carve interposes the wbf cache between staged-opt and embed exactly like
++    // production → byte-identical region addresses across all kernels of one step.
++    DecTcWorkspace W = dec_tc_bind_workspace(tok.workspace, T, B, nCTA, cta);
++    float* lnvec_base = W.lnvec_base;
++    float* loss_part  = W.loss_part;
++    float* dw_part    = W.dw_part;
+     const int kDwG    = dectc::kDecDwSplitK;
+-    float* embed_ws_base = dw_part + dec_tc_dw_part_floats()
+-                         + dec_tc_staged_opt_floats(nCTA);
+-    if (((uintptr_t)embed_ws_base & 0x7) != 0) embed_ws_base += 1;  // 8-byte align
+-    int* embed_row_start = reinterpret_cast<int*>(embed_ws_base);   // [V+1]
+-    int* embed_perm      = embed_row_start + (dec::kVocab + 1);     // [T]
++    int* embed_row_start = W.embed_row_start;               // [V+1]
++    int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
+ 
+-    dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
+-    dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
++    dectc::DecActs acts = dectc::dec_acts_bind(W.acts_base, T, B);
++    dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(W.scratch_base + (int64_t)cta * W.scratch_per);
+     float* my_lnvec = lnvec_base + (int64_t)cta * dectc::kLnVecElems;
+     DecWeights w = dec_bind(const_cast<float*>(params));
++    __nv_bfloat16* wbf_cache = W.wbf_cache;
++    dectc::DecWBf wb = dectc::dec_wbf_bind(wbf_cache);
+ 
+-    // ── P0: zero this CTA's LN-vec partials + loss slot (mirrors fused P0). ──
++    // ── P0: zero this CTA's LN-vec partials + loss slot (mirrors fused P0) +
++    //    fill the bf16 weight cache (PP-2: grid-strided, element-owned). ──
+     for (int i = threadIdx.x; i < dectc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
+     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+-    bar.sync();   // B0
++    dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA);
++    bar.sync();   // B0: LN-vec/loss zeroed + bf16 weight cache complete
+ 
+     // Embedding token lists: ONLY the stage that owns the embeddings consumes
+     // them; built once on cta 0 in the P1 window (fused-kernel pattern).
+@@ -222,11 +239,16 @@ pp_decoder_stage_bwd_tc(PersistentContext ctx,
+     for (int ti = cta; ti < n_tiles; ti += nCTA) {
+         const int g0 = ti * nrows_tile;
+         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
++        // PP-2: wb is the 2nd positional arg; pipeBars=nullptr (non-PIPE PP path);
++        // dh_in/dh_out moved to the regenerated TAIL (after pipeBars). The OLD calls
++        // passed dh_in/dh_out into the pipeBars slot (const float* into an
++        // unsigned long long* slot — a hard type/positional mismatch).
+         float nll = dectc::dectc_forward_tile<S::kLlo, S::kLhi>(
+-            w, g0, nrows, acts, sc, tok.tokens, tok.targets, sm.sA, sm.sB, sm.red);
++            w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets, sm.sA, sm.sB, sm.red,
++            /*pipeBars=*/nullptr);
+         dectc::dectc_backward_tile<S::kLlo, S::kLhi>(
+-            w, g0, nrows, B, acts, sc, tok.targets, my_lnvec, sc.work2,
+-            sm.sA, sm.sB, sm.red, dh_in, dh_out);
++            w, wb, g0, nrows, B, acts, sc, tok.targets, my_lnvec, sc.work2,
++            sm.sA, sm.sB, sm.red, /*pipeBars=*/nullptr, dh_in, dh_out);
+         if (threadIdx.x == 0) nll_acc += nll;
+         __syncthreads();
+     }
+@@ -356,6 +378,12 @@ cudaError_t launch_pp_decoder_stage_fwd_tc(
+     if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
+     ctx.n_ctas = launch_ctas;
+     if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
++    // PP-5: zero the GridBarrier/queue slots before launch (the fwd kernel now has
++    // a B0 GridBarrier for the wb-cache fill — an un-zeroed barrier would deadlock).
++    // Mirrors the bwd launcher + launch_fused_decoder_megakernel_tc.
++    if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
++    if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
++    if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
+     dim3 grid(launch_ctas), block(SG_TC_MEGA_BLOCK);
+     pp_decoder_stage_fwd_tc<Stage, NumStages><<<grid, block, 0, stream>>>(ctx, params, tok);
+     return cudaGetLastError();
+diff --git a/tests/hw/test_pp2_loopback_determinism.py b/tests/hw/test_pp2_loopback_determinism.py
+index b374fb4..0aace2e 100644
+--- a/tests/hw/test_pp2_loopback_determinism.py
++++ b/tests/hw/test_pp2_loopback_determinism.py
+@@ -31,12 +31,17 @@ THE ASSERTS:
+       production step's params_after, BIT-IDENTICAL (PP stages + B2-seam opt
+       == the full fused step).
+ 
+-PATCH GATE: requires .phase2/patches/0001-dectc-layer-range-pp.patch applied to
+-csrc/fused/sm_90/model_stage_decoder_tc.cuh (the SG_DECTC_LAYER_RANGE marker).
+-Unpatched tree ⇒ SKIP with the apply instruction (the JIT build would #error
+-loudly anyway — no silent degradation).
++PATCH GATE (PP-4, versioned): requires the REGENERATED
++.phase2/patches/0001-dectc-layer-range-pp.patch applied to
++csrc/fused/sm_90/model_stage_decoder_tc.cuh — detected by SG_DECTC_LAYER_RANGE
++>= 2 (the live-header patch: template<Llo,Lhi> + wb 2nd-positional + dh_in/dh_out
++AFTER pipeBars). The gate now (a) reads the marker VERSION (a stale value-1 tree
++is no longer mistaken for applied), and (b) runs `git apply --check` so a drifted
++header that the patch no longer applies to SKIPS cleanly instead of dying in a
++confusing nvcc #error during the JIT build. Three SKIP conditions, each loud.
+ 
+ Run (GPU box, after applying the patch):
++    git apply --check .phase2/patches/0001-dectc-layer-range-pp.patch   # preflight
+     git apply .phase2/patches/0001-dectc-layer-range-pp.patch
+     PYTHONPATH=. python -m pytest tests/hw/test_pp2_loopback_determinism.py -q -s
+     PYTHONPATH=. python tests/hw/test_pp2_loopback_determinism.py
+@@ -44,6 +49,8 @@ Run (GPU box, after applying the patch):
+ from __future__ import annotations
+ 
+ import os
++import re
++import subprocess
+ import sys
+ 
+ import pytest
+@@ -60,6 +67,8 @@ if _REPO not in sys.path:
+     sys.path.insert(0, _REPO)
+ _BINDING_CU = os.path.join(_REPO, "tests", "hw", "pp_stage_binding.cu")
+ _STAGE_HEADER = os.path.join(_REPO, "csrc", "fused", "sm_90", "model_stage_decoder_tc.cuh")
++_PATCH_FILE = os.path.join(_REPO, ".phase2", "patches", "0001-dectc-layer-range-pp.patch")
++_SG_DECTC_LAYER_RANGE_REQUIRED = 2
+ _TORCH_EXT_DIR = os.environ.get("SG_TORCH_EXT_DIR", "/workspace/.torch_ext")
+ _BUILD_DIR = os.path.join(_TORCH_EXT_DIR, "pp_stage_bind")
+ 
+@@ -71,22 +80,53 @@ def _sm90a_available() -> bool:
+     return major >= 9
+ 
+ 
+-def _patch_applied() -> bool:
+-    """The layer-range patch defines SG_DECTC_LAYER_RANGE in the stage header."""
++def _patch_version() -> int:
++    """The numeric SG_DECTC_LAYER_RANGE the stage header defines (0 if absent).
++    The PP kernels need >= 2 (the regenerated live-header patch)."""
+     try:
+         with open(_STAGE_HEADER) as f:
+-            return "SG_DECTC_LAYER_RANGE" in f.read()
++            m = re.search(r"#define\s+SG_DECTC_LAYER_RANGE\s+(\d+)", f.read())
++            return int(m.group(1)) if m else 0
+     except OSError:
++        return 0
++
++
++def _patch_apply_check() -> bool:
++    """True iff `git apply --check` of patch 0001 succeeds against the current
++    tree (i.e. the patch is applicable — or already applied cleanly). Any failure
++    (drifted header, missing patch, no git) returns False so the gate SKIPS loudly
++    rather than dying in a confusing nvcc #error during the JIT build."""
++    if not os.path.isfile(_PATCH_FILE):
++        return False
++    try:
++        # --reverse check first: if the patch is ALREADY applied, a forward
++        # --check fails but a reverse --check succeeds — both are "consistent".
++        fwd = subprocess.run(
++            ["git", "apply", "--check", _PATCH_FILE],
++            cwd=_REPO, capture_output=True, text=True, timeout=30)
++        if fwd.returncode == 0:
++            return True
++        rev = subprocess.run(
++            ["git", "apply", "--reverse", "--check", _PATCH_FILE],
++            cwd=_REPO, capture_output=True, text=True, timeout=30)
++        return rev.returncode == 0
++    except (OSError, subprocess.SubprocessError):
+         return False
+ 
+ 
+ def _skip_reason():
+     if not _sm90a_available():
+         return "PP=2 loopback gate needs an sm_90 (Hopper) GPU"
+-    if not _patch_applied():
+-        return ("layer-range patch NOT applied — run `git apply "
+-                ".phase2/patches/0001-dectc-layer-range-pp.patch` first "
+-                "(see .phase2/RUNBOOK.md). Skipping loudly, not faking success.")
++    ver = _patch_version()
++    if ver < _SG_DECTC_LAYER_RANGE_REQUIRED:
++        return (f"layer-range patch missing/stale (SG_DECTC_LAYER_RANGE={ver}, "
++                f"need >={_SG_DECTC_LAYER_RANGE_REQUIRED}) — apply the REGENERATED "
++                ".phase2/patches/0001-dectc-layer-range-pp.patch (see "
++                ".phase2/RUNBOOK.md). Skipping loudly, not faking success.")
++    if not _patch_apply_check():
++        return ("patch 0001 does not `git apply --check` cleanly against the "
++                "current model_stage_decoder_tc.cuh (header drifted) — regenerate "
++                "the patch before building. Skipping loudly, not faking success.")
+     return None
+ 
+ 

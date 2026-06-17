@@ -1,0 +1,714 @@
+--- a/grokking_optimizers/compile.py	2026-06-17 05:03:09.930383480 +0000
++++ b/grokking_optimizers/compile.py	2026-06-17 05:06:54.166106654 +0000
+@@ -7210,21 +7210,49 @@
+     return f"{str(optimizer).strip().lower()}/{short}"
+ 
+ 
++# SINGLE authoritative record of the dimension the default correctness hook's
++# fp64 + A/A/A gate ACTUALLY runs at — the toy grokking scale baked into
++# tests/hw/test_l3tc_tail_gate._build_cell (``DEFAULT_CONFIG["dim_model"]``;
++# ``p=97``). It is NOT the d=2048 production/roofline scale the winner is timed
++# and roofline-reported at — RG4 (oracle_trust_audit / test_coverage_gap_audit):
++# the hook's prior docstring claimed "PRODUCTION-scale (d=2048)" while its body
++# ran this toy gate, an SG11-class scale-drift (claimed scale != actual scale).
++# The ``_self_test_correctness_hook_scale`` section reads the gate's REAL baked
++# dim out of grokking_race_v2.DEFAULT_CONFIG and asserts it equals this constant,
++# so the documented scale and the gate scale can never silently drift apart
++# again. A genuine production-scale gate is a SEPARATE, larger ``-DSG_*_D`` build
++# (test_coverage_gap_audit RG6) — when it lands, gate it at its own scale; do NOT
++# relabel this toy constant.
++_CORRECTNESS_HOOK_GATE_DIM: int = 128
++
++
+ def _default_correctness_hook(
+         spec: "BuildSpec") -> Optional[Callable[[Dict[str, Any]], bool]]:
+     """P0-1 — build the fp64 ground-truth + A/A/A determinism gate hook for
+     ``pick_winner`` (the marquee correctness fix), or return None when it
+     cannot run here so the historical timing-only selection is preserved.
+ 
+-    The returned callable ``hook(candidate_trial) -> bool`` re-checks the
+-    PRODUCTION-scale (d=2048) L3-TC train step against the PURE-fp64 canonical
+-    reference + the 3x A/A/A bit-determinism check from
+-    ``tests/hw/test_l3tc_tail_gate.run_cell_gate`` — NOT the same-dtype fp32
+-    self-consistency oracle the sweep uses for the timing objective. ``True``
+-    iff the (optimizer, model) cell PASSES both gates. ``pick_winner`` calls it
+-    on the top-K candidate winners and DEMOTES any failure (re-selecting the
+-    next-best), so a winner that merely shares a rounding error with the fp32
+-    oracle (the IL=4 trap class) can no longer be finalized.
++    The returned callable ``hook(candidate_trial) -> bool`` re-checks the L3-TC
++    train step against the PURE-fp64 canonical reference + the 3x A/A/A
++    bit-determinism check from ``tests/hw/test_l3tc_tail_gate.run_cell_gate`` —
++    NOT the same-dtype fp32 self-consistency oracle the sweep uses for the timing
++    objective. ``True`` iff the (optimizer, model) cell PASSES both gates.
++    ``pick_winner`` calls it on the top-K candidate winners and DEMOTES any
++    failure (re-selecting the next-best), so a winner that merely shares a
++    rounding error with the fp32 oracle (the IL=4 trap class) can no longer be
++    finalized.
++
++    SCALE (RG4 — do not let this drift again): the gate runs at the TOY grokking
++    scale ``run_cell_gate`` bakes in (``dim_model=_CORRECTNESS_HOOK_GATE_DIM``=128,
++    ``p=97`` via ``_build_cell``), NOT the d=2048 production/roofline scale the
++    winner is TIMED at. This catches the IL=4 fp32-rounding-collision class and
++    every per-element-math regression, which are scale-invariant. It does NOT
++    catch a defect that only manifests when a tensor spans many CTAs (occupancy
++    spill, tile-count-dependent reduction) — that needs a separate, larger
++    ``-DSG_*_D`` correctness gate (test_coverage_gap_audit RG6). The prior
++    docstring/comment claimed "PRODUCTION-scale (d=2048)" while the body ran this
++    toy gate — the exact SG11-class claimed-vs-actual mismatch; the scale is now
++    pinned to one constant + a self-test (``_self_test_correctness_hook_scale``).
+ 
+     The hook is INSTALLED only when ALL of these hold (else this returns None):
+       * a CUDA GPU + the built fused extension are present (``_gpu_ready()`` in
+@@ -7268,10 +7296,12 @@
+     def _hook(candidate: Dict[str, Any]) -> bool:
+         # The production extension `run_cell_gate` exercises is the one carrying
+         # the autotuned macros (the winner is rebuilt + published before the
+-        # gate runs in the main loop's verify phase); here we run the SAME
+-        # cell gate at production scale. ``ok`` is the AND of (1) fp64 parity
+-        # and (2) A/A/A determinism. Any exception propagates to pick_winner,
+-        # which treats it as a fail-closed demotion.
++        # gate runs in the main loop's verify phase); here we run the SAME cell
++        # gate at the TOY grokking scale it bakes in (dim_model=
++        # _CORRECTNESS_HOOK_GATE_DIM=128, p=97 — NOT the d=2048 timing scale; see
++        # the factory docstring + _self_test_correctness_hook_scale). ``ok`` is
++        # the AND of (1) fp64 parity and (2) A/A/A determinism. Any exception
++        # propagates to pick_winner, which treats it as a fail-closed demotion.
+         ok, _detail = _run_cell_gate(cell_key, verbose=False)
+         return bool(ok)
+ 
+@@ -26845,6 +26875,73 @@
+     run("math_structural_single_source", structural_single_source_holds)
+ 
+ 
++def _self_test_correctness_hook_scale(run) -> None:
++    """`[self-test] correctness_hook_scale` section (RG4).
++
++    Binds the dimension ``_default_correctness_hook``'s gate ACTUALLY runs at to
++    the dimension it DOCUMENTS, so the two cannot silently drift (the SG11-class
++    claimed-scale-vs-actual-scale failure: the prior docstring said "PRODUCTION-
++    scale (d=2048)" while the body ran the toy d=128/p=97 grokking gate). CPU-only
++    — reads ``grokking_race_v2.DEFAULT_CONFIG`` + this module's own source; never
++    builds a GPU cell."""
++    import inspect as _inspect
++    sys.stdout.write("[self-test] correctness_hook_scale\n")
++
++    def documented_dim_equals_actual_gate_dim():
++        # The gate's REAL scale = the dim the gate cell bakes in. tests/hw/
++        # test_l3tc_tail_gate._build_cell starts from grokking_race_v2.
++        # DEFAULT_CONFIG and updates ONLY {model_type, ..., p}: it never overrides
++        # dim_model, so DEFAULT_CONFIG["dim_model"] IS the gate's actual dim.
++        import grokking_race_v2 as _grv2
++        actual = int(_grv2.DEFAULT_CONFIG["dim_model"])
++        assert actual == _CORRECTNESS_HOOK_GATE_DIM, (
++            f"correctness-hook scale drift: the default correctness hook gate runs "
++            f"at dim_model={actual} (grokking_race_v2.DEFAULT_CONFIG) but "
++            f"_CORRECTNESS_HOOK_GATE_DIM={_CORRECTNESS_HOOK_GATE_DIM}. Update the "
++            f"constant + the _default_correctness_hook docstring in the SAME commit "
++            f"that changed the gate scale (this constant is the single source).")
++        # Guard the binding itself: if _build_cell ever starts overriding dim_model,
++        # DEFAULT_CONFIG would no longer be the gate's real dim and this self-test
++        # would silently bind to the wrong number. Assert it does NOT.
++        from tests.hw import test_l3tc_tail_gate as _gate
++        bc_src = _inspect.getsource(_gate._build_cell)
++        assert "dim_model" not in bc_src, (
++            "_build_cell now sets dim_model — DEFAULT_CONFIG['dim_model'] is no "
++            "longer the gate's actual dim; re-derive _CORRECTNESS_HOOK_GATE_DIM "
++            "from _build_cell's own override and update this self-test.")
++
++    def hook_doc_does_not_claim_production_scale_gate():
++        # The doc must NOT re-introduce the false "PRODUCTION-scale (d=2048)"
++        # gate claim. It is allowed to MENTION d=2048 (it explains the gate is
++        # NOT at that scale), so we forbid only the specific drift phrasing that
++        # asserted the gate runs there.
++        doc = _default_correctness_hook.__doc__ or ""
++        low = doc.lower()
++        assert "production-scale (d=2048) l3-tc" not in low, (
++            "the correctness-hook docstring re-introduced the false "
++            "'PRODUCTION-scale (d=2048) L3-TC' gate claim (RG4 drift).")
++        # And it must affirmatively document the real (toy) scale + the constant.
++        assert "_correctness_hook_gate_dim" in low, (
++            "the correctness-hook docstring must reference _CORRECTNESS_HOOK_GATE_DIM "
++            "so the documented scale is pinned to the authoritative constant.")
++
++    def toy_scale_is_not_the_production_scale():
++        # Sanity: the gate scale must be the TOY scale, well below the d=2048
++        # production/roofline scale — else 'reconciled' would mean we silently
++        # promised a production gate that does not exist (test_coverage_gap RG6).
++        assert _CORRECTNESS_HOOK_GATE_DIM < 2048, (
++            f"_CORRECTNESS_HOOK_GATE_DIM={_CORRECTNESS_HOOK_GATE_DIM} is at/above "
++            f"the d=2048 production scale, but the hook runs the toy grokking gate "
++            f"— a production-scale correctness gate is a separate larger build (RG6).")
++
++    run("correctness_hook_documented_dim_equals_actual_gate_dim",
++        documented_dim_equals_actual_gate_dim)
++    run("correctness_hook_doc_does_not_claim_production_scale_gate",
++        hook_doc_does_not_claim_production_scale_gate)
++    run("correctness_hook_toy_scale_is_not_production_scale",
++        toy_scale_is_not_the_production_scale)
++
++
+ # ─── Self-test count authority (Stage 3) ──────────────────────────────────
+ # The TOTAL number of individual self-test cases (PASS + FAIL lines) that a
+ # full ``--self-test`` run executes. This is the SINGLE authoritative place
+@@ -26857,7 +26954,7 @@
+ # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
+ # any other), so the value is the grand total reported on the final
+ # ``[self-test] N passed, M failed`` line.
+-_SELF_TEST_EXPECTED_COUNT: int = 265
++_SELF_TEST_EXPECTED_COUNT: int = 268
+ 
+ 
+ def _self_test() -> int:
+@@ -26917,6 +27014,7 @@
+     _self_test_synth_codegen(_run)
+     _self_test_flag_probe(_run)
+     _self_test_math_drift_guard(_run)
++    _self_test_correctness_hook_scale(_run)
+     _self_test_e2e_smoke(_run)
+ 
+     # Stage 3 — count-consistency guard. Runs LAST so it can observe the
+--- a/tests/hw/test_l3tc_tail_gate.py	2026-06-17 05:03:09.962383726 +0000
++++ b/tests/hw/test_l3tc_tail_gate.py	2026-06-17 05:04:35.560041514 +0000
+@@ -880,28 +880,43 @@
+ 
+ 
+ def run_sg11_warmup_gate(cell_key, warmup_steps=2, verbose=True):
+-    """WARM-UP SG11 gate — the divergence-exercising check the cold single-step gate is
+-    BLIND to (in the worst case mu≈0 ∧ momentum=0 at step 1 ⇒ cos(grad,mu)==cos(grad,
+-    momentum)==gate(0.5) — the two formulations COINCIDE). After ≥1 warm-up step BOTH
+-    mu≠0 AND momentum (exp_avg)≠0, so the BUGGY cos(grad,mu) gate and the CANONICAL
+-    cos(grad,momentum) gate genuinely differ.
++    """WARM-UP SG11/SG15 gate — the divergence-exercising check the cold single-step gate
++    is BLIND to. For BOTH SG-tier families the cold step-1 gate is structurally pinned:
++    m=v=0 going in, so every momentum-dependent surface is exercised in the ONE regime
++    where the buggy and canonical formulations coincide. This warm-up runs ≥1 real step
++    first so exp_avg (momentum) becomes nonzero, then validates the gated step against the
++    momentum-fed reference.
++
++      * SG11 (per-tensor cosine gate): the historic bug is cos(grad,mu) vs the canonical
++        cos(grad,momentum). At step 1 momentum=0 ⇒ cos(grad,mu)==cos(grad,momentum)==
++        gate(0.5) — the two formulations COINCIDE; only after warm-up do they genuinely
++        differ. The (A)/(B) instrument recovers the kernel's actual per-tensor gate and
++        asserts it tracks cos(grad,MOMENTUM) and NOT cos(grad,mu) (gate_div/err_vs_mu).
++      * SG15 (HOST-SCALAR gate, no per-tensor cosine): the bug class is instead the warmed
++        start-of-step momentum/variance failing to thread through the Adam tail + per-coord
++        alpha clip (mu/v carry, bias-correction at t=warmup+1). The (1a)/(1b)/(B) surfaces
++        in _run_sg_cell_gate — driven with the warmed (m0,v0,p0,t_step) — are the teeth;
++        the cosine-recovery (A)/(B) block below is SKIPPED for SG15 (no operand to swap).
+ 
+     Runs `warmup_steps` real L3-TC steps (shared state_cache so exp_avg accumulates),
+     captures the start-of-step m/v/p going INTO the gated step (= the kernel's
+     st.exp_avg/exp_avg_sq/params at gate time), then runs the gated step and validates
+-    the kernel vs the CORRECTED cos(grad,momentum) reference (_run_sg_cell_gate with
+-    sg11_warmup_state). Returns (ok, detail). detail carries:
+-      * gate_div — max |gate_momentum − gate_mu| over tensors (>0 proves the warm-up
+-        exercises the divergence the bug lives in; the OLD kernel computes the gate_mu
+-        column and must FAIL this corrected reference).
+-      * mom_norm — the start-of-step momentum L2 norm (must be ≫0 — a live warm-up)."""
++    the kernel vs the momentum-fed reference (_run_sg_cell_gate with sg11_warmup_state).
++    Returns (ok, detail). detail carries:
++      * gate_div — (SG11 only) max |gate_momentum − gate_mu| over tensors (>0 proves the
++        warm-up exercises the divergence the bug lives in; the OLD kernel computes the
++        gate_mu column and must FAIL this corrected reference).
++      * mom_norm — the start-of-step momentum L2 norm (must be ≫0 — a live warm-up;
++        asserted for BOTH families)."""
+     import math
+     from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
+                                               canonicalize_model, fused_train_step,
+                                               _opt_scalars_from)
+     spec = _CELLS[cell_key]
+     model, opt = spec["model"], spec["opt"]
+-    assert opt == "supergrok11", f"{cell_key}: warmup gate is SG11-only"
++    assert opt in ("supergrok11", "supergrok15"), (
++        f"{cell_key}: warmup gate is SG-tier only (supergrok11/supergrok15)")
++    is_sg11 = (opt == "supergrok11")
+     g, c, m, data, dev = _build_cell(model)
+     canon = canonicalize_model(model)
+     assert has_l3_real(canon, opt), f"{cell_key}: not L3-REAL"
+@@ -970,29 +985,35 @@
+     off = 0; gate_div = 0.0
+     err_vs_momentum = 0.0   # |gate_kernel − gate_momentum|  → ~0 for FIXED, large for OLD
+     err_vs_mu = 0.0         # |gate_kernel − gate_mu|        → ~0 for OLD,   large for FIXED
+-    for n_, p in named0:
+-        k = p.numel()
+-        gt = grad[off:off + k].double()
+-        mut = k_mu[off:off + k].double()
+-        m0 = m_start[off:off + k].double()
+-        km = k_m[off:off + k].double()
+-        m0b = m_start[off:off + k].double()
+-        def _gate(b):
+-            num = (gt * b).sum()
+-            den = torch.sqrt((gt * gt).sum() * (b * b).sum() + 1e-12)
+-            cos = float(num / den) if den > 0 else 0.0
+-            return 1.0 / (1.0 + math.exp(-gate_temp * cos))
+-        g_mom = _gate(m0); g_mu = _gate(mut)
+-        gate_div = max(gate_div, abs(g_mom - g_mu))
+-        # Recover the kernel's gate from the m-state (per-tensor least-squares).
+-        sg_k = (km - beta1 * m0b) / (1.0 - beta1)
+-        denom = float((mut * mut).sum())
+-        if denom > 1e-20 and alpha > 1e-12:
+-            one_minus_gate = float(((sg_k - gt) * mut).sum()) / (denom * alpha)
+-            gate_kernel = 1.0 - one_minus_gate
+-            err_vs_momentum = max(err_vs_momentum, abs(gate_kernel - g_mom))
+-            err_vs_mu = max(err_vs_mu, abs(gate_kernel - g_mu))
+-        off += k
++    # SG11 ONLY: the per-tensor cosine gate is the surface the operand-swap bug lives on,
++    # so recover the kernel's actual gate and compare it to BOTH formulations. SG15's gate
++    # is a HOST SCALAR (sigmoid(accuracy)) with no per-tensor cosine — there is no operand
++    # to recover or swap, so this block is skipped and the SG15 verdict rests on the
++    # warmed-momentum (1a)/(1b)/(B) Adam-tail parity below.
++    if is_sg11:
++        for n_, p in named0:
++            k = p.numel()
++            gt = grad[off:off + k].double()
++            mut = k_mu[off:off + k].double()
++            m0 = m_start[off:off + k].double()
++            km = k_m[off:off + k].double()
++            m0b = m_start[off:off + k].double()
++            def _gate(b):
++                num = (gt * b).sum()
++                den = torch.sqrt((gt * gt).sum() * (b * b).sum() + 1e-12)
++                cos = float(num / den) if den > 0 else 0.0
++                return 1.0 / (1.0 + math.exp(-gate_temp * cos))
++            g_mom = _gate(m0); g_mu = _gate(mut)
++            gate_div = max(gate_div, abs(g_mom - g_mu))
++            # Recover the kernel's gate from the m-state (per-tensor least-squares).
++            sg_k = (km - beta1 * m0b) / (1.0 - beta1)
++            denom = float((mut * mut).sum())
++            if denom > 1e-20 and alpha > 1e-12:
++                one_minus_gate = float(((sg_k - gt) * mut).sum()) / (denom * alpha)
++                gate_kernel = 1.0 - one_minus_gate
++                err_vs_momentum = max(err_vs_momentum, abs(gate_kernel - g_mom))
++                err_vs_mu = max(err_vs_mu, abs(gate_kernel - g_mu))
++            off += k
+ 
+     # ── Validate the FIXED kernel vs the CORRECTED cos(grad,momentum) reference, with
+     # the warmed start-of-step state threaded through (m0=m_start, gate uses momentum).
+@@ -1003,14 +1024,16 @@
+     detail["mom_norm"] = mom_norm
+     detail["gate_err_vs_momentum"] = err_vs_momentum
+     detail["gate_err_vs_mu"] = err_vs_mu
+-    # (A)/(B) VERDICT on the direct gate surface: the kernel's recovered gate must match
+-    # the CANONICAL cos(grad,momentum) (FIXED) and NOT the buggy cos(grad,mu) (OLD).
+-    # The recovery sg_k=(k_m−β1·m0)/(1−β1) amplifies the bf16 m-state floor by 1/(1−β1)
+-    # (≈10×), so the FIXED kernel lands at err_vs_momentum≈1e-4..1e-3 — a few×1e-3 floor.
+-    # The OLD kernel sits at err_vs_momentum≈0.74..0.92 (and err_vs_mu≈1e-3). The two
++    # (A)/(B) VERDICT on the direct gate surface (SG11 ONLY): the kernel's recovered gate
++    # must match the CANONICAL cos(grad,momentum) (FIXED) and NOT the buggy cos(grad,mu)
++    # (OLD). The recovery sg_k=(k_m−β1·m0)/(1−β1) amplifies the bf16 m-state floor by
++    # 1/(1−β1) (≈10×), so the FIXED kernel lands at err_vs_momentum≈1e-4..1e-3 — a few×1e-3
++    # floor. The OLD kernel sits at err_vs_momentum≈0.74..0.92 (and err_vs_mu≈1e-3). The two
+     # regimes are separated by ~3 orders of magnitude, so generous bands (1e-2 / 1e-1)
+-    # give a robust, floor-tolerant verdict with no risk of a flip either way.
+-    gate_ok = (err_vs_momentum < 1e-2) and (err_vs_mu > 1e-1)
++    # give a robust, floor-tolerant verdict with no risk of a flip either way. For SG15 the
++    # gate is a host scalar (no cosine), so there is no recovered-gate verdict — gate_ok is
++    # vacuously True and the verdict rests on (1a)/(1b)/(B) with the warmed momentum.
++    gate_ok = (not is_sg11) or ((err_vs_momentum < 1e-2) and (err_vs_mu > 1e-1))
+ 
+     # ── (D) A/A/A determinism on the WARM-UP path: re-run the full warmup+gated
+     # sequence 3× from the SAME init; the gated-step params + mu must be bit-identical.
+@@ -1039,22 +1062,32 @@
+     detail["det"] = det_ok
+ 
+     if verbose:
+-        print(f"  (WARMUP) steps={warmup_steps} mom_norm={mom_norm:.4e} "
+-              f"gate_div(momentum vs mu)={gate_div:.4e} "
+-              f"{'OK(divergent)' if gate_div > 1e-4 else 'WARN(coincident!)'}", flush=True)
+-        print(f"  (A/B) recovered-gate: |gate_kernel−gate_momentum|={err_vs_momentum:.4e} "
+-              f"(want <1e-2 → matches CANONICAL) |gate_kernel−gate_mu|={err_vs_mu:.4e} "
+-              f"(want >1e-1 → NOT the bug) {'OK(cos grad,momentum)' if gate_ok else 'FAIL'}",
+-              flush=True)
++        if is_sg11:
++            print(f"  (WARMUP) steps={warmup_steps} mom_norm={mom_norm:.4e} "
++                  f"gate_div(momentum vs mu)={gate_div:.4e} "
++                  f"{'OK(divergent)' if gate_div > 1e-4 else 'WARN(coincident!)'}", flush=True)
++            print(f"  (A/B) recovered-gate: |gate_kernel−gate_momentum|={err_vs_momentum:.4e} "
++                  f"(want <1e-2 → matches CANONICAL) |gate_kernel−gate_mu|={err_vs_mu:.4e} "
++                  f"(want >1e-1 → NOT the bug) {'OK(cos grad,momentum)' if gate_ok else 'FAIL'}",
++                  flush=True)
++        else:
++            print(f"  (WARMUP) steps={warmup_steps} mom_norm={mom_norm:.4e} "
++                  f"[SG15: host-scalar gate, no per-tensor cosine — verdict rests on the "
++                  f"warmed-momentum (1a)/(1b)/(B) Adam-tail parity]", flush=True)
+         print(f"  (D) A/A/A determinism (warmup path): loss {LA:.6f}/{LB:.6f}  "
+               f"param-eq={torch.equal(PA, PB)} mu-eq={torch.equal(MA, MB)} "
+               f"{'OK' if det_ok else 'FAIL'}", flush=True)
+-    # The warm-up MUST exercise the divergence (else (A) old-kernel-fails is vacuous).
++    # The warm-up MUST exercise a LIVE momentum (for BOTH families) — else the gated step
++    # reduces to the cold step-1 regime the cold gate already covers and the warm-up is
++    # vacuous. mom_norm≫0 is the non-vacuity proof common to SG11 and SG15.
+     assert mom_norm > 1e-6, f"{cell_key}: warm-up momentum ~0 — exp_avg did not accumulate"
+-    assert gate_div > 1e-4, (
+-        f"{cell_key}: cos(grad,momentum) and cos(grad,mu) gates COINCIDE "
+-        f"(div={gate_div:.2e}) — the warm-up does not exercise the bug; the (A) "
+-        f"old-kernel-fails demonstration would be vacuous. Strengthen the warm-up.")
++    if is_sg11:
++        # SG11 additionally MUST exercise the cos(grad,momentum) vs cos(grad,mu) divergence
++        # (else the (A) old-kernel-fails demonstration would be vacuous).
++        assert gate_div > 1e-4, (
++            f"{cell_key}: cos(grad,momentum) and cos(grad,mu) gates COINCIDE "
++            f"(div={gate_div:.2e}) — the warm-up does not exercise the bug; the (A) "
++            f"old-kernel-fails demonstration would be vacuous. Strengthen the warm-up.")
+     detail["gate_ok"] = gate_ok
+     return (ok and det_ok and gate_ok), detail
+ 
+@@ -1473,12 +1506,52 @@
+     assert ok, f"{cell} L3-TC gate failed: {detail}"
+ 
+ 
++# ── SG-tier WARM-UP gate (RG1) — the divergence-exercising test the historic SG11
++# cos(grad,mu)-vs-cos(grad,momentum) bug class is caught by. The cold step-1 gate
++# (test_l3tc_cell_gate) is structurally BLIND to it (m=v=0 ⇒ the buggy and canonical
++# formulations COINCIDE), and run_sg11_warmup_gate was previously reachable ONLY via the
++# `--sg11-warmup` CLI flag (main()) — so pytest/CI never collected it. These pytest
++# entries make the warm-momentum gate a default-path (-m hw) guard for ALL 6 SG-tier cells
++# (3× supergrok11 + 3× supergrok15); run_sg11_warmup_gate self-asserts non-vacuity
++# (mom_norm≫0 for both; gate_div>1e-4 for SG11) so a vacuous warm-up fails loudly.
++_SG11_WARMUP_CELLS = [k for k in _CELLS if _CELLS[k]["opt"] == "supergrok11"]
++_SG15_WARMUP_CELLS = [k for k in _CELLS if _CELLS[k]["opt"] == "supergrok15"]
++
++
++@pytest.mark.hw
++@pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
++@pytest.mark.parametrize("cell", _SG11_WARMUP_CELLS)
++def test_sg11_gate_warmup_catches_momentum_bug(cell):
++    """The name the docstring at _run_sg_cell_gate has long advertised, now REAL and
++    pytest-collected. Warms exp_avg nonzero, pumps the meta-net rescale so the gate term is
++    load-bearing, then asserts the kernel's recovered per-tensor gate tracks the CANONICAL
++    cos(grad,MOMENTUM) and NOT the buggy cos(grad,mu). The OLD (cos(grad,mu)) kernel FAILS
++    this; the FIXED kernel passes. Folds the cold gate's (1a)/(1b)/(B) + a warm-path A/A/A."""
++    ok, detail = run_sg11_warmup_gate(cell, warmup_steps=2, verbose=True)
++    assert ok, f"{cell} SG11 warm-up momentum gate failed: {detail}"
++
++
++@pytest.mark.hw
++@pytest.mark.skipif(not _gpu_ready(), reason="needs built extension on GPU")
++@pytest.mark.parametrize("cell", _SG15_WARMUP_CELLS)
++def test_sg15_gate_warmup_warm_momentum(cell):
++    """SG15 analog of the SG11 warm-up gate. SG15's gate is a HOST SCALAR (no per-tensor
++    cosine to swap), so the warmed-momentum teeth are the Adam tail + per-coord alpha clip:
++    the warmed start-of-step (m0,v0,p0,t_step) is threaded through ref_sg15_step, so a
++    step-1-blind moment-carry / bias-correction / mu-carry regression diverges here even
++    though it coincides at the cold step. run_sg11_warmup_gate asserts mom_norm≫0 (the
++    warm-up is live) and validates (1a)/(1b)/(B) at the warmed state + a warm-path A/A/A."""
++    ok, detail = run_sg11_warmup_gate(cell, warmup_steps=2, verbose=True)
++    assert ok, f"{cell} SG15 warm-up momentum gate failed: {detail}"
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--cell", default="", help="single cell e.g. lion/decoder")
+     ap.add_argument("--sg11-warmup", action="store_true",
+-                    help="run the SG11 WARM-UP gate (cos(grad,momentum) divergence) "
+-                         "for the supergrok11 cells instead of the cold step-1 gate")
++                    help="run the SG-tier WARM-UP gate (cos(grad,momentum) divergence for "
++                         "SG11; warmed Adam-tail momentum carry for SG15) for the "
++                         "supergrok11+supergrok15 cells instead of the cold step-1 gate")
+     ap.add_argument("--warmup-steps", type=int, default=2,
+                     help="number of warm-up steps before the gated step (default 2)")
+     args = ap.parse_args()
+@@ -1487,7 +1560,8 @@
+         return
+     if args.sg11_warmup:
+         cells = ([args.cell] if args.cell
+-                 else [k for k in _CELLS if _CELLS[k]["opt"] == "supergrok11"])
++                 else [k for k in _CELLS
++                       if _CELLS[k]["opt"] in ("supergrok11", "supergrok15")])
+         n_ok = 0
+         for cell in cells:
+             print(f"[l3tc-gate WARMUP] {cell}", flush=True)
+@@ -1495,7 +1569,7 @@
+                                          verbose=True)
+             print(f"  => {'PASS' if ok else 'FAIL'}\n", flush=True)
+             n_ok += int(ok)
+-        print(f"[l3tc-gate WARMUP] {n_ok}/{len(cells)} SG11 cells passed", flush=True)
++        print(f"[l3tc-gate WARMUP] {n_ok}/{len(cells)} SG-tier cells passed", flush=True)
+         sys.exit(0 if n_ok == len(cells) else 1)
+     cells = [args.cell] if args.cell else list(_CELLS)
+     n_ok = 0
+--- a/tests/hw/_sg2_l3tc_gate.py	2026-06-17 05:03:09.993383964 +0000
++++ b/tests/hw/_sg2_l3tc_gate.py	2026-06-17 05:06:03.359716224 +0000
+@@ -15,9 +15,12 @@
+   (tie-probe): construct |grad| TIES → assert the in-kernel sort's perm matches a
+        lock-step (|g|, idx) index-tie-break oracle (NOT torch.argsort, which is
+        unstable on CUDA). The keystone for sort top-risk #1.
+-  (N>64 CSA fidelity probe): REPORTS (does NOT fail) the divergence between the
+-       kernel's low-rank CSA indexer (drops idx_UQ, /sqrt(rank)) and the bilevel
+-       oracle's full-d indexer (/sqrt(d)) for N>64 — the documented won't-grok gap.
++  (N>64 CSA fidelity probe): VOTING (oracle de-mirror) — compares the kernel's
++       LOW-RANK CSA indexer (idx_UQ dropped, /sqrt(rank)) to an INDEPENDENT canonical
++       FULL-RANK indexer (idx_UQ applied, /sqrt(d)) derived straight from supergrok2.py,
++       and asserts the selection overlap stays in a documented band (the <1.0 gap is the
++       BY-DESIGN low-rank approximation; a COLLAPSE — disjoint/degenerate/nondeterministic
++       — is a regression that now FAILS the gate verdict, not a print-only report).
+ 
+ The helpers here are imported by tests/hw/test_l3tc_tail_gate.py's SG2 cells; this
+ module is also runnable standalone for fast iteration (PYTHONPATH=. python -m
+@@ -25,6 +28,7 @@
+ """
+ from __future__ import annotations
+ 
++import math
+ import os
+ import sys
+ from pathlib import Path
+@@ -88,6 +92,95 @@
+     return perm, unsort
+ 
+ 
++def _csa_softmax_pool(x_sorted, compress_w, stride, win, Nc):
++    """Softmax-weighted strided window pool of x_sorted → [Nc, d]. Independent
++    transcription of supergrok2.py:437-447 (the CSA compress pool) — NOT a copy of
++    sg2_kernel_mirror.softmax_pool_csa (which is the KERNEL mirror). Both must of
++    course agree; that they are derived separately is the point of de-mirroring."""
++    N, d = x_sorted.shape
++    out = np.zeros((Nc, d), dtype=np.float64)
++    cw = np.asarray(compress_w, dtype=np.float64)
++    for j in range(Nc):
++        base = j * stride
++        taps = [base + wq for wq in range(win) if base + wq < N]
++        if not taps:
++            continue
++        logits = np.array([cw[t - base] for t in taps], dtype=np.float64)
++        e = np.exp(logits - logits.max())
++        wts = e / e.sum()
++        out[j] = (wts[:, None] * x_sorted[taps]).sum(0)
++    return out
++
++
++def _canonical_fullrank_topk(w, x_sorted, D, topk):
++    """INDEPENDENT canonical FULL-RANK lightning-indexer top-k, derived directly from
++    the CANONICAL source (supergrok2.py:449-455 / supergrok2_bilevel_adjoint.h:156-159),
++    NOT from the kernel mirror. This is the de-mirrored reference (oracle_trust_audit:
++    the B1 oracle_step re-implements the KERNEL's LOW-RANK indexer, so it cannot tell a
++    correct low-rank indexer from a buggy one consistent with the mirror).
++
++        qI       = (x @ idx_DQ) @ idx_UQ                 # [N, d]  (FULL d, idx_UQ APPLIED)
++        kI_tok   =  x @ idx_K  @ idx_UQ                  # [N, d]
++        c_kI     = softmax_pool(kI_tok)                  # [Nc, d]
++        scores   = (qI @ c_kI.T) / sqrt(d)               # [N, Nc]   (/sqrt(d), NOT /sqrt(rk))
++        sel      = topk(scores)                          # [N, topk]
++
++    The KERNEL (intentionally, by spec — supergrok2.h:504-511 documents the (void)idx_UQ
++    choice) instead keeps qI rank-INDEXER_RANK (idx_UQ DROPPED) and scores /sqrt(rank).
++    Returns the per-row selected compressed-entry index SET (sorted) so callers can
++    measure the low-rank-vs-canonical SELECTION divergence (Jaccard / overlap)."""
++    N, d = x_sorted.shape
++    stride, win = D.csa_compress, D.csa_window
++    Nc = (N + stride - 1) // stride
++    pooled = _csa_softmax_pool(x_sorted, w["csa_compress_w"], stride, win, Nc)  # [Nc,d]
++    idx_DQ = np.asarray(w["csa_idx_DQ"], dtype=np.float64)   # [d, rk]
++    idx_UQ = np.asarray(w["csa_idx_UQ"], dtype=np.float64)   # [rk, d]
++    idx_K = np.asarray(w["csa_idx_K"], dtype=np.float64)     # [d, rk]
++    qI = (x_sorted @ idx_DQ) @ idx_UQ                        # [N, d]
++    c_kI = (pooled @ idx_K) @ idx_UQ                         # [Nc, d] (pool is linear)
++    scores = (qI @ c_kI.T) / math.sqrt(d)                    # [N, Nc]
++    k = max(min(topk, Nc), 1)
++    # top-k indices per row (descending score); ordering within the set is irrelevant
++    # to a SELECTION-set comparison, so return the sorted index set per row.
++    sel = np.argpartition(-scores, kth=k - 1, axis=1)[:, :k]
++    return np.sort(sel, axis=1)
++
++
++def _lowrank_topk(w, x_sorted, D, topk):
++    """The KERNEL's LOW-RANK indexer top-k (idx_UQ DROPPED, /sqrt(rank)) — the path the
++    B1 oracle_step also takes. Transcribed from supergrok2.h:206/227 + sg2_kernel_mirror
++    lines 356-391, kept SEPARATE here so the N>64 probe can compare it to the canonical
++    full-rank reference above and BOUND the divergence (voting), not just print it."""
++    N, d = x_sorted.shape
++    stride, win = D.csa_compress, D.csa_window
++    Nc = (N + stride - 1) // stride
++    rk = int(D.indexer_rank)
++    pooled = _csa_softmax_pool(x_sorted, w["csa_compress_w"], stride, win, Nc)  # [Nc,d]
++    idx_DQ = np.asarray(w["csa_idx_DQ"], dtype=np.float64)   # [d, rk]
++    idx_K = np.asarray(w["csa_idx_K"], dtype=np.float64)     # [d, rk]
++    qI = x_sorted @ idx_DQ                                   # [N, rk]  (idx_UQ DROPPED)
++    kI = pooled @ idx_K                                      # [Nc, rk]
++    scores = (qI @ kI.T) / math.sqrt(rk)                     # [N, Nc]  (/sqrt(rank))
++    k = max(min(topk, Nc), 1)
++    sel = np.argpartition(-scores, kth=k - 1, axis=1)[:, :k]
++    return np.sort(sel, axis=1)
++
++
++def _x_sorted_from(w, grad_np, sharp_np, perm):
++    """Reproduce the kernel's per-tensor sorted input features x_sorted = input_proj(
++    stack(g_sorted, s_sorted)) — the SAME pre-indexer features both the low-rank and the
++    canonical full-rank indexer score against. Transcribed from supergrok2.h input_proj /
++    sg2_kernel_mirror lines 712-716; both indexers share it so the divergence isolates the
++    indexer projection/score, not the input features."""
++    g_all = np.where(np.isfinite(grad_np), grad_np, 0.0).astype(np.float64)
++    s_all = np.where(np.isfinite(sharp_np), sharp_np, 0.0).astype(np.float64)
++    g_sorted = g_all[perm]; s_sorted = s_all[perm]
++    inp = np.stack([g_sorted, s_sorted], axis=-1)            # [N, 2]
++    W = np.asarray(w["input_proj_W"], dtype=np.float64)      # [d, 2]
++    b = np.asarray(w["input_proj_b"], dtype=np.float64)      # [d]
++    return inp @ W.T + b                                     # [N, d]
++
++
+ def _net_weights_to_oracle_dict(net):
+     """Extract the live CSAHCAMetaNet's parameters into the fp64 numpy `w` layout that
+     sg2_kernel_mirror.oracle_step consumes (SG2Weights row-major). Same mapping as
+@@ -96,8 +189,13 @@
+ 
+     nn.Linear.weight is [out,in] → matches the oracle's `@ W.T` convention directly.
+     expert_W1 [E,H,1] → [E,H] (squeeze); expert_W2 [E,1,H] → [E,H] (squeeze);
+-    expert_b2 [E,1] → [E]. oracle_step uses the LOW-RANK indexer only (csa_idx_DQ /
+-    csa_idx_K), so csa_idx_UQ is intentionally NOT mapped (the kernel path is low-rank)."""
++    expert_b2 [E,1] → [E]. oracle_step uses the LOW-RANK indexer (csa_idx_DQ / csa_idx_K)
++    by construction (the KERNEL path is intentionally low-rank — supergrok2.h:504-511
++    documents the (void)idx_UQ score-path choice). We ALSO map csa_idx_UQ [rank,d] so the
++    INDEPENDENT canonical FULL-RANK indexer reference (_canonical_fullrank_topk, RG —
++    oracle de-mirror) can be derived directly from the canonical source equations
++    (supergrok2.py:449-455) rather than mirroring the kernel; it anchors the VOTING N>64
++    fidelity probe so the low-rank-vs-canonical divergence is bounded, not print-only."""
+     sd = dict(net.named_parameters())
+     nph = int(net.num_peer_heads); ne = int(net.num_experts); eh = int(net.expert_hidden)
+ 
+@@ -110,6 +208,7 @@
+         csa_v_W=f("csa_layer.v_W.weight"), csa_out_W=f("csa_layer.out_W.weight"),
+         csa_compress_w=f("csa_layer.compress_w"),
+         csa_idx_DQ=f("csa_layer.idx_DQ"), csa_idx_K=f("csa_layer.idx_K"),
++        csa_idx_UQ=f("csa_layer.idx_UQ"),
+         hca_q_W=f("hca_layer.q_W.weight"), hca_k_W=f("hca_layer.k_W.weight"),
+         hca_v_W=f("hca_layer.v_W.weight"), hca_out_W=f("hca_layer.out_W.weight"),
+         gru_Wz=f("gru.W_z.weight"), gru_bz=f("gru.W_z.bias"),
+@@ -317,23 +416,73 @@
+         print(f"[tie-probe] strategy-A (|g|,idx) perm total-order + deterministic on "
+               f"tied grad: {'OK' if tie_ok else 'FAIL'}  perm={perm.tolist()}")
+ 
+-    # ── (N>64 CSA fidelity probe) — REPORTS, does NOT fail. The kernel's low-rank CSA
+-    #    indexer (drops idx_UQ, /sqrt(rank)) vs the bilevel oracle's full-d indexer
+-    #    (/sqrt(d)) diverge for N>64. We surface the magnitude on the largest tensor
+-    #    (numel >> 64). The pure-fp64 oracle_step ALSO uses the low-rank indexer (so B1
+-    #    passes); the bilevel divergence is the GROK gap, not a single-step regression.
++    # ── (N>64 CSA fidelity probe) — NOW VOTING (oracle de-mirror). Previously this only
++    #    print()ed the low-rank-vs-canonical divergence under `if verbose` and set no flag,
++    #    so a regression that broke the low-rank CSA indexer (NaN scores, a constant/
++    #    degenerate selection, idx_DQ dropped) was absorbed into a report line — the exact
++    #    SG11 "the only divergence-detecting instrument is non-voting" shape. We now derive
++    #    the CANONICAL FULL-RANK selection INDEPENDENTLY (_canonical_fullrank_topk, straight
++    #    from supergrok2.py:449-455 — idx_UQ APPLIED, /sqrt(d)) and the kernel's LOW-RANK
++    #    selection (_lowrank_topk — idx_UQ DROPPED, /sqrt(rank)) on the largest tensor's
++    #    OWN x_sorted, and assert the overlap lands in a documented band:
++    #      * the gap EXISTS BY DESIGN (the low-rank indexer is an intended approximation —
++    #        supergrok2.h:504-511 documents the (void)idx_UQ score path), so we do NOT
++    #        require perfect agreement (no upper bound below 1.0);
++    #      * but it must NOT collapse: a broken indexer would select an essentially DISJOINT
++    #        (overlap≈0) or DEGENERATE (every row → the same entry) set, which the floor +
++    #        the non-degeneracy check catch. Both selections must also be DETERMINISTIC.
++    #    Note the /sqrt scaling is a positive monotone rescale and does NOT change a top-k
++    #    ranking — the selection divergence is purely the idx_UQ lift-back, so the probe
++    #    isolates the projection, not the (cosmetic) normalization constant.
+     big = max(layout, key=lambda t: t[1])
+-    n_big = big[1]
++    off_big, n_big = big[0], big[1]
++    fidelity_ok = True
++    mean_overlap = float("nan")
++    n_distinct = -1
++    try:
++        topk_big = max(min(int(net.csa_topk),
++                           (n_big + int(net.csa_compress) - 1) // int(net.csa_compress)), 1)
++        g_big = grad_np[off_big:off_big + n_big].copy()
++        s_big = sharp_np[off_big:off_big + n_big].copy()
++        perm_big, _ = _strategy_a_perm(torch.from_numpy(g_big))
++        xb = _x_sorted_from(w_np, g_big, s_big, perm_big)          # [N, d]
++        sel_full = _canonical_fullrank_topk(w_np, xb, _D, topk_big)  # [N, k]
++        sel_low = _lowrank_topk(w_np, xb, _D, topk_big)             # [N, k]
++        # determinism: both selections must re-derive identically (a stable comparator).
++        sel_full2 = _canonical_fullrank_topk(w_np, xb, _D, topk_big)
++        sel_low2 = _lowrank_topk(w_np, xb, _D, topk_big)
++        det_sel = np.array_equal(sel_full, sel_full2) and np.array_equal(sel_low, sel_low2)
++        # per-row overlap fraction of the low-rank set with the canonical full-rank set.
++        k_sel = sel_full.shape[1]
++        overlaps = np.array([
++            len(np.intersect1d(sel_full[r], sel_low[r])) / float(k_sel)
++            for r in range(sel_full.shape[0])
++        ], dtype=np.float64)
++        mean_overlap = float(overlaps.mean()) if overlaps.size else 0.0
++        # non-degeneracy: a broken indexer often collapses to a near-constant selection.
++        n_distinct = int(len({tuple(r) for r in sel_low.tolist()}))
++        # VOTING band: floor 0.05 (a fully-disjoint/random selection signals a broken
++        # low-rank indexer, NOT the by-design gap); non-degenerate; deterministic.
++        OVERLAP_FLOOR = 0.05
++        fidelity_ok = (det_sel and (mean_overlap >= OVERLAP_FLOOR)
++                       and (n_distinct >= 2 or n_big < 2))
++    except Exception as _e:  # a thrown probe is a FAIL (fail-closed), not a silent pass.
++        fidelity_ok = False
++        if verbose:
++            print(f"[N>64 CSA fidelity probe] EXCEPTION: {_e!r}")
+     if verbose:
+-        print(f"[N>64 CSA fidelity probe] largest tensor N={n_big} (>>64): the kernel's "
+-              f"low-rank CSA indexer (idx_UQ DROPPED, score /sqrt(rank={net.indexer_rank}) "
+-              f"not /sqrt(d={net.d_model})) diverges from the bilevel oracle's full-d "
+-              f"indexer for N>64 (supergrok2.h:227-228 vs supergrok2_bilevel_adjoint.h:156-157). "
+-              f"REPORTED as the documented WON'T-GROK gap; single-step parity vs the pure-fp64 "
+-              f"oracle_step (B1, SAME low-rank indexer) is unaffected. NOT a regression.")
+-
+-    ok = b1_ok and aaa_ok and tie_ok
+-    return ok, dict(b1_worst=b1_worst, b1=d, aaa=aaa_ok, tie=tie_ok, loss=loss)
++        print(f"[N>64 CSA fidelity probe] largest tensor N={n_big} (>>64), topk={topk_big}: "
++              f"canonical FULL-RANK (idx_UQ applied, /sqrt(d={net.d_model})) vs kernel "
++              f"LOW-RANK (idx_UQ DROPPED, /sqrt(rank={net.indexer_rank})) selection "
++              f"mean-overlap={mean_overlap:.3f} distinct-rows={n_distinct} "
++              f"(VOTING: floor 0.05 + non-degenerate + deterministic) "
++              f"{'OK' if fidelity_ok else 'FAIL'}. The <1.0 overlap is the documented "
++              f"low-rank approximation gap (BY DESIGN, supergrok2.h:504-511); a COLLAPSE "
++              f"(overlap≈0 / degenerate) is a regression and now FAILS the gate.")
++
++    ok = b1_ok and aaa_ok and tie_ok and fidelity_ok
++    return ok, dict(b1_worst=b1_worst, b1=d, aaa=aaa_ok, tie=tie_ok,
++                    fidelity=fidelity_ok, fidelity_overlap=mean_overlap, loss=loss)
+ 
+ 
+ def main():
+--- a/tests/hw/test_opt_stages.py	2026-06-17 05:03:10.025384210 +0000
++++ b/tests/hw/test_opt_stages.py	2026-06-17 05:06:03.359716224 +0000
+@@ -245,6 +245,47 @@
+         assert 0.0 <= gate_stage <= 1.0
+ 
+ 
++def test_sg11_gate_oracle_operand_is_momentum_not_mu():
++    """OPERAND ANCHOR (oracle de-mirror, RG / oracle_trust_audit): pin the SG11 gate
++    oracle's 2nd cosine operand to MOMENTUM via a LITERAL closed-form case — independent
++    of both same-file twins (_sg11_gate_oracle_fp64 and _sg11_gate_mirror_fp32 are an
++    fp64/fp32 + naive/tree pair that BOTH hardcode `momentum`; the canonical refs the
++    docstrings point at, sg11_gate_ref / _cosine_gate_ref, do NOT exist anywhere in the
++    repo — so a co-edit swapping the operand to `mu` in BOTH twins would pass
++    test_sg11_cosine_gate_matches_fp64_oracle silently). Here we build grad + a momentum
++    vector + a DISTINCT mu vector chosen so cos(grad,momentum) != cos(grad,mu), hand-
++    compute sigmoid(gate_temp·cos(grad,momentum)) from a LITERAL, and assert the oracle
++    equals it AND DIFFERS from sigmoid(gate_temp·cos(grad,mu)). A swap to the cos(grad,mu)
++    operand (the historic SG11 bug) FAILS this by construction."""
++    gate_temp = 5.0
++    # grad ∥ e0; momentum has cos(grad,momentum)=1/√2; mu has cos(grad,mu)=−1/√2.
++    grad = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
++    momentum = torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.float64)  # cos = 1/√2
++    mu = torch.tensor([-1.0, 0.0, 1.0, 0.0], dtype=torch.float64)        # cos = −1/√2
++    cos_mom = 1.0 / math.sqrt(2.0)
++    cos_mu = -1.0 / math.sqrt(2.0)
++    # LITERAL expected gate (not via the oracle's own helper) for the MOMENTUM operand.
++    expect_mom = 1.0 / (1.0 + math.exp(-gate_temp * cos_mom))
++    expect_mu = 1.0 / (1.0 + math.exp(-gate_temp * cos_mu))
++    # the two operands MUST give materially different gates (else the anchor is vacuous).
++    assert abs(expect_mom - expect_mu) > 0.5, "operand choice not discriminating — fix case"
++    got = _sg11_gate_oracle_fp64(grad, momentum, gate_temp=gate_temp)
++    # the oracle must encode cos(grad, MOMENTUM) ...
++    assert math.isclose(got, expect_mom, rel_tol=1e-9, abs_tol=1e-9), (
++        f"SG11 gate oracle = {got} but cos(grad,momentum) literal = {expect_mom}; "
++        f"the oracle's 2nd operand drifted off the canonical MOMENTUM signal.")
++    # ... and must NOT be the cos(grad,mu) value (the historic SG11 operand-swap bug).
++    assert not math.isclose(got, expect_mu, rel_tol=1e-3, abs_tol=1e-3), (
++        f"SG11 gate oracle = {got} matches cos(grad,mu) literal = {expect_mu} — the "
++        f"operand was swapped to mu (the SG11 bug). The gate signal is cos(grad,MOMENTUM).")
++    # Cross-check the fp32 mirror agrees with the SAME momentum literal (the twin must
++    # also encode momentum) — so neither twin can be the one that drifted.
++    got_mirror = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=gate_temp)
++    assert math.isclose(got_mirror, expect_mom, rel_tol=1e-4, abs_tol=1e-6), (
++        f"SG11 gate fp32 mirror = {got_mirror} vs cos(grad,momentum) literal = {expect_mom}")
++    assert not math.isclose(got_mirror, expect_mu, rel_tol=1e-3, abs_tol=1e-3)
++
++
+ def test_sg11_gate_applies_gate_temp():
+     """Mirror the CODE: sg11_finalize_gate applies gate = sigmoid(gate_temp*cos)
+     — so the gate is the TEMPERATURE-SCALED SIGMOID of the cosine, NOT a bare

@@ -1,0 +1,382 @@
+diff --git a/grokking_optimizers/_tuned_inject.py b/grokking_optimizers/_tuned_inject.py
+index d3de021..dd8fd5f 100644
+--- a/grokking_optimizers/_tuned_inject.py
++++ b/grokking_optimizers/_tuned_inject.py
+@@ -155,6 +155,28 @@ MACROS: Dict[str, Dict[str, Any]] = {
+     "mb_dw_splitk":  {"kind": "macro", "macro": "SG_TUNED_MB_DW_SPLITK",  "default": 4},
+     "prod_regs":     {"kind": "macro", "macro": "SG_TUNED_PROD_REGS",     "default": 40},
+     "cons_regs":     {"kind": "macro", "macro": "SG_TUNED_CONS_REGS",     "default": 232},
++    # --- RG3 NEW structural perf levers ----------------------------------
++    # Added to the SAFE FLOOR so a winner combo for one of these knobs emits
++    # its -D even when the JSON lacks the producer-persisted ``_macros`` map
++    # (a stale / pre-RG3 setup.py): without a floor entry the extra-dim path
++    # below would warn-and-IGNORE it (graceful degradation, but the winning
++    # lever would silently not ship). ``default`` is the in-source #ifndef
++    # default (model_stage_vit_tc.cuh:164 / model_stage_decoder_tc.cuh:186,189)
++    # so header_default_macros()'s drift guard and a no-JSON build stay
++    # byte-identical. APPLICABILITY is enforced by the per-model JSON schema +
++    # model_for_source (a ViT-S winner only lands on the mega_vit_*.cu cell;
++    # the decoder ring knobs only on mega_<dec>_*.cu) — and each macro is inert
++    # on the cells that do not #if on it, so a cross-applied value is a no-op.
++    "vit_p1_subtile_s": {"kind": "macro", "macro": "SG_TUNED_VIT_P1_SUBTILE_S", "default": 64},
++    "dec_fwd_pipe":     {"kind": "macro", "macro": "SG_TUNED_DEC_FWD_PIPE",     "default": 1},
++    "dec_fwd_stages":   {"kind": "macro", "macro": "SG_TUNED_DEC_FWD_STAGES",   "default": 4},
++    # TODO(decoder P1-epilogue-fusion): add once .perf/decoder_p1_fusion.diff
++    # lands the `#ifndef SG_TUNED_DEC_EPI_FUSE` guard in
++    # model_stage_decoder_tc.cuh — add BOTH the MACROS entry and the
++    # _EMIT_ORDER slot, plus the compile.py _dim. Until then the guard's
++    # #define default does not exist, so the search-space robust-skip
++    # (_prune_absent_macro_dims) would drop a premature dim anyway:
++    #   "dec_epi_fuse": {"kind": "macro", "macro": "SG_TUNED_DEC_EPI_FUSE", "default": 0},
+     # Real ptxas flag (no preprocessor macro). 0 == unset == emit nothing.
+     "maxrregcount":  {"kind": "flag", "flag": "--maxrregcount", "default": 0},
+ }
+@@ -163,7 +185,10 @@ MACROS: Dict[str, Dict[str, Any]] = {
+ # build.ninja diffs and a predictable unit-test expectation).
+ _EMIT_ORDER = ["mega_block", "tile_m", "tile_n",
+                "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+-               "prod_regs", "cons_regs", "maxrregcount"]
++               "prod_regs", "cons_regs",
++               # RG3 structural levers (TODO dec_epi_fuse slots here next).
++               "vit_p1_subtile_s", "dec_fwd_pipe", "dec_fwd_stages",
++               "maxrregcount"]
+ 
+ # The canonical optimizer tokens (mirrors
+ # grokking_optimizers.dispatch.OPTIMIZERS). Used to validate filename→opt
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index 6e6866e..1712405 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -1487,6 +1487,41 @@ def _macro_to_dim_name(macro: str) -> str:
+     return base.lower()
+ 
+ 
++def _macro_present_in_kernels(macro: str) -> bool:
++    """True iff a committed kernel exposes ``macro`` as a real tuning knob —
++    either it ``#ifndef``-guards it (a tunable default the autotuner may
++    override) OR it reads it via ``#ifdef``/``#if``.
++
++    The robust-skip liveness predicate for RG3: when one of the registered new
++    structural levers (``vit_p1_subtile_s`` / ``dec_fwd_pipe`` /
++    ``dec_fwd_stages``) is ABSENT from a given checkout (a partial knob set — a
++    guard not yet landed or reverted), this returns False and the dim is
++    consequently treated as DEAD by :func:`_is_dead_dim` (a macro no kernel
++    reads), so :func:`_pin_dead_dims` PINS it to its first value — the in-source
++    #ifndef default the per-arch builder leads with — i.e. ×1 at a byte-identical
++    value. The sweep does NOT break; the absent knob just stops being explored
++    while the present knobs keep sweeping. When no source tree is visible
++    (installed wheel) every macro is treated as present so a no-source build
++    keeps its full registered space (the caller already falls back to the LIVE
++    floor in that degenerate case).
++
++    NB present-but-DEAD (a macro guarded by a kernel yet read by no ``#ifdef``)
++    is still handled by the SAME pin path; this predicate only distinguishes a
++    TRULY-ABSENT macro so the self-test can assert the partial-set skip directly
++    rather than relying on the broader source scan.
++    """
++    guarded = _kernel_ifndef_macros()
++    consumed = _kernel_source_macros()
++    if not guarded and not consumed:
++        return True  # no source tree visible — don't prune the registered space
++    if macro in guarded or macro in consumed:
++        return True
++    # A tuple dim expands to per-component macros (SG_TUNED_CLUSTER_SHAPE_0…);
++    # treat the base as present if any derived component is guarded/consumed.
++    return any(t == macro or t.startswith(macro + "_")
++               for t in (guarded | consumed))
++
++
+ def _auto_derived_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     """Return a PINNED dim for every ``#ifndef SG_TUNED_*`` guard the kernels
+     expose that has NO explicit dim in ``dims``.
+@@ -1676,6 +1711,18 @@ def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+     pinned to one value so it can't waste trial budget — yet the dim stays in
+     the space so a different vendor (e.g. HIP) that DOES consume it still sweeps
+     it. Mutates and returns ``dims``. Live dims and Pallas kwargs are untouched.
++
++    RG3 robust-skip: an explicit macro dim whose ``SG_TUNED_*`` guard is ABSENT
++    from the committed kernel sources is handled by the SAME dead-dim mechanism
++    below — :func:`_is_dead_dim` returns True for a macro no kernel reads, so the
++    dim is PINNED to its first value (which the per-arch builders set to the
++    in-source #ifndef default → byte-identical). A partial knob set therefore
++    never breaks the sweep: the absent knob simply collapses to ×1 at its
++    default while the present knobs keep sweeping (see
++    :func:`_macro_present_in_kernels` for the explicit liveness predicate the
++    self-test exercises). NB we deliberately do NOT *remove* the dim object:
++    prefilter rules and config_key keep referencing it, and pinning-to-default
++    is already byte-identical, so removal would only risk a dangling rule ref.
+     """
+     _with_auto_dims(dims)
+     for d in dims:
+@@ -2290,6 +2337,75 @@ def _sm90_full_space() -> Dict[str, Any]:
+                  "SG_TUNED_VIT_GEMM_INTERLEAVE", ["device"]),
+             _dim("pipe_depth", "int", [2, 3],
+                  "SG_TUNED_PIPE_DEPTH", ["device"]),
++            # === NEW structural perf levers (RG3) ============================
++            # These three #ifndef SG_TUNED_* knobs are NEW perf levers that the
++            # kernel-builder committed (decoder PIPE=1/S4 bake + ViT B1 sub-tile)
++            # but that _auto_derived_dims could only DISCOVER-and-PIN to their
++            # in-source default (×1) — so the autotuner saw them but never
++            # EXPLORED them (the RG3 coverage gap: "the new structural knobs are
++            # NOT in compile.py search space"). Promoting each to an explicit
++            # swept _dim here is the deliberate, vetted act _auto_derived_dims
++            # documents (the hand-written dim WINS over the auto-pinned entry).
++            # The FIRST value of every list == the in-source #ifndef default, so
++            # the canonical (first-element) build is BYTE-IDENTICAL to the
++            # committed kernel (same convention as tile_m / mega_block above).
++            # All three are NEEDS-PARITY: each reshapes a ring/sub-tile that the
++            # autotuner cannot prove correct — the H100 fp64 single-step + A/A/A
++            # gate (d=128 hook, then a d=2048 re-gate for any winner) is the only
++            # arbiter before a non-default value ships.
++            #
++            # vit_p1_subtile_s — SG_TUNED_VIT_P1_SUBTILE_S (model_stage_vit_tc.cuh
++            #   :163, #ifndef 64). The #1 ViT perf lever (task #29): sub-tiles the
++            #   B1 phase over whole samples. 64 == OFF == byte-identical; <64 is
++            #   the ON-path (the m_real cross-CTA row-guard + sub-tile partition,
++            #   #if-erased at 6 guard sites when ==64). VIT-ONLY: the macro is
++            #   read only by the ViT TC substrate, so it is meaningful only on the
++            #   mega_vit_*_tc cell; on decoder/mamba cells the override is inert
++            #   (no ViT guard site), and _tuned_inject.model_for_source routes
++            #   each cell ITS model's winner so a ViT-S winner never lands on a
++            #   non-ViT TU. Values lead with 64 (OFF/default), then the ON depths
++            #   {32,16,8} (each divides a sample's rows; smaller S = finer
++            #   sub-tile = more cross-CTA row-guard traffic). No prefilter rule:
++            #   every value is a legal sub-tile count; correctness is the gate's.
++            _dim("vit_p1_subtile_s", "int", [64, 32, 16, 8],
++                 "SG_TUNED_VIT_P1_SUBTILE_S", ["device"]),
++            # dec_fwd_pipe — SG_TUNED_DEC_FWD_PIPE (model_stage_decoder_tc.cuh:185,
++            #   #ifndef 1 BAKED). DECODER-ONLY master enable for the fwd/dX deeper
++            #   cp.async ring. Kernel static_assert admits {0,1,2}; we CAP at
++            #   {1,0}: PIPE=2 (the producer/consumer mbarrier engine, entry-b)
++            #   LOST the tournament (857 vs 618ms) so it is excluded from the
++            #   sweep — registering it would only burn trials on a known loser.
++            #   1 == the BAKED shipped default (first → byte-identical canonical);
++            #   0 == the designated byte-identical revert target (inherits
++            #   GEMM_STAGES, no deeper ring). DECODER-ONLY: the macro guards only
++            #   the decoder fwd/dX engine; inert on vit/mamba cells.
++            _dim("dec_fwd_pipe", "int", [1, 0],
++                 "SG_TUNED_DEC_FWD_PIPE", ["device"]),
++            # dec_fwd_stages — SG_TUNED_DEC_FWD_STAGES (model_stage_decoder_tc.cuh
++            #   :188, #ifndef 4 BAKED). DECODER-ONLY fwd/dX ring DEPTH when
++            #   dec_fwd_pipe!=0. Kernel static_assert: 2..4 when PIPE=1|2 (>4
++            #   blows the smem budget; <2 is not a real ring); when PIPE=0 the
++            #   knob is INHERITED-AWAY (kDecFwdStages = GEMM_STAGES) so any
++            #   stages value paired with dec_fwd_pipe=0 is safe + inert. 4 == the
++            #   BAKED shipped default (first → byte-identical canonical), then
++            #   {2,3}. STAGES>2 takes the dynamic-smem path (the shipped default).
++            _dim("dec_fwd_stages", "int", [4, 2, 3],
++                 "SG_TUNED_DEC_FWD_STAGES", ["device"]),
++            # TODO(decoder P1-epilogue-fusion): register SG_TUNED_DEC_EPI_FUSE
++            #   here as a {0,1} decoder-only swept dim (0 == OFF == byte-identical
++            #   default first) ONCE .perf/decoder_p1_fusion.diff is applied — that
++            #   diff adds the `#ifndef SG_TUNED_DEC_EPI_FUSE` guard to
++            #   model_stage_decoder_tc.cuh. Until the guard lands the macro is
++            #   absent from the kernel sources, so _auto_derived_dims cannot even
++            #   discover it (no #define default to pin to) and emitting a
++            #   -DSG_TUNED_DEC_EPI_FUSE here would be a dead no-op flag. Add:
++            #     _dim("dec_epi_fuse", "int", [0, 1],
++            #          "SG_TUNED_DEC_EPI_FUSE", ["device"]),
++            #   and bump the cartesian/per-arch ceilings ×2 (the autotuner
++            #   already PINS the macro to its byte-identical default when the
++            #   #define is absent — _is_dead_dim → _pin_dead_dims, see
++            #   _macro_present_in_kernels + the test_absent_macro_dim_robust_skip
++            #   self-test below — so a partial knob set never breaks the sweep).
+         ]),
+         "prefilter": {
+             "register_pressure_max": 255,
+@@ -19905,23 +20021,28 @@ def _self_test_search_space(run) -> None:
+         Wave-1 autotuner merge then added the LIVE ptxas optimizer flags
+         (opt_level·allow_expensive_opts = 2·2) and the L3-TC GEMM mainloop knobs
+         (dec/mb_gemm_stages·dec/mb/vit_gemm_interleave·pipe_depth =
+-        2·2·4·4·4·2 = 512x), so the all-live sm_90 space is now ~8.26e14. (The
+-        5 auto-DISCOVERED knobs — bw_ckpt_stride / gemm_impl / pscan_block /
++        2·2·4·4·4·2 = 512x), so the all-live sm_90 space WAS ~8.26e14. (The
++        auto-DISCOVERED knobs — bw_ckpt_stride / gemm_impl / pscan_block /
+         vit_tile_m / wg_count — are PINNED to their in-source #ifndef defaults
+         by _auto_derived_dims, so they are registered/emittable but contribute
+-        ×1, NOT a blanket sweep that would trip a static_assert.) The ceiling is
+-        recalibrated to 10^16: it admits the all-live space (8.26e14) and still
+-        trips on a dead-inflation regression (all-live·160 ≈ 1.32e17).
++        ×1, NOT a blanket sweep that would trip a static_assert.) RG3 then
++        PROMOTED three previously-pinned new structural levers to swept dims —
++        vit_p1_subtile_s {64,32,16,8} (×4), dec_fwd_pipe {1,0} (×2), and
++        dec_fwd_stages {4,2,3} (×3) — a ×24 lift to ~1.009e16. The ceiling is
++        recalibrated to 10^17: it admits the all-live space (1.009e16) and still
++        trips on a dead-inflation regression (all-live·160 ≈ 1.61e18).
+         Recalibration to admit genuinely-live dims is NOT suppression — no
+         coverage is removed (owner rule: every perf constant stays a swept
+-        SG_TUNED dim; the ptxas flags reshape codegen directly and the GEMM
+-        macros ARE read by csrc/fused/sm_90/model_stage_*_tc.cuh)."""
++        SG_TUNED dim; the ptxas flags reshape codegen directly and the GEMM/
++        structural macros ARE read by csrc/fused/sm_90/model_stage_*_tc.cuh +
++        fused_decoder_megakernel.cuh)."""
+         space = load_embedded_search_space()
+         count = cartesian_count(space, "sm_90")
+-        # Sanity bound — all-live sm_90 space is ~8.26e14 (#12 tile dims + the
+-        # Wave-1 ptxas/GEMM live dims); dead-inflation regression is ~1.32e17.
++        # Sanity bound — all-live sm_90 space is ~1.009e16 (#12 tile dims + the
++        # Wave-1 ptxas/GEMM live dims + the RG3 structural levers); dead-inflation
++        # regression is ~1.61e18.
+         assert count > 1_000_000, f"sm_90 count too small: {count}"
+-        assert count < 10**16, f"sm_90 count unreasonably large: {count}"
++        assert count < 10**17, f"sm_90 count unreasonably large: {count}"
+         # Iterator yields exactly that many items — verify on a tiny slice.
+         it = cartesian(space, "sm_90")
+         first_few = list(itertools.islice(it, 5))
+@@ -20046,13 +20167,15 @@ def _self_test_search_space(run) -> None:
+         — read by csrc/fused/sm_90/model_stage_*_tc.cuh; a 576x product), AND the
+         Wave-1 autotuner-merge live dims (the ptxas flags + the GEMM mainloop
+         knobs dec/mb_gemm_stages·dec/mb/vit_gemm_interleave·pipe_depth = 512x),
+-        which lift its all-live space to ~8.26e14. Its ceiling is raised to 10^16
+-        to admit them — that still trips on a dead-dim pin regression
+-        (all-live·160 ≈ 1.32e17) so the guard's purpose is intact, and no live
+-        coverage is removed (owner rule: every perf constant stays a swept
+-        SG_TUNED dim, no hand-tuning). Every OTHER arch keeps the tight 10^8
+-        dead-inflation ceiling (the GEMM macros are sm_90-megakernel-only, so on
+-        bodyless arches they are discovered-and-pinned, never swept)."""
++        AND the RG3 structural levers (vit_p1_subtile_s·dec_fwd_pipe·
++        dec_fwd_stages = 4·2·3 = 24x), which lift its all-live space to
++        ~1.009e16. Its ceiling is raised to 10^17 to admit them — that still
++        trips on a dead-dim pin regression (all-live·160 ≈ 1.61e18) so the
++        guard's purpose is intact, and no live coverage is removed (owner rule:
++        every perf constant stays a swept SG_TUNED dim, no hand-tuning). Every
++        OTHER arch keeps the tight 10^8 dead-inflation ceiling (the GEMM +
++        structural macros are sm_90-megakernel-only, so on bodyless arches they
++        are discovered-and-pinned, never swept)."""
+         space = build_full_search_space()
+         all_arches = _canonical_arches()
+         assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
+@@ -20062,9 +20185,10 @@ def _self_test_search_space(run) -> None:
+             vendor = ARCH_TABLE[arch].vendor
+             if vendor in ("cuda", "hip"):
+                 # sm_90a carries the extra live warp-launch dims + #12 tile dims
+-                # + the Wave-1 ptxas/GEMM live dims (~8.26e14); all other
+-                # CUDA/HIP arches keep the tight dead-inflation ceiling.
+-                hi = 10**16 if arch == "sm_90a" else 10**8
++                # + the Wave-1 ptxas/GEMM live dims + the RG3 structural levers
++                # (~1.009e16); all other CUDA/HIP arches keep the tight
++                # dead-inflation ceiling.
++                hi = 10**17 if arch == "sm_90a" else 10**8
+                 assert 10_000 <= cnt <= hi, (
+                     f"{arch}: count {cnt} out of CUDA/HIP bounds")
+             else:  # pallas
+@@ -20073,6 +20197,109 @@ def _self_test_search_space(run) -> None:
+             sys.stdout.write(
+                 f"    [per_arch] {arch}({vendor}) cardinality={cnt:,}\n")
+ 
++    def test_new_structural_knobs_registered_and_swept():
++        """RG3 — the NEW committed structural perf levers are registered in the
++        sm_90 search space as SWEPT dims (not auto-pinned to ×1), with the
++        in-source #ifndef default LEADING each value list (byte-identical
++        canonical build), and the kernel's static_assert range respected.
++
++        This is the standing 'new -D knob is explored' guard: before RG3 these
++        knobs were DISCOVERED-and-PINNED by _auto_derived_dims (×1), so the
++        front-load autotuner saw them but never explored them. The assertion
++        fails loudly if a future edit reverts one back to a single value (the
++        coverage would silently regress to the pre-RG3 blind spot)."""
++        space = load_embedded_search_space()
++        dims = {d["name"]: d for d in space["sm_90"]["dims"]}
++        # Macro guards must be present in the committed kernel sources for these
++        # dims to be live (the robust-skip prunes them if absent). On the repo
++        # checkout the guards ARE present, so each dim is swept.
++        expect = {
++            # name              first==default   full swept set (order matters)
++            "vit_p1_subtile_s": (64, [64, 32, 16, 8]),
++            "dec_fwd_pipe":     (1,  [1, 0]),
++            "dec_fwd_stages":   (4,  [4, 2, 3]),
++            # tile_m was already a swept dim (#12); RG3 confirms the decoder
++            # {64,128,256} applicability is registered (default 128 leads).
++            "tile_m":           (128, [128, 64, 256]),
++        }
++        for name, (default, values) in expect.items():
++            assert name in dims, (
++                f"RG3: structural knob {name!r} not registered in sm_90 space")
++            d = dims[name]
++            assert d["values"][0] == default, (
++                f"{name}: first value {d['values'][0]} != in-source default "
++                f"{default} (canonical build would not be byte-identical)")
++            assert d["values"] == values, (
++                f"{name}: swept set {d['values']} != expected {values}")
++            assert d.get("live") is True, (
++                f"{name}: must be a LIVE swept dim (kernel guards it), not "
++                f"auto-pinned — the autotuner must EXPLORE it")
++            assert len(d["values"]) > 1, (
++                f"{name}: still pinned to one value — not explored (RG3 gap)")
++            assert d["applies_to"] == ["device"], (
++                f"{name}: structural macro applies to device codegen only")
++        # PIPE=2 (the lost tournament entry) must NOT be in the dec_fwd_pipe
++        # sweep — registering it would burn trials on a known loser.
++        assert 2 not in dims["dec_fwd_pipe"]["values"], (
++            "dec_fwd_pipe must cap at {0,1}: PIPE=2 lost the tournament")
++        # dec_fwd_stages stays inside the kernel static_assert [2,4].
++        assert all(2 <= v <= 4 for v in dims["dec_fwd_stages"]["values"]), (
++            "dec_fwd_stages values must stay in the kernel static_assert [2,4]")
++        # The pending SG_TUNED_DEC_EPI_FUSE knob is NOT yet registered (its
++        # #ifndef guard lands with .perf/decoder_p1_fusion.diff); assert it is
++        # absent so the TODO stays honest and nobody silently half-wires it.
++        assert "dec_epi_fuse" not in dims, (
++            "dec_epi_fuse must NOT be registered until its kernel guard lands "
++            "(see the TODO in _sm90_full_space)")
++        sys.stdout.write(
++            "    [rg3] swept: vit_p1_subtile_s{64,32,16,8} dec_fwd_pipe{1,0} "
++            "dec_fwd_stages{4,2,3} tile_m{128,64,256}; dec_epi_fuse pending\n")
++
++    def test_absent_macro_dim_robust_skip():
++        """RG3 robust-skip — an explicit macro dim whose #define is ABSENT from
++        the kernel sources is treated as DEAD and PINNED to its byte-identical
++        default (×1, the dim stays so prefilter rules + config_key never see a
++        dangling ref), so a PARTIAL knob set never breaks the sweep. Simulate a
++        checkout missing the ViT sub-tile guard and confirm vit_p1_subtile_s
++        collapses to its default while the decoder knobs keep sweeping."""
++        global _KERNEL_MACRO_CACHE, _KERNEL_IFNDEF_CACHE, _DEAD_KEY_DIMS_CACHE
++        saved_src = _KERNEL_MACRO_CACHE
++        saved_if = _KERNEL_IFNDEF_CACHE
++        saved_key = _DEAD_KEY_DIMS_CACHE
++        try:
++            base_src = _kernel_source_macros()
++            base_if = _kernel_ifndef_macros()
++            # Drop SG_TUNED_VIT_P1_SUBTILE_S from BOTH scans (the guard reverted).
++            _KERNEL_MACRO_CACHE = frozenset(
++                m for m in base_src if "VIT_P1_SUBTILE_S" not in m)
++            _KERNEL_IFNDEF_CACHE = frozenset(
++                m for m in base_if if "VIT_P1_SUBTILE_S" not in m)
++            _DEAD_KEY_DIMS_CACHE = None
++            # The absent macro is no longer present per the liveness predicate.
++            assert not _macro_present_in_kernels("SG_TUNED_VIT_P1_SUBTILE_S")
++            assert _macro_present_in_kernels("SG_TUNED_DEC_FWD_PIPE")
++            space = _sm90_full_space()
++            dd = {d["name"]: d for d in space["dims"]}
++            # The dim is RETAINED (no dangling prefilter ref) but PINNED to its
++            # byte-identical default and marked dead — i.e. NOT explored.
++            assert "vit_p1_subtile_s" in dd, (
++                "absent-macro dim must be retained (pinned), not removed")
++            assert dd["vit_p1_subtile_s"]["values"] == [64], (
++                "absent-macro dim must collapse to its byte-identical default")
++            assert dd["vit_p1_subtile_s"].get("live") is False, (
++                "absent-macro dim must be marked dead (not swept)")
++            # The decoder knobs (guards still present) keep sweeping.
++            assert dd["dec_fwd_pipe"]["values"] == [1, 0]
++            assert dd["dec_fwd_pipe"].get("live") is True
++            assert dd["dec_fwd_stages"]["values"] == [4, 2, 3]
++        finally:
++            _KERNEL_MACRO_CACHE = saved_src
++            _KERNEL_IFNDEF_CACHE = saved_if
++            _DEAD_KEY_DIMS_CACHE = saved_key
++        sys.stdout.write(
++            "    [rg3] absent-macro dim pinned to default ×1 (partial set does "
++            "not break the sweep); present knobs keep sweeping\n")
++
+     def test_alias_search_space_consistency():
+         """Aliases (sm_90, sm_100, ...) must return the same space dict
+         object as their canonical 'a' counterpart."""
+@@ -20192,6 +20419,9 @@ def _self_test_search_space(run) -> None:
+     run("config_key_deterministic", test_config_key_deterministic)
+     run("hash_space_stable", test_hash_space_stable)
+     run("per_arch_search_space", test_per_arch_search_space)
++    run("new_structural_knobs_registered_and_swept",
++        test_new_structural_knobs_registered_and_swept)
++    run("absent_macro_dim_robust_skip", test_absent_macro_dim_robust_skip)
+     run("alias_search_space_consistency", test_alias_search_space_consistency)
+ 
+ 
