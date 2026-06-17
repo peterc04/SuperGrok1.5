@@ -461,6 +461,19 @@ class ArchEntry:
     # back to a conservative default via ``_arch_l2_bytes``. Values are nominal
     # vendor specs (verify on silicon — GPU-deferred P2/P12).
     l2_bytes: Optional[int] = None
+    # P1-#24 — ROOFLINE ceiling constants. ``peak_tf`` is the dense bf16/fp16
+    # tensor-core peak in FLOP/s (the carrier the L3-TC megakernel rides);
+    # ``peak_bw`` is HBM/GDDR bandwidth in bytes/s. Both feed the roofline
+    # objective: ``achieved_tf = kernel_FLOPs / median_ms`` is divided by
+    # ``peak_tf`` to report a %-of-roofline on the winner, and a winner that
+    # lands below ``_SUB_CEILING_PCT`` is FLAGGED (so a structurally-capped
+    # 2–4% result is surfaced, not reported as "tuned"). Values are nominal
+    # vendor datasheet figures (dense, no sparsity) and mirror
+    # tuning/roofline.py::PEAKS for sm_90a — GPU-VERIFY on silicon (the
+    # achieved-TF number depends on the exact FLOP basis). None on arches
+    # with no measured/published value; the roofline report is then skipped.
+    peak_tf: Optional[float] = None       # dense bf16/fp16 TC FLOP/s
+    peak_bw: Optional[float] = None       # HBM/GDDR bytes/s
     search_space_builder: Optional[Callable[[], Dict[str, Any]]] = None
     # True only for arches that ship a real committed kernel body (a *.cu /
     # *.hip.cpp with arch-specific intrinsics). Today that is sm_90a + gfx942;
@@ -604,6 +617,10 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_threads_per_block=1024,
         features=frozenset(_F_AMPERE),
         l2_bytes=40 * 1024 * 1024,   # A100 L2 = 40 MB
+        # P1-#24 — A100 SXM4 datasheet (dense). bf16/fp16 TC = 312 TFLOP/s;
+        # HBM2e (80 GB) = 2.039 TB/s. GPU-VERIFY achieved-TF % on silicon.
+        peak_tf=312.0e12,
+        peak_bw=2.039e12,
     ),
 
     "sm_86": ArchEntry(
@@ -665,6 +682,11 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_threads_per_block=1024,
         features=frozenset(_F_HOPPER),
         l2_bytes=50 * 1024 * 1024,   # H100 L2 = 50 MB
+        # P1-#24 — H100 SXM5 datasheet (dense, no sparsity). bf16/fp16 TC =
+        # 989.4 TFLOP/s; HBM3 = 3.35 TB/s. Mirrors tuning/roofline.py::PEAKS
+        # ("bf16_tc"/"hbm_bw"). GPU-VERIFY the achieved-TF % against a real run.
+        peak_tf=989.4e12,
+        peak_bw=3.35e12,
         has_kernel_body=True,   # cuda/sm_90 ships real Hopper kernel bodies
     ),
 
@@ -687,6 +709,10 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_threads_per_block=1024,
         features=frozenset(_F_BLACKWELL),
         l2_bytes=50 * 1024 * 1024,   # B100/B200 L2 ≈ 50 MB
+        # P1-#24 — B200 datasheet (dense, no sparsity). bf16/fp16 TC ≈ 2250
+        # TFLOP/s; HBM3e ≈ 8 TB/s. NOMINAL pre-silicon spec — GPU-VERIFY.
+        peak_tf=2250.0e12,
+        peak_bw=8.0e12,
     ),
 
     "sm_103a": ArchEntry(
@@ -1302,6 +1328,8 @@ _ASYNC_DEPTH_MAX: int = 4
 # name to know which flag to emit.
 _PTXAS_FLAG_DIMS: frozenset = frozenset({
     "maxrregcount", "opt_level", "allow_expensive_opts",
+    # P1-#23 — promoted from pinned base constants to TUNED ptxas dims.
+    "def_load_cache", "register_usage_level",
 })
 
 # Suggested 2-point on/off sweep for PROMOTING an auto-discovered boolean knob
@@ -1675,8 +1703,25 @@ def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ---- Shared dim builders --------------------------------------------------
 
+# P1-#23 — genuinely-uncapped maxrregcount sentinel. When a config's
+# ``maxrregcount`` equals this, the ``--maxrregcount`` / ``-amdgpu-max-num-vgprs``
+# flag is OMITTED entirely (ptxas / llvm runs its own register-allocation
+# heuristic). This is DISTINCT from ``=255``: an explicit cap at the per-thread
+# maximum still pins ptxas to that ceiling and yields different SASS than no
+# flag at all. -1 is used (never a valid register count) so it round-trips
+# through the int dim + config_key cleanly.
+_MAXRREGCOUNT_UNCAPPED: int = -1
+
+
 def _maxrregcount_values(arch_key: str) -> List[int]:
-    """Per-arch maxrregcount range, capped at max_regs_per_thread."""
+    """Per-arch maxrregcount range, capped at max_regs_per_thread.
+
+    P1-#23 — the list LEADS with the genuinely-uncapped sentinel
+    (``_MAXRREGCOUNT_UNCAPPED``) so the canonical (first-element) build OMITS
+    the ``--maxrregcount`` flag — i.e. the committed default is ptxas's own
+    register heuristic, which is what an un-flagged kernel build does. The
+    explicit caps follow (24..248 step 4, then 255 on archs that reach it).
+    """
     entry = ARCH_TABLE[arch_key]
     cap = entry.max_regs_per_thread or 255
     # Per spec: [24, 28, 32, ..., 248] in 4-step increments, capped per arch.
@@ -1684,7 +1729,9 @@ def _maxrregcount_values(arch_key: str) -> List[int]:
     vals = list(range(floor_n, min(249, cap + 1), 4))
     if cap >= 255 and 255 not in vals:
         vals.append(255)
-    return vals or [cap]
+    vals = vals or [cap]
+    # Lead with the uncapped sentinel (canonical/un-flagged build).
+    return [_MAXRREGCOUNT_UNCAPPED] + vals
 
 
 def _cuda_block_values(arch_key: str) -> List[int]:
@@ -2180,7 +2227,36 @@ def _sm90_full_space() -> Dict[str, Any]:
             # num_stages dropped: SG_TUNED_NUM_STAGES is dead on sm_90 (no kernel
             # reads it). It remains a LIVE Pallas kwarg only (see
             # _build_pallas_space), so it stays in config_key + the cost model.
-            _dim("maxrregcount", "int", list(range(32, 253, 4)) + [255],
+            # P1-#23 — LEAD with the genuinely-uncapped sentinel so the
+            # canonical (first-element) build OMITS --maxrregcount (matching a
+            # plain kernel build, which sets no register cap), then the
+            # explicit caps. -1 (omit flag) ≠ =255 (explicit cap at the max):
+            # different SASS, so the uncapped point is a real distinct config.
+            _dim("maxrregcount", "int",
+                 [_MAXRREGCOUNT_UNCAPPED] + list(range(32, 253, 4)) + [255],
+                 None, ["device"]),
+            # P1-#23 — register-usage-level + def-load-cache PROMOTED from
+            # pinned base constants to TUNED ptxas dims (macro=None ⇒ bare
+            # flags via resolve_extra_nvcc_flags). First value == the prior
+            # pinned base (10 / "ca") so the CANONICAL (first-element) build is
+            # byte-identical to before this change; the rest (incl. the
+            # omit-flag sentinels -1 / "") let the autotuner explore the
+            # cache-policy / register-budget axis the base constant pinned.
+            # VERSION GATING: --register-usage-level needs CUDA>=12.3,
+            # --def-load-cache>=11.0 (see _device_cflags version gates). There
+            # is no per-toolchain search-space pruner, so on an OLDER nvcc the
+            # exploratory (non-canonical) values emit a flag ptxas rejects and
+            # those variants simply FAIL TO BUILD and are dropped by the
+            # autotuner (and pre-caught by the flag-probe pass) — the canonical
+            # value always builds because it equals the version-gated base.
+            # The base constant still emits the same flag for the AOT / non-
+            # sm_90 path (unchanged); in the sm_90 JIT variant path the tuned
+            # dim's flag is appended via resolve_extra_nvcc_flags and ptxas
+            # honors last-wins, so a tuned value overrides the base. [GPU-VERIFY
+            # the last-wins ordering + the explored values on real silicon.]
+            _dim("register_usage_level", "int", [10, _MAXRREGCOUNT_UNCAPPED, 5, 8],
+                 None, ["device"]),
+            _dim("def_load_cache", "enum", ["ca", "cg", "cv", ""],
                  None, ["device"]),
             _dim("cluster_shape", "tuple", _hopper_cluster_shapes(),
                  "SG_TUNED_CLUSTER_SHAPE", ["device"]),
@@ -3242,10 +3318,18 @@ def resolve_extra_nvcc_flags(config: Dict[str, Any],
     capability picks up the corresponding macro automatically.
 
     Currently emits:
-      - ``maxrregcount`` -> ``--maxrregcount=N``
+      - ``maxrregcount`` -> ``--maxrregcount=N`` (P1-#23: the sentinel
+        ``_MAXRREGCOUNT_UNCAPPED`` (-1) OMITS the flag entirely so ptxas runs
+        its own register-allocation heuristic — genuinely uncapped, distinct
+        from ``=255`` which is an explicit cap at the per-thread max and
+        produces different SASS).
       - ``opt_level`` -> ``-Xptxas --opt-level=N`` (ptxas PTX optimization)
       - ``allow_expensive_opts`` -> ``-Xptxas
         --allow-expensive-optimizations=true`` (only when the dim is True)
+      - ``def_load_cache`` -> ``-Xptxas --def-load-cache=<ca|cg|cv>`` (P1-#23
+        TUNED dim, was a pinned base constant; sentinel "" omits it)
+      - ``register_usage_level`` -> ``-Xptxas --register-usage-level=N`` (P1-#23
+        TUNED dim, was a pinned base constant; sentinel -1 omits it)
       - feature macros for arch capabilities (TMA, fp4/fp8, cluster, ...)
       - layout macros for tuned dtypes (e.g. ``fp8_layout=e4m3`` -> ``-DCUDA_FP8_E4M3=1``)
 
@@ -3261,7 +3345,12 @@ def resolve_extra_nvcc_flags(config: Dict[str, Any],
         name = spec.get("name")
         if name == "maxrregcount":
             v = config.get("maxrregcount")
-            if v is not None:
+            # P1-#23 — the uncapped sentinel OMITS the flag (ptxas heuristic);
+            # any other value emits an explicit cap. (Before, every value —
+            # including a notional 0 — emitted a flag, so there was no way to
+            # express the genuinely-uncapped point that yields different SASS
+            # from an explicit ``=255`` ceiling.)
+            if v is not None and int(v) != _MAXRREGCOUNT_UNCAPPED:
                 out.append(f"--maxrregcount={int(v)}")
         elif name == "opt_level":
             v = config.get("opt_level")
@@ -3275,6 +3364,20 @@ def resolve_extra_nvcc_flags(config: Dict[str, Any],
             # entirely for the canonical config).
             if config.get("allow_expensive_opts"):
                 out.extend(["-Xptxas", "--allow-expensive-optimizations=true"])
+        elif name == "def_load_cache":
+            # P1-#23 — promoted from a pinned base constant ("ca") to a TUNED
+            # dim. Empty-string sentinel omits the flag (ptxas default cache
+            # policy); a value emits the explicit per-default load-cache mode.
+            v = config.get("def_load_cache")
+            if v:
+                out.extend(["-Xptxas", f"--def-load-cache={v}"])
+        elif name == "register_usage_level":
+            # P1-#23 — promoted from a pinned base constant (10) to a TUNED
+            # dim. Sentinel -1 omits the flag (ptxas default level 5); a value
+            # emits the explicit register-usage level.
+            v = config.get("register_usage_level")
+            if v is not None and int(v) >= 0:
+                out.extend(["-Xptxas", f"--register-usage-level={int(v)}"])
 
     if arch and arch in ARCH_TABLE:
         entry = get_arch_entry(arch)
@@ -5158,6 +5261,16 @@ _COST_MODEL_CANONICAL_DIM_VALUES: "collections.OrderedDict[str, Tuple[Any, ...]]
 
 # Numeric features emitted for every config (zero-filled when the dim
 # isn't present in the active search space).
+#
+# P1-#23 — the last two are MEASURED features (from the per-variant ptxas-v
+# report), distinct from the derived proxies above (e.g. regpressure_estimate
+# = maxrregcount/255). ``spill_stores_norm`` / ``stack_frame_norm`` are the
+# real local-memory spill the compiler emitted, normalized; before this the
+# parsed bytes were recorded to the sidecar and consumed by nothing. They are
+# zero at PREDICT time (no compile yet) and populated at TRAIN time from each
+# trial's ``ptxas_info`` — consistent zero-vs-measured across the column, so
+# no train/predict skew, and the model learns "configs that spilled were
+# slow" from history. Appended LAST so existing feature offsets are unchanged.
 _COST_MODEL_NUMERIC_FEATURES: Tuple[str, ...] = (
     "block_log2",
     "vec_log2",
@@ -5168,6 +5281,8 @@ _COST_MODEL_NUMERIC_FEATURES: Tuple[str, ...] = (
     "regpressure_estimate",
     "arith_intensity_proxy",
     "cluster_volume",
+    "spill_stores_norm",   # P1-#23 measured: ptxas spill_stores bytes (norm)
+    "stack_frame_norm",    # P1-#23 measured: ptxas stack_frame bytes (norm)
 )
 
 # Arch features mirrored from ARCH_TABLE entries (see _F_* tuples above).
@@ -5236,7 +5351,8 @@ def _ensure_numpy():
 def featurize_config(config: Dict[str, Any],
                      dims: List[Dict[str, Any]],
                      arch_entry: "ArchEntry",
-                     stall_info: Optional[Dict[str, Any]] = None
+                     stall_info: Optional[Dict[str, Any]] = None,
+                     ptxas_info: Optional[Dict[str, Any]] = None
                      ) -> "Any":
     """Hand-engineered feature vector for a candidate config.
 
@@ -5244,11 +5360,19 @@ def featurize_config(config: Dict[str, Any],
       1. One-hot per dim-value drawn from ``_COST_MODEL_CANONICAL_DIM_VALUES``.
          Dims absent from ``dims`` (or values outside the canonical list)
          contribute zeros.
-      2. Per-dim normalized numerics (block_log2 / vec_log2 / etc.).
+      2. Per-dim normalized numerics (block_log2 / vec_log2 / etc.), plus the
+         P1-#23 MEASURED spill features (spill_stores_norm / stack_frame_norm)
+         drawn from ``ptxas_info`` when supplied (the per-variant ptxas-v
+         report); zero when absent (e.g. at PREDICT time, before any compile).
       3. Physical proxies — occupancy, smem footprint, register pressure,
          arithmetic intensity, cluster volume.
       4. Arch-feature flags (``feat in arch_entry.features``).
       5. Stall-reason fractions when ``stall_info`` is provided.
+
+    ``ptxas_info`` is the parsed ``_parse_ptxas_v_stderr`` dict for THIS
+    config (keys ``spill_stores`` / ``stack_frame`` / ...). It is the
+    measured-cost-model-feature seam (mandate #23): training rows pass the
+    trial's recorded ptxas info, prediction passes None (no build yet).
 
     Returns a numpy ndarray of fixed shape ``(FEATURE_DIM,)``."""
     np = _ensure_numpy()
@@ -5364,6 +5488,26 @@ def featurize_config(config: Dict[str, Any],
             out[idx] = 1.0 / 16.0
     else:
         out[idx] = 1.0 / 16.0
+    idx += 1
+
+    # P1-#23 — MEASURED spill features (ptxas-v). Normalize the byte counts
+    # to a saturating [0,1] band so the magnitude is comparable across kernels
+    # without a hard scale assumption: any nonzero spill pushes the feature
+    # well off zero (the model's signal is mostly spill-vs-no-spill, with a
+    # graded tail). Denominator 4096 B ⇒ a 4 KB spill saturates the band. Zero
+    # (and left at 0.0) when no ptxas_info is supplied — the predict-time case.
+    _pinfo = ptxas_info if isinstance(ptxas_info, dict) else {}
+    try:
+        _spill = float(_pinfo.get("spill_stores", 0) or 0)
+    except (TypeError, ValueError):
+        _spill = 0.0
+    out[idx] = min(1.0, max(0.0, _spill) / 4096.0)
+    idx += 1
+    try:
+        _stack = float(_pinfo.get("stack_frame", 0) or 0)
+    except (TypeError, ValueError):
+        _stack = 0.0
+    out[idx] = min(1.0, max(0.0, _stack) / 4096.0)
     idx += 1
 
     # (4) arch features
@@ -5792,8 +5936,14 @@ def _cost_model_train_from_trials(
             continue
         if not math.isfinite(float(ms)):
             continue
+        # P1-#23 — feed the trial's MEASURED ptxas-v info (spill_stores /
+        # stack_frame) as features so the model learns the spill→slow signal.
+        # Empty {} for legacy rows lacking it ⇒ those slots train at 0.0,
+        # matching the predict-time (no-build) value (no train/predict skew).
+        _trial_ptxas = t.get("ptxas_info") if isinstance(t, dict) else None
         try:
-            feat = featurize_config(cfg, dims, arch_entry, stall_info)
+            feat = featurize_config(cfg, dims, arch_entry, stall_info,
+                                    ptxas_info=_trial_ptxas)
         except Exception as _swexc:
             _debug_swallow('_cost_model_train_from_trials', _swexc)
             continue
@@ -6743,8 +6893,36 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
                     if t.get("numerical_status") == "deterministic"]
     if not eligible:
         return None
-    # Ascending-timing order — the historical ``min(...)`` picks eligible[0].
-    ranked = sorted(eligible, key=lambda t: t["timing_ms"])
+    # P1-#23 — TIERED-SPILL reaction. A trial whose ptxas-v report shows
+    # nonzero LOCAL-memory spill (spill_stores / stack_frame) breached the
+    # "never local/DRAM" tier: it could not fit its live state in registers.
+    # DEMOTE every such trial below all clean trials via the SORT KEY (clean
+    # first, then by ascending timing) — i.e. prefer a non-spilling config
+    # whenever one exists. This is a RE-RANK, NOT a hard exclude: a spilling
+    # trial stays eligible as a last resort, so (a) an all-spill pool still
+    # finalizes the fastest, and (b) the fp64 correctness gate below can still
+    # reach a spilling-but-correct trial if every clean trial fails it
+    # (correctness outranks the spill tier). The breach is surfaced on the
+    # winner record + report. The spill bytes were otherwise measured-and-
+    # ignored before this.
+    _n_spill = sum(1 for t in eligible if _trial_spill_breach(t))
+    if report is not None and 0 < _n_spill < len(eligible):
+        report.write(
+            f"  [pick_winner] tiered-spill: {_n_spill} eligible trial(s) "
+            f"spill to local memory (nonzero ptxas spill_stores/stack frame) "
+            f"— DEMOTED below the {len(eligible) - _n_spill} clean trial(s) "
+            f"(re-rank, not exclude).\n")
+    elif report is not None and _n_spill == len(eligible) and _n_spill > 0:
+        report.write(
+            "  [pick_winner] tiered-spill: ALL eligible trials spill to "
+            "local memory — finalizing the fastest spilling trial (breach "
+            "FLAGGED on the winner; no clean alternative exists).\n")
+    # Sort: clean trials first (spill_breach False < True), then ascending
+    # timing within each tier. eligible[0] is the fastest clean trial when one
+    # exists, else the fastest spilling trial.
+    ranked = sorted(
+        eligible,
+        key=lambda t: (_trial_spill_breach(t), t["timing_ms"]))
     if correctness_hook is None:
         return ranked[0]
     # P0-1 — fp64 ground-truth gate on the top-K candidate winners. Walk the
@@ -6792,6 +6970,220 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
             f"{max(1, int(correctness_top_k))} cleared the fp64 + A/A/A "
             f"production-scale check — leaving winner UNSET (fail-closed).\n")
     return None
+
+
+# ===========================================================================
+# P1-#24 — ROOFLINE-CEILING-AWARE objective + P1-#23 — TIERED-SPILL reaction
+# ===========================================================================
+#
+# The primary objective stays ``timing_ms`` (don't destabilize the proven
+# search). These helpers ADD, as REPORTED + optionally-weighted secondaries:
+#   * a %-of-roofline number on the winner (achieved_tf / arch.peak_tf), and
+#   * a sub-ceiling FLAG so a structurally-capped 2–4%-of-roofline result is
+#     SURFACED rather than reported as "tuned"; and
+#   * a register-spill TIER BREACH so a nonzero local-memory spill demotes a
+#     trial (the ptxas spill-bytes were parsed but nothing reacted before).
+
+# A winner achieving below this fraction of the arch's roofline peak is
+# FLAGGED ``sub_ceiling`` — i.e. the kernel is structurally capped (occupancy
+# / memory / scalar-fallback) and the tuned number, while the best FOUND, is
+# not near the hardware ceiling. 0.10 = 10% of peak. Conservative: the L3-TC
+# megakernel is occupancy-pinned at ~2–4% of bf16 peak (see roofline.py
+# BATCH_SATURATION_SWEEP verdict), so this threshold flags exactly that class.
+_SUB_CEILING_PCT: float = 0.10
+
+# Production hidden-dim at which the roofline %-of-peak is reported — the same
+# d=2048 scale the fp64 winner gate re-checks at (so the %-roofline answers
+# "at production scale, how near the ceiling is the winner?"). The winner
+# record doesn't carry the (smaller) microbench timing size, and a fixed
+# production basis is the meaningful one for a REPORTED secondary.
+_PRODUCTION_ROOFLINE_D: int = 2048
+
+# A trial whose ptxas-v report shows nonzero LOCAL-memory spill (``spill_stores``
+# bytes > 0, or a nonzero ``stack_frame``) has breached the "never local/DRAM"
+# tier. In ``pick_winner`` such trials are demoted BELOW every non-spilling
+# eligible trial (so a clean kernel always wins when one exists) but are NOT
+# hard-excluded — if EVERY eligible trial spills we still return the fastest
+# (and the breach is surfaced on the record) rather than refusing to build.
+
+
+def _trial_spill_bytes(trial: Dict[str, Any]) -> int:
+    """LOCAL-memory spill magnitude (bytes) for a trial, from its parsed
+    ptxas-v info. Sums ``spill_stores`` + ``stack_frame`` (both are
+    local/stack traffic ptxas reports under register pressure). 0 when the
+    trial carries no ptxas info (e.g. a synthetic / never-compiled trial).
+    """
+    info = trial.get("ptxas_info") or {}
+    if not isinstance(info, dict):
+        return 0
+    try:
+        spill = int(info.get("spill_stores", 0) or 0)
+        stack = int(info.get("stack_frame", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, spill) + max(0, stack)
+
+
+def _trial_spill_breach(trial: Dict[str, Any]) -> bool:
+    """True when a trial breached the local/DRAM-spill tier (nonzero spill).
+
+    Mandate #23 — ptxas ``spill stores`` / ``stack frame`` bytes are recorded
+    by ``_parse_ptxas_v_stderr`` but, before this, consumed by nothing. A
+    nonzero value means the compiler could not fit the kernel's live state in
+    registers and spilled to local memory (which lands in L1/L2/DRAM), so the
+    config is paying a latency tax the timing may or may not have caught under
+    a warm-L2 microbenchmark. Treated as a tier breach for winner selection.
+    """
+    return _trial_spill_bytes(trial) > 0
+
+
+# Per-CTA dW row-atom (one 16-row tile, the occupancy-pinned unit of work in
+# the L3-TC megakernel — see tuning/roofline.py's "one 16-row dW atom × 132
+# SMs" note). The CPU-side FLOP basis is deliberately this SMALLEST defensible
+# unit so the computed achieved-TF is a conservative LOWER BOUND that can
+# never exceed the hardware peak (no false "above-ceiling" claim); a lower
+# bound biases the sub-ceiling FLAG toward OVER-flagging (surfacing more
+# winners for review) rather than UNDER-flagging (silently hiding a capped
+# result) — the correct bias for a surface-the-cap signal. GPU-VERIFY scales
+# this to the true profiled FLOPs/step.
+_ROOFLINE_DW_ATOM_ROWS: int = 16
+
+
+def _analytic_kernel_flops(optimizer: str, model: str, size: int
+                           ) -> Optional[float]:
+    """Conservative analytic FLOP LOWER BOUND for the L3-TC train-step cell.
+
+    *** GPU-VERIFY ***  tuning/roofline.py derives FLOPs/step from
+    ``torch.profiler(with_flops=True)`` over a real eager run — a GPU-only
+    measurement, NOT an importable analytic count. This is an INDEPENDENT
+    CPU-side approximation used to turn a measured ``timing_ms`` into an
+    ``achieved_tf`` / %-of-roofline. It models ONE dW row-atom GEMM
+    (M=16, N=K=d) — the occupancy-pinned unit roofline.py describes — so the
+    achieved-TF is a deliberate LOWER BOUND (it cannot exceed peak; pct ≤ a
+    realistic value). It MUST be scaled to the true profiled FLOPs/step before
+    its ABSOLUTE %-roofline is trusted; the SHAPE (which configs sit nearer the
+    ceiling) is robust to the constant basis. Re-calibrate the sub-ceiling FLAG
+    threshold (``_SUB_CEILING_PCT``) once the profiled basis is confirmed.
+
+    Returns FLOPs for one dW row-atom cell, or None when the model has no
+    known formula (caller then skips the roofline %).
+
+    Model: a GEMM of (M,N,K) costs 2·M·N·K FLOPs; the cell's dominant term is
+    the QKV/MLP d×d projection over one 16-row atom, fwd+bwd ≈ 3 such GEMMs
+    (fwd + dgrad + wgrad): FLOPs ≈ 3 · 2 · 16 · d · d.
+    """
+    short = _CORRECTNESS_MODEL_ALIASES.get(str(model).strip().lower())
+    if short not in ("decoder", "vit", "mamba"):
+        return None
+    try:
+        d = float(size)
+    except (TypeError, ValueError):
+        return None
+    if d <= 0:
+        return None
+    gemms = 3.0             # fwd + dgrad + wgrad
+    # mamba's selective-scan adds a small elementwise term vs the pure-GEMM
+    # decoder/vit; keep the same dominant-GEMM basis (the scan is O(d), the
+    # GEMMs are O(d^2) — negligible at d>=512). Per-model hook kept explicit
+    # so a future, profiled per-model constant can slot in here.
+    return gemms * 2.0 * float(_ROOFLINE_DW_ATOM_ROWS) * d * d
+
+
+def roofline_for_winner(arch: str, optimizer: str, model: str,
+                        size: int, timing_ms: Optional[float]
+                        ) -> Dict[str, Any]:
+    """Compute the P1-#24 roofline secondary metrics for a finalized winner.
+
+    Returns a dict (always JSON-safe) with:
+      * ``achieved_tf``  — kernel_FLOPs / median_ms, in FLOP/s (None if the
+        FLOP basis or timing is unavailable).
+      * ``peak_tf``      — the arch's dense-bf16 TC ceiling (None if unset).
+      * ``pct_roofline`` — achieved_tf / peak_tf in [0, 1] (None if either
+        operand is missing).
+      * ``sub_ceiling``  — True when ``pct_roofline`` is below
+        ``_SUB_CEILING_PCT`` (the structural-cap FLAG); False when at/above;
+        None when pct_roofline could not be computed.
+      * ``flops_basis``  — provenance string for the FLOP count.
+
+    Pure / no I/O — safe to call CPU-side. The %-roofline is a REPORTED
+    secondary; the primary objective remains ``timing_ms``.
+    """
+    out: Dict[str, Any] = {
+        "achieved_tf": None, "peak_tf": None, "pct_roofline": None,
+        "sub_ceiling": None,
+        "flops_basis": "analytic GEMM (3·2·16·d² per cell; GPU-VERIFY)",
+    }
+    entry = ARCH_TABLE.get(arch) if isinstance(arch, str) else None
+    peak = getattr(entry, "peak_tf", None) if entry is not None else None
+    out["peak_tf"] = peak
+    flops = _analytic_kernel_flops(optimizer, model, size)
+    if (flops is None or timing_ms is None
+            or not isinstance(timing_ms, (int, float))
+            or not math.isfinite(float(timing_ms)) or float(timing_ms) <= 0.0):
+        return out
+    achieved = float(flops) / (float(timing_ms) * 1e-3)   # ms → s
+    out["achieved_tf"] = achieved
+    if peak and peak > 0:
+        pct = achieved / float(peak)
+        out["pct_roofline"] = pct
+        out["sub_ceiling"] = bool(pct < _SUB_CEILING_PCT)
+    return out
+
+
+def _attach_winner_roofline(best: Dict[str, Any], spec: "BuildSpec",
+                            won: Dict[str, Any], report) -> Dict[str, Any]:
+    """Annotate a finalized winner dict in-place with the P1-#24 roofline
+    secondaries + the P1-#23 spill-breach flag, and log both.
+
+    Mutates and returns ``best``. The primary objective (``timing_ms``) is
+    untouched — these are REPORTED secondaries surfaced on the tuned record so
+    a structurally-capped (sub-ceiling) or register-spilling winner is visible
+    rather than reported as a clean "tuned" number. Fail-soft: any error is
+    swallowed (the winner is still returned) — this is reporting, not gating.
+    """
+    try:
+        rf = roofline_for_winner(
+            spec.arch, spec.optimizer, spec.model,
+            _PRODUCTION_ROOFLINE_D, best.get("timing_ms"))
+        best["achieved_tf"] = rf["achieved_tf"]
+        best["pct_roofline"] = rf["pct_roofline"]
+        best["sub_ceiling"] = rf["sub_ceiling"]
+        best["roofline_flops_basis"] = rf["flops_basis"]
+        # P1-#23 — carry the winner's spill state onto the record so a
+        # spilling winner (the only-spilling-trials case in pick_winner) is
+        # flagged, and feed the measured bytes through for provenance.
+        spill_bytes = _trial_spill_bytes(won)
+        best["spill_breach"] = bool(spill_bytes > 0)
+        best["spill_bytes"] = int(spill_bytes)
+        if report is not None:
+            if rf["pct_roofline"] is not None:
+                msg = (f"  [roofline] winner @ {rf['achieved_tf']/1e12:.2f} "
+                       f"TF/s = {rf['pct_roofline']*100:.2f}% of peak "
+                       f"({(rf['peak_tf'] or 0)/1e12:.0f} TF/s, "
+                       f"d={_PRODUCTION_ROOFLINE_D}, analytic FLOPs — "
+                       f"GPU-VERIFY)\n")
+                report.write(msg)
+                if rf["sub_ceiling"]:
+                    report.write(
+                        f"  [roofline] *** SUB-CEILING FLAG: winner sits "
+                        f"below {_SUB_CEILING_PCT*100:.0f}% of roofline — "
+                        f"this is the BEST FOUND but is STRUCTURALLY CAPPED "
+                        f"(occupancy / memory / scalar-fallback), NOT near "
+                        f"the hardware ceiling. Surfaced, not hidden. ***\n")
+            else:
+                report.write(
+                    f"  [roofline] %-of-peak unavailable "
+                    f"(peak_tf set={best.get('pct_roofline') is not None}; "
+                    f"model={spec.model}) — skipped.\n")
+            if spill_bytes > 0:
+                report.write(
+                    f"  [roofline] *** SPILL BREACH: winner spills "
+                    f"{spill_bytes} bytes to local memory (ptxas "
+                    f"spill_stores+stack_frame) — no register-clean "
+                    f"alternative was found. ***\n")
+    except Exception as _swexc:
+        _debug_swallow('_attach_winner_roofline', _swexc)
+    return best
 
 
 # Map a spec model name (canonical or short) to the short L3-TC gate-cell model
@@ -16197,6 +16589,9 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
     report.write(f"\n  [exhaustive] WINNER: {best['config_key']} "
                  f"@ {best['timing_ms']:.4f}ms "
                  f"(origin={won.get('origin', ORIGIN_TEMPLATE)})\n")
+    # P1-#24 / #23 — annotate the winner with %-of-roofline + sub-ceiling /
+    # spill-breach flags (REPORTED secondaries; primary objective unchanged).
+    _attach_winner_roofline(best, spec, won, report)
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, best,
                     mode="exhaustive", search_space_hash=space_hash)
     return best
@@ -16595,6 +16990,9 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     out["stage_won"] = winner["stage"]
     report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
                  f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")
+    # P1-#24 / #23 — annotate the winner with %-of-roofline + sub-ceiling /
+    # spill-breach flags (REPORTED secondaries; primary objective unchanged).
+    _attach_winner_roofline(out, spec, winner, report)
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, out,
                     mode="bayesian", search_space_hash=space_hash,
                     early_stop_info=stop_info)
@@ -17521,7 +17919,13 @@ def build(
     # no-op skip when its soft dep / device is missing, so flipping
     # them on costs nothing on hosts that can't use them and earns
     # everything on hosts that can. Pass False to disable individually.
-    pgo: bool = True,
+    #
+    # P1-#5 — the proven layers (pgo / device-pgo / emitter / runtime-
+    # specialization / transfer-learning) are TRI-STATE ``Optional[bool]``
+    # so the CLI can pass ``None`` for an absent flag and have the maximal
+    # default survive (see the None→True coercion in the body). A direct
+    # Python caller still gets the True default; pass False to opt out.
+    pgo: Optional[bool] = True,
     pgo_workload: Optional[Path] = None,
     pgo_steps: int = 1000,
     bayesian_trials: Optional[int] = None,
@@ -17537,18 +17941,26 @@ def build(
     bootstrap_rocm: bool = True,
     bootstrap_jax: bool = True,
     pruner: str = "hyperband",
-    transfer_learning: bool = True,
-    enable_runtime_specialization: bool = True,
+    transfer_learning: Optional[bool] = True,
+    enable_runtime_specialization: Optional[bool] = True,
     config: Optional[Any] = None,
-    enable_emitter: bool = True,
-    enable_device_pgo: bool = True,
+    enable_emitter: Optional[bool] = True,
+    enable_device_pgo: Optional[bool] = True,
     prune_after_autotune: bool = True,
     prune_max_age_days: int = 30,
     prune_keep_top_n: int = 100,
     strict_numerics: bool = False,
     allow_nondeterministic: bool = False,
-    enable_synth_codegen: bool = True,
-    enable_polyhedral: bool = True,
+    # P1-#5 — synth-codegen + polyhedral stay OPT-IN (default False), NOT part
+    # of the maximal flip. They are Level-2 superoptimizer SCAFFOLD being made
+    # real separately (task #27); the winner gate (#16) already prevents an
+    # unvalidated generated/transformed variant from ever WINNING, but leaving
+    # them ON by default would burn ~5-min-per-variant compiles on layers that
+    # cannot currently win. The CLI mirrors this (plain --enable-synth-codegen
+    # / --enable-polyhedral store_true, default off). Flip True (or pass the
+    # CLI flag) to opt in once they are proven.
+    enable_synth_codegen: bool = False,
+    enable_polyhedral: bool = False,
     enable_cost_model: Optional[bool] = None,
     multi_fidelity: Optional[bool] = None,
     incremental_variant_build: bool = False,
@@ -17559,14 +17971,20 @@ def build(
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
-    Every feature toggle defaults to MAXIMAL performance — host PGO,
-    device PGO, Jinja2 emitter, NVRTC runtime specialization, OpGraph
-    synth codegen, polyhedral schedule search, learned cost model,
-    Hyperband pruning, transfer learning, vendor-dispatched toolchain
-    bootstrap. Each layer has a graceful skip path when its soft
-    dependency or hardware is absent, so leaving them on costs nothing
-    on hosts that can't use them. Pass ``False`` for any individual
-    knob to opt out.
+    P1-#5 — the PROVEN layers default to MAXIMAL performance and are ON by
+    default (and the CLI is tri-state so a plain ``python -m
+    grokking_optimizers.compile`` keeps them on): host PGO, device PGO, Jinja2
+    emitter, NVRTC runtime specialization, learned cost model, multi-fidelity
+    pruning, Hyperband pruning, transfer learning, vendor-dispatched toolchain
+    bootstrap. Each has a graceful skip path when its soft dependency or
+    hardware is absent, so leaving them on costs nothing on hosts that can't
+    use them. Pass ``False`` for any individual knob to opt out.
+
+    OPT-IN (default OFF): OpGraph ``enable_synth_codegen`` + ``enable_polyhedral``
+    — Level-2 superoptimizer scaffold (task #27) the winner gate already
+    prevents from winning; off by default so the sweep doesn't waste compiles
+    on layers that cannot currently win. Pass ``True`` (or the CLI
+    ``--enable-synth-codegen`` / ``--enable-polyhedral``) to opt in.
 
     The autotune budget (``bayesian_trials``, ``top_k``,
     ``max_tune_seconds``, ``patience``) defaults to ``None`` so the
@@ -17688,6 +18106,27 @@ def build(
 
     if debug:
         verbose = True
+
+    # P1-#5 — resolve the TRI-STATE proven-layer toggles. The CLI passes
+    # ``None`` for an absent flag (e.g. no ``--pgo`` / no ``--no-pgo``); that
+    # MUST resolve to build()'s True MAXIMAL default, NOT to False. (Before
+    # the tri-state flip a plain ``python -m ...compile`` ran with PGO /
+    # device-PGO / emitter / runtime-specialization / transfer-learning all
+    # OFF — the exact inversion of the owner's maximal philosophy.) An
+    # explicit False (``--no-pgo`` etc.) is preserved. synth_codegen +
+    # polyhedral are deliberately NOT in this set — they stay opt-in (task
+    # #27 scaffold), so their CLI flags remain plain store_true (default
+    # False) and reach build() as a real bool.
+    if pgo is None:
+        pgo = True
+    if transfer_learning is None:
+        transfer_learning = True
+    if enable_runtime_specialization is None:
+        enable_runtime_specialization = True
+    if enable_emitter is None:
+        enable_emitter = True
+    if enable_device_pgo is None:
+        enable_device_pgo = True
 
     spec = BuildSpec(
         optimizer=optimizer, model=model, arch=arch,
@@ -18541,15 +18980,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Bayesian sampler seed (default: 0).")
     parser.add_argument("--no-autotune", action="store_true",
                         help="Skip JIT autotune even when a GPU is visible.")
-    # §12 A1 — Hyperband / median pruner option
+    # §12 A1 — Hyperband / median pruner option.
+    # P1-#5 — default flipped none → hyperband to match build()'s maximal
+    # default (17539) and the module docstring. The plain
+    # ``python -m grokking_optimizers.compile`` invocation now runs the
+    # Successive-Halving pruner out of the box (the owner's MAXIMAL
+    # philosophy); pass ``--pruner none`` for the un-pruned TPE sweep.
     parser.add_argument("--pruner", choices=("none", "median", "hyperband"),
-                        default="none",
-                        help="Optuna pruner. Default: none. 'hyperband' "
-                             "enables Successive Halving (§12 A1).")
-    # §12 A2 — Transfer learning seeding
-    parser.add_argument("--transfer-learning", action="store_true",
-                        help="Seed Bayesian TPE from sibling-optimizer "
-                             "trials on the same (model, arch). §12 A2.")
+                        default="hyperband",
+                        help="Optuna pruner. Default: hyperband (Successive "
+                             "Halving, §12 A1) — matches build()'s maximal "
+                             "default. Pass 'none' for the un-pruned TPE "
+                             "sweep, 'median' for the median pruner.")
+    # §12 A2 — Transfer learning seeding. P1-#5 — TRI-STATE (default None ⇒
+    # build()'s True maximal default survives; --no-transfer-learning forces
+    # off). Was a plain store_true (default False) that INVERTED the maximal
+    # default. Mirrors the --cost-model / --multi-fidelity pattern below.
+    _tl = parser.add_mutually_exclusive_group()
+    _tl.add_argument("--transfer-learning", dest="transfer_learning",
+                     action="store_true", default=None,
+                     help="Seed Bayesian TPE from sibling-optimizer trials on "
+                          "the same (model, arch). §12 A2. ON by default "
+                          "(maximal); no-op when no sibling trials exist.")
+    _tl.add_argument("--no-transfer-learning", dest="transfer_learning",
+                     action="store_false",
+                     help="Disable sibling-optimizer TPE seeding "
+                          "(transfer learning).")
 
     # ── Search space + PGO ──────────────────────────────────────────
     parser.add_argument("--search-space", type=Path,
@@ -18558,9 +19014,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "(default: full programmatic space from "
                              "build_full_search_space() — billions of "
                              "candidates per arch).")
-    parser.add_argument("--pgo", action="store_true",
-                        help="Enable 3-pass PGO loop (instrument → "
-                             "workload → use). Doubles AOT compile time.")
+    # P1-#5 — TRI-STATE (default None ⇒ build()'s True maximal default
+    # survives; --no-pgo forces off). Was a plain store_true (default False)
+    # that INVERTED the maximal default so the plain invocation skipped PGO.
+    _pgo = parser.add_mutually_exclusive_group()
+    _pgo.add_argument("--pgo", dest="pgo",
+                      action="store_true", default=None,
+                      help="Enable the 3-pass PGO loop (instrument → "
+                           "workload → use). ON by default (maximal); roughly "
+                           "doubles AOT compile time but is a measured win on "
+                           "hosts with a profiler. Pass --no-pgo to skip it.")
+    _pgo.add_argument("--no-pgo", dest="pgo",
+                      action="store_false",
+                      help="Disable the 3-pass PGO loop (and the device-PGO "
+                           "sidecar, which is a no-op without it).")
     parser.add_argument("--pgo-workload", type=Path,
                         default=DEFAULT_PGO_WORKLOAD,
                         help="PGO workload script.")
@@ -18570,11 +19037,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Stream 8 — device-side PGO (complements LLVM PGO which nvcc strips
     # from device code). Collects CUPTI / rocprof / XLA stall info into a
     # JSON sidecar consumed by the Bayesian autotuner.
-    parser.add_argument("--enable-device-pgo", action="store_true",
-                        help="Collect CUPTI / rocprof / XLA stall info as a "
-                             "PGO sidecar after the standard 3-pass loop. "
-                             "No-op when --pgo is off or the profiler tool "
-                             "(nsys / rocprof) is unavailable.")
+    # P1-#5 — TRI-STATE (default None ⇒ build()'s True maximal default
+    # survives; --no-device-pgo forces off). Was a plain store_true.
+    _dpgo = parser.add_mutually_exclusive_group()
+    _dpgo.add_argument("--enable-device-pgo", dest="enable_device_pgo",
+                       action="store_true", default=None,
+                       help="Collect CUPTI / rocprof / XLA stall info as a "
+                            "PGO sidecar after the standard 3-pass loop. ON by "
+                            "default (maximal). No-op when --pgo is off or the "
+                            "profiler tool (nsys / rocprof) is unavailable.")
+    _dpgo.add_argument("--no-device-pgo", dest="enable_device_pgo",
+                       action="store_false",
+                       help="Disable device-side PGO stall-info collection.")
 
     # ── Cross-host artefact dir ─────────────────────────────────────
     parser.add_argument("--aot-artifact-dir", type=Path, default=None,
@@ -18639,14 +19113,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Wall-clock cap for --e2e-smoke autotune phase "
                              "(default 120s).")
     # Stream 7 — runtime kernel specialization via NVRTC / hipRTC.
-    parser.add_argument("--enable-runtime-specialization", action="store_true",
-                        help="Pre-warm a per-arch KernelRegistry that JIT-"
-                             "specializes hot kernels via NVRTC (CUDA) / "
-                             "hipRTC (HIP) with shape-class constants baked "
-                             "in. CUBINs are cached under "
-                             "<out>/nvrtc_cache. CPU-only hosts without "
-                             "cuda-python degrade gracefully — the build "
-                             "still succeeds.")
+    # P1-#5 — TRI-STATE (default None ⇒ build()'s True maximal default
+    # survives; --no-runtime-specialization forces off). Was a plain
+    # store_true that INVERTED the maximal default.
+    _rts = parser.add_mutually_exclusive_group()
+    _rts.add_argument("--enable-runtime-specialization",
+                      dest="enable_runtime_specialization",
+                      action="store_true", default=None,
+                      help="Pre-warm a per-arch KernelRegistry that JIT-"
+                           "specializes hot kernels via NVRTC (CUDA) / "
+                           "hipRTC (HIP) with shape-class constants baked in. "
+                           "ON by default (maximal). CUBINs are cached under "
+                           "<out>/nvrtc_cache. CPU-only hosts without "
+                           "cuda-python degrade gracefully — the build still "
+                           "succeeds.")
+    _rts.add_argument("--no-runtime-specialization",
+                      dest="enable_runtime_specialization",
+                      action="store_false",
+                      help="Disable NVRTC / hipRTC runtime kernel "
+                           "specialization (the pre-warmed KernelRegistry).")
     # Stream 11 — TOML project config (Stream A added --project-config alias)
     parser.add_argument("--config", default=None,
                         help="Path to project config TOML "
@@ -18655,14 +19140,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                         dest="project_config",
                         help="Stream A: alias of --config. When both are "
                              "given, --project-config wins.")
-    # Stream 6 — kernel emission backend
-    parser.add_argument("--enable-emitter", action="store_true",
-                        help="Route each variant through "
-                             "grokking_optimizers.codegen.emit_variant_source "
-                             "so the autotuner compiles a freshly rendered "
-                             "Jinja2 template per config instead of "
-                             "re-compiling one fixed source with -D macros. "
-                             "Falls back to macros-only on any emitter error.")
+    # Stream 6 — kernel emission backend.
+    # P1-#5 — TRI-STATE (default None ⇒ build()'s True maximal default
+    # survives; --no-emitter forces off). Was a plain store_true that
+    # INVERTED the maximal default.
+    _em = parser.add_mutually_exclusive_group()
+    _em.add_argument("--enable-emitter", dest="enable_emitter",
+                     action="store_true", default=None,
+                     help="Route each variant through "
+                          "grokking_optimizers.codegen.emit_variant_source so "
+                          "the autotuner compiles a freshly rendered Jinja2 "
+                          "template per config instead of re-compiling one "
+                          "fixed source with -D macros. ON by default "
+                          "(maximal). Falls back to macros-only on any "
+                          "emitter error.")
+    _em.add_argument("--no-emitter", dest="enable_emitter",
+                     action="store_false",
+                     help="Disable the Jinja2 kernel emitter; build each "
+                          "variant from the fixed source with -D macros.")
     # Stream 12 — toolchain bootstrap for HIP + Pallas archs.
     parser.add_argument("--bootstrap-rocm", action="store_true",
                         help="Install the ROCm toolchain (hipcc + rocm-dev) "
@@ -19094,7 +19589,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         extra_macros=extra,
         search_space_path=args.search_space,
         aot_artifact_dir=args.aot_artifact_dir,
-        pgo=args.pgo,
+        # P1-#5 — tri-state: absent flag ⇒ getattr returns None ⇒ build()'s
+        # True maximal default survives; --no-pgo passes False. (Was
+        # ``args.pgo`` from a plain store_true that forced False by default.)
+        pgo=getattr(args, "pgo", None),
         pgo_workload=args.pgo_workload,
         pgo_steps=args.pgo_steps,
         bayesian_trials=args.bayesian_trials,
@@ -19110,11 +19608,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         bootstrap_rocm=args.bootstrap_rocm,
         bootstrap_jax=args.bootstrap_jax,
         pruner=args.pruner,
-        transfer_learning=args.transfer_learning,
-        enable_runtime_specialization=args.enable_runtime_specialization,
+        # P1-#5 — tri-state: absent flag ⇒ getattr returns None ⇒ build()'s
+        # True maximal default survives; --no-<X> passes False. (Were plain
+        # store_true flags that forced False by default, inverting maximal.)
+        transfer_learning=getattr(args, "transfer_learning", None),
+        enable_runtime_specialization=getattr(
+            args, "enable_runtime_specialization", None),
         config=project_cfg,
-        enable_emitter=args.enable_emitter,
-        enable_device_pgo=args.enable_device_pgo,
+        enable_emitter=getattr(args, "enable_emitter", None),
+        enable_device_pgo=getattr(args, "enable_device_pgo", None),
         prune_after_autotune=not args.no_auto_prune,
         prune_max_age_days=args.prune_max_age_days,
         prune_keep_top_n=args.prune_keep_top_n,
@@ -20582,6 +21084,68 @@ def _self_test_flags(run) -> None:
     run("build_failure_summary_conditional_common_causes",
         test_build_failure_summary_conditional_common_causes)
 
+    # ── P1-#5 — CLI MAXIMAL-FLIP (tri-state proven layers) ─────────────
+    def test_build_proven_layer_defaults_are_maximal():
+        """build()'s signature defaults for the PROVEN layers are maximal:
+        pgo / transfer_learning / runtime-spec / emitter / device-pgo default
+        True, pruner defaults 'hyperband'. synth_codegen / polyhedral are NOT
+        asserted here — they stay opt-in (task #27 scaffold)."""
+        import inspect
+        sig = inspect.signature(build)
+        d = sig.parameters
+        assert d["pgo"].default is True, d["pgo"].default
+        assert d["transfer_learning"].default is True
+        assert d["enable_runtime_specialization"].default is True
+        assert d["enable_emitter"].default is True
+        assert d["enable_device_pgo"].default is True
+        assert d["pruner"].default == "hyperband", d["pruner"].default
+        # OPT-IN scaffold stays OFF by default (NOT part of the maximal flip).
+        assert d["enable_synth_codegen"].default is False
+        assert d["enable_polyhedral"].default is False
+    run("build_proven_layer_defaults_are_maximal",
+        test_build_proven_layer_defaults_are_maximal)
+
+    def test_build_none_resolves_to_maximal_default():
+        """P1-#5 contract — an absent CLI flag reaches build() as None and
+        MUST resolve to the True maximal default (not False). Proven via
+        source: build() coerces each None proven-layer toggle to True before
+        constructing BuildSpec (mirrors the --cost-model/--multi-fidelity
+        pattern). synth_codegen / polyhedral are deliberately NOT coerced."""
+        import inspect
+        src = inspect.getsource(build)
+        for knob in ("pgo", "transfer_learning",
+                     "enable_runtime_specialization", "enable_emitter",
+                     "enable_device_pgo"):
+            assert f"if {knob} is None:" in src, \
+                f"build() must coerce None {knob} → True (P1-#5)"
+        # The opt-in scaffold must NOT be force-coerced on.
+        assert "if enable_synth_codegen is None:" not in src
+        assert "if enable_polyhedral is None:" not in src
+    run("build_none_resolves_to_maximal_default",
+        test_build_none_resolves_to_maximal_default)
+
+    def test_cli_proven_layers_are_tristate_and_pruner_default():
+        """P1-#5 — the CLI registers --no-<X> inverses (tri-state, default
+        None) for the proven layers and defaults --pruner to hyperband.
+        Source-level proof (the parser isn't exposed standalone)."""
+        import inspect
+        src = inspect.getsource(main)
+        for inv in ("--no-pgo", "--no-device-pgo", "--no-emitter",
+                    "--no-runtime-specialization", "--no-transfer-learning"):
+            assert inv in src, f"missing inverse flag {inv}"
+        # Pruner default flipped none → hyperband.
+        assert 'default="hyperband"' in src
+        # The call site threads getattr(args, X, None) so absent ⇒ None ⇒
+        # build()'s True survives.
+        assert 'getattr(args, "pgo", None)' in src
+        assert 'getattr(args, "enable_emitter", None)' in src
+        # synth/polyhedral stay opt-in: passed as a plain bool, not via the
+        # None-survives path.
+        assert "args.enable_synth_codegen" in src
+        assert "args.enable_polyhedral" in src
+    run("cli_proven_layers_are_tristate_and_pruner_default",
+        test_cli_proven_layers_are_tristate_and_pruner_default)
+
 
 def _self_test_bayesian(run) -> None:
     """`[self-test] bayesian` section."""
@@ -21155,6 +21719,49 @@ def _self_test_cost_model(run) -> None:
         assert mf_rejected <= int(cap * 100) + 1, mf_rejected
         assert mf_rejected >= int(cap * 100) - 1, mf_rejected
     run("multi_fidelity_cap_logic", test_multi_fidelity_cap_logic)
+
+    def test_cost_model_feature_dim_matches_components():
+        """P1 / audit-D — FEATURE_DIM equals the sum of its declared
+        components (the guard the comment promised but that did not exist).
+        Closes the silent schema-drift risk: adding/removing a feature
+        without updating the count is now caught here.
+        """
+        from grokking_optimizers.compile import (
+            FEATURE_DIM, _cost_model_compute_feature_dim,
+            _COST_MODEL_NUMERIC_FEATURES,
+        )
+        assert FEATURE_DIM == _cost_model_compute_feature_dim(), (
+            f"FEATURE_DIM={FEATURE_DIM} != computed "
+            f"{_cost_model_compute_feature_dim()}")
+        # The P1-#23 measured spill features are present in the numeric set.
+        assert "spill_stores_norm" in _COST_MODEL_NUMERIC_FEATURES
+        assert "stack_frame_norm" in _COST_MODEL_NUMERIC_FEATURES
+    run("cost_model_feature_dim_matches_components",
+        test_cost_model_feature_dim_matches_components)
+
+    def test_cost_model_spill_features_measured():
+        """P1-#23 — spill_stores / stack_frame are MEASURED features:
+        featurize_config produces a DIFFERENT vector when ptxas_info shows
+        spill vs none, and the predict-time (no ptxas) vector matches the
+        zero-spill case (so there is no train/predict skew)."""
+        import numpy as np
+        from grokking_optimizers.compile import featurize_config, ARCH_TABLE
+        arch = ARCH_TABLE["sm_90a"]
+        dims = [{"name": "block", "type": "int", "values": [64, 128, 256],
+                 "macro": "B"}]
+        cfg = {"block": 128}
+        f_none = featurize_config(cfg, dims, arch)                 # predict
+        f_zero = featurize_config(cfg, dims, arch, ptxas_info={})  # legacy row
+        f_spill = featurize_config(
+            cfg, dims, arch, ptxas_info={"spill_stores": 512,
+                                         "stack_frame": 128})
+        assert np.array_equal(f_none, f_zero), \
+            "predict-time (None) must equal empty-ptxas (no skew)"
+        assert not np.array_equal(f_none, f_spill), \
+            "a spilling config must featurize differently"
+        assert f_spill.shape[0] == FEATURE_DIM
+    run("cost_model_spill_features_measured",
+        test_cost_model_spill_features_measured)
 
 
 def _self_test_cache(run) -> None:
@@ -22423,6 +23030,140 @@ def _self_test_fastmath_integration(run) -> None:
         test_origin_constants_single_source_of_truth)
     run("mandate_features_have_nontest_callsites",
         test_mandate_features_have_nontest_callsites)
+
+    # ── P1-#23 — TIERED-SPILL reaction in pick_winner ──────────────────
+    def test_spill_breach_detection():
+        """_trial_spill_breach / _trial_spill_bytes read ptxas spill_stores +
+        stack_frame; clean / missing-info trials are not breaches."""
+        assert _trial_spill_breach(
+            {"ptxas_info": {"spill_stores": 64}}) is True
+        assert _trial_spill_breach(
+            {"ptxas_info": {"stack_frame": 32}}) is True
+        assert _trial_spill_breach(
+            {"ptxas_info": {"regs_used": 200}}) is False
+        assert _trial_spill_breach({}) is False
+        assert _trial_spill_breach({"ptxas_info": None}) is False
+        assert _trial_spill_bytes(
+            {"ptxas_info": {"spill_stores": 128, "stack_frame": 256}}) == 384
+    run("spill_breach_detection", test_spill_breach_detection)
+
+    def test_spilling_trial_demoted_below_clean():
+        """A FASTER trial that spills to local memory is DEMOTED below a
+        slower CLEAN trial — the clean kernel wins (tier breach)."""
+        fast_spill = {"timing_ms": 0.01, "numerical_status": "ok",
+                      "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                      "trial_num": 1, "ptxas_info": {"spill_stores": 128}}
+        slow_clean = {"timing_ms": 0.20, "numerical_status": "ok",
+                      "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                      "trial_num": 2, "ptxas_info": {"regs_used": 200}}
+        w = pick_winner([fast_spill, slow_clean])
+        assert w is not None and w["trial_num"] == 2, \
+            "spilling trial must be demoted below the clean trial"
+    run("spilling_trial_demoted_below_clean",
+        test_spilling_trial_demoted_below_clean)
+
+    def test_all_spilling_falls_back_to_fastest():
+        """When EVERY eligible trial spills, pick_winner still finalizes the
+        fastest (no clean alternative) rather than returning None."""
+        a = {"timing_ms": 0.05, "numerical_status": "ok",
+             "origin": ORIGIN_TEMPLATE, "config": {"x": 1}, "trial_num": 1,
+             "ptxas_info": {"spill_stores": 64}}
+        b = {"timing_ms": 0.02, "numerical_status": "ok",
+             "origin": ORIGIN_TEMPLATE, "config": {"x": 2}, "trial_num": 2,
+             "ptxas_info": {"spill_stores": 256}}
+        w = pick_winner([a, b])
+        assert w is not None and w["trial_num"] == 2, \
+            "all-spilling pool must fall back to the fastest spilling trial"
+    run("all_spilling_falls_back_to_fastest",
+        test_all_spilling_falls_back_to_fastest)
+
+    # ── P1-#24 — ROOFLINE-CEILING-AWARE objective ──────────────────────
+    def test_arch_entry_has_peak_tf():
+        """sm_90a carries the H100 bf16 dense peak (989.4 TF/s) + HBM3 BW."""
+        e = ARCH_TABLE["sm_90a"]
+        assert e.peak_tf == 989.4e12, e.peak_tf
+        assert e.peak_bw == 3.35e12, e.peak_bw
+        # An arch with no published value leaves them None (report skips).
+        assert ARCH_TABLE["sm_75"].peak_tf is None
+    run("arch_entry_has_peak_tf", test_arch_entry_has_peak_tf)
+
+    def test_roofline_pct_and_sub_ceiling_flag():
+        """roofline_for_winner computes achieved_tf / %-roofline and FLAGS a
+        sub-ceiling winner; the primary objective (timing_ms) is untouched."""
+        # Very slow winner ⇒ tiny % of peak ⇒ sub_ceiling True (the
+        # structurally-capped case the flag exists to surface).
+        r = roofline_for_winner("sm_90a", "adamw", "decoder",
+                                _PRODUCTION_ROOFLINE_D, timing_ms=10.0)
+        assert r["achieved_tf"] is not None and r["achieved_tf"] > 0
+        assert r["peak_tf"] == 989.4e12
+        assert 0.0 <= r["pct_roofline"] <= 1.0
+        assert r["sub_ceiling"] is True, r
+        # Missing timing ⇒ no %-roofline, flag None (not False).
+        r2 = roofline_for_winner("sm_90a", "adamw", "decoder",
+                                 _PRODUCTION_ROOFLINE_D, timing_ms=None)
+        assert r2["pct_roofline"] is None and r2["sub_ceiling"] is None
+        # Unknown model ⇒ no FLOP basis ⇒ no %-roofline.
+        r3 = roofline_for_winner("sm_90a", "adamw", "mlp",
+                                 _PRODUCTION_ROOFLINE_D, timing_ms=1.0)
+        assert r3["pct_roofline"] is None
+        # Arch without peak_tf ⇒ achieved_tf computed but no % (peak None).
+        r4 = roofline_for_winner("sm_75", "adamw", "decoder",
+                                 _PRODUCTION_ROOFLINE_D, timing_ms=1.0)
+        assert r4["peak_tf"] is None and r4["pct_roofline"] is None
+    run("roofline_pct_and_sub_ceiling_flag",
+        test_roofline_pct_and_sub_ceiling_flag)
+
+    def test_analytic_kernel_flops_scales_with_d():
+        """The analytic FLOP estimate is O(d^2) and None for unknown models."""
+        f1 = _analytic_kernel_flops("adamw", "decoder", 1024)
+        f2 = _analytic_kernel_flops("adamw", "decoder", 2048)
+        assert f1 is not None and f2 is not None
+        assert abs(f2 / f1 - 4.0) < 1e-6, "FLOPs must scale as d^2"
+        assert _analytic_kernel_flops("adamw", "mlp", 2048) is None
+    run("analytic_kernel_flops_scales_with_d",
+        test_analytic_kernel_flops_scales_with_d)
+
+    # ── P1-#23 — uncapped maxrregcount sentinel + promoted ptxas dims ───
+    def test_maxrregcount_uncapped_sentinel_omits_flag():
+        """The uncapped sentinel OMITS --maxrregcount (ptxas heuristic);
+        an explicit value (incl. 255) emits the cap — distinct SASS."""
+        sp = build_full_search_space()
+        dims = sp["sm_90a"]["dims"]
+        omitted = resolve_extra_nvcc_flags(
+            {"maxrregcount": _MAXRREGCOUNT_UNCAPPED}, dims, "sm_90a")
+        assert not any("--maxrregcount" in f for f in omitted), omitted
+        capped = resolve_extra_nvcc_flags(
+            {"maxrregcount": 255}, dims, "sm_90a")
+        assert "--maxrregcount=255" in capped, capped
+        # The sm_90 maxrregcount dim LEADS with the uncapped sentinel so the
+        # canonical (first-value) build omits the flag.
+        mrc = next(d for d in dims if d["name"] == "maxrregcount")
+        assert mrc["values"][0] == _MAXRREGCOUNT_UNCAPPED
+    run("maxrregcount_uncapped_sentinel_omits_flag",
+        test_maxrregcount_uncapped_sentinel_omits_flag)
+
+    def test_def_load_cache_and_register_usage_level_are_tuned_dims():
+        """def_load_cache / register_usage_level are now TUNED ptxas dims
+        (in _PTXAS_FLAG_DIMS, emitted by resolve_extra_nvcc_flags); canonical
+        first values reproduce the prior pinned base; sentinels omit."""
+        assert "def_load_cache" in _PTXAS_FLAG_DIMS
+        assert "register_usage_level" in _PTXAS_FLAG_DIMS
+        sp = build_full_search_space()
+        dims = sp["sm_90a"]["dims"]
+        by = {d["name"]: d for d in dims}
+        assert by["register_usage_level"]["values"][0] == 10  # prior base
+        assert by["def_load_cache"]["values"][0] == "ca"      # prior base
+        emitted = resolve_extra_nvcc_flags(
+            {"register_usage_level": 8, "def_load_cache": "cg"}, dims, "sm_90a")
+        assert "--register-usage-level=8" in emitted, emitted
+        assert "--def-load-cache=cg" in emitted, emitted
+        # Sentinels omit both flags.
+        omit = resolve_extra_nvcc_flags(
+            {"register_usage_level": -1, "def_load_cache": ""}, dims, "sm_90a")
+        assert not any("register-usage-level" in f for f in omit), omit
+        assert not any("def-load-cache" in f for f in omit), omit
+    run("def_load_cache_and_register_usage_level_are_tuned_dims",
+        test_def_load_cache_and_register_usage_level_are_tuned_dims)
 
 
 def _self_test_silent_degradation(run) -> None:
@@ -26116,7 +26857,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 252
+_SELF_TEST_EXPECTED_COUNT: int = 265
 
 
 def _self_test() -> int:
