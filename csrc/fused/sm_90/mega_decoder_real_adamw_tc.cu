@@ -271,6 +271,32 @@ static std::vector<int64_t> tc_profile_read() {
     for (int i = 0; i < 8; ++i) out[i] = (int64_t)h[i];
     return out;
 }
+
+#if SG_DEC_PROFILE_FWD_FINE
+// Parallel reader for the FINE fwd/dX sub-phase counters (SG_DEC_PROFILE_FWD_FINE;
+// only compiled when BOTH SG_DEC_PROFILE and SG_DEC_PROFILE_FWD_FINE are set).
+// Read + reset g_dec_prof_fwd_fine [kDecFwdFineSlots] (cycles). Layout is
+// [phase*kDecFwdFineSub + sub]: phase 0 = fwd ring, 1 = dX ring; sub ∈
+// {0 ISSUE (cp.async LDGSTS issue), 1 WAIT (cp.async drain — the DRAIN/latency
+// cost), 2 WGMMA (mma issue+commit+wait), 3 EPI (epilogue store), 4 BARRIER
+// (fence+__syncthreads publish)}. Call AFTER one tc_train_step; divide by the SM
+// clock (~1.98 GHz on H100) for ms, or read the RATIOS to localize whether P1_fwd
+// / P1_bwd is DRAIN-bound (WAIT dominates → the deeper-ring lever helps) vs
+// COMPUTE/EPILOGUE-bound (WGMMA/EPI dominate → it won't). Returns the flat slots
+// + the (phases, sub) shape so the main loop can label them.
+static std::vector<int64_t> tc_profile_read_fwd_fine() {
+    constexpr int kSlots = ::sg::fused::sm90::dectc::kDecFwdFineSlots;
+    unsigned long long h[kSlots];
+    for (int i = 0; i < kSlots; ++i) h[i] = 0;
+    cudaMemcpyFromSymbol(h, ::sg::fused::sm90::dectc::g_dec_prof_fwd_fine, sizeof(h));
+    unsigned long long z[kSlots];
+    for (int i = 0; i < kSlots; ++i) z[i] = 0;
+    cudaMemcpyToSymbol(::sg::fused::sm90::dectc::g_dec_prof_fwd_fine, z, sizeof(z));
+    std::vector<int64_t> out(kSlots);
+    for (int i = 0; i < kSlots; ++i) out[i] = (int64_t)h[i];
+    return out;
+}
+#endif
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
@@ -304,7 +330,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
            "diagnostic-only: per-phase clock64 maxima "
            "[P1fwd,P1bwd,B1wait,P2dW,P2asm,P3opt,B2wait,B0wait] (cycles), resets after read");
     mm.attr("HAS_PROFILE") = true;
+#if SG_DEC_PROFILE_FWD_FINE
+    mm.def("tc_profile_read_fwd_fine", &tc_profile_read_fwd_fine,
+           "diagnostic-only: FINE fwd/dX sub-phase clock64 maxima, flat "
+           "[phase*FWD_FINE_SUB + sub]; phase 0=fwd ring, 1=dX ring; "
+           "sub {0 ISSUE,1 WAIT(drain),2 WGMMA,3 EPI,4 BARRIER} (cycles), resets after read");
+    mm.attr("HAS_FWD_FINE") = true;
+    mm.attr("FWD_FINE_SUB") = (int)::sg::fused::sm90::dectc::kDecFwdFineSub;       // 5
+    mm.attr("FWD_FINE_PHASES") = (int)::sg::fused::sm90::dectc::kDecFwdFinePhases; // 2
+#else
+    mm.attr("HAS_FWD_FINE") = false;
+#endif
 #else
     mm.attr("HAS_PROFILE") = false;
+    mm.attr("HAS_FWD_FINE") = false;
 #endif
+    // Expose the fwd/dX deeper-ring knobs so the bench/main-loop can report them.
+    mm.attr("FWD_PIPE") = (int)::sg::fused::sm90::dectc::kDecFwdPipe;
+    mm.attr("FWD_STAGES") = (int)::sg::fused::sm90::dectc::kDecFwdStages;
 }

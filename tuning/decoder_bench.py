@@ -50,14 +50,17 @@ _TC_TU = str(ROOT / "csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu")
 
 
 def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool = False,
-                  defines: list[str] | None = None):
+                  defines: list[str] | None = None, fwd_fine: bool = False):
     """JIT-build the decoder TC cell TU as a coexisting variant extension. Distinct
     module name + own build dir => incremental ninja rebuild, sccache-friendly, and
     NO collision with the production _ops. Returns the loaded module.
 
     `defines` is a list of extra "-DKEY=VAL" override flags (e.g. the hill-climb
     knob sweep: -DSG_TUNED_DEC_DW_SPLITK=8). Each distinct define-set gets its own
-    module name (suffix from the KEY=VAL pairs) so variants coexist + cache cleanly."""
+    module name (suffix from the KEY=VAL pairs) so variants coexist + cache cleanly.
+
+    `fwd_fine` adds -DSG_DEC_PROFILE_FWD_FINE=1 (the FINE fwd/dX sub-phase profiler;
+    requires profile=True — it is gated on BOTH SG_DEC_PROFILE and the fine flag)."""
     bench = (d != 128)
     flags = ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
              "-gencode=arch=compute_90a,code=sm_90a",
@@ -75,6 +78,11 @@ def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool 
         flags.append("-DSG_DEC_SCALAR_MEGAKERNEL=0")
     if profile:
         flags.append("-DSG_DEC_PROFILE=1")
+    if fwd_fine:
+        # The fine profiler is gated on BOTH SG_DEC_PROFILE and SG_DEC_PROFILE_FWD_FINE.
+        if not profile:
+            flags.append("-DSG_DEC_PROFILE=1")
+        flags.append("-DSG_DEC_PROFILE_FWD_FINE=1")
     # Hill-climb knob overrides (-DKEY=VAL). Appended LAST so they win over defaults.
     suffix = ""
     if defines:
@@ -89,13 +97,21 @@ def build_variant(d: int, profile: bool, name: str | None = None, verbose: bool 
         name += "_bench" if bench else "_prod"
         if profile:
             name += "_prof"
+        if fwd_fine:
+            name += "_fine"
         name += suffix
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
+    # The host side (the pybind module: tc_profile_read[_fwd_fine]) is also gated on
+    # these flags, so mirror them into extra_cflags.
+    host_defs = []
+    if profile or fwd_fine:
+        host_defs.append("-DSG_DEC_PROFILE=1")
+    if fwd_fine:
+        host_defs.append("-DSG_DEC_PROFILE_FWD_FINE=1")
     mod = load(name=name, sources=[_TC_TU],
                extra_include_paths=[str(ROOT)],
                extra_cuda_cflags=flags,
-               extra_cflags=["-O3", "-std=c++17",
-                             *(["-DSG_DEC_PROFILE=1"] if profile else [])],
+               extra_cflags=["-O3", "-std=c++17", *host_defs],
                verbose=verbose)
     return mod
 
@@ -177,6 +193,26 @@ def measure(mod, d: int, B: int, reps: int, warmup: int, iters: int,
         # median per slot across reps
         cyc = [int(statistics.median(s)) for s in zip(*prof_reps)]
         res["phase_cycles"] = cyc
+
+    if getattr(mod, "HAS_FWD_FINE", False):
+        # FINE fwd/dX sub-phase readout (SG_DEC_PROFILE_FWD_FINE build). Flat slots
+        # [phase*FWD_FINE_SUB + sub]; phase 0 = fwd ring, 1 = dX ring. Localizes
+        # whether P1_fwd / P1_bwd is DRAIN-bound (WAIT dominates) vs COMPUTE/EPI-bound.
+        mod.tc_profile_read_fwd_fine()  # reset
+        fine_reps = []
+        for _ in range(reps):
+            mod.tc_profile_read_fwd_fine()  # reset before this rep
+            for _ in range(iters):
+                call()
+            torch.cuda.synchronize()
+            fine_reps.append(mod.tc_profile_read_fwd_fine())
+        fine = [int(statistics.median(s)) for s in zip(*fine_reps)]
+        res["fwd_fine_cycles"] = fine
+        res["fwd_fine_sub"] = int(mod.FWD_FINE_SUB)
+        res["fwd_fine_phases"] = int(mod.FWD_FINE_PHASES)
+    # Report the active fwd/dX ring knobs (so a knob-sweep run self-documents).
+    res["fwd_pipe"] = int(getattr(mod, "FWD_PIPE", 0))
+    res["fwd_stages"] = int(getattr(mod, "FWD_STAGES", 2))
     return res
 
 
@@ -216,6 +252,31 @@ def _print_report(res):
               f"~{bar_cyc/(SM_GHZ*1e9)*1e3:.3f} ms ({100.0*bar_cyc/tot:.1f}% of summed)",
               flush=True)
 
+    if "fwd_fine_cycles" in res:
+        fine = res["fwd_fine_cycles"]
+        nsub = res["fwd_fine_sub"]
+        sub_names = ["ISSUE(cp.async)", "WAIT(drain)", "WGMMA(mma)", "EPI(store)", "BARRIER(sync)"]
+        ph_names = ["P1_fwd ring", "P1_bwd(dX) ring"]
+        print(f"\n  [FINE fwd/dX GEMM-engine sub-phases — clock64 critical-path inside the "
+              f"cp.async ring]  (PIPE={res.get('fwd_pipe',0)} STAGES={res.get('fwd_stages',2)})",
+              flush=True)
+        for ph in range(res["fwd_fine_phases"]):
+            seg = fine[ph * nsub:(ph + 1) * nsub]
+            tot = sum(seg) or 1
+            print(f"    {ph_names[ph] if ph < len(ph_names) else f'phase{ph}':18s}"
+                  f"  (Σ {tot/(SM_GHZ*1e9)*1e3:.3f} ms critical-path inside the ring)", flush=True)
+            for sn, c in zip(sub_names, seg):
+                print(f"      {sn:18s} {c:>14,d} cyc  {c/(SM_GHZ*1e9)*1e3:>8.3f} ms  {100.0*c/tot:>6.1f}%",
+                      flush=True)
+            # the diagnosis: WAIT-dominant => DRAIN-bound (deeper-ring lever helps);
+            # WGMMA/EPI-dominant => compute/epilogue-bound (it won't).
+            wait_pct = 100.0 * seg[1] / tot
+            mma_pct = 100.0 * seg[2] / tot
+            verdict = ("DRAIN-bound (cp.async WAIT dominates → SG_TUNED_DEC_FWD_PIPE deeper ring SHOULD help)"
+                       if wait_pct >= mma_pct else
+                       "COMPUTE/EPI-bound (WGMMA/EPI dominate → deeper ring unlikely to help)")
+            print(f"      => {verdict}  [WAIT {wait_pct:.0f}% vs WGMMA {mma_pct:.0f}%]", flush=True)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -225,27 +286,35 @@ def main():
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=10, help="steps per rep")
     ap.add_argument("--profile", action="store_true", help="build with -DSG_DEC_PROFILE and read per-phase clock64")
+    ap.add_argument("--fwd-fine", dest="fwd_fine", action="store_true",
+                    help="build with -DSG_DEC_PROFILE_FWD_FINE and read the FINE fwd/dX "
+                         "GEMM-engine sub-phase breakdown (ISSUE/WAIT/WGMMA/EPI/BARRIER, "
+                         "split fwd vs dX). Implies --profile. Diagnoses drain- vs compute-bound.")
     ap.add_argument("--ncta-cap", type=int, default=0, help="0 = one CTA/SM (full saturation)")
     ap.add_argument("--verbose-build", action="store_true")
     ap.add_argument("-D", dest="defines", action="append", default=[],
                     metavar="KEY=VAL",
                     help="extra -D compile override (repeatable), e.g. "
-                         "-D SG_TUNED_DEC_DW_SPLITK=8. Each set builds its own variant.")
+                         "-D SG_TUNED_DEC_FWD_PIPE=1 -D SG_TUNED_DEC_FWD_STAGES=3. "
+                         "Each set builds its own variant.")
     args = ap.parse_args()
     assert args.B % 16 == 0, "B must be divisible by 16 (dW K-loop is 16-step atoms)"
+    profile = args.profile or args.fwd_fine
 
-    print(f"[decoder-bench] building variant: d={args.d} profile={args.profile} "
+    print(f"[decoder-bench] building variant: d={args.d} profile={profile} fwd_fine={args.fwd_fine} "
           f"(SG_DEC_BENCH_LAYOUT={'1' if args.d != 128 else 'unset'})"
           + (f"  defines={args.defines}" if args.defines else ""), flush=True)
     t0 = time.perf_counter()
-    mod = build_variant(args.d, args.profile, verbose=args.verbose_build,
-                        defines=args.defines)
+    mod = build_variant(args.d, profile, verbose=args.verbose_build,
+                        defines=args.defines, fwd_fine=args.fwd_fine)
     print(f"[decoder-bench] build done in {time.perf_counter()-t0:.1f}s  "
           f"(D={int(mod.D)} TOTAL={int(mod.TOTAL):,} TILE_N={int(mod.TILE_N)} "
-          f"HAS_PROFILE={getattr(mod,'HAS_PROFILE',False)})", flush=True)
+          f"FWD_PIPE={int(getattr(mod,'FWD_PIPE',0))} FWD_STAGES={int(getattr(mod,'FWD_STAGES',2))} "
+          f"HAS_PROFILE={getattr(mod,'HAS_PROFILE',False)} "
+          f"HAS_FWD_FINE={getattr(mod,'HAS_FWD_FINE',False)})", flush=True)
 
     res = measure(mod, args.d, args.B, args.reps, args.warmup, args.iters,
-                  args.profile, args.ncta_cap)
+                  profile, args.ncta_cap)
     _print_report(res)
     return res
 

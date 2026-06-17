@@ -364,13 +364,27 @@ struct DecTcSmem {
     // 2·(2·2KB + 4KB)=16KB; DecTcSmem total ~17.5KB ≪ the 48KB static cap.
     static constexpr int kDecAtomsPerSlot =
         (dectc::kAtomsM < dectc::kDecMaxIL) ? dectc::kAtomsM : dectc::kDecMaxIL;
+    // RING DEPTH for the smem allocation = kDecRingStagesMax = max(fwd/dX ring
+    // depth, dW ring depth). When SG_TUNED_DEC_FWD_PIPE=0 this == kDecTcStages
+    // (the shipped 2), so sA/sB are BYTE-IDENTICAL to every shipped build → the
+    // kernel's static smem (and thus the launcher's cudaOccupancyMaxActiveBlocks
+    // certification) is unchanged. When PIPE=1 the deeper fwd/dX ring needs
+    // kDecFwdStages (2..4) slots, so the ring smem grows ∝ depth — this is the
+    // OCCUPANCY COST of the lever: at N=128, IL=2, each extra slot adds
+    // (2·64·16 + 128·16)·2 B = 8 KB (sA +4KB, sB +4KB). The launcher REFUSES
+    // (cudaErrorLaunchOutOfResources) if the larger static smem drops occupancy
+    // below 1 CTA/SM (the persistent grid-barrier requires ≥1) — so the operator
+    // backs off the depth knob if a chosen depth won't place. NO register growth
+    // (the WgmmaAccum<N> fragments are independent of ring depth), so the ceiling
+    // is purely the 228 KB/SM smem budget (≈ depth 4 fits comfortably at d=2048).
+    static constexpr int kDecRingStages = dectc::kDecRingStagesMax;
     // alignas(16): the cp.async RING (fwd/dX staging) lands 16-byte LDGSTS
     // chunks here, which require a 16B-aligned smem destination. Every
     // tile-internal offset is a multiple of 8 bf16 (16B) and the sA block size
     // is a multiple of 16B at every legal (stages, IL, TILE_N), so the alignas
     // changes NO member offset — it only pins the guarantee the ring needs.
-    alignas(16) __nv_bfloat16 sA[dectc::kDecTcStages * kDecAtomsPerSlot * 64 * 16];
-    alignas(16) __nv_bfloat16 sB[dectc::kDecTcStages * SG_TUNED_TILE_N * 16];
+    alignas(16) __nv_bfloat16 sA[kDecRingStages * kDecAtomsPerSlot * 64 * 16];
+    alignas(16) __nv_bfloat16 sB[kDecRingStages * SG_TUNED_TILE_N * 16];
     float red[256];
     dectc::DecDwSpec spec[9];
 };

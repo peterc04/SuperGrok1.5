@@ -145,6 +145,63 @@ namespace wgs = ::sg::sm90::wgs;
 #define SG_TUNED_DEC_DW_STAGE 1
 #endif
 
+// ── fwd/dX DEEPER cp.async RING (campaign P1-fwd/dX lever; 2026-06-16). The
+//    P1_fwd (28.8%) + P1_bwd-dX (27.7%) GEMMs are 56.5% of the step. Unlike dW
+//    (97% scalar-gather staging → STAGING-bound, where the reverted P0 producer/
+//    consumer split REGRESSED −11.6%), fwd/dX are bf16-CONTIGUOUS: they already
+//    run the proven kRingAsync cp.async double-buffer ring (16B coalesced LDGSTS,
+//    no scalar gather), so they are plausibly DRAIN/LATENCY-bound — the regime
+//    where DEEPER prefetch SHOULD help. This knob deepens ONLY the fwd/dX ring
+//    (the lowest-risk mechanism (a): reuses the SAME silicon-validated ring
+//    machinery, the SAME M-atom-interleave (kIL), the SAME all-256-threads-stage /
+//    WG0-consume structure). It does NOT touch dW (just-fixed staging), the
+//    optimizer tail, attention/scan, or the scalar production path.
+//
+//    SG_TUNED_DEC_FWD_PIPE (0/1): master enable. 0 (DEFAULT, revert-safe) →
+//      the fwd/dX ring depth == SG_TUNED_DEC_GEMM_STAGES (the shipped S=2 double-
+//      buffer), so the engine is BYTE-IDENTICAL to every shipped build (PTX-
+//      verified). 1 → the fwd/dX ring uses SG_TUNED_DEC_FWD_STAGES slots.
+//    SG_TUNED_DEC_FWD_STAGES (2..4): fwd/dX ring depth when PIPE=1. S slots keep
+//      S-1 cp.async groups IN FLIGHT (vs the S=2 ring's single prefetch tile),
+//      so more HBM operand latency is hidden behind the in-flight wgmmas.
+//
+//    PARITY BY CONSTRUCTION: the deeper ring changes ONLY when each operand tile
+//    becomes available (MEMORY-LOAD reorder) — the wgmma ISSUE sequence is
+//    UNCHANGED (ascending-k, k=0 overwrite / k>0 accumulate, per-k commit +
+//    wgmma_wait_group<0> drain), so the fp32 accumulation order is bit-identical
+//    → fp64-oracle parity + A/A/A determinism hold (the same invariant the S=2
+//    ring and the dW contiguous-staging KEEP already preserve). At S=2 the deeper
+//    loop COLLAPSES to the current ring exactly (cp_async_wait_group<S-2> ==
+//    <0>), which is why PIPE=0 (S maps to the GEMM_STAGES default) is byte-clean.
+//
+//    OCCUPANCY/REGISTER CEILING: the deeper ring adds NO accumulator registers
+//    (the per-atom WgmmaAccum<N> fragments are independent of S); it adds only
+//    smem (DecTcSmem.sA/sB grow ∝ ring depth). The persistent grid-barrier
+//    REQUIRES ≥1 CTA/SM (the launcher REFUSES via cudaErrorLaunchOutOfResources
+//    if occupancy<1) — so the ring depth is smem-capped, not reg-capped. This is
+//    the OPPOSITE of the P0 failure mode (P0 stole MMA threads + regs for a
+//    producer/consumer split on a staging-bound GEMM). DecTcSmem sizes sA/sB for
+//    max(fwd-ring, dW-ring) depth; see the smem-budget note there.
+#ifndef SG_TUNED_DEC_FWD_PIPE
+#define SG_TUNED_DEC_FWD_PIPE 0
+#endif
+#ifndef SG_TUNED_DEC_FWD_STAGES
+#define SG_TUNED_DEC_FWD_STAGES 2
+#endif
+
+// ── fwd/dX FINE sub-phase profiler (campaign P1-fwd/dX diagnosis; 2026-06-16).
+//    Splits the coarse P1_fwd (slot 0) / P1_bwd (slot 1) clock64 regions into
+//    fine sub-counters INSIDE the GEMM engine's cp.async ring, so the main loop
+//    can read WHERE the time goes (drain-bound vs compute/epilogue-bound) before
+//    committing the deeper-ring lever. ONLY meaningful when SG_DEC_PROFILE is
+//    also set (the fine array + the engine stamps are #if-gated on BOTH). OFF by
+//    default → ZERO overhead, byte-identical when off (PTX-verified). See
+//    g_dec_prof_fwd_fine + the SG_DEC_FWD_FINE_* slot enum in
+//    fused_decoder_megakernel.cuh.
+#ifndef SG_DEC_PROFILE_FWD_FINE
+#define SG_DEC_PROFILE_FWD_FINE 0
+#endif
+
 namespace dectc {
 
 // dW staging-method selector (see the SG_TUNED_DEC_DW_STAGE macro doc above).
@@ -160,10 +217,84 @@ static_assert(kDecMaxIL >= 1 && kDecMaxIL <= 4,
 constexpr int kDecTcStages = SG_TUNED_DEC_GEMM_STAGES;
 static_assert(kDecTcStages >= 1 && kDecTcStages <= 2,
               "SG_TUNED_DEC_GEMM_STAGES must be 1 (serial) or 2 (double-buffer)");
+
+// fwd/dX DEEPER-ring depth (SG_TUNED_DEC_FWD_PIPE / SG_TUNED_DEC_FWD_STAGES). When
+// the master enable is OFF, the fwd/dX ring depth == kDecTcStages (the shipped
+// double-buffer) so the engine is byte-identical. When ON it is the FWD_STAGES
+// knob (2..4). The dW path is UNAFFECTED (it never takes the ring — lambda
+// sources, DecTileSrcIsGmem=false — so it keeps kDecTcStages regardless).
+constexpr int kDecFwdPipe = SG_TUNED_DEC_FWD_PIPE;
+static_assert(kDecFwdPipe == 0 || kDecFwdPipe == 1,
+              "SG_TUNED_DEC_FWD_PIPE must be 0 (off, byte-identical) or 1 (deeper fwd/dX ring)");
+// PIPE=0 → inherit kDecTcStages VERBATIM (1 or 2; preserves the serial S=1 build
+// and the byte-identical S=2 default). PIPE=1 → the FWD_STAGES knob (asserted
+// 2..4 below; <2 is not a real ring, >4 blows the smem budget).
+constexpr int kDecFwdStages = kDecFwdPipe ? SG_TUNED_DEC_FWD_STAGES : kDecTcStages;
+static_assert(kDecFwdPipe == 0 || (kDecFwdStages >= 2 && kDecFwdStages <= 4),
+              "SG_TUNED_DEC_FWD_STAGES must be 2..4 when SG_TUNED_DEC_FWD_PIPE=1 "
+              "(smem-capped; >1 for a real ring). PIPE=0 inherits GEMM_STAGES (1|2).");
+// The widest ring any call site uses, for the DecTcSmem sA/sB allocation: fwd/dX
+// take kDecFwdStages; dW takes kDecTcStages. Spell the max out (covers the S=1
+// build, where both are 1, AND the PIPE=1 deeper case where fwd > dW).
+constexpr int kDecRingStagesMax =
+    (kDecFwdStages > kDecTcStages) ? kDecFwdStages : kDecTcStages;
+
 constexpr int kDecTcSmemA1 = wgs::kWgmmaAtomM * wgs::kWgmmaAtomK;   // 64*16 bf16
 constexpr int kDecTcSmemB1 = SG_TUNED_TILE_N * wgs::kWgmmaAtomK;    // N*16 bf16
 constexpr int kDecDwSplitK = SG_TUNED_DEC_DW_SPLITK;
 static_assert(kDecDwSplitK >= 1, "SG_TUNED_DEC_DW_SPLITK must be >= 1");
+
+// ════════════════════════════════════════════════════════════════════════
+//  fwd/dX FINE sub-phase profiler (SG_DEC_PROFILE && SG_DEC_PROFILE_FWD_FINE).
+//  Diagnostic-only; NEVER on the shipped path (both flags default OFF; the
+//  production _ops sets neither). When OFF, NONE of this — nor any engine stamp
+//  — is compiled (the engine's fine-stamp blocks are #if-gated on the SAME pair),
+//  so the kernel's PTX/regalloc is BYTE-IDENTICAL to every shipped build.
+//
+//  The coarse profiler (g_dec_prof_max[0]=P1_fwd, [1]=P1_bwd) wraps the WHOLE
+//  tile fwd / bwd call (GEMMs + LN/softmax/attention/elementwise). This array
+//  splits the time SPENT INSIDE THE GEMM ENGINE's cp.async ring into 5 fine
+//  sub-counters, separately for the fwd ring (phase 0) and the dX ring (phase 1):
+//    [phase*kDecFwdFineSub + sub], with sub ∈ {
+//      0 ISSUE   = cp.async LDGSTS issue (stage_k_async: the 16B coalesced copies)
+//      1 WAIT    = cp.async drain (cp_async_wait_group<...>) — the DRAIN/latency cost
+//      2 WGMMA   = wgmma issue + commit + wait_group<0> (the MMA compute+drain)
+//      3 EPI     = epilogue fragment-decode + bf16/fp32 store
+//      4 BARRIER = fence_async_proxy + __syncthreads (the ring publish barrier)
+//    }
+//  Stamped thread-0-only, atomicMax across CTAs (= the slowest CTA = the
+//  critical path the host wall sees), the SAME idiom as g_dec_prof_max. The dW
+//  GEMM never enters the ring branch (lambda sources → !kRingAsync), so it never
+//  stamps these — the fine counts are PURELY fwd/dX, as intended.
+#if defined(SG_DEC_PROFILE) && SG_DEC_PROFILE_FWD_FINE
+constexpr int kDecFwdFineSub    = 5;   // ISSUE, WAIT, WGMMA, EPI, BARRIER
+constexpr int kDecFwdFinePhases = 2;   // 0 = fwd ring, 1 = dX ring
+constexpr int kDecFwdFineSlots  = kDecFwdFinePhases * kDecFwdFineSub;   // 10
+enum DecFwdFineSub { kFineIssue = 0, kFineWait = 1, kFineWgmma = 2,
+                     kFineEpi = 3, kFineBarrier = 4 };
+// Plain __device__ (matches g_dec_prof_max). Each TU that enables the pair is its
+// own JIT extension (.so) — no cross-TU linkage, so no ODR concern. The .cu TU's
+// reader (tc_profile_read_fwd_fine) copies+resets it via cudaMemcpyFromSymbol.
+__device__ unsigned long long g_dec_prof_fwd_fine[kDecFwdFineSlots];
+// Accumulate a fine delta into [phase][sub] (thread-0-only; atomicMax across CTAs).
+__device__ __forceinline__ void dec_fwd_fine_acc(int phase, int sub,
+                                                 unsigned long long delta) {
+    atomicMax(&g_dec_prof_fwd_fine[phase * kDecFwdFineSub + sub], delta);
+}
+#endif
+
+// fwd/dX engine call-site phase tags. The fwd wrappers append SG_DEC_FINE_FWD (the
+// `prof_phase=0` arg), the dX wrappers SG_DEC_FINE_DX (`=1`) — but ONLY when the
+// fine-profiler pair is set. When OFF these expand to NOTHING, so the wrapper's
+// engine call is the original 9-arg form → byte-identical PTX (and the selftest's
+// 9-arg calls are unaffected; prof_phase keeps its -1 default there).
+#if defined(SG_DEC_PROFILE) && SG_DEC_PROFILE_FWD_FINE
+#define SG_DEC_FINE_FWD , /*prof_phase=fwd*/ 0
+#define SG_DEC_FINE_DX  , /*prof_phase=dX */ 1
+#else
+#define SG_DEC_FINE_FWD
+#define SG_DEC_FINE_DX
+#endif
 
 // Token-tile rows a CTA owns. Must be a multiple of 64 (wgmma atom M) AND of
 // kSeq (so a tile boundary is a sample boundary — attention stays in-tile).
@@ -508,12 +639,22 @@ template <> struct DecTileSrcIsGmem<DecGmemTileSrcB> { static constexpr bool val
 //
 //  Determinism: ascending-k, one CTA owns the tile end-to-end, no atomics.
 // ════════════════════════════════════════════════════════════════════════
+// `prof_phase` (default -1) is the FINE-profiler phase tag (0 = fwd ring, 1 = dX
+// ring) used ONLY when SG_DEC_PROFILE && SG_DEC_PROFILE_FWD_FINE is set — the
+// fwd wrappers pass 0, the dX wrappers pass 1, dW leaves the default. It is a
+// trailing defaulted scalar that is NEVER referenced unless that pair is set
+// (then it selects which g_dec_prof_fwd_fine phase the engine stamps), so the
+// selftest's existing 9-arg calls still compile AND the shipped PTX is byte-
+// identical (an unreferenced trailing defaulted arg is dropped by the optimizer;
+// PTX-verified OFF-vs-baseline).
 template <int N, int MaxAtomsM, typename SrcA, typename SrcB, typename Out>
 __device__ void tc_gemm_block_unpipelined(
         int mbase0, int m_atoms, int n_real, int k_steps,
         SrcA srcA, SrcB srcB, Out out,
-        __nv_bfloat16* smemA, __nv_bfloat16* smemB) {
+        __nv_bfloat16* smemA, __nv_bfloat16* smemB,
+        int prof_phase = -1) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    (void)prof_phase;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;            // 256
     const bool in_wg0 = (tid < 128);
@@ -562,8 +703,14 @@ __device__ void tc_gemm_block_unpipelined(
             [&] (int mn, int kk) { return srcB(mn, kk); }, tid, nthreads);
     };
     // Issue the group's g_atoms wgmmas for staged slot k (k=0 overwrite else accum).
-    auto issue_k = [&] (int g_atoms, int k) {
-        const int sl = k % S;
+    // `rs` is the ring-slot modulus (kDecTcStages for the scalar/dW path; the
+    // deeper kDecFwdStages for the fwd/dX cp.async ring). Both are compile-time at
+    // every call site so the % folds; the wgmma ISSUE SEQUENCE (ascending k, k=0
+    // overwrite / k>0 accumulate) is identical regardless of rs — only the slot
+    // the operands were staged into differs, so the fp32 accumulation order is
+    // bit-identical (parity / A/A/A preserved).
+    auto issue_k = [&] (int g_atoms, int k, int rs) {
+        const int sl = k % rs;
         wgs::SmemDesc dB = wgs::make_desc_B_kmajor<N, wgs::kSwizzleNone>(
             smemB + (int64_t)sl * kDecTcSmemB1);
         #pragma unroll
@@ -599,6 +746,24 @@ __device__ void tc_gemm_block_unpipelined(
     constexpr bool kRingAsync = (S > 1)
         && DecTileSrcIsGmem<SrcA>::value && DecTileSrcIsGmem<SrcB>::value;
 
+    // ── FINE-profiler accumulators (SG_DEC_PROFILE && SG_DEC_PROFILE_FWD_FINE).
+    //    Thread-0-only clock64 deltas, summed across ALL M-atom groups + k-steps
+    //    of THIS engine call, atomicMax'd into g_dec_prof_fwd_fine ONCE after the
+    //    group loop (= the slowest CTA's critical path per sub-phase). Compiled
+    //    out entirely (no vars, no clock64, no atomic) unless the pair is set →
+    //    byte-identical when off. Only the kRingAsync (fwd/dX) path stamps; the dW
+    //    !kRingAsync path never reaches these TICs.
+#if defined(SG_DEC_PROFILE) && SG_DEC_PROFILE_FWD_FINE
+    unsigned long long _f_issue = 0, _f_wait = 0, _f_wgmma = 0, _f_epi = 0, _f_bar = 0;
+    unsigned long long _t0 = 0;
+    const bool _prof_t0 = (tid == 0);
+    #define SG_FINE_TIC() do { if (_prof_t0) _t0 = clock64(); } while (0)
+    #define SG_FINE_ACC(acc) do { if (_prof_t0) (acc) += clock64() - _t0; } while (0)
+#else
+    #define SG_FINE_TIC() do {} while (0)
+    #define SG_FINE_ACC(acc) do {} while (0)
+#endif
+
     // Loop M-atom GROUPS of kIL; each group runs its own k-chain into kIL fragments.
     #pragma unroll 1
     for (int g0 = 0; g0 < m_atoms; g0 += kIL) {
@@ -606,7 +771,12 @@ __device__ void tc_gemm_block_unpipelined(
         const int g_atoms = (m_atoms - g0) < kIL ? (m_atoms - g0) : kIL;
         if constexpr (kRingAsync) {
             (void)stage_k;   // the scalar stager is the !ring branch's transport
-            // Stage the group's k-tile `kk` into ring slot kk % S via 16B cp.async:
+            // RING DEPTH for the fwd/dX path. PIPE=0 → RS==kDecTcStages (the
+            // shipped S=2 double-buffer), and the RS==2 sub-branch below is the
+            // ORIGINAL ring VERBATIM → byte-identical PTX. PIPE=1 → RS=2..4 keeps
+            // RS-1 cp.async groups in flight (deeper prefetch; the deeper sub-branch).
+            constexpr int RS = kDecFwdStages;
+            // Stage the group's k-tile `kk` into ring slot kk % RS via 16B cp.async:
             // g_atoms A(64×16) tiles + the ONE shared B(N×16) tile (the M-atom-
             // interleave structure, verbatim). Chunk space is FLAT and fixed
             // (kIL·64·2 A-halves then N·2 B-halves) so every thread's share is
@@ -616,7 +786,7 @@ __device__ void tc_gemm_block_unpipelined(
             // offset half·(MN·8)+mn·8 — the same map stage_kmajor_tile writes and
             // the same chunking tile_pipeline.cuh::pipeline_produce_ktile issues.
             auto stage_k_async = [&] (int kk) {
-                const int sl = kk % S;
+                const int sl = kk % RS;
                 const int kb = kk * wgs::kWgmmaAtomK;
                 constexpr int kAChunks = kIL * wgs::kWgmmaAtomM * 2;
                 constexpr int kChunks  = kAChunks + N * 2;
@@ -649,27 +819,80 @@ __device__ void tc_gemm_block_unpipelined(
                 }
                 decprim::cp_async_commit();
             };
-            // Prologue: tile 0 in flight → drain own copies → ONE async-proxy
-            // fence → publish (barrier). Fence choreography then matches the
-            // synchronous path (wgmma_fence once, wg0).
-            stage_k_async(0);
-            decprim::cp_async_wait_group<0>();
-            wgs::fence_async_proxy();
-            __syncthreads();
-            if (in_wg0) wgs::wgmma_fence();
-            // Steady state: (1) wg0 issues the slot-k wgmmas (async tensor pipe);
-            // (2) ALL threads fire tile k+1's copies into the OTHER slot — the
-            // gmem→smem transfers overlap the in-flight wgmmas (slot (k+1)%S was
-            // last READ by wgmma k-1, drained at the end of iteration k-1 →
-            // WAR-safe); (3) drain tensor pipe + own copies, fence, ONE barrier.
-            #pragma unroll 1
-            for (int k = 0; k < k_steps; ++k) {
-                if (in_wg0) { issue_k(g_atoms, k); wgs::wgmma_commit_group(); }
-                if (k + 1 < k_steps) stage_k_async(k + 1);
-                if (in_wg0) wgs::wgmma_wait_group<0>();
-                decprim::cp_async_wait_group<0>();
-                wgs::fence_async_proxy();
-                __syncthreads();
+            if constexpr (RS <= 2) {
+                // ── ORIGINAL S=2 DOUBLE-BUFFER RING (verbatim; byte-identical when
+                //    PIPE=0). One prefetch tile in flight; full drain + barrier per k.
+                //    (RS<=2 also covers the dead RS=1 case — kRingAsync needs S>1, so
+                //    this block is only ever reached with RS>=2; the <=2 guard just
+                //    keeps the deeper else-branch's cp_async_wait_group<RS-2> from
+                //    being instantiated with a negative immediate.)
+                // Prologue: tile 0 in flight → drain own copies → ONE async-proxy
+                // fence → publish (barrier). Fence choreography then matches the
+                // synchronous path (wgmma_fence once, wg0).
+                SG_FINE_TIC(); stage_k_async(0);                 SG_FINE_ACC(_f_issue);
+                SG_FINE_TIC(); decprim::cp_async_wait_group<0>(); SG_FINE_ACC(_f_wait);
+                SG_FINE_TIC(); wgs::fence_async_proxy(); __syncthreads(); SG_FINE_ACC(_f_bar);
+                if (in_wg0) wgs::wgmma_fence();
+                // Steady state: (1) wg0 issues the slot-k wgmmas (async tensor pipe);
+                // (2) ALL threads fire tile k+1's copies into the OTHER slot — the
+                // gmem→smem transfers overlap the in-flight wgmmas (slot (k+1)%2 was
+                // last READ by wgmma k-1, drained at the end of iteration k-1 →
+                // WAR-safe); (3) drain tensor pipe + own copies, fence, ONE barrier.
+                #pragma unroll 1
+                for (int k = 0; k < k_steps; ++k) {
+                    SG_FINE_TIC();
+                    if (in_wg0) { issue_k(g_atoms, k, RS); wgs::wgmma_commit_group(); }
+                    SG_FINE_ACC(_f_wgmma);
+                    SG_FINE_TIC(); if (k + 1 < k_steps) stage_k_async(k + 1); SG_FINE_ACC(_f_issue);
+                    SG_FINE_TIC(); if (in_wg0) wgs::wgmma_wait_group<0>();     SG_FINE_ACC(_f_wgmma);
+                    SG_FINE_TIC(); decprim::cp_async_wait_group<0>();          SG_FINE_ACC(_f_wait);
+                    SG_FINE_TIC(); wgs::fence_async_proxy(); __syncthreads();  SG_FINE_ACC(_f_bar);
+                }
+            } else {
+                // ── DEEPER cp.async RING (RS=3..4; SG_TUNED_DEC_FWD_PIPE=1). Keeps
+                //    RS-1 cp.async groups IN FLIGHT so more HBM operand latency is
+                //    hidden behind the in-flight wgmmas (the drain-bound lever).
+                //    PARITY: the wgmma ISSUE order is IDENTICAL to the RS==2 ring
+                //    (ascending k, per-k commit + wgmma_wait_group<0> drain) — only
+                //    the cp.async prefetch DISTANCE (and thus WHEN each tile lands)
+                //    changes. fp32 accumulation order bit-identical.
+                //
+                //    WAR safety: a refill for tile k+RS-1 writes slot (k+RS-1)%RS ==
+                //    (k-1)%RS, which tile k-1 occupied and wgmma k-1 finished reading
+                //    (drained via wgmma_wait_group<0> in iter k-1, ordered before this
+                //    iter's top __syncthreads). The refill goes to slot (k-1)%RS while
+                //    wgmma k reads slot k%RS (distinct) → no live-slot clobber.
+                //
+                //    FIFO drain discipline (cp_async_wait_group<N> is a compile-time
+                //    immediate, FIFO-ordered): in the STEADY region (a refill happens
+                //    this iter ⇒ exactly RS-1 groups in flight) wait_group<RS-2> drains
+                //    exactly the oldest (tile k). In the TAIL (refills exhausted) there
+                //    is no future copy to overlap, so wait_group<0> (drain all
+                //    remaining) is free and keeps the wait depth a valid immediate.
+                const int n_pre = (RS - 1) < k_steps ? (RS - 1) : k_steps;
+                #pragma unroll 1
+                for (int p = 0; p < n_pre; ++p) { SG_FINE_TIC(); stage_k_async(p); SG_FINE_ACC(_f_issue); }
+                if (in_wg0) wgs::wgmma_fence();
+                #pragma unroll 1
+                for (int k = 0; k < k_steps; ++k) {
+                    const bool will_refill = (k + (RS - 1) < k_steps);
+                    // Land tile k. Steady: keep RS-2 in flight. Tail: drain all.
+                    SG_FINE_TIC();
+                    if (will_refill) decprim::cp_async_wait_group<RS - 2>();
+                    else             decprim::cp_async_wait_group<0>();
+                    SG_FINE_ACC(_f_wait);
+                    SG_FINE_TIC(); wgs::fence_async_proxy(); __syncthreads(); SG_FINE_ACC(_f_bar);
+                    SG_FINE_TIC();
+                    if (in_wg0) {
+                        issue_k(g_atoms, k, RS);
+                        wgs::wgmma_commit_group();
+                        wgs::wgmma_wait_group<0>();   // drain wgmma k → slot k%RS free
+                    }
+                    SG_FINE_ACC(_f_wgmma);
+                    // Refill the ring (WAR-safe; see above). No post-wgmma barrier
+                    // needed: the refill targets slot (k-1)%RS, freed in iter k-1.
+                    SG_FINE_TIC(); if (will_refill) stage_k_async(k + (RS - 1)); SG_FINE_ACC(_f_issue);
+                }
             }
         } else {
         // Prologue: stage tile 0 (the group's atoms); make visible; fence ONCE.
@@ -682,7 +905,7 @@ __device__ void tc_gemm_block_unpipelined(
         // collapses to staging into the single slot AFTER the wait (serial, exact).
         #pragma unroll 1
         for (int k = 0; k < k_steps; ++k) {
-            if (in_wg0) { issue_k(g_atoms, k); wgs::wgmma_commit_group(); }
+            if (in_wg0) { issue_k(g_atoms, k, S); wgs::wgmma_commit_group(); }
             if (S > 1) {
                 if (k + 1 < k_steps) stage_k(gbase, g_atoms, k + 1);
                 if (in_wg0) wgs::wgmma_wait_group<0>();
@@ -696,6 +919,9 @@ __device__ void tc_gemm_block_unpipelined(
         }
         // Epilogue: warpgroup 0 owns the fp32 fragments; decode + emit (real cols).
         // All reads happen AFTER the final wait_group<0> — no overlap with any wgmma.
+        // EPI fine-stamp only on the ring (fwd/dX) path (constexpr-guarded so the dW
+        // !kRingAsync path emits no stamp); the store accessor cost is the EPI bucket.
+        if constexpr (kRingAsync) SG_FINE_TIC();
         if (in_wg0) {
             #pragma unroll
             for (int ai = 0; ai < kIL; ++ai) {
@@ -709,11 +935,31 @@ __device__ void tc_gemm_block_unpipelined(
                 }
             }
         }
+        if constexpr (kRingAsync) SG_FINE_ACC(_f_epi);
         __syncthreads();
     }
+    // Stamp the fine sub-phases ONCE (thread-0-only, atomicMax across CTAs). Only
+    // the ring (fwd/dX) path accumulated nonzero deltas (the dW path never TIC'd);
+    // guard on kRingAsync so the dW engine emits no atomic. prof_phase: 0 = fwd
+    // ring, 1 = dX ring (the wrapper passed it); -1 (defensive) → phase 0.
+#if defined(SG_DEC_PROFILE) && SG_DEC_PROFILE_FWD_FINE
+    if constexpr (kRingAsync) {
+        if (_prof_t0) {
+            const int ph = (prof_phase == 1) ? 1 : 0;
+            dec_fwd_fine_acc(ph, kFineIssue,   _f_issue);
+            dec_fwd_fine_acc(ph, kFineWait,    _f_wait);
+            dec_fwd_fine_acc(ph, kFineWgmma,   _f_wgmma);
+            dec_fwd_fine_acc(ph, kFineEpi,     _f_epi);
+            dec_fwd_fine_acc(ph, kFineBarrier, _f_bar);
+        }
+    }
+#endif
+#undef SG_FINE_TIC
+#undef SG_FINE_ACC
 #else
     (void)mbase0; (void)m_atoms; (void)n_real; (void)k_steps;
     (void)srcA; (void)srcB; (void)out; (void)smemA; (void)smemB;
+    (void)prof_phase;
 #endif
 }
 
@@ -757,7 +1003,7 @@ __device__ __forceinline__ void dectc_gemm_fwd(
         auto out  = [&] (int m, int n, float v) {
             Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
     }
 }
 
@@ -778,7 +1024,7 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
         DecGmemTileSrcB srcB{W + (int64_t)n0 * Kin, Kin, Nout - n0};
         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
     }
 }
 
@@ -802,7 +1048,7 @@ __device__ __forceinline__ void dectc_gemm_dx_f32(
         DecGmemTileSrcB srcB{WT + (int64_t)n0 * Nout, Nout, Kin - n0};
         auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_DX);
     }
 }
 
@@ -827,8 +1073,9 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
             int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+        // fp32-W (TP) lambda sources → !kRingAsync (no stamp); tag kept for intent.
         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
     }
 }
 template <int N>
@@ -844,8 +1091,9 @@ __device__ __forceinline__ void dectc_gemm_dx_f32(
         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
             int nn = n0 + n; return nn < Kin ? __float2bfloat16(W[(int64_t)k * Kin + nn]) : __float2bfloat16(0.f); };
         auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
+        // fp32-W (TP) lambda sources → !kRingAsync (no stamp); tag kept for intent.
         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_DX);
     }
 }
 

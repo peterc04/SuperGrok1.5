@@ -87,6 +87,48 @@ decoder-maxing → attack the NON-GEMM surface, and wire the ViT per-phase profi
 6-slot, unwired in vit_bench) FIRST so the relevance gate flags low-share levers like this one before we
 build them. SG2/vit parity mechanism deferred (low priority — the lever is wrong for ViT regardless).
 
+## Track E — decoder P1 fwd/dX deeper cp.async ring: **REJECT (resource-blocked at S≥3)** (2026-06-16)
+Drain-bound CONFIRMED via the new `--fwd-fine` sub-profiler (fwd ring WAIT 43% vs WGMMA 31%; dX WAIT 56% vs
+20%) → deeper prefetch SHOULD hide the cp.async drain (the RIGHT lever, unlike the staging-bound dW that sank
+P0). Authored: `SG_TUNED_DEC_FWD_PIPE` + `_FWD_STAGES` knob (deepen the proven `kRingAsync` ring; mechanism
+(a), NOT the P0 producer/consumer; byte-identical OFF). RUNTIME: PIPE=1 STAGES={3,4} BOTH **"too many
+resources requested for launch"** (occupancy<1; persistent grid-barrier needs ≥1 CTA/SM). S=2 ≡ baseline (no
+gain). The authoring agent's nvcc-codegen check claimed "depth-4 places" — WRONG at runtime (again:
+CPU-codegen-clean ≠ launchable; fast_triage caught it as BUILD_FAILED). HYPOTHESIS: the +8KB/stage ring smem
+competes with the dW-STAGING transpose scratch (the 2× KEEP raised base smem) → at S≥3 the 1-CTA/SM smem
+budget is exceeded. REDIRECT (the prize is real — fwd+dX = 56.5% of the step): reclaim smem via a UNION
+across the P1 fwd/dX ring and the P2 dW-transpose scratch (they don't temporally overlap: P1→B1→P2), or a
+lower reg cap to free SM budget. The `--fwd-fine` profiler is a KEEPER (byte-identical OFF, valuable diagnostic); the PIPE knob stays OFF
+pending the smem fix. **ROOT-CAUSED (probes, 2026-06-17):** NOT smem-competition (S=3 fails even with
+dW-staging OFF) and NOT registers (fails with cons_regs=168). Cause = **`DecTcSmem` is STATIC `__shared__`,
+hard-capped at 48 KB on H100** (`fused_decoder_megakernel.cuh:577`; launch uses 0 dynamic smem); the S=2
+ring (~43 KB) fits, S=3 (~51.6 KB) EXCEEDS the 48 KB STATIC cap → "too many resources". FIX (queued):
+convert `DecTcSmem` to DYNAMIC smem (`extern __shared__` + `cudaFuncSetAttribute(…MaxDynamicSharedMemorySize,
+sizeof(DecTcSmem))` + launch `<<<…, dyn_bytes, …>>>` + occupancy-cert with the real bytes), GATED to the
+deep ring (STAGES>2) so the default stays static + byte-identical. The 227 KB DYNAMIC cap easily fits S=3/4
+at 1 CTA/SM. Unblocks the 56.5% fwd/dX prize + any future smem-hungry lever. (Earlier smem-UNION idea is
+unnecessary — the static→dynamic conversion is the actual fix.)
+
+## Track E — Mamba-3 M0 (wgmma projections): **DEFER (scan-blocked, wrong lever)** (2026-06-16)
+SAFE HALF DONE (scaffold + gate `SG_TUNED_MB_PROJ_WGMMA` + workspace sizer↔carve agreement PROVEN [heeding
+the ViT IMA] + nvcc EXIT-0 all configs + byte-identical-OFF; `.perf/M0_mamba_integration_scaffold.patch`,
+DORMANT, not applied to main). Body-rewire BLOCKED: the validated Mamba scalar fwd/bwd processes ONE SAMPLE
+AT A TIME with projections fused INLINE into the scan; X/dY operands live transiently in per-sample smem,
+NEVER materialized to HBM; dW accumulates over a single sample's kSeq=8 rows. The M0 output-stationary dW
+(full-T K-contraction) CHANGES the fp32 accumulation order → violates parity-by-construction (GPU-only to
+re-validate) AND needs the correctness-critical scan kernel's data-flow rewritten first. COMBINED: Mamba is
+scan-DOMINATED (projections are a minority → M0 is low-relevance, cf. ViT dW) and d=128-bound (smem-blocked
+at d=2048). VERDICT: **DEFER** — low-ROI (minority phase) × high-risk (parity + scan rewrite) × bounded
+(d=128). Keep the validated scalar Mamba megakernel; revisit only if a Mamba profiler shows projections
+are a meaningful share.
+
+## META-LESSON (this campaign's CORE finding, 2026-06-16): the decoder GEMM-staging win does NOT generalize
+Decoder = dW/fwd-GEMM-bound (the 2× lived there). **ViT = non-GEMM-surface-bound** (head-CE/LN/attn → dW twin
+gave only +4.5% and gate-RED). **Mamba = scan-bound** (M0 projections low-relevance + parity-risky). Porting
+the decoder lever to ViT (dW twin) and Mamba (M0) BOTH proved wrong. **RULE: profile each model's actual
+bottleneck (wire its per-phase profiler) BEFORE picking its lever — the relevance gate is the guard.** ViT &
+Mamba benches are currently wall-only; wire their profilers (ViT has a latent `g_vit_prof` 6-slot) FIRST.
+
 ## compile.py audit (2026-06-16) — see COMPILE_AUDIT.md
 11-agent line-by-line audit of the autotuner. Backbone + correctness-gate machinery are
 production-grade; the gaps are P0-correctness (fp64 oracle not wired; polyhedral/cutlass/ck winners
