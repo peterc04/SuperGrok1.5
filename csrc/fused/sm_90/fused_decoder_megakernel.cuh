@@ -408,6 +408,21 @@ struct DecTcSmem {
 #endif
 };
 
+// ── DESIGN-TOURNAMENT entry (b): the fwd/dX tile-call trailing arg that hands the
+//    producer/consumer engine its mbarrier words. Expands to `, sm.pipe_bars` ONLY
+//    under PIPE=2 and to NOTHING otherwise — so the shipped PIPE=0|1 fwd/bwd tile
+//    calls are TEXTUALLY UNCHANGED (the tile functions' `pipeBars` param defaults to
+//    nullptr, unreferenced in their non-engine path → byte-identical PTX). Mirrors
+//    the SG_DEC_FINE_* macro idiom. `sm` is the kernel's __shared__ DecTcSmem local;
+//    this macro is only ever used inside fused_decoder_megakernel_tc where `sm` is
+//    in scope. The dW + optimizer-tail calls do NOT take it (dW never enters the
+//    ring; the tail has no GEMM) — only the 4 fwd/bwd tile call sites use it.
+#if SG_TUNED_DEC_FWD_PIPE == 2
+#define SG_DEC_PIPE_BARS_ARG , sm.pipe_bars
+#else
+#define SG_DEC_PIPE_BARS_ARG
+#endif
+
 // ── DEEP-RING SMEM ALLOCATION GATE (decoder fwd/dX deeper-ring lever) ─────────
 // The static __shared__ DecTcSmem (kernel `sm`, below) is hard-capped at 48 KB on
 // H100 (the per-CTA STATIC smem limit; the larger 228 KB/SM budget is reachable
@@ -431,7 +446,14 @@ struct DecTcSmem {
 // is the SUFFICIENT condition — every config that can bust 48 KB does so only at
 // S≥3 (S=2 is static-safe at every legal tile: measured max S=2 = 25.64 KB at
 // TILE_M=256/TILE_N=128/IL=4, and PIPE=1 requires STAGES≥2 so a PIPE=1/S=2 build
-// still takes the static path here). Routing a sub-48 KB S=3 config (e.g. the
+// still takes the static path here). NOTE the `SG_TUNED_DEC_FWD_PIPE &&` operand is
+// VALUE-AGNOSTIC: it is truthy for BOTH PIPE=1 (entry a, deeper ring) and PIPE=2
+// (entry b, the producer/consumer mbarrier engine — DESIGN-TOURNAMENT), so the
+// deeper PIPE=2 ring (STAGES≥3) ALSO routes to dynamic smem here. PIPE=2's extra
+// 2·Depth·8 ≤ 64 B of mbarrier words (DecTcSmem::pipe_bars) ride inside the same
+// allocation (static at Depth=2: sizeof 18096 B < 48 KB; dynamic at Depth≥3:
+// 26304 B @ S=3, 34512 B @ S=4 — both placed at 1 CTA/SM under the 227 KB cap).
+// Routing a sub-48 KB S=3 config (e.g. the
 // default-tile S=3 = 25.64 KB) through dynamic smem is harmless (dynamic alloc +
 // the exact-size opt-in + the ≥1-CTA cert are valid at any size ≤ the dynamic
 // cap); the gate trades a tiny launch-path change on the deep ring for keeping
@@ -458,7 +480,8 @@ static_assert(sizeof(DecTcSmem) <= 48 * 1024,
               "DecTcSmem exceeds the 48 KB STATIC __shared__ cap with the deep-ring "
               "dynamic-smem gate OFF — this build would hit the runtime 'too many "
               "resources requested for launch'. Enable the deep ring "
-              "(SG_TUNED_DEC_FWD_PIPE=1) or widen SG_DEC_TC_DYNAMIC_SMEM's gate.");
+              "(SG_TUNED_DEC_FWD_PIPE=1 or =2 with STAGES>2) or widen "
+              "SG_DEC_TC_DYNAMIC_SMEM's gate.");
 #endif
 // DecTcSmem's strongest member alignment is 16 B (alignas(16) on sA, which is the
 // first member and therefore governs the whole object's alignment). The dynamic
@@ -823,19 +846,19 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
         float nll;
         if constexpr (kSamCoupled)
             nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
-                                                     tok.targets, sm.sA, sm.sB, sm.red);
+                                                     tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
         else
             nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                            sm.sA, sm.sB, sm.red);
+                                            sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
 #ifdef SG_DEC_PROFILE
         __syncthreads(); unsigned long long _c1 = clock64();
 #endif
         if constexpr (kSamCoupled)
             dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
-                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
         else
             dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
-                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
 #ifdef SG_DEC_PROFILE
         __syncthreads(); unsigned long long _c2 = clock64();
         if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
@@ -1035,9 +1058,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                 const int g0 = ti * nrows_tile;
                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
                 dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
-                                                   tok.targets, sm.sA, sm.sB, sm.red);
+                                                   tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
                 dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
-                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
                 __syncthreads();
             }
             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
