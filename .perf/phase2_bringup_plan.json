@@ -1,0 +1,226 @@
+{
+  "summary": "Read-only: adversarially verify the dormant 4D-parallel + ZeRO-3 scaffolding (shard math / TP geometry / PP ownership / DP determinism / loopback transport), scope the CPU fixes, and produce a turnkey 8xH100 bring-up gate sequence",
+  "agentCount": 29,
+  "logs": [
+    "Verified 4 Phase-2 subsystems; 26 claims to adversarially check.",
+    "Adversarial pass: 5/24 claims overturned/corrected."
+  ],
+  "result": {
+    "plan": {
+      "scoped_fixes": [
+        {
+          "id": "PP-1",
+          "file": ".phase2/patches/0001-dectc-layer-range-pp.patch (regenerate against csrc/fused/sm_90/model_stage_decoder_tc.cuh, live 2595 lines)",
+          "change": "REGENERATE, not rebase. git apply --check FAILS (verified: 'patch does not apply at :724'; dectc_forward_tile is now at :1508, backward at :1747, _outlined wrappers at :1916/:1924). The live tile signatures are (const DecWeights& w, const DecWBf& wb, int g0, ..., float* red, unsigned long long* pipeBars=nullptr) — the 2nd positional `wb` (bf16 weight cache, non-defaulted) was added by regpressure/0001; the trailing `pipeBars` came from COMMITTED cp.async-ring work (commits 74260dd/a89f6f1/98e6151), NOT regpressure/0005 (verified: zero pipeBars hits in any .regpressure patch). Regenerate so that: (i) add `template <int Llo=0, int Lhi=dec::kLayers>` + `#define SG_DECTC_LAYER_RANGE 2` (versioned marker) above BOTH tiles, KEEPING `wb` and `pipeBars`; (ii) add fp32 `dh_in`/`dh_out` params AFTER pipeBars=nullptr (so existing positional pipeBars call sites stay valid); (iii) gate embedding write (:1516-1523) in `if constexpr(Llo==0)`; (iv) layer loops `for(li=Llo;li<Lhi;++li)` fwd (:1526) and `for(li=Lhi-1;li>=Llo;--li)` bwd (:1833); (v) gate head/CE block (:1604-1650) in `if constexpr(Lhi==dec::kLayers){...}else{return 0.0f;}`; (vi) gate bwd CE-seed of sc.dh (:1769-1827) on `if constexpr(Lhi!=dec::kLayers){seed sc.dh from dh_in}else{existing}`; (vii) gate embedding-bwd write (:1895-1899) on `if constexpr(Llo==0){dh0}else{write fp32 dh_out}`; (viii) MIRROR template + if-constexpr onto the _outlined wrappers (:1916-1931) so the PRODUCTION kernel (the ONLY caller of _outlined, at megakernel :848/:857/:1060/:1062) still compiles once the inline tiles become templates — NOTE: PP does NOT call _outlined (it calls the inline tiles directly), so this edit is for production-compile-survival, not PP reachability. Re-prove the nvcc -ptx default-instantiation identity of <OptId::AdamW> patched-vs-unpatched on the CURRENT header (the 2026-06-12 proof is stale).",
+          "severity": "blocker",
+          "gpu_needed": false
+        },
+        {
+          "id": "PP-2",
+          "file": "csrc/fused/sm_90/pp_stage_decoder_tc.cuh (both kernel bodies; call sites :147-148, :225-229)",
+          "change": "PP kernel bodies are independently stale — even a perfect PP-1 will not compile this. The fwd call (:147) and bwd call (:225-227) use the OLD signature with NO `wb`, and pass dh_in/dh_out (const float*) into the slot the live signature reads as `pipeBars` (unsigned long long*) — a hard type/positional mismatch. Neither kernel binds or fills the bf16 weight cache (grep: zero hits for wb/DecWBf/dec_wbf/dectc_wbf_convert/pipeBars in this header), so every GEMM B-operand (wb.in_w[li] etc., read at decoder :1530/:1549/:1569) would read uninitialized workspace. Fix BOTH kernels: (1) bind `DecWBf wb = dectc::dec_wbf_bind(wbf_cache)` where wbf_cache is the carve slot from PP-3; (2) fill it via `dectc::dectc_wbf_convert(params, wbf_cache, cta, nCTA)` in P0 BEFORE the B0 GridBarrier (mirror megakernel :814+:818); (3) pass `wb` as the 2nd positional arg at all 3 tile call sites, move dh_in/dh_out to the regenerated tail (after pipeBars=nullptr), pass pipeBars=nullptr for the non-PIPE PP path. Author the gate-cell path (adamw/grokfast, not SAM-coupled) through the inline tiles; _outlined mirroring is optional for PP.",
+          "severity": "blocker",
+          "gpu_needed": false
+        },
+        {
+          "id": "PP-3",
+          "file": "csrc/fused/sm_90/pp_stage_decoder_tc.cuh (bwd carve :195-199; fwd carve :132-139)",
+          "change": "Workspace carve DIVERGED from production — breaks the byte-identical-carve precondition the loopback bit-exactness rests on. PP bwd computes `embed_ws_base = dw_part + dec_tc_dw_part_floats() + dec_tc_staged_opt_floats(nCTA)` (:195-196), but production (megakernel :760-778 + sizer :638-655) NOW interposes the bf16 weight cache between the staged-opt block and embed lists: order is ...| dw_part | staged_opt | (16B-align) wbf_f=dec_wbf_floats() | (8B-align) embed_lists | dw_transpose | slack. So PP's embed_row_start/embed_perm ALIAS the wbf cache region (corrupt embedding owner-scan on stage 0), and there is no wbf_cache pointer at all. The binding (pp_stage_binding.cu:88) DOES size the buffer with the live dec_tc_workspace_floats, so the buffer is big enough — only the PP offset arithmetic is stale. Fix: rewrite the PP bwd carve to byte-match megakernel :760-778's #else (non-bench, sg2_ws_base) branch EXACTLY — after the staged-opt block compute `float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA); while(((uintptr_t)wbf_f&0xF)!=0)wbf_f+=1; __nv_bfloat16* wbf_cache=(__nv_bfloat16*)wbf_f; float* embed_ws=wbf_f+dectc::dec_wbf_floats(); if(((uintptr_t)embed_ws&0x7)!=0)embed_ws+=1;` then embed_row_start/embed_perm off embed_ws. The fwd kernel (:132-139, currently stops at scratch_base) also needs the full carve up to wbf_f since its tiles now stage weights from wb. STRONGLY RECOMMENDED: factor the production pointer chain into a shared __device__ helper dec_tc_bind_workspace(ws,T,B,nCTA,cta)->struct in fused_decoder_megakernel.cuh and call it from BOTH the production kernel and the two PP kernels — permanently kills this offset-drift class. Arithmetic is CPU-correct; byte-identity must be GPU-verified by the PP=2 gate's bit-exact assert.",
+          "severity": "blocker",
+          "gpu_needed": true
+        },
+        {
+          "id": "PP-5",
+          "file": "csrc/fused/sm_90/pp_stage_decoder_tc.cuh (pp_decoder_stage_fwd_tc :118-151) + launch_pp_decoder_stage_fwd_tc",
+          "change": "CORRECTED per adversarial review: the fwd kernel does NOT reference wb TODAY (verified: zero wb/DecWBf hits), so there is no current read-before-write race and regenerating PP-1 alone does not create one. The race only arises AFTER PP-2/PP-3 thread wb into the fwd kernel — at which point dectc_wbf_convert is grid-strided/element-owned across ALL CTAs, so a barrier-free fwd kernel filling wb would let a CTA read rows another CTA wrote (nondeterminism, breaks A/A/A). The fix is therefore part of the wb-threading work and is LARGER than a one-line P0 add: (1) the fwd kernel currently declares NO GridBarrier (contrast the bwd kernel's `GridBarrier bar = ctx.barrier();` at :176) — ADD it; (2) its workspace partition (:132-139) currently stops at scratch_base — extend it to carve+bind the wbf cache (PP-3); (3) call dectc_wbf_convert(params, wbf_cache, cta, nCTA) then bar.sync() BEFORE the tile loop; (4) make launch_pp_decoder_stage_fwd_tc zero ctx.g_arrived/g_generation/g_next_task before launch (mirror the bwd launcher :389-391) so the barrier is well-formed. The bwd kernel already has the GridBarrier + zeroed slots, so its convert+B0 is a one-line add. Confirm by the gate's A/A/A assert on GPU.",
+          "severity": "major",
+          "gpu_needed": true
+        },
+        {
+          "id": "PP-4",
+          "file": "tests/hw/test_pp2_loopback_determinism.py (_patch_applied :74-80) + .phase2/RUNBOOK.md (:63-97)",
+          "change": "Stale patch-presence gate + stale RUNBOOK. _patch_applied() only greps for the string 'SG_DECTC_LAYER_RANGE'; it cannot detect that `git apply 0001` FAILS on the drifted header, nor that the PP kernel bodies (PP-2/PP-3) are stale — so the test would attempt a JIT build that dies with a confusing nvcc error instead of a clean SKIP. RUNBOOK §2 (:67) still instructs `git apply 0001` (fails) and cites the stale 2026-06-12 PTX-identity proof. Fix: (1) bump the marker to a versioned token (SG_DECTC_LAYER_RANGE 2) so a stale half-applied tree is detectable; (2) add a CI/preflight `git apply --check .phase2/patches/0001-...patch` assertion; (3) update RUNBOOK §2 to reference the regenerated patch + note the PP-header signature/carve/wb-prestage fix as a prerequisite + refresh the PTX-identity proof line/date.",
+          "severity": "major",
+          "gpu_needed": false
+        },
+        {
+          "id": "PP-6",
+          "file": "csrc/fused/sm_90/pp_stage_decoder_tc.cuh (header comment block :41-52, dataflow narrative :153-165)",
+          "change": "CORRECTED severity (adversarial review flagged it as functional, but the FUNCTIONAL break is already captured by PP-1/PP-2/PP-3 — PP-6 itself is the residual documentation cleanup AFTER those land). The :41-52 block is the tensor-ownership + #error gate (the 'head=8' at :90 is correct and needs no change); its surrounding dataflow narrative predates the bf16-prestage redesign and documents the old tile contract (no wb/pipeBars), which would mislead a bring-up engineer doing the manual re-base. Fix (documentation-only, AFTER PP-1/2/3): refresh the comment to reflect the wb-cache prestage + pipeBars tail + dh_in/dh_out tail position + the shared-carve-helper if PP-3 takes that route.",
+          "severity": "minor",
+          "gpu_needed": false
+        },
+        {
+          "id": "TP-1",
+          "file": "tests/hw/tp_loopback_binding.cu + tests/hw/test_tp_loopback.py",
+          "change": "Highest-leverage TP pre-work. The loopback gate exercises ONLY the FFN col->row pair (ff0 Col -> gelu -> ff2 Row -> all-reduce + conjugate bwd; verified at binding :120-153). The ColQKV split and the ENTIRE attention path (in_proj ColQKV -> attention -> out_proj Row -> all-reduce ①) are NEVER exercised — the QKV index math (tp_colqkv_full_row, tp_layer.cuh:182-187) and the 'attention runs unchanged on H/P heads' claim are asserted only in comments. This is the larger/riskier half of decoder TP (the head-shaped reduce ① is where Megatron attention TP is subtle). Fix: add a second loopback path driving the attention col->row pair — add a host packer tp_pack_qkv_shards using tp_colqkv_full_row (mirror the existing tp_pack_pair_shards at :442), run tp_colparallel_fwd_tile on the [3d/P] qkv shard, the rank-local attention (needs TP-2), the out_proj Row partial, fixed-order reduce ①, and the conjugate bwd. Assert the same 5 invariants (cross-rank identity, A/A/A, ==chunked-serial bit-exact, dW/db slice-exactness, parity-vs-unsharded). Pure CPU/JIT-test authoring; runs on the existing single H100.",
+          "severity": "major",
+          "gpu_needed": true
+        },
+        {
+          "id": "TP-2",
+          "file": "csrc/fused/sm_90/model_stage_decoder_tc.cuh (dectc_attn_fwd_tile :1437-1475 + its bwd)",
+          "change": "The attention function is HARDCODED to dec::kHeads, dec::kDhead, dec::kD and qkv row-stride 3*dec::kD (verified at :1442/:1447/:1449/:1454/:1467/:1475); it takes NO local-head-count/local-d/local-stride param, so a ColQKV-sharded qkv buffer ([rows,3*d/P], H/P heads) cannot be consumed — the in-kernel attention TP insertion (reduce ①) is unaddressable. tp_layer.cuh's 'math runs UNCHANGED' is true at the per-head arithmetic level but NOT at the call-signature level. Fix: parameterize dectc_attn_fwd_tile (and bwd) to take (H_local, D_local, qkv_row_stride) with compile-time defaults = the full dec::* values, so the SingleGPU path stays byte-identical (defaulted template/params => if-constexpr fold, no PTX change — PTX-diff gate confirms). The ColQKV-shard local attention then becomes a parameter substitution (H_local=H/P, D_local=d/P, stride=3*d/P). Cover via the TP-1 attention loopback.",
+          "severity": "major",
+          "gpu_needed": true
+        },
+        {
+          "id": "TP-3",
+          "file": "tests/hw/test_parallel_instantiation.py (harness :104-125) — add a sibling TP-body compile",
+          "change": "The §7.2 'front-load every template/ABI bug on CPU' gate compiles ONLY parallel_config.cuh + static_asserts on derived flags (verified: harness only #includes parallel_config.cuh and static_asserts ParConfig predicates). It does NOT nvcc -c the TP-layer bodies, so template/ABI breakage in tp_layer.cuh / tp_transport.cuh / the dectc fp32-W GEMM overloads at TP=2/4 is caught ONLY by the GPU-gated JIT loopback build. Fix: add a sibling harness that nvcc -c compiles a tiny .cu including tp_layer.cuh (pulls tp_transport.cuh + GEMMs) instantiating tp_colparallel_fwd_tile<128>, tp_rowparallel_fwd_partial_tile<128,LoopbackTransport>, tp_rowparallel_dx_tile<128>, tp_colparallel_dx_partial_tile<128,LoopbackTransport>, tp_allreduce_sum_fixed_order<LoopbackTransport> — -o /dev/null, no run. Catches TP template/ABI breakage with zero GPU (the decoder header already compiles standalone on this box — the loopback binding includes it).",
+          "severity": "minor",
+          "gpu_needed": false
+        },
+        {
+          "id": "TP-4",
+          "file": "csrc/fused/sm_90/tp_layer.cuh (line-anchor comment block :58-78)",
+          "change": "Doc-staleness (not a math error). The call-site anchors cite decoder ~1085-1087/~1116-1118/~1421-1423/~1392-1395 and 'was ~1100 ... 1946 as of 2026-06-16'; the header is now 2595 lines and the real anchors are out_proj ① ~1548, ff2 ② ~1579, in_proj dX ①' ~1885, ff0 dX ②' ~1856 (all DRIFTED ~400-500 lines). The quoted comment texts ARE still grep-able (self-aware comment), so this is staleness, but the stale '1946 lines / verified 2026-06-16' line will mislead the builder doing the if-constexpr insertion. Fix: refresh the 4 anchors to current values and update the parenthetical to ~2595, or drop the absolute numbers and reference only the grep-anchor texts.",
+          "severity": "minor",
+          "gpu_needed": false
+        },
+        {
+          "id": "TP-5",
+          "file": "csrc/fused/sm_90/tp_layer.cuh (add tp_validate_decoder_plan; preconditions :99-101,:150-162)",
+          "change": "tp_layer.cuh repeatedly states 'the host plan asserts before launch' for the divisibility preconditions, but grep confirms NO TpPlan/tp_validate exists anywhere (only tp_loopback_binding.cu's local TORCH_CHECK for kDff%P + 16|dff/P; nothing asserts H%P==0 or in_proj/out_proj d%P or the whole-head ColQKV constraint). Harmless for the FFN-only loopback, but the moment the attention/in_proj TP insertion (TP-1/TP-2) lands there is no enforced guard on head-divisibility — an invalid TP degree would silently produce a non-head-aligned shard. Fix: add tp_validate_decoder_plan(int P) that asserts dec::kD%P==0, dec::kDff%P==0, dec::kHeads%P==0, (dec::kD/P)%wgs::kWgmmaAtomK==0, (dec::kDff/P)%wgs::kWgmmaAtomK==0, and call it from the loopback binding's run path + (later) the real launcher. Pure CPU; turns documented-but-unenforced preconditions into a loud check. Pairs with TP-1/TP-2.",
+          "severity": "minor",
+          "gpu_needed": false
+        },
+        {
+          "id": "DP-1",
+          "file": "tests/hw/test_dp2_loopback_determinism.py (worker_main assert (a) :337-344; _run_decomposed_step :255-271)",
+          "change": "Assert (a) is near-tautological — CORRECTED FIX per adversarial review. The returned `out` (=runs[0]) is built ENTIRELY from dist.all_gather_into_tensor (:263) then a deterministic stitch (:266-271), so runs[0] is byte-identical cross-rank BY CONSTRUCTION before (a) runs. Assert (a) then re-gathers these already-identical tensors and compares the two halves — equal by NCCL broadcast-consistency regardless of whether each rank's OWNED-shard apply was correct. The originally-proposed fix (owned-shard A/A/A: torch.equal of params_shard across the 3 same-rank repeat runs) is WRONG — it checks WITHIN-rank determinism, not the cross-rank divergence the gap describes, and is already subsumed by existing assert (b) (at DP=2 out[s:e] on rank r equals that rank's owned params_shard, so the full-vector (b) torch.equal across the 3 runs already covers run-to-run stability of each owned slice). CORRECT fix: have _run_decomposed_step also return each rank's pre-gather OWNED params_shard.clone() + its [s,e); in worker_main, BEFORE the laundering gather, all_gather the DISTINCT per-rank owned shards (padded to per=ceil(total/world)) and assert each rank's owned slice equals the same-positioned slice of the independently-trusted single-GPU reference `ref` (already computed for assert (c), :354) within _PARITY_TOL — i.e. the disjoint owned shards reconstitute the reference update BEFORE the gather. Keep existing (b) A/A/A and (c) full-vs-ref.",
+          "severity": "major",
+          "gpu_needed": true
+        },
+        {
+          "id": "DP-2",
+          "file": "tests/hw/test_3d_parallel.py (run_harness / test_3d_parallel_smoke :285-296)",
+          "change": "The 3D-parallel hardware test asserts only `thr > 0.0` (:295) — NO numerical invariant, so a sharding/collective regression in the 7B harness would pass silently as long as it produced any positive throughput. It also drives a scalar surrogate loss with framework_backward=lambda x:None (:218-219) and uses the LEGACY grokking_optimizers.distributed path (ParallelConfig/ZeRO3Sharder/DistributedContext, import :34) — NOT the grokking_optimizers.parallel.* modules the other Phase-2 gates validate (a divergence between the two distributed code paths). Fix: (1) use a deterministic same-seed init across DP ranks (not independent randn at :164); (2) after the steps loop, for each named local param all_gather across the DP group (ZeRO3Sharder.all_gather_params reconstitutes full params) and assert torch.equal across DP ranks (same-seed init + deterministic even_partition shards must reconstruct identically on every DP rank); (3) assert the union of ZeRO3Sharder shard boundaries covers [0,numel) exactly per param (reuse test_zero3_partition_covers_param_exactly logic on live sharder._shards); (4) file a note to migrate/cross-check the legacy distributed.py path against grokking_optimizers.parallel.* before the 4D run. Converts the smoke test from liveness into a correctness gate without needing the >=70% weak-scaling driver.",
+          "severity": "major",
+          "gpu_needed": true
+        },
+        {
+          "id": "P2-5",
+          "file": "csrc/fused/sm_90/tp_transport.cuh (NvshmemTransport :156-182, tp_allreduce_sum_fixed_order :203-216) + future Par-threaded launcher",
+          "change": "Highest bring-up risk, partially CPU-de-riskable. The decoder TC megakernel launches at exactly 1 CTA/SM with a ZERO-margin occ>=1 launcher guard (megakernel :310-321: cudaOccupancyMaxActiveBlocksPerMultiprocessor; assert occ>=1; else cudaErrorLaunchOutOfResources — because the GridBarrier deadlocks if not all CTAs co-resident). NvshmemTransport adds register pressure inside the persistent kernel: VERIFIED that peer() (:167-173) calls nvshmem_ptr(heap_base,pe) and the ascending-pe reduce loop (:208-214) calls tr.peer(slot_off,pe) PER-ELEMENT inside the inner loop — so the peer-translation is re-done every element, ballooning live registers in the hot loop. CPU pre-work: (1) when TP is wired behind `if constexpr(Par::kTPComm)`, restructure tp_allreduce_sum_fixed_order so nvshmem_ptr peer translation is HOISTED to a per-peer pointer array computed ONCE outside the element loop (keep NvshmemTransport a minimal POD {heap_base,n_pes_,my_pe_} — already minimal at :157-159); (2) pre-stage a -maxrregcount / __launch_bounds__ fallback knob in the build so the engineer can trade registers for occupancy without a code change; (3) add a launcher-level occupancy print of the measured occ + reg/smem for each <...,TP=k,...> instantiation so a failure is diagnosed loudly. The actual occ>=1 verification is GPU-only (Gate 7a).",
+          "severity": "blocker",
+          "gpu_needed": true
+        },
+        {
+          "id": "P2-6",
+          "file": "tests/hw/ (add an automated single-GPU PTX-diff regression gate) + .phase2/RUNBOOK.md",
+          "change": "The byte-identity (dormancy) claim rests on a one-time MANUAL nvcc -ptx diff documented in the patch headers (2026-06-12) — there is NO automated standing gate (verified: no PTX-diff test under tests/; test_parallel_instantiation only compiles parallel_config.cuh's constexpr flags, NOT the megakernel specialized over each ParConfig point). Fix: (1) add a CPU test that nvcc -ptx compiles fused_decoder_megakernel_tc<Opt,SingleGPU> vs <Opt> and asserts byte-identity (modulo the documented scheduling-jitter tolerance), making §1.2 a standing gate not a one-time check; (2) optionally extend test_parallel_instantiation to nvcc -c a tiny TU instantiating the megakernel template over each allow-list ParConfig point (front-loads if-constexpr/ABI breakage). All CPU-authorable.",
+          "severity": "minor",
+          "gpu_needed": false
+        },
+        {
+          "id": "DP-4",
+          "file": "tests/hw/test_sharded_optimizer.py (run_sharded_parity :236-237)",
+          "change": "The DP=1 sharded-opt parity checks m_eq (plane 0) and v_eq (plane 1) but NOT the extra/ema plane state[2*total:3*total] (verified: only m_eq/v_eq at :237). For grokfast the ema plane drives the update; param_eq implicitly validates the ema READ this step, but a bug writing back a wrong ema (correct param this step, wrong stored ema) is not caught at DP=1 — it would only surface at step 2 of test_zero3_roundtrip (which has no real cross-rank reduce). Fix: add `ema_eq = torch.equal(state[2*total:3*total], kstate[2*total:3*total])` for grokfast (opt_id==2) and include in ok/assert (guarded to grokfast since adamw/lion leave the ema plane inert; cache layout is [m|v|extra] per binding make_state). Pure test edit.",
+          "severity": "minor",
+          "gpu_needed": true
+        },
+        {
+          "id": "DP-3",
+          "file": "tests/hw/test_distributed_step.py (worker_main world=2 cross_ok :213-220)",
+          "change": "Same near-tautology as DP-1 through the production-shaped module: `full` is stitched from zero3.allgather_full_params (an all-gather), so cross_ok (:219) compares already-identical tensors. Lower severity than DP-1 because this path also has the strong (b) plain-2-step parity vs an independent reference (:232) and the world=1 bit-identity gate (test_world1_decomposed_identity), which together already pin the module numerics. Fix: apply the DP-1 owned-shard invariant through the module — have fused_train_step_distributed optionally expose the pre-gather owned shard (via ctx.store.shard) and in the world=2 worker assert each rank's owned shard matches the same-positioned slice of the plain reference within tol.",
+          "severity": "minor",
+          "gpu_needed": true
+        },
+        {
+          "id": "DP-5",
+          "file": "tests/hw/ (add a torchrun world=2 tensor-granular gate) — exercises grokking_optimizers/parallel/zero3.py:234-242",
+          "change": "Not a correctness bug (the audit's 'non-contiguous broadcast' premise is FALSE — slices ARE contiguous 1D views of a contiguous full, verified). But the tensor-granular real-NCCL broadcast path (per-tensor optimizers muon/SG11/SG15/SG2) is UNTESTED on real torch.distributed — both the CPU test (test_zero3_plan.py) and the GPU roundtrip (test_zero3_roundtrip.py) only exercise the in-process peers= virtual-rank path and the elementwise all_gather path; the dist.broadcast loop never runs under any gate. Fix: add a torchrun world=2 gate (sibling to test_distributed_step.py, both ranks cuda:0 via the NCCL_HOSTID loopback trick) that builds a tensor_granular plan (e.g. opt='muon' in flat_plan_for_optimizer) and asserts gather_full over the dist.broadcast path reconstitutes the full blob bit-exactly and identically on both ranks, matching the in-process peers= result. Closes the only collective path with zero coverage. Authorable on CPU; runs on the 1-GPU loopback.",
+          "severity": "minor",
+          "gpu_needed": true
+        }
+      ],
+      "bringup_sequence": [
+        {
+          "step": 0,
+          "name": "GATE 0 — Single-GPU PTX-diff / dormancy contract",
+          "command_or_test": "Automated PTX-diff (P2-6): nvcc -ptx fused_decoder_megakernel_tc<Opt,SingleGPU> vs <Opt> byte-identity; python wiring_check.py --require-all; pytest tests/hw/test_parallel_instantiation.py -q (after TP-3 extension)",
+          "go_no_go": "GO iff PTX byte-identical (modulo the documented one-instruction reschedule jitter), wiring_check 33/33, and every allow-list ParConfig point + TP-body TU compiles. ANY PTX delta beyond documented jitter = NO-GO (the dormancy contract is broken; comm code leaked into _ops — STOP, do not proceed).",
+          "gpus_needed": "0 (CPU-runnable now; re-echo on the GPU box)"
+        },
+        {
+          "step": 1,
+          "name": "GATE 1 — sharded-opt DP=1 bit-parity (the correctness anchor)",
+          "command_or_test": "pytest tests/hw/test_sharded_optimizer.py -q (with DP-4 ema-plane check added)",
+          "go_no_go": "GO iff sharded_optimizer_kernel<Opt> over the whole flat set (world=1) is bit-identical (torch.equal, no tol) to the in-kernel P3 tail across all 9 cells {adamw,lion,grokfast}x{decoder,vit,mamba}: param_eq + m_eq + v_eq + ema_eq(grokfast) + grad_unmutated, maxd==0. ANY non-bit-identical cell = NO-GO. This is the anchor for the entire sharded path — nothing cross-rank proceeds until this is green.",
+          "gpus_needed": "1xH100 (sm_90)"
+        },
+        {
+          "step": 2,
+          "name": "GATE 2 — ZeRO-3 round-trip (virtual world=2 slice plumbing + checkpoint)",
+          "command_or_test": "pytest tests/hw/test_zero3_roundtrip.py -q; then the new DP-5 torchrun world=2 tensor-granular broadcast gate",
+          "go_no_go": "GO iff sharded 2-step chain == production 2-step chain bit-exact (torch.equal), save->resume->step bit-identical, drifted-plan/wrong-rank loads RAISE (loud guards fire), AND the DP-5 tensor-granular dist.broadcast path reconstitutes the full blob identically on both ranks. NO-GO if any torch.equal fails or any guard does NOT raise. Depends on GATE 1 (reuses sharded_opt_step).",
+          "gpus_needed": "1xH100 (virtual world via NCCL_HOSTID loopback)"
+        },
+        {
+          "step": 3,
+          "name": "GATE 3 — DP=2 NCCL loopback + cross-rank A/A/A (the real cross-rank correctness gate)",
+          "command_or_test": "torchrun --nproc_per_node=2 tests/hw/test_dp2_loopback_determinism.py (with the DP-1 cross-rank owned-shard-vs-reference invariant added), both ranks cuda:0 via NCCL_HOSTID trick",
+          "go_no_go": "GO iff (NEW DP-1) each rank's PRE-GATHER owned shard matches the same-positioned slice of the single-GPU reference within _PARITY_TOL (3e-5), (b) 3x A/A/A bit-identical on both ranks, (c) within 3e-5 of the unsharded single-GPU step. NO-GO if A/A/A drifts (fixed-order ascending-rank fp32 reduce must be exact) or the owned shard diverges from the reference. Then run test_distributed_step.py world=2 with the DP-3 owned-shard invariant. Depends on GATES 1-2.",
+          "gpus_needed": "1xH100 (2 ranks loopback) — real value also confirmed at 2xH100"
+        },
+        {
+          "step": 4,
+          "name": "GATE 4 — TP via LoopbackTransport (FFN + attention/ColQKV, TP in {2,4})",
+          "command_or_test": "pytest tests/hw/test_tp_loopback.py -q (with the TP-1 attention/ColQKV loopback path added, TP-2 attention parameterized, TP-5 host validator wired)",
+          "go_no_go": "GO iff all 5 invariants pass on BOTH the FFN col->row pair AND the new attention ColQKV->Row pair: cross-rank identity, A/A/A x3, transport-neutrality (==serial chunked-order bit-exact), dW/db slice-exactness, parity-vs-unsharded. NO-GO if the attention reduce ① is not bit-exact or any invariant fails. This binding calls tp_layer.cuh tiles DIRECTLY (not the bit-rotted decoder body) so it is independently buildable — no PP patch dependency. BLOCKED only on the CPU pre-work TP-1/TP-2/TP-5.",
+          "gpus_needed": "1xH100 (TP={2,4} virtual ranks on one GPU)"
+        },
+        {
+          "step": 5,
+          "name": "GATE 5 — PP=2 stage loopback (bit-exact grad/loss vs single-launch fused step)",
+          "command_or_test": "pytest tests/hw/test_pp2_loopback_determinism.py -q (after PP-1 patch regenerated + applied, PP-2/PP-3/PP-5 PP-header regeneration done, PP-4 gate/RUNBOOK refreshed)",
+          "go_no_go": "GO iff concatenated grad (all 30 tensors) + loss bit-identical to the production fused step (return_grad=wgmma), A/A/A x3 bit-identical, ownership matches the Python plan, and the sharded-opt closure (assert d) passes. NO-GO on any non-bitwise result. BLOCKED until PP-1 (regenerate patch 0001 + re-prove PTX identity) AND PP-2+PP-3+PP-5 (regenerate the PP kernel bodies: bind+fill wb cache with a GridBarrier in BOTH kernels, byte-match the workspace carve) are ALL done — all CPU-authorable, MUST land before this gate can even compile. Preflight: `git apply --check 0001` must succeed. The occ>=1 launcher guard will catch any wb-cache+barrier register/smem blowup loudly (refuse, not hang) — watch for cudaErrorLaunchOutOfResources here.",
+          "gpus_needed": "1xH100 (PP=2 on one GPU, zero-copy acts handoff)"
+        },
+        {
+          "step": 6,
+          "name": "GATE 6 — distributed-step module (world=1 identity + world=2 torchrun)",
+          "command_or_test": "pytest tests/hw/test_distributed_step.py -q; torchrun --nproc_per_node=2 (world=2 path)",
+          "go_no_go": "GO iff world=1 decomposed step is bit-identical to the plain fused step, and world=2 is cross-rank bitwise (via the DP-3 owned-shard invariant) + within 3e-5 of the plain 2-step reference. NO-GO on any drift. Depends on GATES 1-3.",
+          "gpus_needed": "1xH100 (2 ranks loopback)"
+        },
+        {
+          "step": 7,
+          "name": "GATE 7 — REAL NVSHMEM device-TP (THE highest-risk gate; occupancy first)",
+          "command_or_test": "Install NVSHMEM toolkit on the 8xH100 image; author csrc/bindings/nvshmem_bootstrap.cu (nvshmem_init keyed to NCCL rank/world for the TP subgroup) + tests/hw/test_tp_nvshmem_gate.py; build with -DSG_HAS_NVSHMEM=1; swap LoopbackTransport->NvshmemTransport at the declared swap point in tp_loopback_binding.cu",
+          "go_no_go": "Verify IN ORDER. 7a (GATE-KEEPER): ptxas -v / cudaOccupancyMaxActiveBlocksPerMultiprocessor for the TP>1 megakernel instantiation MUST still place >=1 CTA/SM the moment NvshmemTransport compiles, BEFORE any multi-GPU run. If occ drops to 0 the launcher hard-refuses (cudaErrorLaunchOutOfResources) — TP doesn't slow down, it FAILS TO LAUNCH. NO-GO on 7a => STOP, apply the P2-5 -maxrregcount/__launch_bounds__ fallback knob + the hoisted-nvshmem_ptr reduce-loop shape, re-measure. 7b: device-TP bit-identical-or-tol to host-NCCL/loopback TP (parity). 7c: cross-rank A/A/A bit-exact x3 across REAL ranks. 7d: device-TP MFU beats host-NCCL-split TP. 7e: GridBarrier+NVSHMEM-barrier coexistence (no deadlock) + NVSHMEM init/teardown vs persistent-kernel/CUDA-graph lifetime. NEVER block the 4D flagship on 7 — host-NCCL TP (DistributedContext.all_reduce_tp) is the fallback; gate device-TP as the LAST increment.",
+          "gpus_needed": "2-8xH100 with NVSHMEM toolkit on the image"
+        },
+        {
+          "step": 8,
+          "name": "GATE 8 — TP insertion into the production megakernel body",
+          "command_or_test": "Insert the tp_layer.cuh tile-TP blocks behind `if constexpr(Par::kTPComm)` at the 4 reduce points (refresh the TP-4 anchors first: out_proj ① ~1548, ff2 ② ~1579, in_proj dX ①' ~1885, ff0 dX ②' ~1856); Par-thread fused_decoder_megakernel.cuh; re-run GATE 0 PTX-diff",
+          "go_no_go": "GO iff the SingleGPU instantiation stays byte-identical (re-run GATE 0 PTX-diff — the defaulted Par<1,1,1,1> kEmitComm=false must fold every comm branch away) AND the TP>1 path passes parity vs GATE 7. NO-GO if SingleGPU PTX changes. Depends on GATE 7 (transport choice).",
+          "gpus_needed": "8xH100"
+        },
+        {
+          "step": 9,
+          "name": "GATE 9 — 4D DPxTPxPP + ZeRO-3 + weak-scaling + cross-rank A/A/A at real DP",
+          "command_or_test": "torchrun --nproc_per_node=8 tests/hw/test_3d_parallel.py (with the DP-2 cross-DP param-identity invariant added); HARDWARE_VALIDATION.md weak-scaling driver 1->8 (and ->32 if multi-node)",
+          "go_no_go": "GO iff weak-scaling efficiency >=70% (1->8/32), cross-DP param identity bitwise (torch.equal across DP ranks after all_gather), ZeRO-3 max-fit/OOM threshold characterized, PP 1F1B bubble acceptable at real stage counts (mb>1 grad-parity is tol-level not bitwise — reassociation across microbatches). NO-GO if weak-scaling <70% or cross-DP param identity is not bitwise. BLOCKED until DP-2 (add the cross-DP param-identity invariant — currently asserts only thr>0) and the legacy-distributed.py vs parallel.* path reconciliation. Depends on GATES 7-8.",
+          "gpus_needed": "8xH100 (multi-node for the ->32 weak-scaling point)"
+        }
+      ],
+      "risks": [
+        "RANK 1 (highest): NVSHMEM-vs-occupancy invariant (Gate 7a). The decoder TC megakernel launches at EXACTLY 1 CTA/SM with a zero-margin occ>=1 launcher guard (fused_decoder_megakernel.cuh:310-321) because the whole-grid GridBarrier deadlocks unless all CTAs are co-resident. NvshmemTransport adds register pressure inside the persistent kernel; VERIFIED that peer() calls nvshmem_ptr() per-element inside the ascending-pe reduce loop (tp_transport.cuh:172 via :212), which balloons live registers in the hot loop. If this pushes reg/smem past the 1-CTA/SM threshold the launcher HARD-REFUSES (cudaErrorLaunchOutOfResources) — TP does not slow down, it fails to launch, blocking everything downstream. Unmeasurable without NVSHMEM on real H100. MITIGATION (CPU now): hoist nvshmem_ptr to a per-peer pointer computed ONCE outside the element loop (P2-5); pre-stage a -maxrregcount/__launch_bounds__ fallback knob; add a launcher occ/reg/smem print. Verify the moment NvshmemTransport compiles, before any multi-GPU run.",
+        "RANK 2: PP bring-up is a kernel-body REGENERATION, not a patch rebase — the most under-scoped item if taken at face value. Verified THREE independent layers all blocking compile: (1) patch 0001 bit-rotted (git apply --check fails at :724; tiles now at :1508/:1747); (2) the live tiles require a non-defaulted `const DecWBf& wb` 2nd positional arg + trailing pipeBars, and the PP call sites (pp_stage_decoder_tc.cuh:147-148,:225-229) use the OLD signature passing dh_in/dh_out (const float*) into the pipeBars slot (unsigned long long*) — type+positional mismatch; (3) the PP kernels never build/bind the bf16 weight pre-stage cache (zero wb/dec_wbf_convert hits) and the workspace carve (:195-196) omits dec_wbf_floats(), so embed lists ALIAS the wbf cache region AND the GEMM B-operand reads uninitialized memory. The fwd kernel additionally has NO GridBarrier (needed once wb is threaded). All CPU-authorable but treating it as 'git apply + 2 args' ships a kernel that compiles-but-reads-garbage, discovered only on expensive 8xH100 time.",
+        "RANK 3: byte-identical workspace carve drift is a recurring failure class (PP-3). The production carve (megakernel.cuh:760-778) and its sizer (:638-655) interpose dec_wbf_floats() between staged_opt and embed_ws; any hand-mirrored carve (PP, and future Par-threaded launchers) silently aliases regions when production evolves. The carve is currently duplicated in 3 places. MITIGATION: factor a shared __device__ dec_tc_bind_workspace() helper called from the production kernel AND both PP kernels — kills the drift class permanently; otherwise re-verify byte-identity on GPU at every production carve change.",
+        "RANK 4: GridBarrier + NVSHMEM-barrier coexistence and NVSHMEM init/teardown vs persistent-kernel/CUDA-graph lifetime (Gate 7e) are genuinely unproven and CANNOT be loopback-tested — irreducible 8xH100 work. Two barrier systems (the hand-built GridBarrier + nvshmemx_barrier_all_block in NvshmemTransport::rendezvous, tp_transport.cuh:175-181) must coexist without deadlock; NVSHMEM lifetime must compose with the persistent megakernel and CUDA-graph capture. The host-NCCL TP fallback (DistributedContext.all_reduce_tp) keeps the 4D flagship shippable if device-TP NO-GOs, so device-TP must be gated LAST and never block the flagship.",
+        "RANK 5: cross-rank determinism gates were near-tautological and the originally-proposed DP fix was WRONG. test_dp2_loopback_determinism assert (a) compares two halves of one all_gather whose input was itself an all_gather (byte-identical by construction); the proposed owned-shard A/A/A fix checks WITHIN-rank determinism (already subsumed by existing assert (b)) — it does NOT test the cross-rank divergence it claims to. The CORRECT fix is a pre-gather cross-rank owned-shard-vs-reference identity (DP-1). If shipped as originally written, a per-rank owned-shard apply bug (wrong slice math, wrong state-plane offset, asymmetric scalar) would pass the cross-rank gate silently and only surface in the tol-level parity-vs-single-GPU check. The fp64-anchored parity (assert c) + the DP=1 bit-parity anchor (Gate 1) carry the real weight until DP-1 lands.",
+        "RANK 6: the 3D-parallel hardware test (Gate 9) asserts only thr>0 with NO numerical invariant AND exercises the LEGACY grokking_optimizers.distributed path, not the grokking_optimizers.parallel.* modules the other gates validate — a divergence between two distributed code paths. A sharding/collective regression in the 7B harness passes silently. MITIGATION: add the DP-2 cross-DP param-identity invariant (same-seed init + all_gather + torch.equal across DP ranks + shard-coverage assert) and reconcile/migrate the legacy path before the 4D run.",
+        "RANK 7: no automated standing PTX-diff regression gate (P2-6). The load-bearing dormancy/byte-identity guarantee (ParConfig<1,1,1,1> kEmitComm=false folds all comm away => single-GPU build byte-identical) rests on a ONE-TIME manual nvcc -ptx diff from 2026-06-12 — now stale, and not re-run automatically. test_parallel_instantiation only compiles parallel_config.cuh's constexpr flags, not the megakernel over each ParConfig point. Any future edit to the decoder body or the Par-threading could silently leak comm code into _ops. MITIGATION: add the automated PTX-diff gate as Gate 0 and re-run it after Gate 8 (Par-threading).",
+        "RANK 8: TP attention/ColQKV shard math is UNVERIFIED by any test (TP-1/TP-2). The loopback gate exercises only the FFN col->row pair; the head-shaped reduce ① (where Megatron attention TP is subtle), the tp_colqkv_full_row index math, and the rank-local attention are asserted only in comments. dectc_attn_fwd_tile is hardcoded to dec::kHeads/kDhead/kD/stride 3*kD and cannot consume a ColQKV-sharded buffer without parameterization. If the device-TP gate (7) runs before TP-1/TP-2 land, it exercises unverified attention shard math simultaneously with the unproven transport — two unknowns at once. MITIGATION: land TP-1/TP-2/TP-5 on the single H100 (Gate 4) BEFORE Gate 7, so the device gate tests only the transport.",
+        "RANK 9 (low): host TpPlan divisibility preconditions are documented-but-unenforced (TP-5). tp_layer.cuh says 'the host plan asserts before launch' but no TpPlan/tp_validate exists — nothing guards H%P==0, d%P, the whole-head ColQKV constraint, or (d/P)%wgmma_atom_K==0. Harmless for the current FFN-only loopback (its local TORCH_CHECK covers kDff%P + 16|dff/P) but the moment attention/in_proj TP lands an invalid TP degree silently produces a non-head-aligned shard. MITIGATION: add tp_validate_decoder_plan (CPU, pairs with TP-1/TP-2)."
+      ],
+      "notes": "VERIFICATION SUMMARY (all checked against live code, READ-ONLY, no edits/builds/GPU):\n\nPP blockers CONFIRMED + the adversarial corrections are RIGHT and folded in. `git apply --check .phase2/patches/0001-...patch` FAILS at :724. Live dectc_forward_tile (:1508) / dectc_backward_tile (:1747) signatures: `(const DecWeights& w, const DecWBf& wb, int g0, ..., float* red, unsigned long long* pipeBars=nullptr)` — non-defaulted `wb` 2nd positional, trailing pipeBars. NO template<Llo,Lhi> in the live header; SG_DECTC_LAYER_RANGE appears ONLY in pp_stage's #ifndef check (not defined). PP call sites (:147-148,:225-229) use the OLD signature and pass dh_in/dh_out into the pipeBars slot (type mismatch). PP carve (:195-196) omits dec_wbf_floats() — embed lists alias the wbf cache region. PP fwd kernel has NO GridBarrier. Production carve verified at megakernel :760-778 + sizer :638-655 (wbf interposed between staged_opt and embed_ws); P0 wb fill + B0 fence at :805-818. => PP is a kernel-body REGENERATION (3 layers), not a patch rebase.\n\nPROVENANCE CORRECTION CONFIRMED: pipeBars is in ZERO .regpressure patches (it came from committed cp.async-ring work, not regpressure/0005). Reconcile against the live committed header.\n\nPP-5 OVERTURNED (adversarial correction holds): the fwd kernel does NOT reference wb today (zero hits), so there is no current race; the race + the (also-missing) GridBarrier are consequences of the wb-threading regeneration. Re-scoped accordingly.\n\nDP-1/P2-3 FIX CORRECTED (adversarial correction holds): the originally-proposed within-rank owned-shard A/A/A is wrong/redundant (subsumed by existing assert (b)); the correct fix is a pre-gather CROSS-RANK owned-shard-vs-reference identity. _run_decomposed_step returns `out` built from all_gather_into_tensor (:263) so runs[0] is byte-identical cross-rank before assert (a) runs (:337-344) — verified.\n\nTP all gaps CONFIRMED: loopback drives only FFN ff0/ff2 (binding :120-153); dectc_attn_fwd_tile hardcoded to dec::* (:1437-1475); test_parallel_instantiation only includes parallel_config.cuh; line anchors stale (header 2595, comment says 1946); no TpPlan/tp_validate exists. P2-5 reg-pressure shape CONFIRMED: peer()/nvshmem_ptr re-called per-element in the reduce loop (:172 via :212).\n\n3D test CONFIRMED: asserts only thr>0 (:295), uses legacy grokking_optimizers.distributed (:34). DP-4 CONFIRMED: only m_eq/v_eq, no ema plane (:237). P2-6 CONFIRMED: no automated PTX-diff gate exists. Occupancy guard CONFIRMED at megakernel :310-321 (assert occ>=1, refuse with cudaErrorLaunchOutOfResources).\n\nAUDIT CLAIM (d) RE-ADJUDICATED: the original audit (d) is now TRUE on the live tree — test_decoder_kernel_mirror_matches_oracle IS a real test function (tests/hw/test_decoder_tc.py:341, consumes tests/hw/decoder_kernel_mirror.py). The adversarial subsystem-4 correction calling (d) 'unverified state drift / no such test' was itself stale; the test exists. Minor, non-blocking — noted for the record.\n\nDORMANCY CONTRACT VERIFIED INTACT: ParConfig<1,1,1,1> kIsSingleGPU + kEmitComm=!(DP==1&&TP==1&&PP==1&&SP==1) folds all comm; the decoder launcher is still the non-Par <Opt> overload — Phase-2 is genuinely NOT wired into _ops. All scoped_fixes are zero-risk to the shipped _ops (test/JIT-only edits + defaulted-template kernel edits that PTX-diff confirms byte-identical for SingleGPU).\n\nCRITICAL PATH: Gates 0-1-2-3-4-6 run on 1xH100 today with only CPU fixes (DP-1 strengthen, TP-1/2/3/5, DP-4/5). Gate 5 (PP) is BLOCKED on CPU fixes PP-1+PP-2+PP-3+PP-5 (all authorable now, no GPU to author; GPU only to bit-verify). Gates 7-9 are the genuine 8x residual; Gate 7a (NVSHMEM occupancy) is the first thing to check the moment NVSHMEM+8xH100 land, with the P2-5 register-fallback knob pre-staged. Recommended CPU pre-work order before hardware: PP-1 -> PP-2/PP-3/PP-5 -> PP-4 (unblocks Gate 5); TP-2 -> TP-1 -> TP-5 -> TP-3 (unblocks Gate 4 attention coverage); DP-1, DP-2, DP-4, DP-5 (strengthen Gates 1-3,9); P2-5 reduce-loop reshape + fallback knob (de-risk Gate 7a); P2-6 PTX-diff gate (standing dormancy guard).\""
+    },
+    "subsystems_verified": 4,
+    "claims_overturned": 5
+  }
+}
