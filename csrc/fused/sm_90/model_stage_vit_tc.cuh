@@ -161,7 +161,12 @@ namespace wgs = ::sg::sm90::wgs;
 //    n_tiles,T)). No atomics, no ragged reduce. ⇒ OFF = byte-identical; ON = a
 //    NEEDS-PARITY swept dim, the GPU fp64 + A/A/A gate is the arbiter.
 #ifndef SG_TUNED_VIT_P1_SUBTILE_S
-#define SG_TUNED_VIT_P1_SUBTILE_S 64
+// BAKED default 64->8 (2026-06-17): gate verdict from the B1 flip-gate sweep.
+// S=8 is parity-clean (11/11 ViT cells x 3 seeds {42,7,123}; A/A/A held — S is a
+// fixed deterministic partition) AND fastest: 4.02x vs S=64 OFF at d=2048/B=1024
+// (B1_barrier 51.2%->41.9%; the U-curve inflects at 8 — S=4 ticks back +1.2%).
+// The #1 perf lever (was 51% of the ViT step). Final confirm-build on return.
+#define SG_TUNED_VIT_P1_SUBTILE_S 8
 #endif
 
 namespace vittc {
