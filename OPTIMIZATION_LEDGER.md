@@ -60,6 +60,23 @@ compile.py vs regular nvcc @ d=2048 (adamw/decoder, `20013f7`): **A→B = +0.43%
 ## Track E — dW contiguous-layout staging: **KEEP +2.05× — the campaign's first major structural win** (2026-06-16)
 The Track-E redirect lever (after the P0 pipelining revert). `SG_TUNED_DEC_DW_STAGE=1` (Option B, contiguous-layout): a cheap grid-cooperative pre-transpose writes each weight's dY/X **once per step** into K-contiguous scratch → the dW reuses the proven `kRingAsync` cp.async ring (the −14.2% fwd/dX win) instead of the scalar transposed-strided gather. **Measured @ d=2048/B=16384, 3 seeds:** stage=0/sk=1 scalar **1889.8 ms** → stage=1/sk=1 contiguous **920.7 ms = 2.05× faster**; vs production stage=0/sk=2 (1925.5 ms) = **2.09×**. Roofline **2.08% → 4.35% (doubled)**. **fp64 PARITY + A/A/A GATE GREEN: 11/11 decoder cells × seeds {42,7,123}.** Production default set to **stage=1, splitk=1** — **SUPERSEDES the Track-C split-K=2 KEEP** (split-K was a scalar-dW grid-fill mitigation; with fast staging the single-CTA dW wins). **Mechanism validated:** the dW was staging-bound (~97% staging) → fixing the *staging* (not pipelining the MMA, the reverted P0) was the lever. **KEY REFRAME: the megakernel's ~2% roofline was a STAGING artifact, not a hardware ceiling.** Next: the same fix on ViT dW (even more staging-dominated → likely a bigger win) + Mamba.
 
+## Track E — decoder fwd/dX deeper cp.async ring: **KEEP +1.49× — the campaign's 2nd major structural win** (2026-06-17)
+`SG_TUNED_DEC_FWD_PIPE=1, SG_TUNED_DEC_FWD_STAGES=4` — deepen the proven `kRingAsync` cp.async ring
+(mechanism (a), NOT the P0 producer/consumer engine). Drain-bound CONFIRMED first via the new `--fwd-fine`
+sub-profiler (fwd ring WAIT 43% vs WGMMA 31%; dX WAIT 56% vs 20%) → deeper prefetch hides the cp.async
+drain. Unblocked by the **DecTcSmem static→dynamic conversion** (the deeper ring's smem busts the 48 KB
+STATIC `__shared__` cap; gating DecTcSmem to dynamic at STAGES>2 drops S=3 static 51.3KB→25360B, places at
+1 CTA/SM under the 227 KB dynamic cap). **Measured @ d=2048/B=16384, 3 seeds: PIPE=0 920.6 ms (4.35%
+roofline) → PIPE=1/STAGES=4 618.5 ms (6.475%) = 1.49×.** **fp64 + A/A/A GATE GREEN: 11/11 decoder cells ×
+seeds {42,7,123}.** Production default = PIPE=1/STAGES=4. **Mechanism validated:** fwd/dX are DRAIN-bound —
+the OPPOSITE of the staging-bound dW that sank P0 (you can hide a WAIT behind more in-flight loads; you
+can't hide 97% staging behind 3% MMA). **CUMULATIVE decoder: dW-staging (1889→920) × fwd/dX (920→618) =
+1889→618 ms ≈ 3.05× from session start; roofline 2.08%→6.475%.** Process notes: the fine profiler confirmed
+drain-bound BEFORE building (doctrine); a stale-build false-negative (header edit + SKIP_GENDEPS loses
+ninja header-dep tracking → touch the .cu) initially masked the win; ptxas -v root-caused the smem cap.
+NEXT: STAGES=5+ sweep (cheap, via the screen) + the PIPE=2 producer/consumer tournament entry (gate vs
+STAGES=4, keep the faster) + the B1 barrier (19%, the b1-roadmap workflow).
+
 ## Track E — ViT dW contiguous-staging twin: **REVERT (runtime IMA)** (2026-06-16)
 The verbatim twin of the decoder dW 2× win, ported to the ViT megakernel (`SG_TUNED_VIT_DW_STAGE=1`).
 Authored CPU-only: nvcc codegen EXIT 0 for all configs, **byte-identical PTX when OFF** (proven to
@@ -128,6 +145,17 @@ gave only +4.5% and gate-RED). **Mamba = scan-bound** (M0 projections low-releva
 the decoder lever to ViT (dW twin) and Mamba (M0) BOTH proved wrong. **RULE: profile each model's actual
 bottleneck (wire its per-phase profiler) BEFORE picking its lever — the relevance gate is the guard.** ViT &
 Mamba benches are currently wall-only; wire their profilers (ViT has a latent `g_vit_prof` 6-slot) FIRST.
+
+## ViT bottleneck map (profiled 2026-06-17, d=2048/B=1024) — the lever is B1 LOAD-IMBALANCE, not the GEMMs
+ViT step 5766 ms, 0.18% roofline. Phase split: **B1_barrier 51.2% (5870 ms — DOMINANT)** · P1_bwd 23.7%
+· P1_fwd 21.7% · **P2_dW_GEMM only 3.0%** · grad_asm 0.1% · opt_tail 0.3%. The B1 grid-sync (between P1
+fwd/bwd and P2 dW) eats HALF the ViT step = severe CTA load IMBALANCE — the barrier waits on the slowest
+CTA (summed-phase 11474 ms ≈ 2× wall confirms the fast-CTA idle). VINDICATES the meta-lesson: dW is 3% of
+ViT (why the dW twin gave only +4.5%) → **ViT-maxing = fix the B1 imbalance** (a structural work-distribution
+fix; ~2× headroom if balanced), the #1 ViT lever by far. CROSS-MODEL: the decoder ALSO has B1 imbalance
+(19.2%) → one B1 load-balance fix helps BOTH (huge for ViT, meaningful for decoder). NEXT ViT lever = B1
+work-distribution (design-tournament it). (Profiler wiring = commit bebeb5b; this is the payoff of #4
+front-load-profiling — it killed a wrong ViT excursion before it cost anything.)
 
 ## compile.py audit (2026-06-16) — see COMPILE_AUDIT.md
 11-agent line-by-line audit of the autotuner. Backbone + correctness-gate machinery are
