@@ -26,6 +26,37 @@ if ! CUDA_VISIBLE_DEVICES="" timeout 10m python -m grokking_optimizers.compile -
 fi
 echo "--- preflight OK: $(tail -1 .perf/batch/preflight_selftest.log) ---"
 
+# ---- GPU-WAIT GUARD: self-launch when the GPU is free (the ViT B1 gate done) ----
+# The ViT B1 gate's build phases idle the GPU for <10min; 10 consecutive low
+# readings (= 10min sustained idle) means it is truly done. The other in-flight
+# workflows are read-only/worktree-isolated (no GPU), so the GPU's only user is
+# the ViT B1 gate. Cap at 2h so a stuck gate never blocks the window forever.
+echo "--- waiting for GPU to free (ViT B1 gate) @ $(date -u) ---"
+low=0; waited=0
+while [ "$low" -lt 10 ] && [ "$waited" -lt 7200 ]; do
+  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+  if [ -n "$used" ] && [ "$used" -lt 4000 ]; then low=$((low+1)); else low=0; fi
+  sleep 60; waited=$((waited+60))
+done
+echo "--- GPU free (low=$low, waited=${waited}s) @ $(date -u) ---"
+
+# ---- opportunistically apply the autotuner new-knob registration so the sweep
+#      explores the NEW perf levers (ViT-B1 sub-tile, decoder ring depth/pipe),
+#      not just the converged knobs. Guarded: apply only if it applies clean AND
+#      --self-test still passes; else revert + sweep the existing knobs only. ----
+if [ -f .perf/autotuner_new_knobs.diff ]; then
+  if git apply --check .perf/autotuner_new_knobs.diff 2>/dev/null && git apply .perf/autotuner_new_knobs.diff 2>/dev/null; then
+    if CUDA_VISIBLE_DEVICES="" timeout 10m python -m grokking_optimizers.compile --self-test >/dev/null 2>&1; then
+      echo "--- applied autotuner_new_knobs.diff (sweep WILL explore the new perf levers) ---"
+    else
+      git checkout -- grokking_optimizers/compile.py grokking_optimizers/_tuned_inject.py 2>/dev/null
+      echo "--- autotuner_new_knobs.diff self-test FAILED -> reverted; sweeping existing knobs only ---"
+    fi
+  else
+    echo "--- autotuner_new_knobs.diff did not apply cleanly -> skip; sweeping existing knobs only ---"
+  fi
+fi
+
 # Enable the autotuner (operator kill-switch; removed for this real tuning run).
 rm -f .STOP_TUNING && echo "--- removed .STOP_TUNING (autotuner enabled) ---"
 
