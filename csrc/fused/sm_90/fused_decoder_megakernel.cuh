@@ -387,7 +387,86 @@ struct DecTcSmem {
     alignas(16) __nv_bfloat16 sB[kDecRingStages * SG_TUNED_TILE_N * 16];
     float red[256];
     dectc::DecDwSpec spec[9];
+#if SG_TUNED_DEC_FWD_PIPE == 2
+    // ── DESIGN-TOURNAMENT entry (b): producer/consumer mbarrier words for the
+    //    PIPE=2 fwd/dX engine (tile_pipeline.cuh's full[]+empty[] ring). Two 8-byte
+    //    barriers per stage (a "full" the producer arrives + an "empty" the consumer
+    //    releases), Depth = kDecRingStages stages → 2·Depth words. This member is
+    //    #if-GATED on the MACRO (not a constexpr), so on the shipped PIPE=0|1 builds
+    //    it is ENTIRELY ABSENT — sizeof(DecTcSmem), the kernel's `.shared` PTX, and
+    //    the launcher's static-smem occupancy cert are BYTE-IDENTICAL to every
+    //    shipped build (PTX-proven OFF below). At PIPE=2 it adds 2·Depth·8 ≤ 64 B
+    //    (Depth ≤ 4) on top of the deeper ring's sA/sB — negligible vs entry (a)'s
+    //    SAME ring tiles (the occupancy ceiling is the depth-scaled sA/sB, identical
+    //    for PIPE 1 vs 2; see kDecRingStagesMax). alignas(8): mbarrier words are
+    //    8-byte; the array follows `spec` (8-byte-aligned members) → no prior member
+    //    offset moves. The whole arena still fits the 48 KB STATIC cap at the
+    //    default Depth (=2): sizeof ≈ 18.1 KB at d=128, ≈ 50.5 KB at d=2048/Depth=4
+    //    — the launcher's cudaOccupancyMaxActiveBlocks≥1 cert REFUSES any depth that
+    //    won't place at 1 CTA/SM (no forced launch); see launch_..._tc.
+    alignas(8) unsigned long long pipe_bars[2 * kDecRingStages];
+#endif
 };
+
+// ── DEEP-RING SMEM ALLOCATION GATE (decoder fwd/dX deeper-ring lever) ─────────
+// The static __shared__ DecTcSmem (kernel `sm`, below) is hard-capped at 48 KB on
+// H100 (the per-CTA STATIC smem limit; the larger 228 KB/SM budget is reachable
+// ONLY via the cudaFuncAttributeMaxDynamicSharedMemorySize opt-in on DYNAMIC
+// smem). DecTcSmem.sA/sB grow ∝ the ring depth kDecRingStagesMax = max(fwd/dX
+// ring, dW ring); at the DEFAULT (PIPE=0, S=GEMM_STAGES≤2) and across EVERY legal
+// tuned tile config the static footprint stays < 48 KB (measured maxima, below),
+// so the default emits the BYTE-IDENTICAL static path. The deeper fwd/dX ring
+// (SG_TUNED_DEC_FWD_PIPE=1 with SG_TUNED_DEC_FWD_STAGES≥3) is the ONLY thing that
+// can push DecTcSmem over the 48 KB STATIC cap (e.g. the legal-max tile
+// TILE_M=256/TILE_N=128/IL=4 reaches 49.64 KB at S=4) → the runtime
+// "too many resources requested for launch". So when (and ONLY when) the deeper
+// ring is requested we allocate DecTcSmem from DYNAMIC smem instead, set the
+// per-func dynamic-smem opt-in to its exact sizeof, and certify ≥1 CTA/SM against
+// that real size (see launch_fused_decoder_megakernel_tc). PARITY: dynamic-vs-
+// static is an ALLOCATION change only — identical layout / access pattern / fp32
+// accumulation order / wgmma issue sequence; no math changes.
+//
+// GATE = PIPE && (STAGES>2): preprocessor-expressible (sizeof is not visible to
+// #if), PIPE-gated so PIPE=0 is provably the untouched static path, and STAGES>2
+// is the SUFFICIENT condition — every config that can bust 48 KB does so only at
+// S≥3 (S=2 is static-safe at every legal tile: measured max S=2 = 25.64 KB at
+// TILE_M=256/TILE_N=128/IL=4, and PIPE=1 requires STAGES≥2 so a PIPE=1/S=2 build
+// still takes the static path here). Routing a sub-48 KB S=3 config (e.g. the
+// default-tile S=3 = 25.64 KB) through dynamic smem is harmless (dynamic alloc +
+// the exact-size opt-in + the ≥1-CTA cert are valid at any size ≤ the dynamic
+// cap); the gate trades a tiny launch-path change on the deep ring for keeping
+// the default path byte-clean. Measured sizeof(DecTcSmem) (nvcc sm_90a, this TU):
+//   default TILE_M=128/N=128/IL=2 : S=2 17.64 KB · S=3 25.64 KB · S=4 33.64 KB
+//   legal-max TILE_M=256/N=128/IL=4: S=2 25.64 KB · S=3 37.64 KB · S=4 49.64 KB(*)
+//   (*) the only > 48 KB case in the legal sweep — exactly what the gate routes.
+#if (SG_TUNED_DEC_FWD_PIPE && (SG_TUNED_DEC_FWD_STAGES > 2))
+#define SG_DEC_TC_DYNAMIC_SMEM 1
+#else
+#define SG_DEC_TC_DYNAMIC_SMEM 0
+#endif
+
+// STATIC-PATH CERTIFICATION: whenever the gate is OFF (the default + every config
+// that keeps the static __shared__), DecTcSmem MUST fit the 48 KB static cap, or
+// the kernel would silently fail to launch with the OPAQUE runtime
+// "too many resources requested for launch". Assert it at COMPILE time so a
+// future config that would bust the static cap WITH THE GATE OFF surfaces as an
+// honest build error here (→ widen the gate) instead of a runtime mystery. The
+// dynamic path (gate ON) is bounded by the SM's 228 KB dynamic cap, certified at
+// launch via cudaOccupancyMaxActiveBlocksPerMultiprocessor — not here.
+#if !SG_DEC_TC_DYNAMIC_SMEM
+static_assert(sizeof(DecTcSmem) <= 48 * 1024,
+              "DecTcSmem exceeds the 48 KB STATIC __shared__ cap with the deep-ring "
+              "dynamic-smem gate OFF — this build would hit the runtime 'too many "
+              "resources requested for launch'. Enable the deep ring "
+              "(SG_TUNED_DEC_FWD_PIPE=1) or widen SG_DEC_TC_DYNAMIC_SMEM's gate.");
+#endif
+// DecTcSmem's strongest member alignment is 16 B (alignas(16) on sA, which is the
+// first member and therefore governs the whole object's alignment). The dynamic
+// path reinterpret_casts a `char[]` pool to DecTcSmem&; the extern __shared__ base
+// is 16 B-aligned on sm_90, so the cast is well-defined — assert the requirement.
+static_assert(alignof(DecTcSmem) == 16,
+              "DecTcSmem alignment changed; the dynamic-smem pool cast assumes 16 B "
+              "(matching the extern __shared__ base alignment on sm_90).");
 
 // ── TC workspace layout (carved from tok.workspace; the host sizes it for the
 //    TC path — see dec_tc_workspace_floats). Regions (float units):
@@ -574,7 +653,20 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
                             DecoderTokenCtx tok,
                             float* __restrict__ grad,
                             float lr, int step, FusedOptState st) {
+#if SG_DEC_TC_DYNAMIC_SMEM
+    // DEEP-RING path: DecTcSmem is allocated from DYNAMIC smem (sized at launch to
+    // exactly sizeof(DecTcSmem), opt-in via cudaFuncAttributeMaxDynamicSharedMem-
+    // orySize) so the deeper fwd/dX ring can exceed the 48 KB STATIC __shared__
+    // cap. The extern __shared__ base is 16 B-aligned on sm_90 and DecTcSmem's
+    // alignment is 16 B (static_assert above), so the reinterpret_cast is
+    // well-defined; the placed object has the IDENTICAL layout/footprint as the
+    // static path — this is purely WHERE it lives (dynamic vs static smem), not a
+    // math/layout/access change (parity by construction).
+    extern __shared__ char sg_dectc_pool[];
+    DecTcSmem& sm = *reinterpret_cast<DecTcSmem*>(sg_dectc_pool);
+#else
     __shared__ DecTcSmem sm;
+#endif
     GridBarrier bar = ctx.barrier();
     // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
     // passes through the out-of-line shims (one shared frame, campaign C2). The
@@ -1399,13 +1491,27 @@ cudaError_t launch_fused_decoder_megakernel_tc(
     err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
     if (err != cudaSuccess) return err;
 
-    // Hang-freedom: certify one block/SM occupancy with the ACTUAL dynamic smem
-    // (0 here — DecTcSmem is static). If the static smem + 200-reg consumer
-    // can't place one block/SM, REFUSE (the grid barrier would hang).
+    // Hang-freedom: certify one block/SM occupancy with the ACTUAL dynamic smem.
+    // DEFAULT (static DecTcSmem): 0 dynamic bytes — unchanged. DEEP RING
+    // (SG_DEC_TC_DYNAMIC_SMEM): DecTcSmem lives in DYNAMIC smem, so certify against
+    // its real sizeof — and opt the func in to >48 KB dynamic smem FIRST (the cap
+    // the occupancy query and the launch both honor). If the deeper ring can't
+    // place one block/SM at its real footprint, REFUSE here (the grid barrier
+    // requires ≥1 CTA/SM — proceeding would hang); that is the honest "won't
+    // launch" signal, surfaced as cudaErrorLaunchOutOfResources, not silenced.
+#if SG_DEC_TC_DYNAMIC_SMEM
+    const int dyn_smem = (int)sizeof(DecTcSmem);
+    err = cudaFuncSetAttribute(
+        (const void*)&fused_decoder_megakernel_tc<Opt>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
+    if (err != cudaSuccess) return err;
+#else
+    const int dyn_smem = 0;   // static DecTcSmem — byte-identical to the shipped cert
+#endif
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &occ, (const void*)&fused_decoder_megakernel_tc<Opt>, SG_TC_MEGA_BLOCK,
-        /*dynamicSMemBytes=*/0);
+        /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
 
@@ -1424,7 +1530,11 @@ cudaError_t launch_fused_decoder_megakernel_tc(
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     dim3 grid(launch_ctas), block(SG_TC_MEGA_BLOCK);
-    fused_decoder_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
+    // dynamicSMemBytes: 0 on the default (static DecTcSmem → byte-identical launch);
+    // sizeof(DecTcSmem) on the deep-ring path (dyn_smem, opt-in already set + the
+    // ≥1-CTA cert passed above). Same grid/block/stream either way — 1 CTA/SM (the
+    // persistent grid-barrier requires it) is preserved.
+    fused_decoder_megakernel_tc<Opt><<<grid, block, dyn_smem, stream>>>(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
