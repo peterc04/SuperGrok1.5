@@ -1,0 +1,959 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index 6e6866e..06fbc96 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -6792,6 +6792,19 @@ ORIGIN_POLYHEDRAL = "polyhedral"  # polyhedral-rescheduled source
+ ORIGIN_CUTLASS = "cutlass"       # CUTLASS GEMM emitter
+ ORIGIN_CK = "ck"                 # Composable-Kernel GEMM emitter
+ ORIGIN_FASTMATH = "fastmath"     # additive fast-math flag variant (#6)
++# Level-2 C0 (#27) — the device-fragment FUSION origin. A FUSION candidate
++# emits a __device__ __forceinline__ epilogue functor (NOT a __global__, NOT a
++# host launcher) via ``emit_fragment_source`` and SPLICES it into the persistent
++# megakernel through a #include + an #ifdef'd Out-template-param swap. It is a
++# GENERATED-source variant exactly like synth, so it must clear the same #16
++# strict-oracle gate and ride the same winner source-swap. To keep the existing
++# _SOURCE_GENERATING_ORIGINS / build_jit swap-read keying working byte-for-byte,
++# a FUSION candidate STAMPS ``_LAST_VARIANT_ORIGIN[ckey] = ORIGIN_SYNTH`` (the
++# fragment is a synthesised source) and stashes under the ``"<ckey>:synth"`` key
++# — ORIGIN_FUSION is the conceptual label (reported in logs / used by the
++# fragment-emitter dispatch) while the on-the-wire origin tag remains synth so
++# pick_winner's gate and the swap engage with no new membership wiring.
++ORIGIN_FUSION = "fusion"         # device-fragment epilogue-fusion emitter (#27)
+ 
+ 
+ # Mandate #16 — variant origins that are GENERATED or TRANSFORMED rather
+@@ -6819,6 +6832,27 @@ _SOURCE_GENERATING_ORIGINS: frozenset = (
+     _VALIDATION_REQUIRED_ORIGINS - {ORIGIN_FASTMATH})
+ 
+ 
++def _emitted_source_key(ckey: str, origin: str) -> str:
++    """SINGLE SOURCE OF TRUTH for the ``spec._emitted_sources`` composite key.
++
++    Phase C0.0 keying-bug fix (#27 Level-2) — the emitted-source STASH side
++    (``_variant_macros`` for the fragment/emitter path, the synth/polyhedral
++    timer stamps) and the winner-swap READ side in ``build_jit`` MUST agree on
++    the same key, or the swap silently no-ops and a GENERATED winner ships a
++    TEMPLATE build under its validated timing (the exact #16/P0-3 false-green
++    these gates exist to stop).
++
++    ``build_jit`` already reads ``f"{won_ckey}:{won_origin}"`` (the composite
++    key, generalised over every ``_SOURCE_GENERATING_ORIGINS``), but
++    ``_variant_macros`` historically stashed the emitter source under the BARE
++    ``config_key`` — so the swap could NEVER fire for an emitter-produced
++    winner. Routing BOTH sides through this one helper makes stash-key ==
++    swap-read-key by construction; the ``emitted_source_stash_key_matches_swap_
++    read_key`` self-test pins it so it can never silently drift again.
++    """
++    return f"{ckey}:{origin}"
++
++
+ def pick_winner(all_trials: List[Dict[str, Any]], *,
+                 strict_numerics: bool = False,
+                 allow_nondeterministic: bool = False,
+@@ -8533,6 +8567,15 @@ class BuildSpec:
+     # variant is built from a freshly rendered source file instead of
+     # one fixed source re-compiled with different -D macros.
+     enable_emitter: bool = False
++    # Level-2 C0 (#27) — when True (AND enable_emitter is True), the device
++    # branch of _variant_macros routes the FUSION origin through
++    # ``emit_fragment_source`` instead of the legacy whole-TU
++    # ``emit_variant_source``. The fragment is a __device__ __forceinline__
++    # Out-functor (.cuh) spliced into the persistent megakernel via #include
++    # (NOT a __global__ + host launcher, which is C2-illegal inside the
++    # GridBarrier-coordinated 1-CTA/SM megakernel). Default False ⇒ the legacy
++    # whole-TU emitter is used and behaviour is byte-identical to today.
++    fragment_emitter: bool = False
+     _emitted_sources: Dict[str, Path] = field(default_factory=dict)
+     # Stream D — generative / structural codegen. When True, the variant
+     # timer ALSO tries the OpGraph-based synthesiser for each (optimizer,
+@@ -14630,6 +14673,39 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
+         try:
+             from grokking_optimizers.codegen import (
+                 emit_variant_source, CodegenError)
++            ck = config_key(config)
++            # ── Level-2 C0 (#27) — device-FRAGMENT emitter path. When
++            #    ``spec.fragment_emitter`` is set, route the FUSION origin
++            #    through ``emit_fragment_source``: it emits a __device__
++            #    __forceinline__ Out-functor (.cuh) that is SPLICED into the
++            #    persistent megakernel via #include — NOT a __global__ kernel
++            #    and NOT an extern "C" host launcher (whole-TU host launchers
++            #    are C2-illegal inside the GridBarrier-coordinated 1-CTA/SM
++            #    megakernel). The fragment is a GENERATED source, so it stamps
++            #    origin=ORIGIN_SYNTH (the synthesised-source tag the #16 gate +
++            #    build_jit swap already recognise) and stashes under the SAME
++            #    composite "<ckey>:synth" key the swap reads. The legacy
++            #    whole-TU emit_variant_source path is left intact below for
++            #    host-launchable OPTIMIZER-STEP cells (no regression).
++            if getattr(spec, "fragment_emitter", False):
++                from grokking_optimizers.codegen import emit_fragment_source
++                frag_path, residual = emit_fragment_source(
++                    config, dims, spec.optimizer, spec.arch, spec.out_dir,
++                    splice_name=ck)
++                # Stash under the COMPOSITE "<ckey>:synth" key (via the
++                # single-source-of-truth helper) so build_jit's winner-swap —
++                # which reads f"{won_ckey}:{won_origin}" — can recover this
++                # fragment when its origin wins. Bare-config_key stash would
++                # silently no-op the swap (the #16/P0-3 false-green).
++                spec._emitted_sources[
++                    _emitted_source_key(ck, ORIGIN_SYNTH)] = frag_path
++                # Stamp the GENERATED origin so pick_winner's #16 gate requires
++                # a strict-oracle PASS before this fragment can win, and the
++                # build_jit swap rebuilds the spliced source (never a template
++                # wearing the fragment's timing). FUSION rides the synth tag.
++                _LAST_VARIANT_ORIGIN[ck] = ORIGIN_SYNTH
++                macros_only = resolve_macros(config, dims, target)
++                return macros_only + residual
+             # Stream A: forward the template_overrides map from spec.config
+             # so a user-supplied TOML can redirect (opt, arch) pairs at
+             # custom .j2 files. Falls back to None when the spec has no
+@@ -14640,7 +14716,17 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
+             emitted_path, residual = emit_variant_source(
+                 config, dims, spec.optimizer, spec.arch, spec.out_dir,
+                 template_overrides=overrides)
+-            spec._emitted_sources[config_key(config)] = emitted_path
++            # Phase C0.0 keying-bug fix (#27) — stash under the COMPOSITE
++            # "<ckey>:synth" key (the one build_jit's swap reads), NOT the bare
++            # config_key. The prior bare-key stash silently no-op'd the swap so
++            # a generated winner shipped a TEMPLATE build under its validated
++            # timing (#16/P0-3 false-green). Byte-identical on the real path
++            # today: no emitter/synth origin has won yet (the generative
++            # back-ends are gated), so the stashed value is never consumed by
++            # the swap — this only makes the swap CORRECT for when one does.
++            spec._emitted_sources[
++                _emitted_source_key(config_key(config), ORIGIN_SYNTH)
++            ] = emitted_path
+             macros_only = resolve_macros(config, dims, target)
+             return macros_only + residual
+         except Exception as _swexc:
+@@ -15743,7 +15829,14 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                         f"for {ckey[:24]}: legality is heuristic; every "
+                         f"polyhedral variant is gated behind the strict "
+                         f"on-device oracle (#16/#20).\n")
+-                emitted_source = (spec._emitted_sources or {}).get(ckey)
++                # Phase C0.0 keying-bug fix (#27) — the emitter
++                # (_variant_macros) now stashes under the composite
++                # "<ckey>:synth" key, so the polyhedral feeder reads the SAME
++                # key (via the shared helper) to pick up the rendered source it
++                # transforms. Keeping both on the helper means the feeder can
++                # never silently drift off the emitter's stash key.
++                emitted_source = (spec._emitted_sources or {}).get(
++                    _emitted_source_key(ckey, ORIGIN_SYNTH))
+                 if emitted_source is not None and Path(emitted_source).exists():
+                     _transformed = _polyhedral_expand_variant(
+                         spec, Path(emitted_source), report)
+@@ -15794,7 +15887,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+             variant_sources = [poly_source]
+             _sources_replaced = True
+             _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
+-            spec._emitted_sources[f"{ckey}:polyhedral"] = poly_source
++            spec._emitted_sources[
++                _emitted_source_key(ckey, ORIGIN_POLYHEDRAL)] = poly_source
+             report.write(
+                 f"    [polyhedral] {ckey[:24]}: building transformed schedule "
+                 f"{poly_source.name} (origin=polyhedral — needs oracle PASS "
+@@ -15809,7 +15903,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                     f"{type(exc).__name__}: {exc}\n")
+                 synth_path = None
+             if synth_path is not None:
+-                spec._emitted_sources[f"{ckey}:synth"] = synth_path
++                spec._emitted_sources[
++                    _emitted_source_key(ckey, ORIGIN_SYNTH)] = synth_path
+                 if spec.synth_codegen_prefer_synth_over_template:
+                     # Synth-only: replace template-driven sources with
+                     # the synthesised file. The existing _torch_load
+@@ -17849,7 +17944,14 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
+     won_origin = (_LAST_VARIANT_ORIGIN.get(won_ckey)
+                   if won_ckey else None)
+     if won_ckey and won_origin in _SOURCE_GENERATING_ORIGINS:
+-        gen_src = (spec._emitted_sources or {}).get(f"{won_ckey}:{won_origin}")
++        # Phase C0.0 keying-bug fix (#27) — read under the SAME composite key
++        # the emitter / synth / polyhedral stash wrote, via the single-source-
++        # of-truth helper. Stash key (_variant_macros, _make_variant_timer) ==
++        # this swap-read key by construction; the
++        # emitted_source_stash_key_matches_swap_read_key self-test pins it so
++        # the swap can never again silently miss and ship a template.
++        gen_src = (spec._emitted_sources or {}).get(
++            _emitted_source_key(won_ckey, won_origin))
+         if gen_src and Path(gen_src).is_file():
+             final_sources = [Path(gen_src)]
+             report.write(
+@@ -30844,6 +30946,281 @@ extern "C" void launch_{sanitized}_{shape_str}(
+         f"synthesize_kernel: unsupported vendor={vendor!r} for arch={arch!r}")
+ 
+ 
++# ───────────────────────────────────────────────────────────────────────────
++# Level-2 C0 (#27) — DEVICE-FRAGMENT emitter
++#
++# emit_fragment_source is the generative entry point for FUSION variants. It
++# emits a __device__ __forceinline__ Out-functor (a .cuh fragment) that the
++# persistent megakernel SPLICES IN via #include — NOT a __global__ kernel and
++# NOT an extern "C" host launcher. A whole-TU host-launched kernel (what
++# synthesize_kernel / emit_variant_source produce) is C2-illegal inside the
++# GridBarrier-coordinated 1-CTA/SM megakernel (it cannot invoke a host-launched
++# __global__ device-side); the only legal generated artifact is a device-
++# inlinable fragment dropped in as the engine's ``typename Out`` epilogue
++# accessor.
++#
++# The emit class is restricted to FOLD-ORDER-PRESERVING POINTWISE epilogue ops
++# over the post-wgmma-drain fp32 accumulator: a per-column bias add (out_b[n])
++# and a per-element residual add (Xin[m,n]). These are pure pointwise over the
++# SAME (row,col) index space the GEMM writes — no reduction, no reassociation,
++# no k-loop touch, no bf16-intermediate round — so the ascending-k bit-
++# determinism (C1) holds BY CONSTRUCTION and the folded write is the byte-
++# identical fp32 value at the same address as the separate-pass write. Any op
++# outside this class (a reduce node, a k-loop touch, a bf16-round fold) is
++# REJECTED at emit time (FragmentEmitError) so an illegal fusion can never
++# reach a build.
++# ───────────────────────────────────────────────────────────────────────────
++
++# The pointwise epilogue op kinds the fragment emitter is allowed to fold. Each
++# maps to a one-line C expression contribution added to the raw fp32 GEMM
++# accumulator ``v``. NOTHING that reassociates a sum or crosses the k-loop is
++# here — that is the whole point of the restriction (C1 ascending-k determinism
++# is preserved because the GEMM reduction itself is untouched; we only add a
++# pointwise term to its already-drained fp32 result).
++_FRAGMENT_FOLD_OPS: frozenset = frozenset({"bias_add", "residual_add"})
++
++# Op kinds that are CATEGORICALLY illegal in a device-fragment epilogue fold:
++# any reduction (reassociates the fp32 sum → C1 violation) or any op that would
++# require touching the contraction k-loop / a bf16 intermediate round (changes
++# the bf16-faithful result → fails the fp64/A-A-A gate). Listed explicitly so
++# the rejection is a named contract, not an accident of the allow-list.
++_FRAGMENT_FORBIDDEN_OPS: frozenset = frozenset({
++    "reduce", "scan", "gemm", "scatter", "gather", "layernorm", "softmax",
++})
++
++
++class FragmentEmitError(SynthCodegenError):
++    """Raised when an OpGraph cannot be lowered to a legal device fragment.
++
++    Distinct subclass of ``SynthCodegenError`` so the ``_variant_macros``
++    fall-through (which already catches the synth-error family) treats an
++    illegal-fold the same as any other emitter failure — it warns loudly and
++    drops back to the legacy macros-only / template path rather than shipping
++    an illegal fusion.
++    """
++
++
++def _fragment_validate_fold(opgraph: "OpGraph") -> List["OpNode"]:
++    """Assert ``opgraph`` is a pure fold-order-preserving POINTWISE epilogue.
++
++    Returns the topologically-ordered nodes on success; raises
++    ``FragmentEmitError`` if ANY node is a reduce / scan / gemm / scatter /
++    gather (a reassociating or k-loop-touching op) or an elementwise node whose
++    declared ``fold_op`` is not in ``_FRAGMENT_FOLD_OPS``. This is the
++    static-assert that makes C1 ascending-k bit-determinism hold by
++    construction: the emit class is bias-add + residual-add ONLY, so the GEMM
++    contraction is never re-ordered and no bf16 intermediate round is inserted.
++    """
++    if not isinstance(opgraph, OpGraph):
++        raise FragmentEmitError(
++            f"emit_fragment_source: opgraph must be an OpGraph, got "
++            f"{type(opgraph).__name__}")
++    nodes = opgraph.topological_order()
++    if not nodes:
++        raise FragmentEmitError(
++            "emit_fragment_source: empty OpGraph — nothing to fold")
++    for n in nodes:
++        if n.op_kind in _FRAGMENT_FORBIDDEN_OPS:
++            raise FragmentEmitError(
++                f"node {n.name!r} is op_kind={n.op_kind!r} — a reducing / "
++                f"k-loop-touching op is FORBIDDEN in a device-fragment "
++                f"epilogue fold (it would reassociate the fp32 sum or insert a "
++                f"bf16 round → C1 / fp64-gate violation). Only "
++                f"{sorted(_FRAGMENT_FOLD_OPS)} pointwise folds are legal.")
++        if n.op_kind != "elementwise":
++            raise FragmentEmitError(
++                f"node {n.name!r} has op_kind={n.op_kind!r}; the fragment "
++                f"emitter only lowers pointwise 'elementwise' fold nodes")
++        fold_op = str(n.attrs.get("fold_op", ""))
++        if fold_op not in _FRAGMENT_FOLD_OPS:
++            raise FragmentEmitError(
++                f"node {n.name!r} declares fold_op={fold_op!r}, not in the "
++                f"legal pointwise epilogue set {sorted(_FRAGMENT_FOLD_OPS)}")
++    return nodes
++
++
++def _emit_fragment_functor_cuda(opgraph: "OpGraph",
++                                arch: str,
++                                dtype: str,
++                                splice_name: str) -> str:
++    """Emit the __device__ __forceinline__ Out-functor body (string).
++
++    The functor matches the engine's ``typename Out`` accessor contract
++    (``operator()(int m, int n, float v) const`` — see the unpipelined GEMM
++    engine's out(m,n,v) in model_stage_decoder_tc.cuh) and folds the legal
++    pointwise terms into the raw fp32 GEMM accumulator ``v``:
++
++      * a ``residual_add`` node contributes ``__bfloat162float(Xin[off])`` (a
++        per-element bf16 residual, read at the SAME flat (row,col) address);
++      * a ``bias_add`` node contributes ``out_b[col]`` (a per-column fp32 bias).
++
++    The fold is written for VALID rows (``m < nrows``) only; padding rows of a
++    ragged last tile get the raw GEMM value ``v`` (byte-identical to the
++    separate-pass OFF path AND out-of-bounds-safe, since the residual buffer is
++    sized exactly [nrows, d] with no tile padding). This is the byte-for-byte
++    shape of the hand-authored SynthEpiR1 in the C0 MVP — the emitter
++    reproduces a known-good fragment, it does not invent a new one.
++    """
++    is_hip = (_synth_arch_vendor(arch) == "hip")
++    scalar_t, _, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # bf16 residual
++    nodes = _fragment_validate_fold(opgraph)
++    struct = f"SynthEpiR1_{_synth_sanitize(splice_name)}"
++    has_residual = any(
++        n.attrs.get("fold_op") == "residual_add" for n in nodes)
++    has_bias = any(n.attrs.get("fold_op") == "bias_add" for n in nodes)
++    # Build the fold expression as the byte-identical grouping of the hand
++    # pass: work[off] = v + (residual + bias). Parenthesise the added terms
++    # together so the fp32 grouping matches the separate-pass
++    # ``work[off] += residual + bias`` exactly.
++    terms: List[str] = []
++    if has_residual:
++        terms.append("__bfloat162float(Xin[off])")
++    if has_bias:
++        terms.append("out_b[col]")
++    if not terms:
++        raise FragmentEmitError(
++            "emit_fragment_source: no foldable term (need at least one of "
++            "residual_add / bias_add)")
++    added = " + ".join(terms)
++    fold_line = (f"work[off] = v + ({added});"
++                 if len(terms) > 1 else f"work[off] = v + {added};")
++    # The bf16 residual pointer is only declared when a residual_add is folded.
++    xin_field = (f"    const {scalar_t}* __restrict__ Xin;      "
++                 f"// per-element residual ([nrows, d])\n"
++                 if has_residual else "")
++    out_b_field = ("    const float* __restrict__         out_b;    "
++                   "// per-column bias ([d])\n" if has_bias else "")
++    fold_ops_present = ", ".join(
++        sorted({str(n.attrs.get("fold_op")) for n in nodes}))
++    return f"""// AUTO-GENERATED by emit_fragment_source (#27 Level-2 C0) — DO NOT EDIT
++// Device-FRAGMENT: a __device__ __forceinline__ Out-functor spliced into the
++// persistent megakernel via #include. NOT a __global__ kernel; NOT an
++// extern "C" host launcher (C2-illegal inside the 1-CTA/SM megakernel).
++// Splice: {splice_name}
++// Arch: {arch}, dtype: {dtype}, fold ops: {fold_ops_present}
++// Fold (pointwise, fold-order-preserving, C1-clean by construction):
++//   work[m*d+col] = v + (residual + bias)   for valid rows (m < nrows)
++//   work[m*d+col] = v                        for padding rows (OOB-safe)
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++
++template <int N>
++struct {struct} {{
++    float* __restrict__               work;     // GEMM fp32 output base ([kTileM, d])
++{xin_field}{out_b_field}    int                               d;        // = Nout (out_proj N == kD)
++    int                               nrows;    // valid rows in this tile
++    int                               col_base; // current n-tile global column (n0)
++    __device__ __forceinline__ void operator()(int m, int n, float v) const {{
++        const int col = col_base + n;
++        const long long off = (long long)m * d + col;
++        if (m < nrows) {fold_line}
++        else           work[off] = v;   // padding row: raw GEMM (== OFF path)
++    }}
++}};
++"""
++
++
++def emit_fragment_source(config: Dict[str, Any],
++                         dims: List[Dict[str, Any]],
++                         optimizer: str,
++                         arch: str,
++                         out_dir: Path,
++                         splice_name: str,
++                         opgraph: Optional["OpGraph"] = None,
++                         ) -> Tuple[Path, List[str]]:
++    """Emit a __device__ __forceinline__ epilogue-fusion FRAGMENT (.cuh).
++
++    This is the Level-2 C0 (#27) generative entry point. Unlike
++    ``emit_variant_source`` (which renders a whole __global__ + extern "C"
++    host launcher TU — C2-illegal inside the persistent megakernel), this emits
++    a device-inlinable Out-functor the megakernel splices in via #include.
++
++    Parameters
++    ----------
++    config, dims, optimizer, arch : as ``emit_variant_source`` (config/dims
++        supply the residual macros host code may still need; the FRAGMENT body
++        itself is geometry-independent — ``operator()`` takes the tile dims as
++        runtime args).
++    out_dir : directory the ``epi_<key>.cuh`` fragment is written to.
++    splice_name : the ckey-shaped name baked into the struct identifier so the
++        emitted functor is uniquely named per variant (no ODR clash across
++        coexisting candidate builds).
++    opgraph : the fold OpGraph to lower. Defaults to the C0 MVP r1 fold
++        (residual_add + bias_add) when None — the one provably bit-identical,
++        perf-positive epilogue fusion (the demonstration vehicle). The default
++        is built here so the FUSION origin has a working pattern end-to-end
++        without the caller having to assemble the OpGraph.
++
++    Returns
++    -------
++    (Path, residual_macros) — the emitted ``.cuh`` path (NEVER a ``.cu``) and
++    the host-side residual macros (same contract as ``emit_variant_source`` so
++    the ``_variant_macros`` call site is signature-compatible).
++
++    TODO (net-net progress beyond this skeleton): (1) generalise ``opgraph`` so
++    the fusion-pattern library (r1, r2 residual+bias; ff0 gelu) maps to per-site
++    operand descriptors instead of the single baked default; (2) wire the ViT /
++    Mamba twins behind their own SG_TUNED_*_EPI seams once the decoder coupling
++    is validated end-to-end (gate the expansion on the decoder verdict per the
++    spec); (3) emit the matching engine call wrapper (dectc_gemm_fwd_f32_epi_r1)
++    as a sibling fragment so the splice seam can #include both the functor AND
++    its caller from one generated source.
++    """
++    # The fp32-output epilogue stores RAW fp32 (no bf16 round on the out_proj
++    # fwd_f32 path), so the fragment's accumulator dtype is fp32; the residual
++    # it folds in is a bf16 tensor (read + up-converted per element). dtype here
++    # selects the residual scalar spelling (bf16) via _synth_dtype_triple.
++    dtype = "bf16"
++    if opgraph is None:
++        # C0 MVP default — the r1 residual+bias fold: the single fusion that is
++        # provably C1-clean (pure pointwise over the GEMM's (row,col) space, no
++        # reduction, no reassociation, no bf16 round) AND perf-positive (removes
++        # a full nrows*d smem write+read pass + one __syncthreads per layer).
++        opgraph = OpGraph(
++            inputs={
++                "v":     ("float", ()),
++                "Xin":   ("bf16", ()),
++                "out_b": ("float", ()),
++            },
++            nodes=[
++                OpNode(
++                    op_kind="elementwise",
++                    name="r1_residual",
++                    inputs=["v", "Xin"],
++                    output="t0",
++                    attrs={"fold_op": "residual_add",
++                           "expr": "v + __bfloat162float(Xin)"},
++                ),
++                OpNode(
++                    op_kind="elementwise",
++                    name="r1_bias",
++                    inputs=["t0", "out_b"],
++                    output="r1",
++                    attrs={"fold_op": "bias_add",
++                           "expr": "t0 + out_b"},
++                ),
++            ],
++            output="r1",
++        )
++    # Legality check + lowering. _emit_fragment_functor_cuda re-runs
++    # _fragment_validate_fold so an illegal OpGraph is rejected before any file
++    # is written (no illegal fragment can ever reach disk / a build).
++    body = _emit_fragment_functor_cuda(opgraph, arch, dtype, splice_name)
++    # Cache by SHA-256(body) so identical (config, arch, opgraph) → same path
++    # (mirrors emit_variant_source's content-addressed scheme; the .cuh rides
++    # into the megakernel's #include closure → source hash → cache key
++    # automatically, so a stable name is all that is required).
++    key = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
++    out_dir = Path(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    out_path = out_dir / f"epi_{_synth_sanitize(splice_name)}_{key}.cuh"
++    if not out_path.exists():
++        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
++        tmp.write_text(body, encoding="utf-8")
++        tmp.replace(out_path)
++    return out_path, _compute_residual_macros(config, dims)
++
++
+ def _synth_cache_key(pattern_name: str, arch: str, dtype: str,
+                      attrs: Dict[str, Any]) -> str:
+     """SHA-256(pattern + arch + dtype + canonical-JSON(attrs))[:16].
+diff --git a/scripts/check_math_single_source.py b/scripts/check_math_single_source.py
+index 2a0a649..1a6ab6f 100644
+--- a/scripts/check_math_single_source.py
++++ b/scripts/check_math_single_source.py
+@@ -69,6 +69,47 @@ OPTS = [
+ # fail on drift, forcing a deliberate --update-manifest (the same acknowledgement
+ # discipline as the canonical-math hashes).
+ BINDINGS_CPP = "csrc/bindings/bindings.cpp"
++
++# ---------------------------------------------------------------------------
++# SuperGrok2 hand-written meta-net drift guard (MISS-3 / oracle_trust_audit).
++#
++# opt_stage_supergrok2.cuh is the largest hand-written optimizer meta-net surface
++# and was, until now, scanned by NOTHING (it is exempted from the fused-consumer
++# assertion via SG2_SEPARATE_PATH because its tail uses the separate
++# launch_csa_hca path, not opt_components.cuh). The header DOES route CSA/HCA
++# attention + compress + the apply through CANONICAL csrc/algorithms/supergrok2.h
++# functions (sg2_csa_compress_kv / sg2_hca_compress_kv / sg2_csa_index_score /
++# sg2_attention_score_and_accumulate / sg2_apply_step — single-sourced, asserted
++# below), but the matrix-GRU forward (S3) and PEER routing+experts (S4) are
++# HAND-WRITTEN per-element sequential dot products + expf/tanhf with NO canonical
++# per-element twin in supergrok2.h (the header itself admits this, ~L136-141).
++#
++# Routing S3/S4 through new canonical algo:: fns would mean authoring those fns +
++# rewriting the kernel (a GPU-compile change, un-verifiable on CPU). Until that
++# lands, we BIND the hand-written math with a content-hash drift guard: the
++# normalized bodies of sg2_stage_gru (the z/r/h̃ gate math + gate ORDER) and
++# sg2_stage_peer (the product-key top-k, softmax TEMPERATURE ×10, k×k routing,
++# expert MLP) are hashed into the manifest under "sg2_handwritten_regions". A
++# silent edit — a z/r gate swap, a changed PEER softmax temperature, a wrong
++# expert-index contraction — now FAILS the guard, forcing a deliberate
++# --update-manifest (the same acknowledgement discipline as the canonical-math
++# hashes). This closes the combined hole MISS-3 names: SG2's heaviest math was
++# both unscanned for drift AND co-validated by an oracle that mirrors the kernel.
++SG2_STAGE_HEADER = "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
++# The two hand-written meta-net stages with no canonical per-element twin; their
++# bodies are pinned by hash. (The CSA/HCA/apply stages are single-sourced via the
++# CANONICAL-CALL assertion in _check_sg2_handwritten — they need no body hash.)
++SG2_HANDWRITTEN_FUNCS = ("sg2_stage_gru", "sg2_stage_peer")
++# Canonical csrc/algorithms/supergrok2.h functions the stage header MUST CALL
++# (rather than re-inline) for the single-sourced CSA/HCA/index/apply math. A
++# missing call means the header has re-inlined canonical math → drift.
++SG2_CANONICAL_CALLS = (
++    "sg2_csa_compress_kv",      # CSA weighted-pool K/V
++    "sg2_hca_compress_kv",      # HCA mean-pool K/V
++    "sg2_csa_index_score",      # low-rank indexer score qI·kI/sqrt(rank)
++    "sg2_attention_score_and_accumulate",  # online-softmax attention
++    "sg2_apply_step",           # the canonical Adam/grokfast apply tail
++)
+ # [Task #10] The eager per-op pybind entrypoints (<opt>_fused_step) were REMOVED —
+ # production routes through the unified fused_step / sg2_fused_step ABI, which is
+ # not a drop-in for the per-function-body hash mechanism. So BINDING_FUNCS is now
+@@ -165,6 +206,80 @@ def _extract_function_body(src: str, fn_name: str) -> str:
+     return ""  # unbalanced — treated as "not found"
+ 
+ 
++def _extract_device_function_body(src: str, fn_name: str) -> str:
++    """Return the full text of a CUDA `__device__`/`__forceinline__` function
++    definition `fn_name` (signature .. matching `}`), for the SG2 hand-written
++    stage functions which are `template<...> __device__ __forceinline__ void
++    sg2_stage_<x>(...)` rather than the host return types _extract_function_body
++    handles. Matches a definition line where `void <fn_name>(` follows a
++    `__device__`/`__forceinline__`/`__host__`/`static`/`inline` qualifier on the
++    same line (so a forward-declaration prototype `void fn(...);` with no body, or
++    a comment that merely names the function, is not mistaken for the body — the
++    brace walk requires a `{`). Reuses the same comment/string-aware brace matcher.
++    Returns "" if not found."""
++    sig = re.compile(
++        r"(?:^|\n)[ \t]*(?:__device__|__host__|__forceinline__|static|inline|[ \t])+"
++        r"void[ \t]+" + re.escape(fn_name) + r"[ \t]*\(")
++    m = sig.search(src)
++    if not m:
++        return ""
++    start = m.start() if src[m.start()] != "\n" else m.start() + 1
++    i = m.end()
++    n = len(src)
++    while i < n and src[i] != "{":
++        i += 1
++    if i >= n:
++        return ""
++    depth = 0
++    j = i
++    in_line_comment = False
++    in_block_comment = False
++    in_str = None
++    while j < n:
++        c = src[j]
++        nxt = src[j + 1] if j + 1 < n else ""
++        if in_line_comment:
++            if c == "\n":
++                in_line_comment = False
++        elif in_block_comment:
++            if c == "*" and nxt == "/":
++                in_block_comment = False
++                j += 1
++        elif in_str is not None:
++            if c == "\\":
++                j += 1
++            elif c == in_str:
++                in_str = None
++        elif c == "/" and nxt == "/":
++            in_line_comment = True
++            j += 1
++        elif c == "/" and nxt == "*":
++            in_block_comment = True
++            j += 1
++        elif c == '"' or c == "'":
++            in_str = c
++        elif c == "{":
++            depth += 1
++        elif c == "}":
++            depth -= 1
++            if depth == 0:
++                return src[start:j + 1]
++        j += 1
++    return ""
++
++
++def _sg2_region_hash(fn_name: str) -> str:
++    """SHA-256 of the comment/whitespace-stripped SG2 hand-written stage body.
++    Empty body hashes to a sentinel so a vanished/renamed function is DETECTED as
++    drift (not silently skipped) — identical discipline to _binding_region_hash."""
++    body = _extract_device_function_body(_read(SG2_STAGE_HEADER), fn_name)
++    return hashlib.sha256(_strip_comments_ws(body).encode()).hexdigest()
++
++
++def current_sg2_region_hashes() -> dict:
++    return {fn: _sg2_region_hash(fn) for fn in SG2_HANDWRITTEN_FUNCS}
++
++
+ def _binding_region_hash(fn_name: str) -> str:
+     """SHA-256 of the comment/whitespace-stripped binding-function body. Empty
+     string hashes to a sentinel so a vanished function is DETECTED as drift
+@@ -340,6 +455,46 @@ def scan_reinlined_math(path: str) -> list:
+     return hits
+ 
+ 
++def check_sg2_structural() -> list:
++    """Structural single-source teeth for the SG2 stage header (MISS-3 (1)):
++      * it MUST exist and #include the canonical csrc/algorithms/supergrok2.h
++        (the CSA/HCA/index/apply math lives there);
++      * it MUST CALL every SG2_CANONICAL_CALLS symbol (comment-stripped, so a name
++        mentioned only in a doc comment cannot fake-pass) — a missing call means
++        that canonical stage was re-inlined instead of called → drift;
++      * the two hand-written stages (sg2_stage_gru/sg2_stage_peer) MUST be
++        present (their bodies are pinned by the manifest hash in check()).
++    Returns a list of failure strings (empty = OK)."""
++    failures = []
++    src = _read(SG2_STAGE_HEADER)
++    if not src:
++        failures.append(
++            f"[sg2-structural] {SG2_STAGE_HEADER} is missing/empty — the SG2 "
++            f"hand-written meta-net drift guard is disabled. Restore the file.")
++        return failures
++    if _canonical_header("supergrok2") not in src:
++        failures.append(
++            f"[sg2-structural] {SG2_STAGE_HEADER} does NOT #include the canonical "
++            f"{_canonical_header('supergrok2')} (the CSA/HCA/index/apply math "
++            f"would be reimplemented → drift). Add the #include.")
++    code = _strip_comments_ws(src)
++    for sym in SG2_CANONICAL_CALLS:
++        if sym not in code:
++            failures.append(
++                f"[sg2-structural] {SG2_STAGE_HEADER} does NOT CALL the canonical "
++                f"sg2alg::{sym} (it must route this stage through "
++                f"{_canonical_header('supergrok2')}, not re-inline it → drift). "
++                f"Restore the call.")
++    for fn in SG2_HANDWRITTEN_FUNCS:
++        if not _extract_device_function_body(src, fn):
++            failures.append(
++                f"[sg2-structural] hand-written stage `{fn}` not found in "
++                f"{SG2_STAGE_HEADER} (removed/renamed?). The GRU/PEER drift guard "
++                f"can no longer bind its math. If intentional, update "
++                f"SG2_HANDWRITTEN_FUNCS and --update-manifest.")
++    return failures
++
++
+ def normalized_math_hash(opt: str) -> str:
+     """SHA-256 of the comment/whitespace-stripped canonical header."""
+     body = _read(_canonical_header(opt))
+@@ -356,12 +511,17 @@ def update_manifest() -> int:
+                    "csrc/algorithms/<opt>.h math (`hashes`) AND of the pybind "
+                    "binding entrypoints in csrc/bindings/bindings.cpp "
+                    "(`binding_regions`: boundary guards + bias-correction + "
+-                   "argument plumbing). Regenerate with `--update-manifest` ONLY "
++                   "argument plumbing) AND of the hand-written SuperGrok2 GRU/PEER "
++                   "stages in csrc/fused/sm_90/opt_stage_supergrok2.cuh "
++                   "(`sg2_handwritten_regions`: matrix-GRU gate math + PEER "
++                   "routing/softmax-temp/expert-MLP that have no canonical "
++                   "per-element twin). Regenerate with `--update-manifest` ONLY "
+                    "when intentionally changing the canonical math (and after "
+-                   "syncing the gfx942/TPU re-expressions) or the binding "
+-                   "entrypoints.",
++                   "syncing the gfx942/TPU re-expressions), the binding "
++                   "entrypoints, or the SG2 hand-written stages.",
+                    "hashes": current_hashes(),
+-                   "binding_regions": current_binding_hashes()},
++                   "binding_regions": current_binding_hashes(),
++                   "sg2_handwritten_regions": current_sg2_region_hashes()},
+                   f, indent=2, sort_keys=True)
+         f.write("\n")
+     print(f"manifest updated: {MANIFEST}")
+@@ -408,9 +568,11 @@ def check(structural_only: bool = False) -> list:
+                         f"{FUSED_CONSUMER} does not #include "
+                         f"{_canonical_header(opt)} — EXPECTED: SuperGrok2's "
+                         f"fused tail uses the separate launch_csa_hca path, not "
+-                        f"opt_components.cuh. (SG2 single-source is still "
+-                        f"covered by the per-op kernel + canonical-math + "
+-                        f"binding-region hashes.) TODO: unify post-refactor.")
++                        f"opt_components.cuh. (SG2 single-source is now covered by "
++                        f"the dedicated check_sg2_structural() teeth + the "
++                        f"sg2_handwritten_regions GRU/PEER body hashes on "
++                        f"{SG2_STAGE_HEADER}, plus the canonical-math hashes.) "
++                        f"TODO: unify post-refactor.")
+                 continue
+             if _canonical_header(opt) not in fused:
+                 failures.append(
+@@ -469,6 +631,13 @@ def check(structural_only: bool = False) -> list:
+                 f"(csrc/algorithms/supergrok11.h), not be re-typed in the consumer "
+                 f"(re-inlining is exactly how the cos(grad,mu) bug crept in).")
+ 
++    # (1d) SuperGrok2 hand-written meta-net structural single-source: the stage
++    # header MUST #include the canonical supergrok2.h, CALL its CSA/HCA/index/apply
++    # functions, and still contain the two hand-written stages whose bodies the
++    # manifest pins (the GRU/PEER math with no canonical per-element twin). This
++    # closes the long-standing SG2_SEPARATE_PATH blind spot (MISS-3 (1)).
++    failures.extend(check_sg2_structural())
++
+     if structural_only:
+         return failures
+ 
+@@ -512,6 +681,34 @@ def check(structural_only: bool = False) -> list:
+                 f"{recorded_bindings[fn][:12]}). The binding owns the boundary "
+                 f"guards / bias-correction / list plumbing each launcher reads; "
+                 f"if the edit is intentional, --update-manifest.")
++
++    # (2c) SuperGrok2 hand-written GRU/PEER body drift (MISS-3 (1)): the matrix-GRU
++    # gate math + PEER routing/softmax-temp/expert-MLP have no canonical per-element
++    # twin, so their bodies are pinned by hash. A silent edit (z/r gate swap, changed
++    # PEER softmax temperature, wrong expert-index contraction) FAILS here, forcing a
++    # deliberate --update-manifest — the same acknowledgement discipline as the
++    # canonical-math/binding hashes.
++    recorded_sg2 = manifest_data.get("sg2_handwritten_regions", {})
++    cur_sg2 = current_sg2_region_hashes()
++    for fn in SG2_HANDWRITTEN_FUNCS:
++        if fn not in recorded_sg2:
++            failures.append(
++                f"[sg2-region] no recorded hash for {SG2_STAGE_HEADER}::{fn} — "
++                f"run --update-manifest.")
++            continue
++        if not _extract_device_function_body(_read(SG2_STAGE_HEADER), fn):
++            failures.append(
++                f"[sg2-region] hand-written stage {fn} not found in "
++                f"{SG2_STAGE_HEADER} (removed/renamed?). If intentional, update "
++                f"SG2_HANDWRITTEN_FUNCS and --update-manifest.")
++        elif recorded_sg2[fn] != cur_sg2[fn]:
++            failures.append(
++                f"[sg2-region] DRIFT: {SG2_STAGE_HEADER}::{fn} hand-written math "
++                f"changed (hash {cur_sg2[fn][:12]} != recorded "
++                f"{recorded_sg2[fn][:12]}). This is the un-single-sourced "
++                f"GRU/PEER meta-net math (no canonical per-element twin); a silent "
++                f"edit here would pass the SG2 B1 oracle (which mirrors the kernel) "
++                f"and the gate. If the edit is intentional, --update-manifest.")
+     return failures
+ 
+ 
+diff --git a/scripts/optimizer_math_manifest.json b/scripts/optimizer_math_manifest.json
+index acc8343..9d0a868 100644
+--- a/scripts/optimizer_math_manifest.json
++++ b/scripts/optimizer_math_manifest.json
+@@ -1,5 +1,5 @@
+ {
+-  "_doc": "WS2 drift guard: normalized hashes of the canonical csrc/algorithms/<opt>.h math (`hashes`) AND of the pybind binding entrypoints in csrc/bindings/bindings.cpp (`binding_regions`: boundary guards + bias-correction + argument plumbing). Regenerate with `--update-manifest` ONLY when intentionally changing the canonical math (and after syncing the gfx942/TPU re-expressions) or the binding entrypoints.",
++  "_doc": "WS2 drift guard: normalized hashes of the canonical csrc/algorithms/<opt>.h math (`hashes`) AND of the pybind binding entrypoints in csrc/bindings/bindings.cpp (`binding_regions`: boundary guards + bias-correction + argument plumbing) AND of the hand-written SuperGrok2 GRU/PEER stages in csrc/fused/sm_90/opt_stage_supergrok2.cuh (`sg2_handwritten_regions`: matrix-GRU gate math + PEER routing/softmax-temp/expert-MLP that have no canonical per-element twin). Regenerate with `--update-manifest` ONLY when intentionally changing the canonical math (and after syncing the gfx942/TPU re-expressions), the binding entrypoints, or the SG2 hand-written stages.",
+   "binding_regions": {},
+   "hashes": {
+     "adamw": "63b7c22c88a93b0169b108f107a2d92949e267e35543f9d8ea59464525a8a299",
+@@ -13,5 +13,9 @@
+     "supergrok11": "0e7089cd9409ee8bdcf7c6f221d440758a68408a0a1c5889eb97dfbcceff8d6b",
+     "supergrok15": "fcef03e5c3571f4a4965b2e2a2de483d21679a00129ce894f0ad83c9f38599db",
+     "supergrok2": "fdf5c82eb9278b942f83927f8b690e7735a45c76fcbb55b029bc25335e0921a2"
++  },
++  "sg2_handwritten_regions": {
++    "sg2_stage_gru": "af89811a553c39cf73c4ee8cc331812fad2a68ccf36f74cfdaba026327bff654",
++    "sg2_stage_peer": "bb75ffdbd6c45a35dfa380a8a72c66e371df21bda7afad64780e1cd44147768f"
+   }
+ }
+diff --git a/tests/hw/sg2_kernel_mirror.py b/tests/hw/sg2_kernel_mirror.py
+index c2bfc75..a5b76ed 100644
+--- a/tests/hw/sg2_kernel_mirror.py
++++ b/tests/hw/sg2_kernel_mirror.py
+@@ -30,6 +30,23 @@ CUDA kernel path, so that is the 1e-12 target here. The transcendentals match th
+ kernel: ptx_expf (≈ accurate in fp64) is just exp in the mirror; the kernel uses
+ accurate expf in GRU/PEER and ptx_expf in attention/compress, both of which are
+ ordinary exp at fp64 precision, so the mirror/oracle agree exactly in fp64.
++
++DE-MIRRORED CSA INDEXER (oracle_trust_audit / critic MISS-3) — the kernel's CSA
++lightning indexer is INTENTIONALLY low-rank (idx_UQ dropped, score /sqrt(rank)),
++a documented approximation of the CANONICAL full-rank path (supergrok2.py:449-450
++qI=(x@idx_DQ)@idx_UQ, score /sqrt(d); supergrok2_bilevel_adjoint.h:156-159). The
++oracle's B1 single-step attention still uses the low-rank selection so the kernel
++parity holds — but using low-rank ALONE made oracle_step a pure MIRROR of the
++kernel for the CSA top-k (kernel==oracle by construction), so a buggy low-rank
++indexer would pass B1 silently. oracle_step(..., return_fullrank_sel=True) now
++ALSO computes the canonical full-rank selection from an INDEPENDENT transcription
++(_csa_canonical_fullrank_select) and returns BOTH selections; the gate's N>64
++fidelity probe VOTES on the kernel-low-rank-vs-canonical-full-rank divergence
++under a documented tolerance, so the CSA top-k gets the same independent-algorithm
++validation HCA/GRU/PEER/Adam-tail already have. FLAG: the low-rank indexer is an
++INTENDED approximation (the documented won't-grok gap), NOT a bug — it is the
++deliberate kernel design (supergrok2.h:510 `(void)idx_UQ`); the de-mirror exists
++so a future REGRESSION in that low-rank path can no longer hide behind the mirror.
+ """
+ 
+ from __future__ import annotations
+@@ -86,7 +103,11 @@ def make_weights(seed=0, D=Dims):
+         input_proj_W=r(d, 2), input_proj_b=r(d),
+         csa_q_W=r(d, d), csa_k_W=r(d, d), csa_v_W=r(d, d), csa_out_W=r(d, d),
+         csa_compress_w=r(D.csa_window),
+-        csa_idx_DQ=r(d, rk), csa_idx_K=r(d, rk),
++        # idx_DQ/idx_K are [d, rk]; idx_UQ is [rk, d] (the rank-lift the kernel
++        # DROPS but the canonical full-rank reference applies). Included so the
++        # de-mirrored full-rank selection (return_fullrank_sel=True) is exercisable
++        # in the standalone path / --selftest; the kernel low-rank path ignores it.
++        csa_idx_DQ=r(d, rk), csa_idx_K=r(d, rk), csa_idx_UQ=r(rk, d),
+         hca_q_W=r(d, d), hca_k_W=r(d, d), hca_v_W=r(d, d), hca_out_W=r(d, d),
+         gru_Wz=r(gh, xin), gru_bz=r(gh),
+         gru_Wr=r(gh, xin), gru_br=r(gh),
+@@ -691,8 +712,42 @@ def _csa_topk_select(qI, kI, inv_sqrt_rk, topk):
+     return sel
+ 
+ 
++def _csa_canonical_fullrank_select(x_sorted, w, pooled_csa, gather_c, w_eff,
++                                   inv_sqrt_d, topk, D):
++    """CANONICAL full-rank CSA lightning-indexer top-k — the INDEPENDENT reference
++    (NOT a re-statement of the kernel). Transcribed directly from the canonical
++    source supergrok2.py:449-453 / supergrok2_bilevel_adjoint.h:156-159:
++
++        qI     = (x @ idx_DQ) @ idx_UQ            # [N, d]   FULL rank (UQ lifted)
++        kI_tok =  x @ idx_K   @ idx_UQ            # [N, d]
++        c_kI   = pool(kI_tok)                     # [Nc, d]  (same weighted pool)
++        idx_scores = (qI @ c_kI.T) / sqrt(d)      # [N, Nc]  /sqrt(D_MODEL)
++        sel = idx_scores.topk(topk)
++
++    This is the algorithm the kernel deliberately APPROXIMATES with the low-rank
++    form (qI=x@idx_DQ rank-rk, score /sqrt(rank), idx_UQ DROPPED — supergrok2.h:510
++    `(void)idx_UQ`). Returns the canonical selected top-k indices [N, topk] in
++    descending score order, so the gate can VOTE on the kernel-vs-canonical
++    divergence with a documented tolerance instead of mirroring the kernel.
++
++    Requires w['csa_idx_UQ'] ([rk, d]); raises KeyError if absent so a missing
++    UQ mapping is a loud failure, never a silent fall-back to the low-rank mirror.
++
++    NOTE on the kI pooling: the canonical source pools the PER-TOKEN projected
++    kI_tok (x @ idx_K @ idx_UQ then weighted-pool over the window). pooled_csa is
++    the pooled RAW x; we therefore project kI per-token here and re-pool with the
++    SAME (gather_c, w_eff) weights the CSA compression used — faithful to
++    supergrok2_bilevel_adjoint.h:158 `c_kI = pool(kI_tok)`."""
++    idx_UQ = w["csa_idx_UQ"]                                  # [rk, d]
++    qI = (x_sorted @ w["csa_idx_DQ"]) @ idx_UQ                # [N, d] full-rank
++    kI_tok = (x_sorted @ w["csa_idx_K"]) @ idx_UQ            # [N, d] per-token
++    # Re-pool kI_tok with the same window weights used for the CSA K/V compression.
++    c_kI = (kI_tok[gather_c] * w_eff[:, :, None]).sum(axis=1)  # [Nc, d]
++    return _csa_topk_select(qI, c_kI, inv_sqrt_d, topk)       # [N, topk]
++
++
+ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+-                mu, slow, param, scalars, D=Dims):
++                mu, slow, param, scalars, D=Dims, return_fullrank_sel=False):
+     N = grad.shape[0]
+     d = D.d_model
+     hd = D.head_dim
+@@ -717,11 +772,18 @@ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+ 
+     def softmax_pool_csa():
+         # weighted pooled x for each (j, channel) via online softmax over window.
++        # Also returns (gather_c, w_eff) — the [Nc, win] tap-index + per-tap weight
++        # arrays — so the CANONICAL full-rank indexer reference can re-pool its
++        # per-token kI_tok with the IDENTICAL window weights (supergrok2_bilevel_
++        # adjoint.h:158 `c_kI = pool(kI_tok)`), not just the pooled raw x.
+         cw = w["csa_compress_w"]
++        win = D.csa_window
+         out = np.zeros((Nc, d), _F64)
++        gather_c = np.zeros((Nc, win), np.intp)        # tap row (clamped) per (j,wq)
++        w_eff = np.zeros((Nc, win), _F64)              # softmax weight (0 if invalid)
+         for j in range(Nc):
+             base = j * D.csa_compress
+-            taps = [base + wq for wq in range(D.csa_window) if base + wq < N]
++            taps = [base + wq for wq in range(win) if base + wq < N]
+             if not taps:
+                 continue
+             logits = np.array([cw[t - base] for t in taps], _F64)
+@@ -729,7 +791,10 @@ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+             e = np.exp(logits - m)
+             wts = e / e.sum()
+             out[j] = (wts[:, None] * x_sorted[taps]).sum(0)
+-        return out
++            for k, (t, wt) in enumerate(zip(taps, wts)):
++                gather_c[j, k] = t
++                w_eff[j, k] = wt
++        return out, gather_c, w_eff
+ 
+     def meanpool_hca():
+         out = np.zeros((Nh, d), _F64)
+@@ -740,7 +805,7 @@ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+                 out[j] = x_sorted[taps].mean(0)
+         return out
+ 
+-    pooled_csa = softmax_pool_csa()       # [Nc, d]  (pooled raw features)
++    pooled_csa, _csa_gather_c, _csa_w_eff = softmax_pool_csa()   # [Nc, d] pooled raw
+ 
+     def heads(t):
+         return t.reshape(t.shape[0], H, hd)
+@@ -770,11 +835,33 @@ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+     # CSA low-rank indexer top-k (the O(N·Nc) dominant cost — see _csa_topk_select).
+     # Reproduces the same per-row top-`topk` of (qI@kI.T)/sqrt(rk) in descending
+     # score; GPU-accelerated when available, chunked-numpy fallback otherwise.
++    #
++    # IMPORTANT (oracle_trust_audit / MISS-3 de-mirror): the kernel's CSA indexer is
++    # INTENTIONALLY low-rank (idx_UQ dropped, /sqrt(rank) — supergrok2.h:510
++    # `(void)idx_UQ`), a documented approximation of the canonical FULL-rank path
++    # (supergrok2.py:449-450 / supergrok2_bilevel_adjoint.h:156-159). The downstream
++    # CSA attention here uses sel_idx (low-rank) so the B1 single-step parity vs the
++    # kernel holds — but using the low-rank form here ALONE made this oracle a pure
++    # MIRROR of the kernel (kernel==oracle by construction), so a buggy low-rank
++    # indexer consistent with the mirror would pass B1 silently. We therefore ALSO
++    # compute the CANONICAL full-rank selection from an INDEPENDENT transcription of
++    # supergrok2.py (_csa_canonical_fullrank_select) and RETURN it; the gate's N>64
++    # fidelity probe votes on the kernel-low-rank-vs-canonical-full-rank divergence
++    # with a documented tolerance (no longer print-only). So the CSA top-k now gets
++    # the same independent-algorithm validation HCA/GRU/PEER/Adam-tail already have.
+     inv_sqrt_rk = 1.0 / math.sqrt(rk)
+     sel_idx = _csa_topk_select(qI, kI, inv_sqrt_rk, topk)   # [N, topk] descending
+     csa_ctx = online_attn(q_csa, c_kh, c_vh, sel_idx)
+     csa_ctx = csa_ctx @ w["csa_out_W"].T
+ 
++    # CANONICAL full-rank CSA-indexer selection — the INDEPENDENT reference (only
++    # computed when the caller asks for it; the B1 attention above does NOT use it).
++    fullrank_sel = None
++    if return_fullrank_sel and "csa_idx_UQ" in w:
++        inv_sqrt_d = 1.0 / math.sqrt(d)
++        fullrank_sel = _csa_canonical_fullrank_select(
++            x_sorted, w, pooled_csa, _csa_gather_c, _csa_w_eff, inv_sqrt_d, topk, D)
++
+     # HCA
+     pooled_hca = meanpool_hca()
+     q_hca = heads(x_sorted @ w["hca_q_W"].T)
+@@ -878,7 +965,7 @@ def oracle_step(w, grad, sharp, perm, unsort, gru_state, exp_avg, exp_avg_sq,
+     param[...] = p - scalars["lr"] * (update + scalars["wd"] * p)
+ 
+     return dict(expert_out=expert_out_sorted, csa_ctx=csa_ctx, hca_ctx=hca_ctx,
+-                new_gru=new_gru)
++                new_gru=new_gru, lowrank_sel=sel_idx, fullrank_sel=fullrank_sel)
+ 
+ 
+ def make_scalars():
+@@ -984,6 +1071,41 @@ def _selftest(Ns=(16, 256, 1024, 16384, 65536), D=Dims, tol=1e-9, verbose=True):
+                   + ("  (<1.0s req)" if N == 65536 else ""))
+ 
+     _USE_VECTORIZED = True   # restore default fast path
++
++    # ── de-mirror cross-check (oracle_trust_audit Option B): the CANONICAL
++    #    full-rank CSA-indexer selection is an INDEPENDENT transcription, not the
++    #    kernel low-rank mirror. Assert (a) it is a valid top-k (in-range, no dups
++    #    per row), and (b) for N>64 it DIVERGES from the low-rank selection — the
++    #    documented approximation gap. If they coincided everywhere the full-rank
++    #    reference would be a useless mirror; the divergence proves independence. ──
++    fr_ok = True
++    rng = np.random.default_rng(1)
++    for N in (16, 256, 4096):
++        inp = _build_inputs(N, rng)
++        ret = oracle_step(w, inp["grad"], inp["sharp"], inp["perm"], inp["unsort"],
++                          inp["gru_state"], inp["exp_avg"], inp["exp_avg_sq"],
++                          inp["mu"], inp["slow"], inp["param"], scalars, D=D,
++                          return_fullrank_sel=True)
++        fr = ret["fullrank_sel"]; lr = ret["lowrank_sel"]
++        Nc = (N + D.csa_compress - 1) // D.csa_compress
++        k = max(min(D.csa_topk, Nc), 1)
++        valid = (fr is not None and fr.shape == (N, k)
++                 and fr.min() >= 0 and fr.max() < Nc
++                 and all(len(set(row.tolist())) == k for row in fr))
++        # divergence: fraction of rows where the full-rank top-k SET != low-rank set.
++        diff_rows = sum(set(fr[i].tolist()) != set(lr[i].tolist()) for i in range(N))
++        frac = diff_rows / N
++        # For N>64 the low-rank approximation MUST diverge somewhere (independence);
++        # for tiny N (Nc<=topk so all keys selected) the sets can legitimately match.
++        independent = (frac > 0.0) if (N > 64 and Nc > k) else True
++        this_ok = bool(valid and independent)
++        fr_ok = fr_ok and this_ok
++        if verbose:
++            print(f"  [fullrank] N={N:5d}  valid-topk={valid}  "
++                  f"lowrank≠fullrank rows={frac:5.1%}  "
++                  f"{'OK' if this_ok else 'FAIL'}")
++    all_ok = all_ok and fr_ok
++
+     if verbose:
+         print(f"\n  RESULT: {'ALL PASS' if all_ok else 'FAIL'} "
+               f"(tol {tol:.0e}, N=65536 must be < 1.0s)")
