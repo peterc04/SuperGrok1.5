@@ -1,0 +1,27 @@
+{
+  "artifact": "round-2 read-only correctness sweep (loop-until-dry)",
+  "task": "#19 recurring full-codebase audit",
+  "agent": "wof36fue4",
+  "date_utc": "2026-06-17",
+  "method": "directed at the LEAST-covered in-production sm_90 surfaces; refute-by-default; cross-checked TC vs scalar (dec_weights) parity; explicitly verified the gate-blind dimensions (mask / scale / edge-long-seq / build-config)",
+  "verdict": "CLEAN — NO new confirmed correctness bugs",
+  "usage": {"agents": 14, "subagent_tokens": 968610, "tool_uses": 416, "duration_ms": 1502735},
+  "clean_areas": [
+    "attention (decoder causal + vit bidirectional): softmax max-subtract/__expf, mask sc[kj>qi]=-INF excluded from denom, bwd ds[]=0 at masked positions, rsqrtf(kDhead=32) scale IDENTICAL across TC and scalar paths",
+    "embedding + counting-sort owner-scan (decoder_tc:2469-2567): per-worker private histogram, exclusive CSR prefix, ascending-worker base + ascending-t scatter is integer-exact + globally-ascending-t per bucket; invalid rows excluded; wcnt smem fixed by kVocab (does NOT scale with d)",
+    "shared wgmma substrate (wgmma.cuh): descriptor bit-packing matches PTX ISA; LayoutType enum matches CUTLASS (ships NONE); single authoritative frag decode; ascending-k mainloop + fence/commit/wait choreography correct",
+    "launcher arg-wiring + opt_id switch: dispatch.cpp:591-621 maps adamw0..sg2=10; decoder/vit/mamba switches cover 0-9 + sg2, default->cudaErrorInvalidValue (no silent fallback); SG2 state-slice + 26-ptr meta-net bundle bound identically",
+    "build-config / kernel selection: SG_TUNED_GEMM_IMPL hardcoded=1 in shipped launchers (cannot mis-inject wgmma cell); SG_*_BENCH_LAYOUT default 0 + NOT in any injection table (cannot leak to production); TC launcher certifies occupancy>=1 else cudaErrorLaunchOutOfResources",
+    "mamba-3 selective scan: x_proj split offsets static_assert to kXProj; fwd recurrence h_t=alpha*Rh+beta*Rv+gamma*v consistent fwd/bwd-recompute; per-coord state NOT unrolled (documented register-persistence fix); inactive lanes zero-contribute",
+    "split-K dW partition (decoder_tc:2287-2362): floor-balanced k0/k1 sums to KS exactly for KS>=G; empty-chunk guard; production SG_TUNED_DEC_DW_SPLITK=1 => single full-K chunk; deterministic G-chunk reduce",
+    "bias-correction / step handling (opt_components.cuh): bc1/bc2 host-computed + bound via FusedScalars (C2-gap fix); grokfast/grokadamw reseed ema at step==1 (gate-covered path)"
+  ],
+  "standing_real_defects_all_build_surface_none_numerical": {
+    "B1": "macro-table default drift dec 4->1 + mamba macro no longer #defined (_tuned_inject / setup build surface)",
+    "B2": "dead mb_dw_splitk knob",
+    "B3": "dead autotuner ninja-linkage to shipped TUs"
+  },
+  "doc_dead_code_drifts_not_correctness": [
+    "mega_decoder_real_adamw_tc.cu:4-5 stale comment claims scalar TU 'ships as the live path' but dispatch.cpp:835 says it was REMOVED; scalar launch reachable ONLY under #ifdef SG_DEC_SCALAR_MEGAKERNEL/SG_DEC_PROFILE (dead on production, guarded) — remit of task #19 dead-code, not a defect"
+  ]
+}

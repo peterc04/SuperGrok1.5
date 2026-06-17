@@ -1,0 +1,523 @@
+[fast-build-env] caching ON: nvcc->sccache(CUDA) + g++->ccache | nvcc --threads 0 (auto=224) | MAX_JOBS=224 | ninja
+build.sh: MAX_JOBS=224
+build.sh: single-pass build
+Using pip 24.2 from /usr/local/lib/python3.11/dist-packages/pip (python 3.11)
+Obtaining file:///workspace/SuperGrok1.5
+  Checking if build backend supports build_editable: started
+  Running command Checking if build backend supports build_editable
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Running command Preparing editable metadata (pyproject.toml)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `authors = 'Peter C.'`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `authors` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `authors` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `classifiers` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+    corresp(dist, value, root_dir)
+    CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+    Compiler launcher: ccache -> /usr/bin/ccache
+    Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+  Building Grokking Optimizers C++/CUDA extension
+    CUDA version: 12.4
+    CUDA gencode archs (toolchain-probed): ['90a'] (+PTX 90)
+    NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+    CUTLASS enabled for archs: ['90a']
+  running dist_info
+  creating /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info
+  writing /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/PKG-INFO
+  writing dependency_links to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/dependency_links.txt
+  writing requirements to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/requires.txt
+  writing top-level names to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/top_level.txt
+  writing manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+  warning: no previously-included files matching '*.pyc' found anywhere in distribution
+  warning: no previously-included files matching '*.pyo' found anywhere in distribution
+  warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+  no previously-included directories found matching 'build'
+  no previously-included directories found matching 'dist'
+  no previously-included directories found matching '.git'
+  adding license file 'LICENSE'
+  writing manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  creating '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers-3.0.0.dist-info'
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch>=2.0.0 in /usr/local/lib/python3.11/dist-packages (from grokking-optimizers==3.0.0) (2.4.1+cu124)
+Requirement already satisfied: filelock in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.13.1)
+Requirement already satisfied: typing-extensions>=4.8.0 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (4.15.0)
+Requirement already satisfied: sympy in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (1.12)
+Requirement already satisfied: networkx in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.2.1)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.1.3)
+Requirement already satisfied: fsspec in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (2024.2.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cudnn-cu12==9.1.0.70 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (9.1.0.70)
+Requirement already satisfied: nvidia-cublas-cu12==12.4.2.65 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.2.65)
+Requirement already satisfied: nvidia-cufft-cu12==11.2.0.44 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (11.2.0.44)
+Requirement already satisfied: nvidia-curand-cu12==10.3.5.119 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (10.3.5.119)
+Requirement already satisfied: nvidia-cusolver-cu12==11.6.0.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (11.6.0.99)
+Requirement already satisfied: nvidia-cusparse-cu12==12.3.0.142 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.3.0.142)
+Requirement already satisfied: nvidia-nccl-cu12==2.20.5 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (2.20.5)
+Requirement already satisfied: nvidia-nvtx-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-nvjitlink-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: triton==3.0.0 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.0.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.11/dist-packages (from jinja2->torch>=2.0.0->grokking-optimizers==3.0.0) (2.1.5)
+Requirement already satisfied: mpmath>=0.19 in /usr/local/lib/python3.11/dist-packages (from sympy->torch>=2.0.0->grokking-optimizers==3.0.0) (1.3.0)
+Building wheels for collected packages: grokking-optimizers
+  Building editable for grokking-optimizers (pyproject.toml): started
+  Running command Building editable for grokking-optimizers (pyproject.toml)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `authors = 'Peter C.'`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `authors` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `authors` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `classifiers` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+    corresp(dist, value, root_dir)
+    CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+    Compiler launcher: ccache -> /usr/bin/ccache
+    Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+  Building Grokking Optimizers C++/CUDA extension
+    CUDA version: 12.4
+    CUDA gencode archs (toolchain-probed): ['90a'] (+PTX 90)
+    NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+    CUTLASS enabled for archs: ['90a']
+  running editable_wheel
+  creating /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info
+  writing /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/PKG-INFO
+  writing dependency_links to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/dependency_links.txt
+  writing requirements to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/requires.txt
+  writing top-level names to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/top_level.txt
+  writing manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+  warning: no previously-included files matching '*.pyc' found anywhere in distribution
+  warning: no previously-included files matching '*.pyo' found anywhere in distribution
+  warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+  no previously-included directories found matching 'build'
+  no previously-included directories found matching 'dist'
+  no previously-included directories found matching '.git'
+  adding license file 'LICENSE'
+  writing manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  creating '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0.dist-info'
+  creating /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0.dist-info/WHEEL
+  running build_py
+  running build_ext
+  /usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py:424: UserWarning: There are no /workspace/SuperGrok1.5/.build_tools/g++-cached version bounds defined for CUDA version 12.4
+    warnings.warn(f'There are no {compiler_name} version bounds defined for CUDA version {cuda_str_version}')
+    [sccache] nvcc wrapped via PYTORCH_NVCC = '/workspace/SuperGrok1.5/.build_tools/nvcc-cached' (cached _ops rebuilds).
+    [tuned-inject] no _kernel_tuned.json found; building with in-header kernel defaults. Run `python -m grokking_optimizers.compile ... --jit-only` to produce winners (see AUTOTUNE_LINKAGE.md).
+  building 'grokking_optimizers._ops' extension
+  creating /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings
+  creating /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90
+  Emitting ninja build file /dev/shm/tmp/tmplopbc353.build-temp/build.ninja...
+  Compiling objects...
+  Using envvar MAX_JOBS (224) as the number of workers...
+ninja:   0%|          | 0/6 [00:00<?, ?obj/s]ninja:  17%|█▋        | 1/6 [00:00<00:00, 60787.01obj/s]                                                          /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp:395:1: warning: multi-line comment [-Wcomment]
+ninja:  17%|█▋        | 1/6 [00:00<00:00, 6605.20obj/s]                                                           395 | //   python -m grokking_optimizers.megakernel_codegen --dispatch-table > \
+ninja:  17%|█▋        | 1/6 [00:00<00:00, 4100.00obj/s]                                                               | ^
+ninja:  17%|█▋        | 1/6 [00:00<00:00, 3163.13obj/s]ninja:  33%|███▎      | 2/6 [00:02<00:05,  1.41s/obj]  ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf', 912 bytes spill stores, 908 bytes spill loads
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : 23 bytes gmem
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf' for 'sm_90a'
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                           1104 bytes stack frame, 912 bytes spill stores, 908 bytes spill loads
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Used 128 registers, 1104 bytes cumulative stack size, 36116 bytes smem
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]                                                       ptxas info    : Used 4 registers
+ninja:  50%|█████     | 3/6 [00:20<00:20,  6.74s/obj]ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                               ^
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                               ^
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                               ^
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                     
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 116 bytes spill stores, 188 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : 23 bytes gmem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10896 bytes stack frame, 116 bytes spill stores, 188 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 255 registers, 10896 bytes cumulative stack size, 96 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 608 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 736 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 138 registers, 10640 bytes cumulative stack size, 176 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 96 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 141 registers, 10640 bytes cumulative stack size, 304 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 139 registers, 10640 bytes cumulative stack size, 48 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 139 registers, 10640 bytes cumulative stack size, 48 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]                                                       ptxas info    : Used 4 registers
+ninja:  67%|██████▋   | 4/6 [00:47<00:23, 11.92s/obj]ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                               ^
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                               ^
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                         using sg::algorithms::adamw_step;
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                               ^
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                     
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6672 bytes spill stores, 7756 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4632 bytes spill stores, 4788 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py', 48 bytes spill stores, 284 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : 23 bytes gmem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           2224 bytes stack frame, 6672 bytes spill stores, 7756 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 2224 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 4632 bytes spill stores, 4788 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 48 bytes spill stores, 284 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 25872 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 26000 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25488 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25616 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]                                                       ptxas info    : Used 4 registers
+ninja:  83%|████████▎ | 5/6 [01:25<00:17, 17.13s/obj]ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                         using sg::algorithms::adamw_step;
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                               ^
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                         using sg::algorithms::adamw_step;
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                               ^
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                         using sg::algorithms::adamw_step;
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                               ^
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 18240 bytes spill stores, 18980 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 48 bytes spill stores, 116 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15900 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15908 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15900 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 4 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 16 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 16 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : 23 bytes gmem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           2272 bytes stack frame, 18240 bytes spill stores, 18980 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 2272 bytes cumulative stack size, 9704 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           0 bytes stack frame, 48 bytes spill stores, 116 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           1456 bytes stack frame, 15020 bytes spill stores, 15900 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 10212 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           1456 bytes stack frame, 15020 bytes spill stores, 15908 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 10340 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           1456 bytes stack frame, 15020 bytes spill stores, 15900 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           688 bytes stack frame, 8 bytes spill stores, 4 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9828 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9956 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           688 bytes stack frame, 8 bytes spill stores, 16 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           688 bytes stack frame, 8 bytes spill stores, 16 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                           0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       ptxas info    : Used 4 registers
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       creating /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       /workspace/SuperGrok1.5/.build_tools/g++-cached -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/bindings.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/dispatch.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/sg2_meta_tail.o -L/usr/local/lib/python3.11/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.51s/obj]                                                       copying /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so -> grokking_optimizers
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.59s/obj]                                                       running egg_info
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       creating /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       writing /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/PKG-INFO
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       writing dependency_links to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/dependency_links.txt
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       writing requirements to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/requires.txt
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       writing top-level names to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/top_level.txt
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       writing manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.61s/obj]                                                       reading manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.62s/obj]                                                       reading manifest template 'MANIFEST.in'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.62s/obj]                                                       warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+ninja: 100%|██████████| 6/6 [02:39<00:00, 26.65s/obj]                                                       warning: no previously-included files matching '*.pyc' found anywhere in distribution
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       warning: no previously-included files matching '*.pyo' found anywhere in distribution
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       no previously-included directories found matching 'build'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       no previously-included directories found matching 'dist'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       no previously-included directories found matching '.git'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       adding license file 'LICENSE'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       writing manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.71s/obj]                                                       Editable install will be performed using a meta path finder.
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       Options like `package-data`, `include/exclude-package-data` or
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       `packages.find.exclude/include` may have no effect.
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding '__editable___grokking_optimizers_3_0_0_finder.py'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding '__editable__.grokking_optimizers-3.0.0.pth'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       creating '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl' and adding '/dev/shm/tmp/tmp9eyfwcjogrokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl' to it
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding 'grokking_optimizers-3.0.0.dist-info/LICENSE'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding 'grokking_optimizers-3.0.0.dist-info/METADATA'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding 'grokking_optimizers-3.0.0.dist-info/WHEEL'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding 'grokking_optimizers-3.0.0.dist-info/top_level.txt'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       adding 'grokking_optimizers-3.0.0.dist-info/RECORD'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       /usr/local/lib/python3.11/dist-packages/setuptools/command/editable_wheel.py:343: InformationOnly: Editable installation.
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       !!
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                               ********************************************************************************
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                               Please be careful with folders in your working directory with the same
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                               name as your package as they may take precedence during imports.
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                               ********************************************************************************
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       !!
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                         with strategy, WheelFile(wheel_path, "w") as wheel_obj:
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.72s/obj]                                                       Building editable for grokking-optimizers (pyproject.toml): finished with status 'done'
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.81s/obj]                                                       Created wheel for grokking-optimizers: filename=grokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl size=12603 sha256=e84c15c8ca7d54b9ca8df21477f04087d3af922957729a6d855df1465a6ff761
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.81s/obj]                                                       Stored in directory: /dev/shm/tmp/pip-ephem-wheel-cache-k_1fycdj/wheels/05/84/a2/cc4100fa1b99cd58ff32e0df6e549e4591c3289b6e96ce9626
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.81s/obj]                                                     Successfully built grokking-optimizers
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.81s/obj]                                                     Installing collected packages: grokking-optimizers
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.83s/obj]                                                       Attempting uninstall: grokking-optimizers
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.83s/obj]                                                         Found existing installation: grokking-optimizers 3.0.0
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.83s/obj]                                                         Uninstalling grokking-optimizers-3.0.0:
+ninja: 100%|██████████| 6/6 [02:40<00:00, 26.83s/obj]                                                           Removing file or directory /usr/local/lib/python3.11/dist-packages/__editable__.grokking_optimizers-3.0.0.pth
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                           Removing file or directory /usr/local/lib/python3.11/dist-packages/__editable___grokking_optimizers_3_0_0_finder.py
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                           Removing file or directory /usr/local/lib/python3.11/dist-packages/__pycache__/__editable___grokking_optimizers_3_0_0_finder.cpython-311.pyc
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                           Removing file or directory /usr/local/lib/python3.11/dist-packages/grokking_optimizers-3.0.0.dist-info/
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                           Successfully uninstalled grokking-optimizers-3.0.0
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                     Successfully installed grokking-optimizers-3.0.0
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                     WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                     
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                     [notice] A new release of pip is available: 24.2 -> 26.1.2
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]                                                     [notice] To update, run: python -m pip install --upgrade pip
+ninja: 100%|██████████| 6/6 [02:41<00:00, 26.86s/obj]ninja: 100%|██████████| 6/6 [02:41<00:00, 26.87s/obj]
+build.sh: done in 3m10s

@@ -1,0 +1,508 @@
+diff --git a/csrc/fused/sm_90/fused_mamba_megakernel.cuh b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+index 7f15102..4e98223 100644
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -517,6 +517,11 @@ __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nC
+          + mb_tc_looksam_floats()                    // SAM 2nd-bwd scratch [sam_backup|sam_grad]
+          + mb_tc_muon_floats(nCTA)                   // Muon NS per-matrix scratch
+          + mb_tc_sg2_floats(nCTA)                    // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
++         + mbtc::mb_proj_wgmma_floats(T)             // M0 projection-wgmma acts + bf16 wcache
++                                                     //   (SG_TUNED_MB_PROJ_WGMMA: 0 when OFF →
++                                                     //    byte-identical; the host size + kernel
++                                                     //    carve BOTH advance by THIS term, so they
++                                                     //    cannot drift — the ViT-IMA invariant)
+ #if SG_MB_TC_PROFILE
+          + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
+ #endif
+@@ -589,11 +594,35 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+     float* sg2_ws_base = muon_base + mb_tc_muon_floats(nCTA);
+     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
++    // ── M0 projection-wgmma region (SG_TUNED_MB_PROJ_WGMMA), carved AFTER the SG2
++    //    scratch (term order matches mb_tc_workspace_floats — carve-LAST keeps every
++    //    prior region's offset unchanged). When the gate is OFF, mb_proj_wgmma_floats
++    //    is 0 → this base == the next region start AND the M0 pointers are never read,
++    //    so the workspace + the kernel carve are BOTH byte-identical to the scalar
++    //    path. The host sizer + this carve advance by the SAME mb_proj_wgmma_floats(T)
++    //    term (the single source) → they cannot drift (the ViT-IMA invariant). When
++    //    the gate is ON the layout is [MbActs acts | bf16 projection-weight cache]:
++    //    acts first (mb_acts_bf16_count(T) bf16 elems), then the wcache
++    //    (kMbWbfTotalElems bf16 elems) — the bind helpers (mb_acts_bind /
++    //    mb_proj_wbf_bind) take their own bf16* base, so the kernel BODY (the GPU-
++    //    iteration-gated rewire) binds acts at mbproj_base and the wcache after it. ──
++    float* mbproj_base = sg2_ws_base + mb_tc_sg2_floats(nCTA);
++    (void)mbproj_base;   // read only by the (GPU-gated) M0 kernel body
++#if SG_TUNED_MB_PROJ_WGMMA
++    // bf16 views over the gated region. acts region first, then the weight cache —
++    // the SAME order mb_proj_wgmma_floats sums (mb_proj_acts_floats + mb_proj_wbf_floats).
++    __nv_bfloat16* mbproj_acts_bf = reinterpret_cast<__nv_bfloat16*>(mbproj_base);
++    __nv_bfloat16* mbproj_wbf_bf  = mbproj_acts_bf + mbtc::mb_acts_bf16_count(T);
++    (void)mbproj_acts_bf; (void)mbproj_wbf_bf;
++#endif
+ #if SG_MB_TC_PROFILE
+     // 8-byte align the double accumulator: round the float offset up to an even
+-    // count so reinterpret_cast<double*> is aligned (past the SG2 scratch — the
+-    // phase-profiler is the LAST workspace term, mirroring mb_tc_workspace_floats).
+-    float* prof_f = sg2_ws_base + mb_tc_sg2_floats(nCTA);
++    // count so reinterpret_cast<double*> is aligned (past the SG2 scratch + the M0
++    // region — the phase-profiler is the LAST workspace term, mirroring
++    // mb_tc_workspace_floats; mbproj_base + mb_proj_wgmma_floats(T) == the profiler
++    // start, and when the M0 gate is OFF that term is 0 so the profiler offset is
++    // unchanged → byte-identical for the profiler build too).
++    float* prof_f = mbproj_base + mbtc::mb_proj_wgmma_floats(T);
+     uintptr_t _pa = reinterpret_cast<uintptr_t>(prof_f);
+     if (_pa & 0x7u) prof_f = reinterpret_cast<float*>((_pa + 7u) & ~uintptr_t(7u));
+     double* prof = reinterpret_cast<double*>(prof_f);   // [nCTA*SLOTS], host-zeroed
+diff --git a/csrc/fused/sm_90/model_stage_mamba_tc.cuh b/csrc/fused/sm_90/model_stage_mamba_tc.cuh
+index 419d2fd..9a5bfee 100644
+--- a/csrc/fused/sm_90/model_stage_mamba_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_mamba_tc.cuh
+@@ -28,6 +28,19 @@
+ #include "csrc/fused/sm_90/mamba3_layout.cuh"
+ #include "csrc/fused/sm_90/model_stage_mamba3.cuh"   // mb:: dims, MambaWeights/Grad, scan/RMSNorm/SwiGLU
+ #include "csrc/backends/cuda/sm_90/wgmma.cuh"
++// LEVER M0 (perf): reuse the silicon-validated, accessor-driven wgmma engine
++//   dectc::tc_gemm_block_unpipelined<N,MaxAtomsM,SrcA,SrcB,Out> + its flat-gmem
++//   K-major tile sources (dectc::DecGmemTileSrc{A,B}) + the canonical Major-K
++//   stager. These are MODEL-AGNOSTIC (templated on N + accessor types; smem
++//   passed in; no dec:: LAYOUT dependence in the engine body — only the SHARED
++//   SG_TUNED_* tuning macros). tp_layer.cuh already includes this header for
++//   exactly the same reuse ("dectc_gemm_* (the wgmma tiles)"). We do NOT touch
++//   the decoder file; we only CALL the engine, mirroring its three validated
++//   orientations (fwd Y=X·Wᵀ, dX=dY·W, dW=dYᵀ·X). The PIPELINED engine
++//   (tc_gemm_block_pipelined) is deliberately NOT used (reverted: net loss on
++//   staging-bound GEMMs); the plain unpipelined wgmma engine is the right tool
++//   for these dense, contiguous projection matmuls.
++#include "csrc/fused/sm_90/model_stage_decoder_tc.cuh"
+ 
+ #include <cuda_runtime.h>
+ #include <cuda_bf16.h>
+@@ -60,6 +73,356 @@ constexpr int kMbMaxIL = 2;
+ constexpr int kMbAtomsPerSlot = (kAtomsM < kMbMaxIL) ? kAtomsM : kMbMaxIL;
+ constexpr int kMbDwSplitK = 1;
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  LEVER M0 — wgmma-accelerated Mamba-3 PROJECTIONS + decoder-style
++//  OUTPUT-STATIONARY dW. (PERF_ANALYSIS.md M0.)
++//
++//  WHY (the corrected first-order fact): the "scan-dominated" comment in
++//  model_stage_mamba_tc.cuh:6-9 is a d=128 ARTIFACT. At 1.5B the PROJECTIONS
++//  are 94% of FLOPs and run SCALAR today (model_stage_mamba3.cuh mb_linear /
++//  mb_linear_bwd + the inlined in_proj/out_proj/SwiGLU GEMMs) → the tensor
++//  cores sit idle. AND the per-CTA FULL-grad partial the TC megakernel
++//  accumulates (fused_mamba_megakernel.cuh:603-651, nCTA·total floats) needs
++//  668 GB at 1.5B — impossible. Output-stationary dW (one CTA owns each weight
++//  tile, contracts the full token dim K=T itself, writes straight to `grad`,
++//  no cross-CTA partial) collapses that to tile-local, exactly as the decoder
++//  did (model_stage_decoder_tc.cuh:1468-1579).
++//
++//  WHAT THIS SLICE CONVERTS (the highest-ROI dense matmuls — the M0 TEMPLATE):
++//    fwd : in_proj (Y=xn·in_wᵀ), out_proj (out=y_gated·out_wᵀ),
++//          SwiGLU gate/up (·gate_wᵀ/·up_wᵀ), down (·down_wᵀ)   — wgmma
++//    dW  : the SAME five matrices' dW = dYᵀ·X (K=T), output-stationary,
++//          owner-computes, ascending-t, NO float atomics → deterministic.
++//  All are dense, contiguous, K∈{d,d_inner,dff} multiples of 16 and N=d/
++//  d_inner/dff multiples of the m64nNk16 atom — the case the plain wgmma
++//  engine wins on (NOT the strided staging-bound scan path).
++//
++//  WHAT IS DEFERRED (clearly, per the M0 mandate — "fine not to finish all"):
++//    * x_proj / dt_proj : x_proj (Kin=d_inner) IS GEMM-shaped but its output
++//      FEEDS the scan splits (dt_lr|A_mod|theta|u_lam|Br|Bi|Cr|Ci) — wiring it
++//      means interleaving with the scalar scan staging; dt_proj is [n_heads,
++//      dt_rank] = [4,8] (prod) / [32,64] (bench), BELOW / borderline the m64
++//      atom, so it stays scalar. (Lower ROI; left scalar.)
++//    * the SSM SCAN itself stays SCALAR + untouched (= lever M2, out of scope).
++//    * the full activation→HBM, one-layer-at-a-time smem restructure that lets
++//      d=2048 PLACE (= lever M1) — here we provide ONLY the M0-necessary HBM
++//      acts buffer for the projection dW operands (MbActs below); routing ALL
++//      forward activations through HBM to shrink MambaSampleSmem is M1.
++//    * fully REWIRING fused_mamba_megakernel_tc's per-sample scalar fwd/bwd
++//      dispatch into the batched-GEMM + tile-scratch + output-stationary-dW
++//      PHASE structure (the decoder's P1 token-tile fwd/dX → P2 dW-stationary)
++//      — that is the remaining integration step; the reusable building blocks +
++//      specs below are the template it plugs into.
++//
++//  DETERMINISM / fp64-GATE PRESERVATION (by construction, identical to decoder):
++//    * fwd/dW route through dectc::tc_gemm_block_unpipelined → ASCENDING-k fp32
++//      accumulation (k=0 overwrite, k>0 add), one CTA owns each output tile
++//      end-to-end, NO float atomics, NO work-steal K-split (kMbDwSplitK=1).
++//    * output-stationary dW: each weight tile owned by tile_id % nCTA (FIXED
++//      every step), contracts the FULL K=T ascending → bit-identical regardless
++//      of which CTA runs it; no [nCTA×total] partial, no cross-CTA dW reduce.
++//    * bf16 operands are produced by __float2bfloat16 of the SAME fp32 the
++//      scalar oracle read, the SAME deterministic round — operand VALUES are
++//      bit-identical to a bf16-rounded reference. (The scan/RMSNorm/SwiGLU
++//      elementwise math stays fp32 in model_stage_mamba3.cuh, untouched.)
++// ════════════════════════════════════════════════════════════════════════
++
++// Shared GEMM-engine smem/interleave constants. The decoder engine's `kIL` is
++// min(MaxAtomsM, dectc::kDecMaxIL) and it stages kIL·S A-tiles + S B-tiles; we
++// MUST size the smem we hand it with the SAME constants (they are SG_TUNED_*
++// tuning macros shared across all TC headers — decoder_tc:74 — NOT dec:: layout).
++constexpr int kMbGemmStages = dectc::kDecTcStages;            // K-loop double-buffer depth
++constexpr int kMbGemmMaxIL  = dectc::kDecMaxIL;               // M-atom interleave cap
++constexpr int kMbSmemA1     = dectc::kDecTcSmemA1;            // 64*16 bf16 (one A atom tile)
++constexpr int kMbSmemB1     = dectc::kDecTcSmemB1;            // TILE_N*16 bf16 (one B tile)
++// Per-CTA GEMM staging smem the engine needs: kIL·S A-tiles + S B-tiles, sized
++// for the widest interleave group (kMbGemmMaxIL). Tiny (≈16 KB at S=2/IL=2/N=128).
++constexpr int kMbSmemAElems = kMbGemmStages * kMbGemmMaxIL * (wgs::kWgmmaAtomM * wgs::kWgmmaAtomK);
++constexpr int kMbSmemBElems = kMbGemmStages * (SG_TUNED_TILE_N * wgs::kWgmmaAtomK);
++// wgmma N-tile width for the projection GEMMs (the compile-time atom width the
++// engine loops). 128 covers d=128/d_inner=256/dff=256 (prod) and the d=1024
++// bench (d_inner=2048/dff=2048) — all multiples of 128.
++constexpr int kMbProjN = 128;
++static_assert(SG_TUNED_TILE_N >= kMbProjN,
++              "mamba TC: SG_TUNED_TILE_N must be >= the projection wgmma N (128) "
++              "so the staged B-tile fits sB.");
++
++// ── (fwd) Batched projection GEMM  Y[M,Nout] = X[M,Kin] @ W[Nout,Kin]ᵀ over the
++//    whole token batch (M = B·kSeq rows, row-major — the layout the flat acts
++//    buffer already favors). Thin wrapper over the validated engine; tiles N over
++//    [0,Nout) in kMbProjN-wide atoms. Both operands flat-gmem K-major → the
++//    engine selects its cp.async double-buffered RING (numerics identical to the
++//    synchronous staging by construction). bf16 acts in, bf16 acts out.
++//    X : [M,Kin] bf16 (the projection input, row-major K-contiguous, 16B-aligned)
++//    Wbf: [Nout,Kin] bf16 (the pre-staged bf16 weight cache — see mbtc_proj_wbf)
++//    Yout: [M,Nout] bf16. sA/sB: per-CTA staging (kMbSmemAElems / kMbSmemBElems).
++//    `m_atoms` = rows this CTA's tile owns / 64 (caller tiles M across CTAs). ──
++template <int N>
++__device__ __forceinline__ void mbtc_gemm_fwd(
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ Wbf,
++        __nv_bfloat16* __restrict__ Yout, int mbase, int m_atoms, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;   // Kin multiple of 16 (d/d_inner/dff)
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        // A: token rows of X (K-contiguous). B: rows n0.. of the bf16 weight cache,
++        // [Nout,Kin] row-major (K-contiguous) → flat-gmem K-major; the engine RINGs
++        // both. Same `nn<Nout? .. :0` pad guard as the decoder fwd (rows_valid).
++        dectc::DecGmemTileSrcA srcA{X, Kin};
++        dectc::DecGmemTileSrcB srcB{Wbf + (int64_t)n0 * Kin, Kin, Nout - n0};
++        auto out = [&] (int m, int n, float v) {
++            Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
++        dectc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kMbGemmMaxIL>(
++            mbase, m_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++    }
++}
++
++// Same as mbtc_gemm_fwd but emits the fp32 result (the SwiGLU silu()/elementwise
++// + scan-gate stages consume the projection outputs in fp32 — identical to the
++// scalar oracle's fp32 compute). Writes [M,Nout] fp32 at Yf32.
++template <int N>
++__device__ __forceinline__ void mbtc_gemm_fwd_f32(
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ Wbf,
++        float* __restrict__ Yf32, int mbase, int m_atoms, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        dectc::DecGmemTileSrcA srcA{X, Kin};
++        dectc::DecGmemTileSrcB srcB{Wbf + (int64_t)n0 * Kin, Kin, Nout - n0};
++        auto out = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
++        dectc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kMbGemmMaxIL>(
++            mbase, m_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++    }
++}
++
++// ── HBM bf16 ACTS buffer for the projection OUTPUT-STATIONARY dW (the M0 slice).
++//    dW = dYᵀ @ X (K=T) needs, for EVERY converted weight, the linear INPUT X and
++//    the OUTPUT adjoint dY of EVERY token — values OTHER CTAs read (cross-tile)
++//    when they own that weight's dW tile. They cannot live in the per-sample
++//    MambaSampleSmem (which is per-CTA, one sample at a time); they go to a flat
++//    bf16 HBM region [T × width] per stream, exactly like the decoder's DecActs.
++//    Offsets are RUNTIME (depend on T = B·kSeq). Only the FIVE converted weights'
++//    operands are carved (in/out/gate/up/down); x_proj/dt_proj/scan stay scalar
++//    (their grads keep the existing per-CTA partial path — DEFERRED above).
++//
++//    NOTE this is the M0-NECESSARY acts slice ONLY; routing ALL forward
++//    activations through HBM to SHRINK MambaSampleSmem so d=2048 places is M1.
++struct MbActs {
++    // Per-layer linear INPUTS X (the dW B-operand, X[T,Kin]):
++    __nv_bfloat16* X_in[mb::kLayers];     // [T, d]        in_proj input (= mixer-norm out, xn)
++    __nv_bfloat16* X_outp[mb::kLayers];   // [T, d_inner]  out_proj input (= y_gated)
++    __nv_bfloat16* X_mlp[mb::kLayers];    // [T, d]        gate/up input (= mlp-norm out, h1n)
++    __nv_bfloat16* X_down[mb::kLayers];   // [T, dff]      down_proj input (= silu(gate)*up)
++    // Per-layer linear OUTPUT adjoints dY (the dW A-operand, dY[T,Nout]):
++    __nv_bfloat16* dY_in[mb::kLayers];    // [T, 2*d_inner] in_proj out adjoint (dx_main|dz)
++    __nv_bfloat16* dY_outp[mb::kLayers];  // [T, d]         out_proj out adjoint (dmix_out)
++    __nv_bfloat16* dY_gate[mb::kLayers];  // [T, dff]       gate_proj out adjoint (dg_pre)
++    __nv_bfloat16* dY_up[mb::kLayers];    // [T, dff]       up_proj out adjoint (du)
++    __nv_bfloat16* dY_down[mb::kLayers];  // [T, d]         down_proj out adjoint (dmlp_out)
++};
++
++// Bytes (as bf16 element COUNT) the MbActs region occupies for T tokens. Used by
++// the host workspace sizing (mb_acts_floats below converts to float units).
++__host__ __device__ __forceinline__ int64_t mb_acts_bf16_count(int T) {
++    const int64_t Td   = (int64_t)T * mb::kD;
++    const int64_t Tdi  = (int64_t)T * mb::kDInner;
++    const int64_t T2di = (int64_t)T * 2 * mb::kDInner;
++    const int64_t Tff  = (int64_t)T * mb::kDff;
++    // per layer: X_in(Td) X_outp(Tdi) X_mlp(Td) X_down(Tff)
++    //          + dY_in(T2di) dY_outp(Td) dY_gate(Tff) dY_up(Tff) dY_down(Td)
++    return (int64_t)mb::kLayers *
++           (Td + Tdi + Td + Tff + T2di + Td + Tff + Tff + Td);
++}
++
++__device__ __forceinline__ MbActs mb_acts_bind(__nv_bfloat16* p, int T) {
++    MbActs a;
++    int64_t off = 0;
++    const int64_t Td   = (int64_t)T * mb::kD;
++    const int64_t Tdi  = (int64_t)T * mb::kDInner;
++    const int64_t T2di = (int64_t)T * 2 * mb::kDInner;
++    const int64_t Tff  = (int64_t)T * mb::kDff;
++    for (int li = 0; li < mb::kLayers; ++li) {
++        a.X_in[li]    = p + off; off += Td;
++        a.X_outp[li]  = p + off; off += Tdi;
++        a.X_mlp[li]   = p + off; off += Td;
++        a.X_down[li]  = p + off; off += Tff;
++        a.dY_in[li]   = p + off; off += T2di;
++        a.dY_outp[li] = p + off; off += Td;
++        a.dY_gate[li] = p + off; off += Tff;
++        a.dY_up[li]   = p + off; off += Tff;
++        a.dY_down[li] = p + off; off += Td;
++    }
++    return a;
++}
++
++// ── OUTPUT-STATIONARY dW spec for ONE converted projection weight. dW = dYᵀ @ X,
++//    K = T (the full token dim, contracted by the OWNER CTA). Mirrors the
++//    decoder's DecDwSpec (Mamba projections have NO bias on these five weights —
++//    in/out/gate/up/down are bias-free in mamba3_block.py — so no db fold). ──
++struct MbProjDwSpec {
++    const __nv_bfloat16* dY;   // [T, Nout]   the output adjoint
++    const __nv_bfloat16* X;    // [T, Kin]    the linear input
++    int Nout; int Kin;         // weight is [Nout, Kin]
++    int grad_off;              // element offset of this weight in `grad`
++};
++
++// The 5 converted weights PER LAYER (in/out/gate/up/down). Tensor indices into
++// kMambaOffsets (mamba3_layout.cuh, named_parameters() order): per layer li the
++// 20-tensor stride lands in_w at index (8 + 20·li)+? — we read the SAME indices
++// the Muon 2D table (kMbMuon2D) verified: in_w, out_w, gate_w, up_w, down_w.
++//   L0: in_w=9,  out_w=17, gate_w=19, up_w=20, down_w=21
++//   L1: in_w=29, out_w=37, gate_w=39, up_w=40, down_w=41   (== L0 + 20)
++constexpr int kMbProjPerLayer = 5;
++constexpr int kMbProjNumDw    = mb::kLayers * kMbProjPerLayer;
++
++// Build the per-(layer,weight) dW specs (called by all CTAs; cheap). T = B·kSeq.
++__device__ __forceinline__ void mbtc_build_proj_dw_specs(
++        const MbActs& acts, int T, MbProjDwSpec spec[kMbProjNumDw]) {
++    for (int li = 0; li < mb::kLayers; ++li) {
++        const int base_t = 9 + 20 * li;   // in_w tensor index for layer li
++        const int in_t   = base_t;        // in_proj.weight     [2*d_inner, d]
++        const int out_t  = base_t + 8;    // out_proj.weight    [d, d_inner]
++        const int gate_t = base_t + 10;   // gate_proj.weight   [dff, d]
++        const int up_t   = base_t + 11;   // up_proj.weight     [dff, d]
++        const int down_t = base_t + 12;   // down_proj.weight   [d, dff]
++        MbProjDwSpec* s = &spec[li * kMbProjPerLayer];
++        // in_proj   : dW[2*d_inner, d] = dY_in[T,2di]ᵀ @ X_in[T,d]
++        s[0] = { acts.dY_in[li],   acts.X_in[li],   2 * mb::kDInner, mb::kD,      kMambaOffsets[in_t]   };
++        // out_proj  : dW[d, d_inner] = dY_outp[T,d]ᵀ @ X_outp[T,d_inner]
++        s[1] = { acts.dY_outp[li], acts.X_outp[li], mb::kD,          mb::kDInner, kMambaOffsets[out_t]  };
++        // gate_proj : dW[dff, d] = dY_gate[T,dff]ᵀ @ X_mlp[T,d]
++        s[2] = { acts.dY_gate[li], acts.X_mlp[li],  mb::kDff,        mb::kD,      kMambaOffsets[gate_t] };
++        // up_proj   : dW[dff, d] = dY_up[T,dff]ᵀ @ X_mlp[T,d]
++        s[3] = { acts.dY_up[li],   acts.X_mlp[li],  mb::kDff,        mb::kD,      kMambaOffsets[up_t]   };
++        // down_proj : dW[d, dff] = dY_down[T,d]ᵀ @ X_down[T,dff]
++        s[4] = { acts.dY_down[li], acts.X_down[li], mb::kD,          mb::kDff,    kMambaOffsets[down_t] };
++    }
++}
++
++// dW M-atom interleave group width (== the engine's cap → smem contract matches).
++constexpr int kMbDwIL = kMbGemmMaxIL;
++__device__ __host__ __forceinline__ int mb_dw_atoms(int Nout)  { return (Nout + 63) / 64; }
++__device__ __host__ __forceinline__ int mb_dw_groups(int Nout) {
++    return (mb_dw_atoms(Nout) + kMbDwIL - 1) / kMbDwIL;
++}
++
++// Total dW output WORK ITEMS (M-atom groups × N-tiles) across the converted
++// weights — the tile loop count the megakernel grid-strides (item % nCTA owns).
++template <int N>
++__device__ __forceinline__ int mbtc_proj_dw_total_tiles(const MbProjDwSpec spec[kMbProjNumDw]) {
++    int n = 0;
++    for (int s = 0; s < kMbProjNumDw; ++s)
++        n += mb_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
++    return n;
++}
++
++// Run ONE global dW work item `gt` (the OWNER CTA gt % nCTA calls this; the
++// caller does the ownership test + grid-stride). Decode (weight, M-atom GROUP,
++// N-tile), then contract K=T via the validated dW orientation (BOTH operands
++// transposed-staged through lambda accessors, ascending-t, owner-computes — the
++// decoder's dectc_dw_run_tile pattern verbatim, just on the Mamba acts/grad).
++// Writes the 64×N tile straight into grad[grad_off] (NO partial, NO atomic).
++//   T must be a multiple of 16 (the caller pads the token count, exactly as the
++//   decoder pads B·kSeq → the k_steps = T/16 loop is exact).
++template <int N>
++__device__ __forceinline__ void mbtc_proj_dw_run_tile(
++        const MbProjDwSpec spec[kMbProjNumDw], int gt, int T, float* __restrict__ grad,
++        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++    // Decode gt → (s, m_group, n_tile).
++    int acc = 0, s = 0, m_group = 0, n_tile = 0;
++    for (s = 0; s < kMbProjNumDw; ++s) {
++        const int ng = mb_dw_groups(spec[s].Nout);
++        const int nt = (spec[s].Kin + N - 1) / N;
++        if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
++        acc += ng * nt;
++    }
++    const MbProjDwSpec& sp = spec[s];
++    const int n_atoms = mb_dw_atoms(sp.Nout);
++    const int a0 = m_group * kMbDwIL;                 // first atom of the group
++    const int g_atoms = (n_atoms - a0) < kMbDwIL ? (n_atoms - a0) : kMbDwIL;
++    const int mbase = a0 * 64;
++    const int n0 = n_tile * N;
++    const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
++    const int k_steps = T / wgs::kWgmmaAtomK;         // K = T (token dim), must be /16
++    const int Nout = sp.Nout, Kin = sp.Kin;
++    const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
++    // A[m=out, k=t] = dY[t,out] (transposed read); B[n=in, k=t] = X[t,in] (transposed).
++    // The engine passes the GLOBAL row m = mbase + (group-local row) to srcA/out
++    // (it adds mbase0 itself), so the accessors use `m` RAW (adding mbase again
++    // double-counts — the decoder's exact note). Pad rows/cols → 0 (inert).
++    auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
++        return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };
++    auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
++        int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
++    auto out = [&] (int m, int n, float v) {
++        if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
++    dectc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kMbDwIL>(
++        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++}
++
++// ── bf16 WEIGHT PRE-STAGE for the converted projection weights (the fwd GEMM B
++//    operand). The fwd GEMM wants a bf16 [Nout,Kin] row-major cache (K-contiguous
++//    → the cp.async ring streams it); the params blob is fp32. Convert ONCE per
++//    step into a workspace cache: cache[i] = __float2bfloat16(params[off+i]) is
++//    the IDENTICAL deterministic per-element round the scalar mb_linear performed
++//    on read → operand VALUES bit-identical; element-owned (one writer per index)
++//    → deterministic. Mirrors dectc_wbf_convert. Caller fences (grid barrier)
++//    before any GEMM reads the cache. We cache only the 5 converted matrices ×
++//    kLayers (in/out/gate/up/down); x_proj/dt_proj stay scalar (DEFERRED). ──
++struct MbProjWBf {
++    const __nv_bfloat16* in_w[mb::kLayers];    // [2*d_inner, d]
++    const __nv_bfloat16* out_w[mb::kLayers];   // [d, d_inner]
++    const __nv_bfloat16* gate_w[mb::kLayers];  // [dff, d]
++    const __nv_bfloat16* up_w[mb::kLayers];    // [dff, d]
++    const __nv_bfloat16* down_w[mb::kLayers];  // [d, dff]
++};
++constexpr int64_t kMbWbfIn   = (int64_t)2 * mb::kDInner * mb::kD;
++constexpr int64_t kMbWbfOut  = (int64_t)mb::kD * mb::kDInner;
++constexpr int64_t kMbWbfGate = (int64_t)mb::kDff * mb::kD;
++constexpr int64_t kMbWbfUp   = (int64_t)mb::kDff * mb::kD;
++constexpr int64_t kMbWbfDown = (int64_t)mb::kD * mb::kDff;
++constexpr int64_t kMbWbfLayerElems = kMbWbfIn + kMbWbfOut + kMbWbfGate + kMbWbfUp + kMbWbfDown;
++constexpr int64_t kMbWbfTotalElems = (int64_t)mb::kLayers * kMbWbfLayerElems;
++__host__ __device__ __forceinline__ int64_t mb_proj_wbf_floats() {
++    return (kMbWbfTotalElems + 1) / 2;   // bf16 elems → float units
++}
++__device__ __forceinline__ MbProjWBf mb_proj_wbf_bind(const __nv_bfloat16* c) {
++    MbProjWBf wb;
++    #pragma unroll
++    for (int li = 0; li < mb::kLayers; ++li) {
++        const __nv_bfloat16* b = c + (int64_t)li * kMbWbfLayerElems;
++        wb.in_w[li]   = b;
++        wb.out_w[li]  = b + kMbWbfIn;
++        wb.gate_w[li] = b + kMbWbfIn + kMbWbfOut;
++        wb.up_w[li]   = b + kMbWbfIn + kMbWbfOut + kMbWbfGate;
++        wb.down_w[li] = b + kMbWbfIn + kMbWbfOut + kMbWbfGate + kMbWbfUp;
++    }
++    return wb;
++}
++// Grid-strided fp32→bf16 convert of the 5 matrices × kLayers into the cache.
++// Element-owned, no atomics → deterministic. The tensor index of [in,out,gate,
++// up,down] for layer li is {9,17,19,20,21} + 20·li (the 20-tensors-per-layer
++// stride of the generated mamba layout — the same indices mbtc_build_proj_dw_specs
++// and kMbMuon2D walk).
++__device__ __forceinline__ void mb_proj_wbf_convert(
++        const float* __restrict__ params, __nv_bfloat16* __restrict__ cache,
++        int cta, int nCTA) {
++    const int64_t stride = (int64_t)nCTA * blockDim.x;
++    for (int64_t i = (int64_t)cta * blockDim.x + threadIdx.x;
++         i < kMbWbfTotalElems; i += stride) {
++        const int li = (int)(i / kMbWbfLayerElems);
++        const int64_t r = i % kMbWbfLayerElems;
++        int ti; int64_t loff;
++        if      (r < kMbWbfIn)                                  { ti = 9;  loff = r; }
++        else if (r < kMbWbfIn + kMbWbfOut)                      { ti = 17; loff = r - kMbWbfIn; }
++        else if (r < kMbWbfIn + kMbWbfOut + kMbWbfGate)         { ti = 19; loff = r - kMbWbfIn - kMbWbfOut; }
++        else if (r < kMbWbfIn + kMbWbfOut + kMbWbfGate + kMbWbfUp) { ti = 20; loff = r - kMbWbfIn - kMbWbfOut - kMbWbfGate; }
++        else                                                    { ti = 21; loff = r - kMbWbfIn - kMbWbfOut - kMbWbfGate - kMbWbfUp; }
++        cache[i] = __float2bfloat16(params[(int64_t)kMambaOffsets[ti + 20 * li] + loff]);
++    }
++}
++
+ // Dummy dW spec (the dormant MbTcSmem holds an array of these; unused on the
+ // scalar path). Kept minimal so the struct + any reference compiles.
+ struct MbDwSpec {
+@@ -68,12 +431,68 @@ struct MbDwSpec {
+     bool has_bias; const __nv_bfloat16* dY_bias; int bias_off;
+ };
+ 
+-// Workspace-sizing stubs — the scalar path's per-CTA partial is the FULL grad
+-// (sized in mb_tc_workspace_floats), so the old acts / split-K dW regions are
+-// zero-width.
++// Workspace-sizing stubs — the CURRENT (un-rewired) scalar TC path's per-CTA
++// partial is the FULL grad (sized in mb_tc_workspace_floats), so the old acts /
++// split-K dW regions are zero-width. These STAY 0 so the already-green megakernel
++// workspace is byte-identical; the M0 integration step (rewiring the per-sample
++// dispatch into the batched-GEMM + output-stationary-dW phase structure) is what
++// switches the host to size + the kernel to USE the M0 regions below.
+ __host__ __device__ __forceinline__ int64_t mb_acts_floats(int /*T*/) { return 0; }
+ __host__ __device__ __forceinline__ int64_t mb_dw_part_floats(int /*G*/) { return 0; }
+ 
++// ── M0 workspace sizing (used by the rewired megakernel — the integration step).
++//    The MbActs HBM region (projection dW operands) + the bf16 projection weight
++//    cache, in FLOAT units (the host allocates one flat float workspace). The
++//    output-stationary dW writes straight to `grad`, so there is NO per-CTA
++//    full-grad partial here (G==1 → no split-K dW partials) — that is the 668 GB
++//    → tile-local collapse. Named distinctly so adding them does NOT perturb the
++//    current path's mb_acts_floats/mb_dw_part_floats (both still 0). ──
++__host__ __device__ __forceinline__ int64_t mb_proj_acts_floats(int T) {
++    return (mb_acts_bf16_count(T) + 1) / 2;   // bf16 elems → float units
++}
++
++// ════════════════════════════════════════════════════════════════════════
++//  M0 INTEGRATION GATE — SG_TUNED_MB_PROJ_WGMMA  (DEFAULT OFF → byte-identical).
++//
++//  Wires the dormant M0 wgmma-projection infra above into fused_mamba_megakernel_tc.
++//  This is the SCAFFOLD half of the integration (the decoder's SG_TUNED_DEC_DW_STAGE
++//  pattern): it gates the WORKSPACE so the host sizer (mb_tc_workspace_floats) and
++//  the kernel carve advance by the SAME gated amount — the ViT-IMA invariant. The
++//  kernel-BODY rewire (running a token-tile fwd that MATERIALIZES the projection
++//  acts to the MbActs HBM region, then the output-stationary dW phase) is the
++//  remaining step and is documented as GPU-iteration-gated below — it is NOT
++//  enabled by this macro flipping ON, because it would change the fp32 dW
++//  accumulation order (single-sample kSeq reduce → full-T K-contraction) and so
++//  MUST be re-validated against the fp64 oracle on real silicon (parity is NOT
++//  provable CPU-side). When OFF (the default) NOTHING here is instantiated: every
++//  sizer term is 0, the kernel carve is gated to match → the production d=128
++//  build is byte-for-byte unchanged (proven via PTX diff).
++//
++//  WHY a SINGLE gated sizer (mb_proj_wgmma_floats): the ViT dW IMA was a workspace
++//  sizer↔carve DISAGREEMENT (a carve advance not gated to match the host size).
++//  Routing BOTH the host term and the kernel carve through THIS ONE function makes
++//  the agreement structural — they cannot drift because there is one source.
++// ════════════════════════════════════════════════════════════════════════
++#ifndef SG_TUNED_MB_PROJ_WGMMA
++#define SG_TUNED_MB_PROJ_WGMMA 0
++#endif
++
++// The TOTAL extra float workspace the M0 projection-wgmma path needs (the MbActs
++// HBM acts region for the dW operands + the bf16 projection weight cache for the
++// fwd GEMM B-operand), in FLOAT units. ZERO when the gate is OFF so the host
++// workspace size + the kernel carve are BOTH byte-identical to the scalar path.
++// This is the ONE function both mb_tc_workspace_floats (host) and the kernel's
++// pointer carve call — the sizer↔carve agreement is structural (cannot drift).
++__host__ __device__ __forceinline__ int64_t mb_proj_wgmma_floats(int T) {
++#if SG_TUNED_MB_PROJ_WGMMA
++    return mb_proj_acts_floats(T)     // MbActs: 4 X-streams + 5 dY-streams, T tokens
++         + mb_proj_wbf_floats();      // bf16 projection-weight cache (5 weights × layers)
++#else
++    (void)T;
++    return 0;
++#endif
++}
++
+ // ── Per-model Muon 2D-weight table (the ndim==2 parameters Muon's P2.7
+ //    Newton-Schulz orthogonalizes; ndim==1/other weights take the AdamW aux tail).
+ //    Flat tensor index (named_parameters() order) + rows[dim0] + cols[dim1],

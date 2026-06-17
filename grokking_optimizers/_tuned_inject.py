@@ -124,9 +124,11 @@ def canonical_arch_key(arch: str) -> str:
 #                     (also model_stage_decoder_tc.cuh:75 =128 / _mamba_tc.cuh:78 =64)
 #   tile_n          SG_TUNED_TILE_N         csrc/backends/cuda/sm_90/wgmma.cuh:133 128
 #                     (shared by decoder/vit/mamba TC substrates)
-#   dec_dw_splitk   SG_TUNED_DEC_DW_SPLITK  csrc/fused/sm_90/model_stage_decoder_tc.cuh:93 4
+#   dec_dw_splitk   SG_TUNED_DEC_DW_SPLITK  csrc/fused/sm_90/model_stage_decoder_tc.cuh:101 1
 #   vit_dw_splitk   SG_TUNED_VIT_DW_SPLITK  csrc/fused/sm_90/model_stage_vit_tc.cuh:105 4
-#   mb_dw_splitk    SG_TUNED_MB_DW_SPLITK   csrc/fused/sm_90/model_stage_mamba_tc.cuh:181 4
+#   (mb_dw_splitk REMOVED 2026-06-17: the Mamba-3 TC rewrite dropped the
+#    output-stationary dW split-K machinery — mb_dw_part_floats()==0 — so
+#    SG_TUNED_MB_DW_SPLITK is no longer #defined/consumed by any kernel.)
 #   prod_regs       SG_TUNED_PROD_REGS      csrc/backends/cuda/sm_90/tile_pipeline.cuh:92 40
 #   cons_regs       SG_TUNED_CONS_REGS      csrc/backends/cuda/sm_90/tile_pipeline.cuh:95 232
 #   maxrregcount    (ptxas flag)            --maxrregcount=N (no -D macro)          0 (unset)
@@ -150,9 +152,8 @@ MACROS: Dict[str, Dict[str, Any]] = {
     "mega_block":    {"kind": "macro", "macro": "SG_TUNED_MEGA_BLOCK",    "default": 256},
     "tile_m":        {"kind": "macro", "macro": "SG_TUNED_TILE_M",        "default": 128},
     "tile_n":        {"kind": "macro", "macro": "SG_TUNED_TILE_N",        "default": 128},
-    "dec_dw_splitk": {"kind": "macro", "macro": "SG_TUNED_DEC_DW_SPLITK", "default": 4},
+    "dec_dw_splitk": {"kind": "macro", "macro": "SG_TUNED_DEC_DW_SPLITK", "default": 1},
     "vit_dw_splitk": {"kind": "macro", "macro": "SG_TUNED_VIT_DW_SPLITK", "default": 4},
-    "mb_dw_splitk":  {"kind": "macro", "macro": "SG_TUNED_MB_DW_SPLITK",  "default": 4},
     "prod_regs":     {"kind": "macro", "macro": "SG_TUNED_PROD_REGS",     "default": 40},
     "cons_regs":     {"kind": "macro", "macro": "SG_TUNED_CONS_REGS",     "default": 232},
     # Real ptxas flag (no preprocessor macro). 0 == unset == emit nothing.
@@ -162,7 +163,7 @@ MACROS: Dict[str, Dict[str, Any]] = {
 # Order in which to emit flags for a TU (stable output → deterministic
 # build.ninja diffs and a predictable unit-test expectation).
 _EMIT_ORDER = ["mega_block", "tile_m", "tile_n",
-               "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+               "dec_dw_splitk", "vit_dw_splitk",
                "prod_regs", "cons_regs", "maxrregcount"]
 
 # The canonical optimizer tokens (mirrors

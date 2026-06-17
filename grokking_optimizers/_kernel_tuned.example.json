@@ -11,7 +11,6 @@
       "cluster_shape": "SG_TUNED_CLUSTER_SHAPE",
       "cons_regs": "SG_TUNED_CONS_REGS",
       "dec_dw_splitk": "SG_TUNED_DEC_DW_SPLITK",
-      "mb_dw_splitk": "SG_TUNED_MB_DW_SPLITK",
       "mega_block": "SG_TUNED_MEGA_BLOCK",
       "prod_regs": "SG_TUNED_PROD_REGS",
       "tile_m": "SG_TUNED_TILE_M",
@@ -38,7 +37,6 @@
     "mamba": {
       "supergrok2": {
         "maxrregcount": 128,
-        "mb_dw_splitk": 8,
         "mega_block": 512,
         "model": "mamba",
         "tile_m": 256,

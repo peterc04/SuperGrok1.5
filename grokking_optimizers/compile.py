@@ -1299,7 +1299,7 @@ def _dim(name: str, dtype: str, values: List[Any], macro: Optional[str],
 # include the TC substrate) — see _make_variant_timer's megakernel-TC timer.
 _LIVE_TUNING_DIMS: frozenset = frozenset({
     "block", "vec", "unroll", "async_depth", "cluster_shape", "maxrregcount",
-    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk",
 })
 
 # Hard ceiling for the async-copy pipeline depth. The committed kernels clamp
@@ -2222,8 +2222,10 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "SG_TUNED_DEC_DW_SPLITK", ["device"]),
             _dim("vit_dw_splitk", "int", [4, 1, 2, 8],
                  "SG_TUNED_VIT_DW_SPLITK", ["device"]),
-            _dim("mb_dw_splitk", "int", [4, 1, 2, 8],
-                 "SG_TUNED_MB_DW_SPLITK", ["device"]),
+            # mb_dw_splitk dim REMOVED 2026-06-17 — the Mamba-3 TC rewrite
+            # dropped the output-stationary dW split-K (mb_dw_part_floats()==0),
+            # so SG_TUNED_MB_DW_SPLITK is no longer #defined/read by any kernel
+            # (a winner for it would only emit a dead -D). See COMPILE_AUDIT.md.
             # num_stages dropped: SG_TUNED_NUM_STAGES is dead on sm_90 (no kernel
             # reads it). It remains a LIVE Pallas kwarg only (see
             # _build_pallas_space), so it stays in config_key + the cost model.
@@ -14837,7 +14839,7 @@ _TC_REAL_STEP_TU: Dict[str, str] = {
 # the cheap timer; routing them here would only add a TC rebuild for no signal.
 _GEMM_TILE_DIM_NAMES: frozenset = frozenset({
     # #12 tile dims — read by model_stage_{decoder,vit,mamba}_tc.cuh.
-    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk", "mb_dw_splitk",
+    "tile_m", "tile_n", "dec_dw_splitk", "vit_dw_splitk",
     # GEMM mainloop stage / interleave knobs — also read ONLY by the real TC
     # path (confirmed in model_stage_*_tc.cuh) so the cheap opt.step() timer is
     # blind to them; a config that varies one is noise unless timed on the real
@@ -14895,7 +14897,6 @@ def _tc_relevant_device_flags(device_extra: List[str]) -> List[str]:
     keep_macros = (
         "SG_TUNED_TILE_M", "SG_TUNED_TILE_N",
         "SG_TUNED_DEC_DW_SPLITK", "SG_TUNED_VIT_DW_SPLITK",
-        "SG_TUNED_MB_DW_SPLITK",
     )
     out: List[str] = []
     for f in device_extra:

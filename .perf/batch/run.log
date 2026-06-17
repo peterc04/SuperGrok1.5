@@ -1,0 +1,9 @@
+==================== FRONT-LOAD START Wed Jun 17 05:41:11 UTC 2026 ====================
+[fast-build-env] caching ON: nvcc->sccache(CUDA) + g++->ccache | nvcc --threads 0 (auto=224) | MAX_JOBS=224 | ninja
+--- preflight: compile.py --self-test (CPU) ---
+!!! preflight self-test FAILED (rc=0) — see preflight_selftest.log; ABORTING front-load to avoid wasting the GPU window.
+==================== FRONT-LOAD START Wed Jun 17 05:48:31 UTC 2026 ====================
+[fast-build-env] caching ON: nvcc->sccache(CUDA) + g++->ccache | nvcc --threads 0 (auto=224) | MAX_JOBS=224 | ninja
+--- preflight: compile.py --self-test (CPU) ---
+--- preflight OK: [self-test] 265 passed, 0 failed ---
+--- waiting for GPU to free (ViT B1 gate) @ Wed Jun 17 05:49:20 UTC 2026 ---

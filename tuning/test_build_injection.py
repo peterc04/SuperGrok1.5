@@ -145,7 +145,7 @@ def _sample_tuned():
                      "vit_dw_splitk": 2, "prod_regs": 48, "cons_regs": 224,
                      "maxrregcount": 0, "model": "vit"},
             "supergrok2": {"mega_block": 512, "tile_m": 256, "tile_n": 128,
-                           "mb_dw_splitk": 8, "maxrregcount": 128},
+                           "maxrregcount": 128},
         },
         "_meta": {"source": "test"},
     }

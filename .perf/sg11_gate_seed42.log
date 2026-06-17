@@ -1,0 +1,224 @@
+[l3tc-gate] adamw/decoder
+  (1a) params vs canonical fp64: max|Δp|=1.199e-07 rel=2.843e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=2.739e-07 v=9.647e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] adamw/vit
+  (1a) params vs canonical fp64: max|Δp|=1.703e-07 rel=4.040e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=2.437e-07 v=9.775e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] lion/decoder
+  (1a) params vs canonical fp64: max|Δp|=2.343e-07 rel=5.556e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=9.695e-07 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] lion/vit
+  (1a) params vs canonical fp64: max|Δp|=1.164e-07 rel=2.760e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=9.391e-07 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokfast/decoder
+  (1a) params vs canonical fp64: max|Δp|=1.198e-07 rel=2.839e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=3.076e-07 v=9.840e-07 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokfast/vit
+  (1a) params vs canonical fp64: max|Δp|=1.169e-07 rel=2.773e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=2.437e-07 v=1.035e-06 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] adamw/mamba
+  (1a) params vs canonical fp64: max|Δp|=2.016e-07 rel=4.779e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=2.028e-07 v=9.304e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] lion/mamba
+  (1a) params vs canonical fp64: max|Δp|=2.343e-07 rel=5.556e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=9.670e-07 v=0.000e+00 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokfast/mamba
+  (1a) params vs canonical fp64: max|Δp|=1.653e-07 rel=3.918e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=2.496e-07 v=9.758e-07 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] neuralgrok/decoder
+  (1a) params vs canonical fp64: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=3.421e-07 v=9.816e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] neuralgrok/vit
+  (1a) params vs canonical fp64: max|Δp|=1.192e-07 rel=2.828e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=2.495e-07 v=1.003e-06 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] neuralgrok/mamba
+  (1a) params vs canonical fp64: max|Δp|=2.384e-07 rel=5.653e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=2.665e-07 v=7.284e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokadamw/decoder
+  (1a) params vs canonical fp64: max|Δp|=1.198e-07 rel=2.839e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=9.352e-08 v=9.840e-07 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokadamw/vit
+  (1a) params vs canonical fp64: max|Δp|=1.169e-07 rel=2.773e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=7.930e-08 v=1.035e-06 ema=0.000e+00 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] grokadamw/mamba
+  (1a) params vs canonical fp64: max|Δp|=1.194e-07 rel=2.831e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=8.342e-08 v=9.709e-07 ema=5.609e-08 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] prodigy/decoder
+  (1a) params vs canonical fp64: max|Δp|=1.191e-07 rel=2.821e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=3.052e-07 v=1.012e-06 ema=4.492e-08 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] prodigy/vit
+  (1a) params vs canonical fp64: max|Δp|=1.170e-07 rel=2.773e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=2.723e-07 v=8.872e-07 ema=4.019e-08 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] prodigy/mamba
+  (1a) params vs canonical fp64: max|Δp|=1.191e-07 rel=2.822e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=2.317e-07 v=8.800e-07 ema=2.971e-08 (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] muon/vit
+  (1a) params vs canonical fp64: max|Δp|=1.603e-06 rel=3.874e-07 (tol 2e-03) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=1.117e-08 v=9.876e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] muon/decoder
+  (1a) params vs canonical fp64: max|Δp|=1.253e-06 rel=3.027e-07 (tol 2e-03) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=1.153e-08 v=9.103e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] muon/mamba
+  (1a) params vs canonical fp64: max|Δp|=1.455e-06 rel=3.518e-07 (tol 2e-03) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=5.849e-09 v=9.391e-07 ema=n/a (tol 1e-4) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] looksam/decoder
+  (1a) params vs canonical fp64: max|Δp|=5.203e-07 rel=1.234e-07 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical fp64: m=2.572e-07 v=9.855e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs PURE-fp64 2nd backward: rel=9.144e-03 (tol 3e-02, kernel bf16-TC vs ground-truth fp64 oracle floor) OK
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] looksam/vit
+  (1a) params vs canonical fp64: max|Δp|=6.169e-07 rel=1.463e-07 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical fp64: m=3.046e-07 v=9.011e-07 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs PURE-fp64 2nd backward: rel=9.677e-03 (tol 3e-02, kernel bf16-TC vs ground-truth fp64 oracle floor) OK
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok11/decoder
+  (1a) params vs canonical SG: max-rel=2.843e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical SG: m=2.382e-07 v=1.002e-06 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=1.346e-02 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.020e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok11/vit
+  (1a) params vs canonical SG: max-rel=4.040e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical SG: m=2.082e-07 v=9.551e-07 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=1.521e-02 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.702e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok15/decoder
+  (1a) params vs canonical SG: max-rel=2.843e-08 (tol 1e-04) OK  loss=4.77541
+  (1b) STATE vs canonical SG: m=2.739e-07 v=9.647e-07 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=1.346e-02 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=2.020e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok15/vit
+  (1a) params vs canonical SG: max-rel=4.040e-08 (tol 1e-04) OK  loss=4.72643
+  (1b) STATE vs canonical SG: m=2.436e-07 v=9.776e-07 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=1.521e-02 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.702e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.726432/4.726432/4.726432  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] looksam/mamba
+  (1a) params vs canonical fp64: max|Δp|=1.435e-06 rel=3.403e-07 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical fp64: m=2.440e-07 v=1.052e-06 ema=n/a (tol 1e-4) OK
+  (1b-sam) sam_dir vs PURE-fp64 2nd backward: rel=8.396e-07 (tol 3e-02, kernel bf16-TC vs ground-truth fp64 oracle floor) OK
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok11/mamba
+  (1a) params vs canonical SG: max-rel=4.778e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical SG: m=2.584e-07 v=9.393e-07 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=9.207e-07 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.828e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=0]
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok15/mamba
+  (1a) params vs canonical SG: max-rel=4.779e-08 (tol 1e-04) OK  loss=4.73610
+  (1b) STATE vs canonical SG: m=2.028e-07 v=9.304e-07 (tol 1e-4) OK
+  (A) sharpness vs PURE-fp64 2nd backward: rel=9.207e-07 (tol 3e-02, bf16-TC vs ground-truth fp64 floor) OK
+  (B) mu vs rescale·phi(g,sharpness): rel=1.828e-07 (tol 3e-03) OK  [rescale=0.1 alpha=0.98 gate_global=2.25e-07]
+  (2) A/A/A determinism: loss 4.736105/4.736105/4.736105  grad-eq=True  param-eq=True  mu-eq=True  sharp-eq=True  OK
+  => PASS
+
+[l3tc-gate] supergrok2/decoder
+[A/A/A] determinism: loss 4.775414/4.775414/4.775414  grad-eq=True  param-eq=True  sharp-eq=True  gru-eq=True  OK
+
+[B1] SG2 decoder TC megakernel vs pure-fp64 oracle_step (single step):
+      max|Δparam| = 1.198e-07
+      max|Δm| = 3.937e-07
+      max|Δv| = 1.120e-09
+      max|Δmu| = 4.218e-07
+      max|Δslow| = 1.253e-09
+      max|Δgru_state| = 1.263e-07
+      WORST = 4.218e-07  (tol 1e-5)  OK
+[tie-probe] strategy-A (|g|,idx) perm total-order + deterministic on tied grad: OK  perm=[3, 4, 6, 0, 1, 2, 5]
+[N>64 CSA fidelity probe] largest tensor N=65536 (>>64): the kernel's low-rank CSA indexer (idx_UQ DROPPED, score /sqrt(rank=4) not /sqrt(d=8)) diverges from the bilevel oracle's full-d indexer for N>64 (supergrok2.h:227-228 vs supergrok2_bilevel_adjoint.h:156-157). REPORTED as the documented WON'T-GROK gap; single-step parity vs the pure-fp64 oracle_step (B1, SAME low-rank indexer) is unaffected. NOT a regression.
+  => PASS
+
+[l3tc-gate] supergrok2/vit
+Traceback (most recent call last):
+  File "/workspace/SuperGrok1.5/tests/hw/test_l3tc_tail_gate.py", line 1512, in <module>
+    main()
+  File "/workspace/SuperGrok1.5/tests/hw/test_l3tc_tail_gate.py", line 1504, in main
+    ok, _ = run_cell_gate(cell, verbose=True)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/SuperGrok1.5/tests/hw/test_l3tc_tail_gate.py", line 1077, in run_cell_gate
+    return run_sg2_gate(model, verbose=verbose)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/SuperGrok1.5/tests/hw/_sg2_l3tc_gate.py", line 165, in run_sg2_gate
+    assert k_sharp.abs().max().item() > 1e-8, (
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: vit: kernel sharpness ~0 — the in-kernel SAM 2nd backward did not run

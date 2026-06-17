@@ -149,8 +149,11 @@ winning — *except* one fake-green hole; (D) cache toolchain-identity blind spo
 - `_cost_model_compute_feature_dim()` is **dead** (never called); the `FEATURE_DIM=14` hardcode is
   guarded by a self-test the comment promises but that **does not exist** → silent schema-drift
   risk. Seed-prediction sibling rows leak into `mae_val` (optimistic).
-- Phantom dead search dims: `mb_dw_splitk`/`mb_gemm_stages`/`mb_gemm_interleave` + `min_blocks`
-  (no kernel macro → auto-pinned dead, never sweep; comments claim otherwise). Blackwell
+- Phantom dead search dims: ~~`mb_dw_splitk`~~ **(REMOVED 2026-06-17 — Mamba-3 TC rewrite dropped
+  the output-stationary dW split-K; macro no longer #defined. Also corrected the `dec_dw_splitk`
+  table default 4→1 drift the header ratchet introduced. `test_macro_drift_against_header` now
+  green.)** / `mb_gemm_stages`/`mb_gemm_interleave` + `min_blocks` (still no kernel macro →
+  auto-pinned dead, never sweep; comments claim otherwise — separate cleanup). Blackwell
   sm_100a/103a/120a route through the generic builder → no TC tile surface (multi-arch maximality
   is really single-arch sm_90). ~10 stranded section-header comments in the self-test tail (nit).
 
