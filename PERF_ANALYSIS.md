@@ -1,5 +1,14 @@
 # SuperGrok1.5 — Master Performance Analysis (1B+ scale)
 
+> **⚠ SUPERSEDED IN PART (2026-06-17) — read OPTIMIZATION_LEDGER.md for the current truth.** This doc's
+> original headline ("the pipelined-GEMM P0 is the built-but-unused #1 lever"; "the ~2% roofline is a
+> hardware/structural ceiling") is OUT OF DATE: **P0 was REVERTED** (it's staging-bound, not drain-bound —
+> −11.6%), and the **dW contiguous-staging redirect is the +2.05× KEEP** that *doubled* decoder roofline
+> 2.08%→4.35% — proving the ~2% was a **STAGING artifact, not a hardware ceiling**. Post-dW the bottleneck
+> MOVED: decoder = fwd/dX 56.5% (drain-bound) + B1 barrier 19%; **ViT = B1-barrier LOAD-IMBALANCE 51%** (its
+> dW is only 3% — not GEMM-bound); Mamba = scan-bound (M0 deferred). The model-specific bottlenecks below
+> still inform, but treat the P0/ceiling framing as historical.
+
 Synthesis of three independent, read-only, file:line-grounded analyses (decoder+ViT, Mamba-3, shared substrate + multi-GPU), 2026-06-16. Goal: maximize all three model megakernels for 1B+ scale, single- and multi-GPU. Every lever is checked against the **fp64 parity hard-gate + A/A/A determinism**; that is a HARD gate, not a tiebreaker.
 
 ## TL;DR — the headline
