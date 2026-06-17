@@ -430,9 +430,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.attr("VOCAB") = (int)vit::kVocab;
 #ifdef SG_VIT_PROFILE
     mm.def("tc_profile_read", &tc_profile_read,
-           "diagnostic-only: per-phase clock64 maxima [P1fwd,P1bwd,P2dW,P3opt] (cycles), resets after read");
+           "diagnostic-only: per-phase clock64 maxima "
+           "[P1fwd,P1bwd,B1wait,P2dW,P2asm,P3opt] (cycles), resets after read");
     mm.def("tc_profile_head_read", &tc_profile_head_read,
            "diagnostic-only: per-sample head/CE loop cycles [fwd,bwd] (subset of P1), resets after read");
+    // Mirror the decoder TU: expose HAS_PROFILE (and the ViT-specific alias
+    // HAS_VIT_PROFILE) so the bench / fast_triage can `getattr(mod, "HAS_PROFILE")`
+    // and assert the profile build flag actually took. Set in BOTH branches so the
+    // attr is always queryable (the non-profile build reports False, not AttributeError).
     mm.attr("HAS_PROFILE") = true;
+    mm.attr("HAS_VIT_PROFILE") = true;
+#else
+    mm.attr("HAS_PROFILE") = false;
+    mm.attr("HAS_VIT_PROFILE") = false;
 #endif
 }

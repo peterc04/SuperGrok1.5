@@ -9,17 +9,24 @@ WHY THIS EXISTS
   harness gives a ~1-3 min directional signal so the expensive full cycle is reserved
   for the few candidates that survive triage.
 
-  It is a THIN ORCHESTRATOR over the EXISTING machinery — it reinvents NOTHING:
-    * the per-variant build is `tuning.decoder_bench.build_variant(d, profile=True, …)`
-      — the coexisting bench TU (csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu built
-      as a SEPARATELY-NAMED extension with its own torch-extensions build dir + ninja
-      incremental rebuild + sccache). It is ONE cache-friendly TU, NOT the full `_ops`,
-      and it NEVER touches the production `_ops.so` or the 33/33 gate.
-    * the timing + per-phase clock64 read is `tuning.decoder_bench.measure(..., profile=True)`
-      → `res["phase_cycles"]` (the same 8-slot clock64 split _h3_splitk_sweep.py reads),
-      mapped by `decoder_bench.PHASE_NAMES`:
+  It is a THIN ORCHESTRATOR over the EXISTING machinery — it reinvents NOTHING. The
+  --model switch selects which megakernel to triage (decoder DEFAULT | vit); both
+  bench modules expose the SAME build_variant(profile=True)/measure(profile=True)->
+  res["phase_cycles"] contract, and the relevance-gate logic is model-agnostic:
+    * the per-variant build is `<bench>.build_variant(d, profile=True, …)` where <bench>
+      is tuning.decoder_bench (mega_decoder_real_adamw_tc.cu) or tuning.vit_bench
+      (mega_vit_real_adamw_tc.cu) — the coexisting bench TU built as a SEPARATELY-NAMED
+      extension with its own torch-extensions build dir + ninja incremental rebuild +
+      sccache. It is ONE cache-friendly TU, NOT the full `_ops`, and it NEVER touches
+      the production `_ops.so` or the 33/33 gate.
+    * the timing + per-phase clock64 read is `<bench>.measure(..., profile=True)`
+      → `res["phase_cycles"]`, mapped by the model's phase table:
+        decoder `decoder_bench.PHASE_NAMES` (8-slot g_dec_prof_max):
           [0]=P1_fwd [1]=P1_bwd [2]=B1_barrier [3]=P2_dW_GEMM
           [4]=P2_grad_asm [5]=P3_opt_tail [6]=B2_barrier [7]=B0_barrier
+        vit `vit_bench.VIT_PHASE_NAMES` (6-slot g_vit_prof_max):
+          [0]=P1_fwd [1]=P1_bwd [2]=B1_barrier [3]=P2_dW_GEMM
+          [4]=P2_grad_asm [5]=P3_opt_tail
     * each variant is timed in its OWN worker subprocess (the tune_optimizers.py:645
       `subprocess.Popen([sys.executable, "-c", script])` idiom) so the baseline and the
       candidate get CLEAN, ISOLATED CUDA contexts — a wedged/OOM build of one variant
@@ -169,11 +176,47 @@ sys.path.insert(0, str(ROOT))
 # The phase-name table is the single source of truth for the clock64 slot order; it
 # lives in decoder_bench and matches mega_decoder_real_adamw_tc.cu's g_dec_prof_max.
 from tuning.decoder_bench import PHASE_NAMES, SM_GHZ  # noqa: E402
+# ViT phase-name table (g_vit_prof_max [6 slots]); lives in vit_bench and matches
+# fused_vit_megakernel.cuh's stamping sites. Imported lazily-safe at module load so a
+# decoder-only triage never pays the ViT import cost difference (both are pure-Python
+# at import). The --model switch selects which table + bench module drive the run.
+from tuning.vit_bench import VIT_PHASE_NAMES  # noqa: E402
+
+# ── per-model wiring: which coexisting bench module + profile macro + clock64 phase
+#    table a triage drives. The decoder is the default + the validated reference; vit
+#    mirrors it (vit_bench.build_variant(profile=True)/measure(profile=True) expose the
+#    SAME res["phase_cycles"] contract). The relevance-gate machinery below is model-
+#    AGNOSTIC — it consumes phase_cycles + a phase-name table, nothing decoder-specific.
+_MODELS = {
+    "decoder": {
+        "bench": "tuning.decoder_bench",
+        "profile_macro": "SG_DEC_PROFILE",
+        "phase_names": PHASE_NAMES,
+        "d_default": 2048,
+        "d_valid": (128, 2048),
+        "d_help": ("decoder width. The bench has exactly TWO layouts: 2048 (roofline "
+                   "scale — DEFAULT, faithful shares) and 128 (production toy). There is "
+                   "NO d=1024 layout — it compiles to D=2048 and trips the mod.D==d assert."),
+    },
+    "vit": {
+        "bench": "tuning.vit_bench",
+        "profile_macro": "SG_VIT_PROFILE",
+        "phase_names": VIT_PHASE_NAMES,
+        "d_default": 1024,
+        "d_valid": (128, 1024),
+        "d_help": ("ViT width. The bench has TWO layouts: 1024 (size-ladder roofline "
+                   "scale — DEFAULT) and 128 (production). --d selects the layout branch."),
+    },
+}
 
 # ── phase auto-targeting: which clock64 phase a -D macro is MEANT to move ─────────
-# (substring match on the macro KEY, first hit wins; order = specificity).
+# (substring match on the macro KEY, first hit wins; order = specificity). The needles
+# are model-agnostic: P2_dW_GEMM / P1_fwd / P3_opt_tail exist in BOTH the decoder and
+# ViT phase tables, and the ViT macro keys (SG_TUNED_VIT_DW_*, SG_TUNED_VIT_GEMM_*, …)
+# carry the same DW_/GEMM_/OPT/TILE_ substrings, so one table serves both models.
 _PHASE_HINTS = [
-    ("DEC_DW", "P2_dW_GEMM"),       # dW staging / split-K / dW-specific knobs
+    ("DEC_DW", "P2_dW_GEMM"),       # dW staging / split-K / dW-specific knobs (decoder)
+    ("VIT_DW", "P2_dW_GEMM"),       # dW knobs (ViT)
     ("DW_", "P2_dW_GEMM"),
     ("PIPE", "P1_fwd"),             # pipelined GEMM ring (fwd/dX path)
     ("GEMM_INTERLEAVE", "P1_fwd"),  # fwd/dX interleave (dW IL shows on P2 too — wall arbitrates)
@@ -184,32 +227,38 @@ _PHASE_HINTS = [
 ]
 
 
-def _infer_phase(cand_defines: list[str]) -> str:
+def _infer_phase(cand_defines: list[str], phase_names: list[str] = PHASE_NAMES) -> str:
     """Infer the targeted phase from the candidate macro KEYs. Defaults to the wall-
-    dominant P2_dW_GEMM when nothing matches (the d=2048 step is P1+P2 dominated)."""
+    dominant P2_dW_GEMM when nothing matches (the roofline step is P1+P2 dominated).
+    `phase_names` is the active model's slot table (decoder by default); the inferred /
+    default phase is guaranteed to be a member of it (P2_dW_GEMM is in both tables)."""
     keys = [d.split("=", 1)[0].lstrip("-D").strip().upper() for d in cand_defines]
     for needle, phase in _PHASE_HINTS:
-        if any(needle in k for k in keys):
+        if any(needle in k for k in keys) and phase in phase_names:
             return phase
-    return "P2_dW_GEMM"
+    return "P2_dW_GEMM" if "P2_dW_GEMM" in phase_names else phase_names[0]
 
 
 # ── the worker body: build ONE bench variant in an isolated CUDA context, profile-
 #    time it, print a single TRIAGE_RESULT JSON line. Driven via `python -c`, the
 #    tune_optimizers.py:645 persistent-subprocess idiom (one warm context per variant).
+#    `{bench}` is the coexisting bench module (tuning.decoder_bench | tuning.vit_bench),
+#    each exposing the SAME build_variant(d, profile=True, defines=…)/measure(…,
+#    profile=True, ncta_cap=…)->res["phase_cycles"] contract. `{profile_macro}` only
+#    labels the HAS_PROFILE assert message.
 _WORKER = r"""
 import json, sys
 from pathlib import Path
 ROOT = Path({root!r})
 sys.path.insert(0, str(ROOT))
-import tuning.decoder_bench as db
+import {bench} as db
 
 d, B, reps, warmup, iters, ncta = {d}, {B}, {reps}, {warmup}, {iters}, {ncta}
 defines = {defines!r}
 try:
     mod = db.build_variant(d, profile=True, defines=defines)
     assert int(mod.D) == d, "TU D=%d != %d" % (int(mod.D), d)
-    assert getattr(mod, "HAS_PROFILE", False), "variant built without -DSG_DEC_PROFILE"
+    assert getattr(mod, "HAS_PROFILE", False), "variant built without -D{profile_macro}"
     res = db.measure(mod, d, B, reps=reps, warmup=warmup, iters=iters,
                      profile=True, ncta_cap=ncta)
     out = {{
@@ -231,10 +280,11 @@ print("TRIAGE_RESULT " + json.dumps(out), flush=True)
 def _run_variant(label: str, defines: list[str], args, env_passthrough: bool = True) -> dict:
     """Build+profile-time one variant in an isolated subprocess. Returns the parsed
     TRIAGE_RESULT dict augmented with build wall + label."""
+    mcfg = _MODELS[getattr(args, "model", "decoder")]
     body = _WORKER.format(
         root=str(ROOT), d=args.d, B=args.B, reps=args.reps,
         warmup=args.warmup, iters=args.iters, ncta=args.ncta_cap,
-        defines=defines,
+        defines=defines, bench=mcfg["bench"], profile_macro=mcfg["profile_macro"],
     )
     print(f"[triage] building+profiling variant '{label}'  defines={defines or '(prod defaults)'}",
           flush=True)
@@ -276,11 +326,11 @@ def _run_variant(label: str, defines: list[str], args, env_passthrough: bool = T
     return result
 
 
-def _phase_ms(res: dict, phase: str) -> float | None:
+def _phase_ms(res: dict, phase: str, phase_names: list[str] = PHASE_NAMES) -> float | None:
     cyc = res.get("phase_cycles")
     if not cyc:
         return None
-    idx = PHASE_NAMES.index(phase)
+    idx = phase_names.index(phase)
     return cyc[idx] / (SM_GHZ * 1e9) * 1e3
 
 
@@ -303,8 +353,9 @@ def _verdict(delta_pct: float, neutral_pct: float) -> str:
 
 
 def _report(base: dict, cand: dict, phase: str, neutral_pct: float,
-            relevance_floor: float = 5.0) -> dict:
-    """Build + print the human triage report. Returns the JSON summary dict."""
+            relevance_floor: float = 5.0, phase_names: list[str] = PHASE_NAMES) -> dict:
+    """Build + print the human triage report. Returns the JSON summary dict.
+    `phase_names` is the active model's clock64 slot table (decoder by default)."""
     print("\n" + "=" * 78, flush=True)
     print("[triage] RESULT", flush=True)
     print("=" * 78, flush=True)
@@ -331,7 +382,7 @@ def _report(base: dict, cand: dict, phase: str, neutral_pct: float,
           flush=True)
     print(f"\n  {'phase':14s} {'baseline ms':>13s} {'candidate ms':>14s} {'Δ%':>9s}  "
           f"{'(b%/c% of step)':>16s}", flush=True)
-    for i, name in enumerate(PHASE_NAMES):
+    for i, name in enumerate(phase_names):
         b_ms = bp[i] / (SM_GHZ * 1e9) * 1e3
         c_ms = cp[i] / (SM_GHZ * 1e9) * 1e3
         dlt = _pct_delta(b_ms, c_ms)
@@ -340,8 +391,8 @@ def _report(base: dict, cand: dict, phase: str, neutral_pct: float,
               f"{100.0*bp[i]/bt:>6.1f}%/{100.0*cp[i]/ct:>5.1f}%{star}", flush=True)
 
     # the two signals that matter: targeted phase + wall.
-    b_phase = _phase_ms(base, phase)
-    c_phase = _phase_ms(cand, phase)
+    b_phase = _phase_ms(base, phase, phase_names)
+    c_phase = _phase_ms(cand, phase, phase_names)
     phase_delta = _pct_delta(b_phase, c_phase)
     wall_delta = _pct_delta(base["wall_ms"], cand["wall_ms"])
     phase_v = _verdict(phase_delta, neutral_pct)
@@ -358,7 +409,7 @@ def _report(base: dict, cand: dict, phase: str, neutral_pct: float,
     # its local Δ looks (the canonical trap: vec4-AdamW was bench-faster on a P3 tail that
     # is <1% of the step → real benchmark NEUTRAL). This is only meaningful because the
     # profile is at the ROOFLINE SCALE — at a shrunk d/B the shares (hence this gate) lie.
-    b_share = 100.0 * bp[PHASE_NAMES.index(phase)] / bt   # % of step in targeted phase
+    b_share = 100.0 * bp[phase_names.index(phase)] / bt   # % of step in targeted phase
     projected_step_pct = (b_share / 100.0) * phase_delta
     max_step_gain_pct = -b_share
     relevant = b_share >= relevance_floor
@@ -422,7 +473,13 @@ def _report(base: dict, cand: dict, phase: str, neutral_pct: float,
 
 def _do_validate(args) -> int:
     """Reproduce the known dW 2× to prove the harness is faithful. Returns process
-    exit code: 0 = faithful, 2 = reproduced the WRONG direction (untrustworthy)."""
+    exit code: 0 = faithful, 2 = reproduced the WRONG direction (untrustworthy).
+    DECODER-specific (the reference KEEP is a decoder dW staging win)."""
+    if getattr(args, "model", "decoder") != "decoder":
+        print(f"[triage --validate] only the decoder has a measured-KEEP reference "
+              f"(the dW 2.05× staging win); --model {args.model} has no validation "
+              f"fixture. Run --validate without --model (or --model decoder).", flush=True)
+        return 1
     print("=" * 78, flush=True)
     print("[triage --validate] FAITHFULNESS CHECK vs the measured dW 2.05× KEEP", flush=True)
     print("  baseline  = SG_TUNED_DEC_DW_STAGE=0 splitk=1  (scalar; measured 1889.8 ms @ d=2048)",
@@ -501,7 +558,11 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--validate", action="store_true",
                     help="run the dW-2× faithfulness check instead of a candidate triage "
-                         "(exit 0=faithful, 2=untrustworthy).")
+                         "(exit 0=faithful, 2=untrustworthy). DECODER-only fixture.")
+    ap.add_argument("--model", choices=tuple(_MODELS), default="decoder",
+                    help="which megakernel to triage: 'decoder' (DEFAULT, the validated "
+                         "reference) or 'vit'. Selects the coexisting bench module + the "
+                         "clock64 phase table; the relevance-gate logic is model-agnostic.")
     ap.add_argument("--baseline-D", dest="baseline_defines", action="append", default=[],
                     metavar="KEY=VAL",
                     help="-D override for the BASELINE variant (repeatable). Empty = the "
@@ -510,19 +571,24 @@ def main() -> int:
                     metavar="KEY=VAL",
                     help="-D override for the CANDIDATE variant (repeatable), e.g. "
                          "--cand-D SG_TUNED_DEC_DW_SPLITK=2.")
+    # --phase choices are the UNION across models (the decoder's 8-slot table is a
+    # superset of the ViT 6-slot one); membership in the ACTIVE model's table is
+    # re-validated after parsing.
     ap.add_argument("--phase", choices=PHASE_NAMES, default=None,
                     help="the clock64 phase to judge the change on. Default: inferred from "
-                         "the candidate macro names (see _PHASE_HINTS).")
+                         "the candidate macro names (see _PHASE_HINTS). Must belong to the "
+                         "selected --model's phase table.")
     # REPRESENTATIVE-BY-DEFAULT: the screen runs at the SAME scale as the roofline
-    # benchmark (d=2048/B=16384) so the phase-SHARES — which drive the relevance gate —
-    # are the real ones. The speed comes from ONE seed + clock64 per-phase counters + a
-    # cached targeted TU (NOT the full _ops, NOT the 3-seed fp64/AAA gate), NOT from
-    # shrinking the problem. A shrunk d/B would be a PROXY with a different bottleneck
-    # structure (the P0 lesson: pipelining looked fine at d=128, regressed at d=2048).
-    ap.add_argument("--d", type=int, default=2048,
-                    help="decoder width. The bench has exactly TWO layouts: 2048 (roofline "
-                         "scale — DEFAULT, faithful shares) and 128 (production toy). There is "
-                         "NO d=1024 layout — it compiles to D=2048 and trips the mod.D==d assert.")
+    # benchmark (d=2048/B=16384 decoder; d=1024/B=16384 vit) so the phase-SHARES — which
+    # drive the relevance gate — are the real ones. The speed comes from ONE seed +
+    # clock64 per-phase counters + a cached targeted TU (NOT the full _ops, NOT the
+    # 3-seed fp64/AAA gate), NOT from shrinking the problem. A shrunk d/B would be a
+    # PROXY with a different bottleneck (the P0 lesson: pipelining looked fine at d=128,
+    # regressed at d=2048). --d default resolves per-model after parsing (None sentinel).
+    ap.add_argument("--d", type=int, default=None,
+                    help="model width. Decoder: 2048 (roofline DEFAULT) | 128 (toy). ViT: "
+                         "1024 (size-ladder roofline DEFAULT) | 128 (production). Defaults "
+                         "to the selected --model's roofline width.")
     ap.add_argument("--B", type=int, default=16384,
                     help="batch (%%16==0). DEFAULT 16384 = the roofline regime where the GEMM "
                          "phases dominate. Smaller B shifts shares toward the fixed-cost "
@@ -546,10 +612,18 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true",
                     help="stream each variant's build/run log (prefixed with '    | ').")
     args = ap.parse_args()
+    mcfg = _MODELS[args.model]
+    phase_names = mcfg["phase_names"]
+    # resolve the --d default + valid-set from the selected model.
+    if args.d is None:
+        args.d = mcfg["d_default"]
     assert args.B % 16 == 0, "B must be divisible by 16 (the dW K-loop is 16-step atoms)"
-    assert args.d in (128, 2048), (
-        f"the decoder bench has only two layouts: d=2048 (roofline, default) and d=128 "
-        f"(production toy). d={args.d} would compile to D=2048 and fail the mod.D==d assert.")
+    assert args.d in mcfg["d_valid"], (
+        f"the {args.model} bench has only these layouts: {mcfg['d_valid']} "
+        f"(default {mcfg['d_default']} = roofline scale). d={args.d} would compile to a "
+        f"different D and trip the mod.D==d assert.")
+    if args.phase is not None and args.phase not in phase_names:
+        ap.error(f"--phase {args.phase} is not a {args.model} phase; valid: {phase_names}")
     if args.B < 16384:
         print(f"[triage] ⚠ B={args.B} < 16384: phase-shares (hence the relevance gate) drift "
               f"from the roofline regime — faster but less faithful. Prefer --B 16384.",
@@ -562,18 +636,20 @@ def main() -> int:
         ap.error("a candidate needs at least one --cand-D KEY=VAL (or use --validate). "
                  "Baseline may be empty (production defaults).")
 
-    phase = args.phase or _infer_phase(args.cand_defines)
+    phase = args.phase or _infer_phase(args.cand_defines, phase_names)
     if args.phase is None:
         print(f"[triage] auto-targeted phase = {phase} "
               f"(inferred from {[d.split('=',1)[0] for d in args.cand_defines]}; "
               f"override with --phase)", flush=True)
 
-    print(f"[triage] scale: d={args.d} B={args.B} reps={args.reps} iters={args.iters}  "
-          f"neutral=±{args.neutral_pct}%  relevance-floor={args.relevance_floor}%", flush=True)
+    print(f"[triage] model={args.model} scale: d={args.d} B={args.B} reps={args.reps} "
+          f"iters={args.iters}  neutral=±{args.neutral_pct}%  "
+          f"relevance-floor={args.relevance_floor}%", flush=True)
     base = _run_variant("baseline", args.baseline_defines, args)
     cand = _run_variant("candidate", args.cand_defines, args)
-    summary = _report(base, cand, phase, args.neutral_pct, args.relevance_floor)
-    summary.update({"baseline_defines": args.baseline_defines,
+    summary = _report(base, cand, phase, args.neutral_pct, args.relevance_floor, phase_names)
+    summary.update({"model": args.model,
+                    "baseline_defines": args.baseline_defines,
                     "candidate_defines": args.cand_defines,
                     "d": args.d, "B": args.B})
     if args.json:
