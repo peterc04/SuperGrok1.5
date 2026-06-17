@@ -65,6 +65,12 @@
 - `grokking_optimizers` is an EDITABLE install: the CODE is on the volume, the install RECORD is in the ephemeral dist-packages.
 - **`ENV_SNAPSHOT.txt`** (committed) = the exact 180-package pin (torch 2.4.1+cu124 / CUDA 12.4 / py 3.11.10).
 
+**SELF-CONTAINED VENV (vendored 2026-06-17 — BULLETPROOF):** `/workspace/venv_selfcontained` (4.9G, on the
+VOLUME) has torch 2.4.1+cu124 + all 179 deps + a `.pth` for `grokking_optimizers` — it depends on **nothing**
+from the base image. **Fastest resume:** `source /workspace/venv_selfcontained/bin/activate && source .fast_build_env.sh`
+(no pip install needed; the `_ops.so` is already built on the volume). The recipe below is only the
+from-scratch fallback if that venv is somehow lost.
+
 RESUME BOOTSTRAP (run after any fresh container; only step 2 is usually needed on a normal restart):
 ```
 cd /workspace/SuperGrok1.5
