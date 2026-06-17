@@ -454,19 +454,16 @@ inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int64_t n) {
 constexpr int64_t kDecoderTotalElems = 422755;
 constexpr int     kDecoderSeq        = 4;   // mirror of SG_DEC_SEQ
 
-// PHASE-1 decoder L3-REAL scratch: per-CTA grad-partial workspace + barrier
-// counters + a reduced-grad buffer. The workspace is nCTA*total grad partials +
-// nCTA loss partials; sized for nCTA = #SMs (the launcher pins one CTA per SM).
-// The per-tensor sizes/offsets are NOT built here — the kernel reads the
-// generated __constant__ kDecSizes/kDecOffsets tables directly. Persisted + reset
-// per step (the big workspace is zeroed IN-KERNEL by phase P0; the host only
-// resets the barrier/task counters here).
+// PHASE-1 decoder L3-REAL scratch: barrier counters only. The kernel owns its
+// own TC-sized device scratch (the host passes nullptr for `workspace` at the
+// launch site), so no host-side grad-partial workspace is allocated here. The
+// per-tensor sizes/offsets are NOT built here — the kernel reads the generated
+// __constant__ kDecSizes/kDecOffsets tables directly. Persisted + reset per step
+// (the host only resets the barrier/task counters here).
 struct DecoderScratch {
  torch::Tensor g_next;        // int32 [1]
  torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
  torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
- torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
- int n_ctas = 0;
 };
 
 inline DecoderScratch& decoder_scratch_for(const torch::Tensor& params) {
@@ -476,25 +473,15 @@ inline DecoderScratch& decoder_scratch_for(const torch::Tensor& params) {
  : -1LL;
  const long long key = dev_idx;   // one decoder shape per device (fixed total)
  auto it = cache.find(key);
- const int64_t total = kDecoderTotalElems;
  if (it == cache.end()) {
- int dev = params.device().is_cuda() ? params.device().index() : 0;
- int n_sms = 1;
- cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
  auto opts_i =
  torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- auto opts_f =
- torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
  DecoderScratch s;
  s.g_next = torch::zeros({1}, opts_i);
  s.g_arrived = torch::zeros({1}, opts_i);
  s.g_generation = torch::zeros({1}, opts_i);
  // The reduced grad is now routed through the ABI `grad` tensor (exposed to the
  // caller for per-tensor parity); no internal grad scratch needed.
- // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0);
- // allocate (not zero) — the in-kernel P0 + the loss reduce overwrite it.
- s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
- s.n_ctas = n_sms;
  it = cache.emplace(key, std::move(s)).first;
  } else {
  it->second.g_next.zero_();
@@ -514,16 +501,16 @@ inline DecoderScratch& decoder_scratch_for(const torch::Tensor& params) {
 constexpr int64_t kVitTotalElems = 418017;
 constexpr int     kVitPatchElems = 16 * 49;   // 784 (kNPatch*kPatch)
 
-// PHASE-2 ViT L3-REAL scratch: per-CTA grad-partial workspace + barrier counters.
-// Modeled BYTE-FOR-BYTE on DecoderScratch/decoder_scratch_for; only the total
-// changes. The per-tensor sizes/offsets are NOT built here — the kernel reads the
-// generated __constant__ kVitSizes/kVitOffsets tables directly.
+// PHASE-2 ViT L3-REAL scratch: barrier counters only. Modeled BYTE-FOR-BYTE on
+// DecoderScratch/decoder_scratch_for. The kernel owns its own TC-sized device
+// scratch (the host passes nullptr for `workspace` at the launch site), so no
+// host-side grad-partial workspace is allocated here. The per-tensor
+// sizes/offsets are NOT built here — the kernel reads the generated
+// __constant__ kVitSizes/kVitOffsets tables directly.
 struct ViTScratch {
  torch::Tensor g_next;        // int32 [1]
  torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
  torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
- torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
- int n_ctas = 0;
 };
 
 inline ViTScratch& vit_scratch_for(const torch::Tensor& params) {
@@ -533,23 +520,13 @@ inline ViTScratch& vit_scratch_for(const torch::Tensor& params) {
  : -1LL;
  const long long key = dev_idx;   // one ViT shape per device (fixed total)
  auto it = cache.find(key);
- const int64_t total = kVitTotalElems;
  if (it == cache.end()) {
- int dev = params.device().is_cuda() ? params.device().index() : 0;
- int n_sms = 1;
- cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
  auto opts_i =
  torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- auto opts_f =
- torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
  ViTScratch s;
  s.g_next = torch::zeros({1}, opts_i);
  s.g_arrived = torch::zeros({1}, opts_i);
  s.g_generation = torch::zeros({1}, opts_i);
- // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0);
- // allocate (not zero) — the in-kernel P0 + the loss reduce overwrite it.
- s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
- s.n_ctas = n_sms;
  it = cache.emplace(key, std::move(s)).first;
  } else {
  it->second.g_next.zero_();
@@ -566,13 +543,14 @@ inline ViTScratch& vit_scratch_for(const torch::Tensor& params) {
 constexpr int64_t kMambaTotalElems = 593713;
 constexpr int     kMambaSeq        = 8;   // mirror of SG_MB_SEQ
 
-// PHASE-2 Mamba L3-REAL scratch: modeled on DecoderScratch/decoder_scratch_for.
+// PHASE-2 Mamba L3-REAL scratch: modeled on DecoderScratch/decoder_scratch_for —
+// barrier counters only. The kernel owns its own TC-sized device scratch (the
+// host passes nullptr for `workspace` at the launch site), so no host-side
+// grad-partial workspace is allocated here.
 struct MambaScratch {
  torch::Tensor g_next;        // int32 [1]
  torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
  torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
- torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
- int n_ctas = 0;
 };
 
 inline MambaScratch& mamba_scratch_for(const torch::Tensor& params) {
@@ -582,22 +560,13 @@ inline MambaScratch& mamba_scratch_for(const torch::Tensor& params) {
  : -1LL;
  const long long key = dev_idx;   // one Mamba shape per device (fixed total)
  auto it = cache.find(key);
- const int64_t total = kMambaTotalElems;
  if (it == cache.end()) {
- int dev = params.device().is_cuda() ? params.device().index() : 0;
- int n_sms = 1;
- cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
  auto opts_i =
  torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- auto opts_f =
- torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
  MambaScratch s;
  s.g_next = torch::zeros({1}, opts_i);
  s.g_arrived = torch::zeros({1}, opts_i);
  s.g_generation = torch::zeros({1}, opts_i);
- // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0).
- s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
- s.n_ctas = n_sms;
  it = cache.emplace(key, std::move(s)).first;
  } else {
  it->second.g_next.zero_();

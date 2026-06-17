@@ -18,7 +18,6 @@
 //   b_out = M_B * b_A + b_B
 //
 // Used by:
-//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
 //   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
 //   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
 

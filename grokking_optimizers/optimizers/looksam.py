@@ -199,6 +199,17 @@ class LookSAM(Optimizer):
 # runs while gradient data is still L2-warm. Duplicated across every optimizer
 # file by design (self-containment); requires PyTorch >= 2.1.
 def _register_grad_hooks(optimizer):
+    # Fail-fast (construction time): the per-parameter eager `_single_param_step`
+    # was removed under pure L3-TC (the megakernel owns the optimizer update via
+    # fused_train_step), so the grad-hook path cannot run. Raise HERE — when the
+    # optimizer is constructed with use_grad_hooks=True — rather than mid-backward
+    # from inside the hook, so `--grad-hooks` fails immediately with a clear
+    # message. The plumbing below is retained for when an eager path returns.
+    raise NotImplementedError(
+        "use_grad_hooks is not supported: the per-parameter eager step was "
+        "removed under pure L3-TC (the megakernel owns the optimizer update via "
+        "fused_train_step). Construct the optimizer with use_grad_hooks=False "
+        "(the default) and drive training through the fused L3-TC megakernel.")
     _pt = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
     if _pt < (2, 1):
         raise RuntimeError(

@@ -536,14 +536,15 @@ def get_ops():
     return _cached_ops
 
 
-# Kernel entry points whose presence indicates a usable GPU build. We probe a
-# representative spread (the two SG2 fused steps + the SG15 step) rather than
-# one name, so a partial/renamed build is still reported honestly.
+# Kernel entry points whose presence indicates a usable GPU build. PURE L3-TC:
+# the shipped `_ops.so` registers only the two fused (model, optimizer)
+# megakernel entries (`fused_step` + `sg2_fused_step`, bindings.cpp:164/228) —
+# every eager per-op `*_fused_step` / `supergrok2_*_batched_step` binding was
+# removed with the eager path. We probe both megakernel names so a
+# partial/renamed build is still reported honestly.
 _KERNEL_PROBE_NAMES = (
-    "supergrok2_prepare_and_batched_step",
-    "supergrok2_batched_step",
-    "supergrok2_mamba_peer_batched_step",
-    "sg15_fused_step",
+    "fused_step",
+    "sg2_fused_step",
 )
 
 

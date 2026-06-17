@@ -328,6 +328,47 @@ def _eager_decoder(device="cuda", seed=0):
     return Transformer(N_LAYERS, D_MODEL, N_HEADS, VOCAB, SEQ).to(device)
 
 
+# ===========================================================================
+#  A2 (CPU) STRUCTURAL MIRROR vs ORACLE  (twin of
+#  test_{vit,mamba}_kernel_mirror_matches_oracle)
+#
+#  NOTE: matched to its twins, which are UNMARKED CPU tests (they are collected
+#  and run on the `pytest -m "not hw"` CPU CI path — the whole point of the
+#  structural mirror is to catch the missing-term/index/alias bug class WITHOUT
+#  a GPU). Adding @pytest.mark.hw here would skip it on CPU CI and leave the
+#  coverage hole open, so it is intentionally left ungated like its twins.
+# ===========================================================================
+def test_decoder_kernel_mirror_matches_oracle():
+    """The structural kernel mirror == the oracle, including the embedding
+    scatter under a within-sample token-id collision, the causal 3-pass
+    attention backward, the LN/GELU/FF chain, and the last-position CE. Catches
+    the missing-term / index / alias bug class the un-runnable decoder .cu would
+    hide. Pure-CPU (fp64 oracle + fp64 mirror) — the only diff is structure.
+
+    Twin of tests/hw/test_vit_megakernel.py::test_vit_kernel_mirror_matches_oracle
+    and tests/hw/test_mamba_megakernel.py::test_mamba_kernel_mirror_matches_oracle;
+    reuses the race-decoder Transformer built by _eager_decoder (== the builder
+    the megakernel layout mirrors)."""
+    from tests.hw.decoder_oracle import (VOCAB, SEQ, decoder_param_layout,
+        DecoderWeights, decoder_forward, decoder_backward)
+    from tests.hw.decoder_kernel_mirror import mirror_loss_and_grads
+    m = _eager_decoder("cpu", seed=7)
+    named = {n: p.detach().clone() for n, p in m.named_parameters()}
+    B = 2
+    tokens = torch.randint(0, VOCAB, (B, SEQ))
+    tokens[0, 1] = tokens[0, 0]   # force a within-sample token-id collision
+    targets = torch.randint(0, VOCAB, (B,))
+    W = DecoderWeights.from_named({k: v.double() for k, v in named.items()})
+    oloss, cache = decoder_forward(W, tokens, targets)
+    ograds = decoder_backward(W, cache)
+    mloss, mgrads = mirror_loss_and_grads(named, tokens, targets)
+    assert abs(oloss.item() - mloss) < 1e-8, "mirror loss != oracle"
+    for n in decoder_param_layout()["names"]:
+        a = (ograds[n].double() - mgrads[n]).abs().max().item()
+        denom = ograds[n].abs().max().item() + 1e-30
+        assert a / denom < 1e-6, f"mirror grad {n} rel {a/denom:.2e} > 1e-6"
+
+
 def _flat_params(m):
     return torch.cat([p.detach().reshape(-1) for _, p in m.named_parameters()]).contiguous()
 
