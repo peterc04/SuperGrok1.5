@@ -27,3 +27,15 @@ data/
 results/tuning/
 # NFS silly-rename handles (deleted-but-open files on NFS mounts).
 .nfs*
+# Build + gate operational scratch (regenerable; never deliverables). build.sh
+# writes build*.log every run; compile.py writes compiled_cache.db; the perf
+# campaign emits gate/timing logs + ptxas err-marked files. The curated record
+# lives in OPTIMIZATION_LEDGER.md; promoted patches are committed under .perf/.
+build*.log
+compiled_cache.db
+*_timing.txt
+*.errmarked
+gate_seed*.log
+p[0-9]_*.log
+.task*_*.log
+.regpressure/
