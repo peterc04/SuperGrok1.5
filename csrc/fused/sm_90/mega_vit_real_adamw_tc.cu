@@ -68,8 +68,13 @@ gemm_fwd_kernel(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __rest
         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
             int nn = n0 + n; return nn < Nout ? W[(int64_t)nn * Kin + k] : __float2bfloat16(0.f); };
         auto out  = [&] (int m, int n, float v) { if (m < M) D[(int64_t)m * Nout + n0 + n] = v; };
+        // The micro-gate exercises full tiles (M=kTileM=17·64, no pad) and self-
+        // guards `out` with m<M, so the engine's m_real row-guard (present only
+        // when the P1 sub-tile knob is ON) is a no-op here. SG_VIT_DW_MREAL_ARG
+        // expands to nothing when the knob is OFF (byte-identical) and to a
+        // no-op upper bound when ON (so the TU still compiles at S<64).
         vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/vittc::kAtomsM>(
-            0, m_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
+            0, m_atoms, n_real, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
     }
 #else
     (void)X; (void)W; (void)D; (void)Kin; (void)Nout;
@@ -89,7 +94,7 @@ gemm_dx_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 { return W[(int64_t)k * N + n]; };
     auto out  = [&] (int m, int n, float v) { if (m < M) dX[(int64_t)m * N + n] = v; };
     vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/vittc::kAtomsM>(
-        0, m_atoms, /*n_real=*/N, k_steps, srcA, srcB, out, sA, sB);
+        0, m_atoms, /*n_real=*/N, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
 #else
     (void)dY; (void)W; (void)dX; (void)Nout;
 #endif
@@ -109,7 +114,7 @@ gemm_dw_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
     auto srcB = [&] (int n, int k) -> __nv_bfloat16 { return X[(int64_t)k * N + n]; };
     auto out  = [&] (int m, int n, float v) { if (m < Nout) dW[(int64_t)m * N + n] = v; };
     vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/8>(
-        0, m_atoms, /*n_real=*/N, k_steps, srcA, srcB, out, sA, sB);
+        0, m_atoms, /*n_real=*/N, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
 #else
     (void)dY; (void)X; (void)dW; (void)Nout; (void)T;
 #endif

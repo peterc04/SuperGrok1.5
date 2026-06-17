@@ -576,10 +576,16 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     }
     bar.sync();   // B0
 
-    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
-    //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
-    //    dY, dh0, LN-vec partials). Barrier-free within the tile. ──
-    const int nrows_tile = vittc::kTileM;
+    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over (sub-)tiles
+    //    of kVitP1SubtileRows rows; for its tile it runs fwd (→ acts X, NLL) then
+    //    bwd (→ acts dY, dh0, LN-vec partials). Barrier-free within the tile. The
+    //    B1 load-imbalance knob (SG_TUNED_VIT_P1_SUBTILE_S) sets the sub-tile to S
+    //    whole samples (kSeq·S rows): S=64 ⇒ kVitP1SubtileRows==kTileM==1088 ⇒
+    //    this loop is BYTE-IDENTICAL to the whole-1088-tile schedule (n_tiles=16
+    //    at B=1024); S<64 grows n_tiles ~64/S× so the idle CTAs (116/132 at B1024)
+    //    pick up P1 work and the B1 spin collapses. The tile boundary stays a
+    //    whole-sample boundary (attention stays in-tile). ──
+    const int nrows_tile = vittc::kVitP1SubtileRows;
     const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
     float nll_acc = 0.0f;
 #ifdef SG_VIT_PROFILE
