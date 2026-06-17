@@ -56,6 +56,34 @@
   yields fast recompile immediately on resume. (`/dev/shm/tmp` stays as regenerable nvcc scratch.)
 - `.STOP_TUNING` restored (autotuner DISABLED by default; the front-load script removes it for a run).
 
+## Environment / resume bootstrap (IMPORTANT — the Python deps live on the EPHEMERAL overlay)
+- `/workspace` (the NFS VOLUME, persists): repo + all commits + `build/` + `.build_cache` + `venv` + outputs (~3.3G).
+- `/` (overlay, EPHEMERAL = base image, ~7G): python 3.11.10 + **torch 2.4.1+cu124** + 180 deps (6.3G in
+  `/usr/local/lib/python3.11/dist-packages`) + CUDA 12.4 toolkit (4.7G). These are the BASE IMAGE, so a
+  normal stop/start restores them; only a full container RECREATION loses them.
+- `/workspace/venv` is a `--system-site-packages` venv (borrows torch from the system) — **no torch of its own**.
+- `grokking_optimizers` is an EDITABLE install: the CODE is on the volume, the install RECORD is in the ephemeral dist-packages.
+- **`ENV_SNAPSHOT.txt`** (committed) = the exact 180-package pin (torch 2.4.1+cu124 / CUDA 12.4 / py 3.11.10).
+
+RESUME BOOTSTRAP (run after any fresh container; only step 2 is usually needed on a normal restart):
+```
+cd /workspace/SuperGrok1.5
+python -m pip install -e .                 # 1. re-link grokking_optimizers (code already on the volume)
+# 2. ONLY if torch/deps are missing (full image recreation):
+#   pip install torch==2.4.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r ENV_SNAPSHOT.txt
+source .fast_build_env.sh                   # 3. restores the volume-backed sccache/ccache (fast recompile)
+CUDA_VISIBLE_DEVICES="" python -m grokking_optimizers.compile --self-test   # 4. expect 265/0
+```
+
+## Accessing the volume WITHOUT a GPU instance (this is a RunPod `runpodfs` network volume)
+- **No pod at all (cheapest):** RunPod's **S3-compatible API** for network volumes. In the RunPod console
+  Settings, create an "S3 API key" (separate from the normal API key), configure `aws-cli` with it, and use the
+  datacenter S3 endpoint (e.g. `https://REDACTED-s3-endpoint`) to `aws s3 ls/cp` files directly. Available
+  only in select datacenters (US-KS-2 / EU-CZ-1 / US-CA-2 at last check) — confirm THIS volume's DC is supported.
+  Community GUI: Runpod-Network-Volume-Explorer-GUI.
+- **Cheap pod alt:** attach this same network volume to a **CPU-only** pod (cents/hr, no GPU) → web terminal / SSH / browse.
+
 ## Front-load batch — STOPPED (was fixed + running; halted for the clean shutdown)
 `.perf/batch/run_12h_frontload.sh` was fixed + running real autotune this session, then STOPPED for the
 instance close (it cannot cover an absence while the instance is down). The decoder RE-PROFILE completed:
