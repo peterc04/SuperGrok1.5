@@ -1,0 +1,37 @@
+[decoder-bench] building variant: d=2048 profile=True fwd_fine=True (SG_DEC_BENCH_LAYOUT=1)
+[decoder-bench] build done in 0.0s  (D=2048 TOTAL=101,134,435 TILE_N=128 FWD_PIPE=1 FWD_STAGES=4 HAS_PROFILE=True HAS_FWD_FINE=True)
+
+[decoder-bench] d=2048  B=16384  params=101,134,435
+  wall/step = 636.039 ms  (median of reps ['636.14', '636.04', '635.92'])
+  steps/s   = 1.5722
+  GEMM FLOPs/step = 3.961e+13  => achieved 62.274 TF/s (6.30% of 989 TF/s bf16 dense roofline)
+
+  [phase breakdown — clock64 critical-path, median of reps]  (summed-phase ~661.243 ms vs wall 636.039 ms; the wall-minus-summed gap is host/launch + un-stamped slack)
+    phase                  cycles         ms   % of summed
+    P1_fwd            370,034,937    186.886         28.3%
+    P1_bwd            368,731,334    186.228         28.2%
+    B1_barrier        226,983,104    114.638         17.3%
+    P2_dW_GEMM        208,492,599    105.299         15.9%
+    P2_grad_asm        32,830,450     16.581          2.5%
+    P3_opt_tail        75,266,783     38.014          5.7%
+    B2_barrier         25,220,133     12.737          1.9%
+    B0_barrier          1,702,526      0.860          0.1%
+    SUM             1,309,261,866    661.243        100.0%
+  DOMINANT phase = P1_fwd (28.3% of summed-phase cycles)
+  grid-barrier wait total (B0+B1+B2) = 253,905,763 cyc ~128.235 ms (19.4% of summed)
+
+  [FINE fwd/dX GEMM-engine sub-phases — clock64 critical-path inside the cp.async ring]  (PIPE=1 STAGES=4)
+    P1_fwd ring         (Σ 2.253 ms critical-path inside the ring)
+      ISSUE(cp.async)         1,633,794 cyc     0.825 ms    36.6%
+      WAIT(drain)               439,777 cyc     0.222 ms     9.9%
+      WGMMA(mma)              2,078,132 cyc     1.050 ms    46.6%
+      EPI(store)                 29,760 cyc     0.015 ms     0.7%
+      BARRIER(sync)             280,409 cyc     0.142 ms     6.3%
+      => COMPUTE/EPI-bound (WGMMA/EPI dominate → deeper ring unlikely to help)  [WAIT 10% vs WGMMA 47%]
+    P1_bwd(dX) ring     (Σ 0.287 ms critical-path inside the ring)
+      ISSUE(cp.async)           260,919 cyc     0.132 ms    45.9%
+      WAIT(drain)                32,950 cyc     0.017 ms     5.8%
+      WGMMA(mma)                228,480 cyc     0.115 ms    40.2%
+      EPI(store)                 10,976 cyc     0.006 ms     1.9%
+      BARRIER(sync)              34,729 cyc     0.018 ms     6.1%
+      => COMPUTE/EPI-bound (WGMMA/EPI dominate → deeper ring unlikely to help)  [WAIT 6% vs WGMMA 40%]

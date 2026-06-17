@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.egg-info/
 build/
+# Persistent build caches (sccache + ccache), volume-backed for fast recompile
+# across sessions. Large + host-specific — kept on the volume, never committed.
+.build_cache/
 dist/
 *.so
 .eggs/

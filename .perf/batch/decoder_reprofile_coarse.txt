@@ -1,0 +1,21 @@
+[decoder-bench] building variant: d=2048 profile=True fwd_fine=False (SG_DEC_BENCH_LAYOUT=1)
+[decoder-bench] build done in 0.0s  (D=2048 TOTAL=101,134,435 TILE_N=128 FWD_PIPE=1 FWD_STAGES=4 HAS_PROFILE=True HAS_FWD_FINE=False)
+
+[decoder-bench] d=2048  B=16384  params=101,134,435
+  wall/step = 616.376 ms  (median of reps ['616.51', '616.38', '616.26'])
+  steps/s   = 1.6224
+  GEMM FLOPs/step = 3.961e+13  => achieved 64.261 TF/s (6.50% of 989 TF/s bf16 dense roofline)
+
+  [phase breakdown — clock64 critical-path, median of reps]  (summed-phase ~646.111 ms vs wall 616.376 ms; the wall-minus-summed gap is host/launch + un-stamped slack)
+    phase                  cycles         ms   % of summed
+    P1_fwd            353,524,750    178.548         27.6%
+    P1_bwd            349,870,384    176.702         27.3%
+    B1_barrier        214,630,391    108.399         16.8%
+    P2_dW_GEMM        211,240,380    106.687         16.5%
+    P2_grad_asm        33,167,874     16.751          2.6%
+    P3_opt_tail        75,305,182     38.033          5.9%
+    B2_barrier         39,861,241     20.132          3.1%
+    B0_barrier          1,699,886      0.859          0.1%
+    SUM             1,279,300,088    646.111        100.0%
+  DOMINANT phase = P1_fwd (27.6% of summed-phase cycles)
+  grid-barrier wait total (B0+B1+B2) = 256,191,518 cyc ~129.390 ms (20.0% of summed)

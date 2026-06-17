@@ -1,25 +1,25 @@
   [prefilter] WARNING: rule 'tc' raised at sweep time (TypeError: not all arguments converted during string formatting); treating the config as FEASIBLE for this rule (pass-through) rather than silently rejecting it. Fix the rule if this is unexpected — configs are NOT being dropped on its account.
 /usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
   optuna_warn(
-[I 2026-06-17 05:48:42,011] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:42,549] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:42,839] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:43,594] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:43,703] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:43,807] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:43,916] A new study created in RDB with name: sg_tune
-[I 2026-06-17 05:48:43,990] A new study created in memory with name: sg_tune
-[I 2026-06-17 05:48:44,022] A new study created in memory with name: sg_tune
-[I 2026-06-17 05:48:44,530] A new study created in memory with name: sg_tune
+[I 2026-06-17 06:40:47,486] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:48,018] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:48,304] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:49,013] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:49,120] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:49,223] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:49,336] A new study created in RDB with name: sg_tune
+[I 2026-06-17 06:40:49,400] A new study created in memory with name: sg_tune
+[I 2026-06-17 06:40:49,430] A new study created in memory with name: sg_tune
+[I 2026-06-17 06:40:49,937] A new study created in memory with name: sg_tune
 /usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
   optuna_warn(
-[I 2026-06-17 05:48:46,336] A new study created in memory with name: sg_tune
+[I 2026-06-17 06:40:51,596] A new study created in memory with name: sg_tune
   [tuned-inject] WARNING: winner dim 'mystery_dim' for adamw/sm_90 has no macro mapping in the JSON's _macros table; skipping it (the kernel keeps its in-header default). Re-export with a current compile.py to map it.
 [deps] nvrtc: cuda not installed — skipping. To enable: pip install cuda-python>=12.2,<14 (or pass --auto-install / set BuildSpec.auto_install_optional_deps=True).
 [compile] correcting CUDA_HOME: <unset> -> /usr/local/cuda-12.4 (derived from /usr/local/cuda-12.4/bin/nvcc)
 No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda-12.4'
 [compile] refreshed torch CUDA_HOME = /usr/local/cuda-12.4
-WARNING:2026-06-17 05:49:17,810:jax._src.xla_bridge:969: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:2026-06-17 06:41:22,970:jax._src.xla_bridge:969: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
 [deps] polyhedral: clang not installed — skipping. To enable: pip install libclang>=16,<19 (or pass --auto-install / set BuildSpec.auto_install_optional_deps=True).
   [synth-gemm] WARNING: native MMA opcode 'wgmma.mma_async' for sm_90a is a ZERO-FRAGMENT STUB (real A/B fragment loads not wired); SKIPPING the native path and emitting the numerically-correct SCALAR mainloop instead. This GEMM will NOT use tensor cores until the loads are implemented and pass the numerical gate on silicon.
   [synth-gemm] WARNING: native MMA opcode 'tcgen05.mma.async' for sm_100a is a ZERO-FRAGMENT STUB (real A/B fragment loads not wired); SKIPPING the native path and emitting the numerically-correct SCALAR mainloop instead. This GEMM will NOT use tensor cores until the loads are implemented and pass the numerical gate on silicon.
@@ -114,7 +114,7 @@ WARNING:2026-06-17 05:49:17,810:jax._src.xla_bridge:969: An NVIDIA GPU may be pr
   PASS: install_nvcc_flags_gpuless_source
   PASS: flag_trace_recorded_per_decision
 ========================================================================
-grokking_optimizers.compile  --flag-audit  (2026-06-17T05:48:41.126426)
+grokking_optimizers.compile  --flag-audit  (2026-06-17T06:40:46.655066)
 detected nvcc : Cuda compilation tools, release 12.4, V12.4.131 | Build cuda_12.4.r12.4/compiler.34097967_0
 detected hipcc: <not on PATH>
 detected jax  : jax 0.4.38 | jaxlib 0.4.38
@@ -1833,7 +1833,7 @@ detected jax  : jax 0.4.38 | jaxlib 0.4.38
 [ldflags] FINAL: 1 flags accepted, 0 skipped due to version gates
 [xla_env] (no flag decisions recorded)
 
-[flag-audit] wrote /dev/shm/tmp/tmpxq4or7j3/flag_audit.txt
+[flag-audit] wrote /dev/shm/tmp/tmp6t_b0m85/flag_audit.txt
   PASS: flag_audit_mode_writes_file
   PASS: debug_banner_includes_toolchain_versions
   PASS: build_failure_summary_lists_first_nvcc_error
@@ -1899,14 +1899,14 @@ detected jax  : jax 0.4.38 | jaxlib 0.4.38
   PASS: make_trial_record_documents_v4_schema
   PASS: variant_reuse_skips_recompile
   PASS: version_gated_flags_fold_into_cache_hash
-    [hdr-stale] source_hash before=4c110db0f1db after=28a267e348a7 (header edit ⇒ AOT/JIT stale)
+    [hdr-stale] source_hash before=c79dfc8ce1b8 after=712c1cd18281 (header edit ⇒ AOT/JIT stale)
   PASS: header_edit_busts_source_hash_and_freshness
 [self-test] multi_gpu_pool
   PASS: visible_devices_default
   PASS: visible_devices_multi
   PASS: visible_devices_hip
   PASS: pool_constructs_per_device_workers
-    (fast=9 slow=1 wall=0.102s)
+    (fast=9 slow=1 wall=0.103s)
   PASS: multigpu_work_stealing
 [self-test] clock_lock
   PASS: clock_lock_pallas_is_na

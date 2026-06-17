@@ -1,0 +1,3 @@
+[compile] correcting CUDA_HOME: <unset> -> /usr/local/cuda-12.4 (derived from /usr/local/cuda-12.4/bin/nvcc)
+[compile] refreshed torch CUDA_HOME = /usr/local/cuda-12.4
+lion/decoder/sm_90:   0%|          | 0/4 [00:00<?, ?phase/s] 

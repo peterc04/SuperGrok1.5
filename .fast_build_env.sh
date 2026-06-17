@@ -32,14 +32,14 @@ ln -sf "$ROOT/.build_tools/g++-cached" /workspace/.local/bin/g++-cached 2>/dev/n
 export TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES=1        # unblock: strip the gendeps flag
 export PYTORCH_NVCC="$ROOT/.build_tools/nvcc-cached"       # nvcc -> sccache + --threads 0 (device)
 export CXX="$ROOT/.build_tools/g++-cached"                 # g++ -> ccache (host stubs); single-token path for torch's which()
-export SCCACHE_DIR=/dev/shm/sccache
+export SCCACHE_DIR="$ROOT/.build_cache/sccache"   # PERSISTENT (was /dev/shm ramdisk -> wiped on instance close). Volume-backed so fast-recompile survives across sessions.
 export SCCACHE_CACHE_SIZE=20G
-export CCACHE_DIR=/dev/shm/ccache
+export CCACHE_DIR="$ROOT/.build_cache/ccache"     # PERSISTENT (volume-backed, survives instance close)
 export CCACHE_MAXSIZE=10G
 export CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime
 export TMPDIR=/dev/shm/tmp                                 # nvcc cicc/ptxas scratch on ramdisk
 export MAX_JOBS="$(nproc)"                                 # ninja TU parallelism (auto-detect)
 unset NVCC_THREADS 2>/dev/null || true                    # superseded by --threads 0 in the wrapper
-mkdir -p /dev/shm/tmp /dev/shm/sccache /dev/shm/ccache 2>/dev/null
+mkdir -p /dev/shm/tmp "$ROOT/.build_cache/sccache" "$ROOT/.build_cache/ccache" 2>/dev/null
 command -v sccache >/dev/null 2>&1 && sccache --start-server >/dev/null 2>&1 || true
 echo "[fast-build-env] caching ON: nvcc->sccache(CUDA) + g++->ccache | nvcc --threads 0 (auto=$(nproc)) | MAX_JOBS=$(nproc) | ninja"
