@@ -1,0 +1,32 @@
+{
+  "summary": "Read-only: hunt scale/edge correctness the single-step fp64 gate misses — integer overflow at 1B+, fp accumulation precision, determinism-contract edge cases, cross-CTA memory safety; adversarially verified",
+  "agentCount": 30,
+  "logs": [
+    "24 scale/edge candidates; verifying (opus, refute-by-default)."
+  ],
+  "result": {
+    "triage": {
+      "confirmed": [
+        {
+          "id": "BUG-04",
+          "area": "mamba megakernel — staged-opt scratch workspace sizing (bench)",
+          "file_line": "csrc/fused/sm_90/fused_mamba_megakernel.cuh:448,463,476,502,507 (sizers) vs decoder twins :552,566,583,618; trigger: mega_mamba_real_adamw_tc.cu:68/78 (tc_scratch_for -> torch::empty); tuning/mamba_bench.py --d 1024",
+          "klass": "scale-OOM / missing-gate memory-safety asymmetry",
+          "severity": "high",
+          "fix": "Mirror the decoder/ViT gate in fused_mamba_megakernel.cuh: add `constexpr bool kMbStagedOptScratch = (SG_MB_BENCH_LAYOUT ? false : true);` and early-return 0 under it in all four sizers (mb_tc_opt_reduce_floats, mb_tc_looksam_floats, mb_tc_muon_floats, mb_tc_sg2_floats). The kernel's pointer-carve chain (lines 566-596) derives every region offset from these same four helpers, so gating to 0 keeps host sizer and device carve byte-consistent at bench width and leaves production (d=128, gate=true) byte-identical. Brings the d=1024 mamba bench workspace from ~199 GiB down to ~13.4 GiB. CONFIRMED: decoder gates at :552/566/583/618 and ViT gates analogously; grep kMbStagedOptScratch returns zero hits — mamba is the lone un-gated sibling. NOTE: does NOT fix the separate structural 'per-CTA full-grad reduce = hard 668 GB at 1.5B' item (PERF_ANALYSIS.md:68), which needs an output-stationary reduce. Both GPU-repro (mamba_bench.py --d 1024) and static-provable."
+        },
+        {
+          "id": "BUG-INT32-LAYOUT-OFFSETS",
+          "area": "all 3 layout headers + codegen — int32 param-offset/size tables",
+          "file_line": "grokking_optimizers/megakernel_codegen.py:635/640 (emits __device__ __constant__ int kDecOffsets[]/kDecSizes[]), :665-672 offsets_consistent() casts (int)acc at :668; mirrored in decoder_layout.cuh:50/57/91, mamba3_layout.cuh:73/82/120, vit_layout.cuh:65/73; consumed at fused_mamba_megakernel.cuh:646/1127, fused_decoder_megakernel.cuh:1284, model_stage_vit_tc.cuh:1685",
+          "klass": "int64-vs-int32 overflow in offset arithmetic (latent, >2.1B-param threshold)",
+          "severity": "medium",
+          "fix": "Widen the cumulative offset arrays to int64: codegen should emit __device__ __constant__ int64_t kDecOffsets[] (sizes may stay int — no single tensor here exceeds int32 — but offsets are cumulative). Add a codegen guard assert total < (1<<31) or unconditionally use int64, and change offsets_consistent() line 668 `if (kOffsets[i] != (int)acc)` to `!= acc` (drop the truncating (int) cast). RATIONALE: cumulative offsets are int32 with NO total<INT32_MAX guard anywhere. At exactly 1.5B params the largest offset (~1.5e9) still fits int32 (headroom only ~1.43x), so 1.5B is currently SAFE; but any config >2,147,483,647 cumulative params overflows the emitted positive offset literals in the C int array (implementation-defined/negative) AND the (int)acc cast in the build-time consistency static_assert wraps (false-pass or spurious build break). The fp64 A/A/A gate runs at d=2048 decoder (101M total) / d=1024 mamba (27M total), ~21x below the int32 ceiling, so it cannot exercise this. STATIC-PROVABLE; no GPU repro needed — compile-time array-type/codegen defect that manifests only when a >2.1B-param layout is codegen'd."
+        }
+      ],
+      "notes": "TRIAGE COMPLETE (read-only static analysis of csrc/fused/sm_90/* + megakernel_common.cuh + layout headers + dispatch.cpp + codegen + helpers.h).\n\nCONFIRMED (2): BUG-04 (high, mamba bench OOM, verified the missing-gate asymmetry vs decoder:552/566/583/618 and ViT; GPU-repro via tuning/mamba_bench.py --d 1024 AND static-provable). BUG-INT32-LAYOUT-OFFSETS (medium, latent above ~2.1B cumulative params; static-provable, no GPU needed; NOT triggered at exactly 1.5B which fits int32 with ~1.43x headroom).\n\nINVESTIGATED AND CLEARED (recorded so they are not re-flagged):\n1. Grad-norm clip per-CTA fp32 sum-of-squares (fused_decoder_megakernel.cuh:1140-1153, fused_vit_megakernel.cuh:830-843): NOT a regression. Eager clip_grad_norms_device_side (csrc/bindings/helpers.h:289-313) is explicitly fp32 by design; the megakernel adds an fp64 cross-CTA owner-sum (decoder:1158, vit:847) so it is strictly MORE precise than eager. Parity-correct.\n2. Prodigy owner-sum fp32 (fused_decoder_megakernel.cuh:1236): intended eager-parity (comment :1182-1194 made it fixed-partition for DETERMINISM; fp32 bit-matches launch_multi_tensor_prodigy_fused_reduce_step). Loss + grad-norm cross-CTA reduces are already fp64.\n3. Determinism contract: ZERO atomics in any megakernel. All cross-CTA reduces use fixed contiguous element partitions + ascending-CTA fp64 owner-sums; the work-steal TaskQueue only assigns whole-tensor tasks with fixed in-task summation order (mamba:643-651, decoder P2), so determinism holds regardless of steal timing. No holes.\n4. Cross-CTA memory safety: embed counting-sort built on cta0 in the P1 window, fenced by the existing B1 barrier before P2 consume (fused_decoder_megakernel.cuh:823-829,877). No dangling .workspace — every .workspace ref (mamba:1103, decoder:1396, vit:1041, opt_stage_supergrok2.cuh:1282) is the live SG2State member, bound per-CTA via + (int64_t)blockIdx.x * ws_stride.\n5. T*d / nrows*d / g0 indexing: every product that can exceed int32 is promoted with (int64_t) AT the multiply site (dec_tc_acts_floats:505 (int64_t)T*d, tile indexing (int64_t)g0*dec::kD, si_global wrapped in (int64_t)). T=B*kSeq and g0=ti*nrows_tile stay int32 but are bounded by T which only overflows at unrealistic B (>536M for kSeq=4). All workspace sizers and launcher cudaMalloc ((size_t)need*sizeof(float)) are int64/size_t-clean.\n\nKey files: /workspace/SuperGrok1.5/csrc/fused/sm_90/fused_mamba_megakernel.cuh, fused_decoder_megakernel.cuh, fused_vit_megakernel.cuh, decoder_layout.cuh, mamba3_layout.cuh, vit_layout.cuh, mega_mamba_real_adamw_tc.cu, mega_mamba_real_adamw_tc_launcher.cu, model_stage_decoder_tc.cuh; /workspace/SuperGrok1.5/grokking_optimizers/megakernel_codegen.py; /workspace/SuperGrok1.5/csrc/bindings/helpers.h."
+    },
+    "confirmed": 1,
+    "candidates": 24
+  }
+}
