@@ -80,7 +80,7 @@ timeout 30m python tuning/decoder_bench.py --profile --fwd-fine --d 2048 --B 163
 # so it OOMs at the d=2048 autotune timing (~199 GiB) AND can't place at d=2048 (M1). Run mamba autotune
 # on return AFTER the byte-identical kMbStagedOptScratch gate (BUG-04) + M1 land. Decoder/ViT gate it at
 # bench width, so they autotune cleanly at d=2048.
-MODELS="transformer_decoder vit"
+MODELS="decoder vit"   # FIX 2026-06-17: the CLI --model wants the SHORT token (decoder), not
 # adamw first (the production default / highest value), then the rest.
 OPTS="adamw lion grokfast grokadamw prodigy muon neuralgrok looksam supergrok11 supergrok15 supergrok2"
 for model in $MODELS; do

@@ -21,6 +21,14 @@
 # change forces a real recompile (a stale hit is impossible).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 export PATH="/workspace/.local/bin:$PATH"                 # sccache lives here
+# FIX (2026-06-17): torch's check_compiler_ok_for_platform (cpp_extension.py L320) runs
+# `<basename CXX> -v`, i.e. the BARE name `g++-cached`, NOT the full $CXX path. The wrapper is
+# at $ROOT/.build_tools/g++-cached which is on no PATH dir, so the autotuner's --jit-only build
+# died at the ABI probe ("g++-cached: command not found") for EVERY cell. (The bench/load() path
+# tolerated the full path, which is why the re-profile built fine.) Symlink the wrapper into the
+# PATH dir so the basename resolves too — keeps full nvcc+ccache caching intact.
+mkdir -p /workspace/.local/bin 2>/dev/null
+ln -sf "$ROOT/.build_tools/g++-cached" /workspace/.local/bin/g++-cached 2>/dev/null || true
 export TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES=1        # unblock: strip the gendeps flag
 export PYTORCH_NVCC="$ROOT/.build_tools/nvcc-cached"       # nvcc -> sccache + --threads 0 (device)
 export CXX="$ROOT/.build_tools/g++-cached"                 # g++ -> ccache (host stubs); single-token path for torch's which()
