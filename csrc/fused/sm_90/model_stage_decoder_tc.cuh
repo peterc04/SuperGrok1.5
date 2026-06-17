@@ -183,10 +183,10 @@ namespace wgs = ::sg::sm90::wgs;
 //    producer/consumer split on a staging-bound GEMM). DecTcSmem sizes sA/sB for
 //    max(fwd-ring, dW-ring) depth; see the smem-budget note there.
 #ifndef SG_TUNED_DEC_FWD_PIPE
-#define SG_TUNED_DEC_FWD_PIPE 0
+#define SG_TUNED_DEC_FWD_PIPE 1   // BAKED default: gate verdict — entry-a deeper cp.async ring (+1.49x); entry-b PIPE=2 LOST (857 vs 618ms)
 #endif
 #ifndef SG_TUNED_DEC_FWD_STAGES
-#define SG_TUNED_DEC_FWD_STAGES 2
+#define SG_TUNED_DEC_FWD_STAGES 4 // BAKED with PIPE=1 (STAGES>2 → dynamic-smem path; gated 11/11 x 3 seeds @ 618ms/6.477%)
 #endif
 
 // ── fwd/dX FINE sub-phase profiler (campaign P1-fwd/dX diagnosis; 2026-06-16).
