@@ -1,0 +1,265 @@
+--- /workspace/SuperGrok1.5/grokking_optimizers/verify_all.py	2026-06-09 01:08:15.893323686 +0000
++++ /workspace/SuperGrok1.5/.claude/worktrees/wf_2b9c5846-d82-1/grokking_optimizers/verify_all.py	2026-06-17 05:03:36.530080196 +0000
+@@ -14,13 +14,17 @@
+ than silently passing.
+ 
+     PHASE 0  toolchain probe            — what can be proven here vs on silicon
+-    PHASE 1  structural inventory       — every component + 99 cells exist
++    PHASE 1  structural inventory       — every component + 66 cells exist
++                                          (gfx942 33 + tpu_v6e 33) plus the 7
++                                          production sm_90 real TUs
+     PHASE 2  single-component gates      — per-op launchers + models + headers
+-    PHASE 3  MODULAR COMPOSITION         — 99 cells: optimizer × model compile
+-                                            *together* (the core guarantee)
+-    PHASE 4  MAXIMALITY                   — max fusion tier, codegen idempotency,
+-                                            register/smem budget, math drift
+-    PHASE 5  cross-validation            — dispatch tables, self-test, ruff
++    PHASE 3  MODULAR COMPOSITION         — 66 non-sm_90 cells: optimizer × model
++                                            compiled TOGETHER (the core guarantee)
++    PHASE 4  MAXIMALITY                   — max fusion tier, codegen idempotency
++                                            (66 cells), register/smem budget,
++                                            math drift
++    PHASE 5  cross-validation            — dispatch tables, self-test, ruff,
++                                          production sm_90 path consistency
+     PHASE 6  report                       — totals + tier map + silicon + design
+ 
+ Run:
+@@ -57,7 +61,27 @@
+ OPTIMIZERS: Tuple[str, ...] = mk.OPTIMIZERS
+ MODELS: Tuple[str, ...] = mk.MODELS
+ ARCHES: Tuple[str, ...] = mk.MEGAKERNEL_ARCHS  # sm_90, gfx942, tpu_v6e
+-N_CELLS = len(OPTIMIZERS) * len(MODELS) * len(ARCHES)  # 99
++N_CELLS = len(OPTIMIZERS) * len(MODELS) * len(ARCHES)  # 99 (used by solver tier-map)
++
++# sm_90 no longer ships 33 per-cell generated TUs — the production surface is 3
++# hand-written *_real_adamw_tc.cu megakernels (one per model), 3 matching
++# *_real_adamw_tc_launcher.cu files, and sg2_meta_tail.cu (7 TUs total).  The
++# old per-cell mega_<model>_<opt>.cu and per-op launch_<opt>.cu files were
++# deleted in the #10 aftermath.  Only gfx942 (33) + tpu_v6e (33) = 66 cells
++# still exist as individual generated files on disk.
++SM90_REAL_TUS: Tuple[Path, ...] = tuple(
++    REPO_ROOT / "csrc" / "fused" / "sm_90" / name
++    for name in (
++        "mega_decoder_real_adamw_tc.cu",
++        "mega_decoder_real_adamw_tc_launcher.cu",
++        "mega_vit_real_adamw_tc.cu",
++        "mega_vit_real_adamw_tc_launcher.cu",
++        "mega_mamba_real_adamw_tc.cu",
++        "mega_mamba_real_adamw_tc_launcher.cu",
++        "sg2_meta_tail.cu",
++    )
++)
++N_CELLS_ON_DISK = 66  # gfx942 33 + tpu_v6e 33; sm_90 uses SM90_REAL_TUS
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -191,8 +215,10 @@
+                   "" if not missing else f"missing: {missing}"))
+ 
+     # Per-op launchers per GPU arch.
++    # NOTE: sm_90 no longer uses per-op launch_<opt>.cu files — the production
++    # surface is SM90_REAL_TUS (3 megakernels + 3 launchers + sg2_meta_tail).
++    # gfx942 and pallas still have per-op launchers (11 each).
+     launcher_specs = [
+-        ("sm_90 launchers (11)", "csrc/backends/cuda/sm_90", "launch_{o}.cu"),
+         ("gfx942 launchers (11)", "csrc/backends/hip/gfx942", "launch_{o}.hip.cpp"),
+         ("pallas launchers (11)", "csrc/backends/pallas", "launch_{o}.py"),
+     ]
+@@ -205,14 +231,23 @@
+         rep.add(Check("1", label, PASS if not miss else FAIL,
+                       "" if not miss else f"missing {len(miss)}: {miss}"))
+ 
+-    # 99 fused cells exist on disk.
++    # sm_90 production TUs (7 hand-written real TUs; no per-cell generated files).
++    miss_sm90 = [str(p.name) for p in SM90_REAL_TUS if not p.exists()]
++    rep.add(Check("1", f"sm_90 real TUs ({len(SM90_REAL_TUS)})",
++                  PASS if not miss_sm90 else FAIL,
++                  "" if not miss_sm90 else f"missing: {miss_sm90}"))
++
++    # 66 fused cells exist on disk (gfx942 33 + tpu_v6e 33).
++    # sm_90 ships as SM90_REAL_TUS (checked above), not per-cell files.
+     missing_cells: List[str] = []
+     for arch in ARCHES:
++        if arch == "sm_90":
++            continue  # production TUs checked separately above
+         for model in MODELS:
+             for opt in OPTIMIZERS:
+                 if not _cell_path(model, opt, arch).exists():
+                     missing_cells.append(f"{model}/{opt}/{arch}")
+-    rep.add(Check("1", f"fused cells on disk ({N_CELLS})",
++    rep.add(Check("1", f"fused cells on disk ({N_CELLS_ON_DISK})",
+                   PASS if not missing_cells else FAIL,
+                   "" if not missing_cells
+                   else f"missing {len(missing_cells)}: {missing_cells[:5]}…"))
+@@ -232,18 +267,17 @@
+ def phase2_components(rep: Report, tc: Toolchain, jobs: int) -> None:
+     sys.stdout.write("\n[PHASE 2] single-component compile gates\n")
+ 
+-    # sm_90 per-op launchers + models (nvcc -c object).
++    # sm_90 real production TUs (nvcc -c object).
++    # The old per-op launch_<opt>.cu and models/*.cu are deleted; the production
++    # surface is SM90_REAL_TUS (7 files: 3 megakernel + 3 launcher + sg2_meta_tail).
+     if tc.nvcc:
+-        units = [REPO_ROOT / "csrc/backends/cuda/sm_90" / f"launch_{o}.cu"
+-                 for o in OPTIMIZERS]
+-        units += [REPO_ROOT / "csrc/backends/cuda/sm_90/models" / f"{m}.cu"
+-                  for m in ("mamba", "decoder", "vit")]
+-        _parallel_compile(rep, "2", "sm_90 component", units,
++        units = list(SM90_REAL_TUS)
++        _parallel_compile(rep, "2", "sm_90 real TU", units,
+                           _nvcc_compile, jobs)
+     else:
+-        rep.add(Check("2", "sm_90 components (nvcc)", SKIP,
++        rep.add(Check("2", "sm_90 real TUs (nvcc)", SKIP,
+                       "nvcc absent"))
+-        rep.silicon.append("sm_90 component object-compile (needs nvcc)")
++        rep.silicon.append("sm_90 real TU object-compile (needs nvcc)")
+ 
+     # gfx942 device headers (AMDGCN clang gate).
+     if tc.clang:
+@@ -266,14 +300,16 @@
+     sys.stdout.write("\n[PHASE 3] MODULAR COMPOSITION — 99 cells: "
+                      "optimizer × model compiled TOGETHER\n")
+ 
+-    # sm_90: nvcc -c on each mega_*.cu (composes opt component + model stage).
+-    sm90 = [_cell_path(m, o, "sm_90") for m in MODELS for o in OPTIMIZERS]
++    # sm_90: nvcc -c on each real production TU (3 megakernel + 3 launcher +
++    # sg2_meta_tail = 7 files; the old 33 per-cell mega_<model>_<opt>.cu are
++    # deleted — SM90_REAL_TUS is the complete production sm_90 compile surface).
+     if tc.nvcc:
+-        _parallel_compile(rep, "3", "sm_90 compose", sm90, _nvcc_compile, jobs)
++        _parallel_compile(rep, "3", "sm_90 real", list(SM90_REAL_TUS),
++                          _nvcc_compile, jobs)
+     else:
+-        for p in sm90:
+-            rep.add(Check("3", f"sm_90 compose {p.stem}", SKIP, "nvcc absent"))
+-        rep.silicon.append("sm_90 fused-cell composition compile (needs nvcc)")
++        for p in SM90_REAL_TUS:
++            rep.add(Check("3", f"sm_90 real {p.stem}", SKIP, "nvcc absent"))
++        rep.silicon.append("sm_90 real TU composition compile (needs nvcc)")
+ 
+     # gfx942: AMDGCN device gate on each mega_*.hip (forces the composed
+     # template instantiation — type-checks opt×model on device).
+@@ -438,10 +474,15 @@
+                   PASS if not over_budget else FAIL,
+                   "" if not over_budget else "; ".join(over_budget[:3])))
+ 
+-    # 4d. CODEGEN IDEMPOTENCY: re-emit every cell in memory and assert it is
+-    # byte-identical to the committed file (no drift, no stale generated code).
++    # 4d. CODEGEN IDEMPOTENCY: re-emit every non-sm_90 cell in memory and assert
++    # it is byte-identical to the committed file (no drift, no stale code).
++    # sm_90 cells are EXCLUDED: the production sm_90 surface is the hand-written
++    # SM90_REAL_TUS (not generated by cg.emit_cell), so a byte-compare vs the
++    # stale 33-cell generator output is meaningless and would false-fail.
+     drifted: List[str] = []
+     for p in plans:
++        if p.arch == "sm_90":
++            continue  # hand-written real TUs; not cg.emit_cell output
+         path = _cell_path(p.model, p.optimizer, p.arch)
+         if not path.exists():
+             drifted.append(f"{path.name} (missing)")
+@@ -449,15 +490,19 @@
+         emitted = cg.emit_cell(p.model, p.optimizer, p.arch)
+         if emitted.rstrip() != path.read_text().rstrip():
+             drifted.append(path.name)
+-    rep.add(Check("4", f"codegen idempotency ({N_CELLS} cells byte-identical)",
++    rep.add(Check("4", f"codegen idempotency ({N_CELLS_ON_DISK} cells byte-identical)",
+                   PASS if not drifted else FAIL,
+                   "" if not drifted
+                   else f"{len(drifted)} drifted: {drifted[:5]}"))
+ 
+     # 4e. The committed cell's tier COMMENT matches the solver's live decision
+     # (catches a stale generated header even if the body is right).
++    # sm_90 cells are EXCLUDED: the production surface is SM90_REAL_TUS which
++    # do not carry the generated tier-comment header.
+     tier_mismatch: List[str] = []
+     for p in plans:
++        if p.arch == "sm_90":
++            continue  # hand-written real TUs; no solver tier-comment
+         path = _cell_path(p.model, p.optimizer, p.arch)
+         if not path.exists():
+             continue
+@@ -562,6 +607,83 @@
+     except Exception as exc:  # noqa: BLE001
+         rep.add(Check("5", "utilization crash-hard", FAIL, str(exc)[:200]))
+ 
++    # 5f. Production sm_90 path consistency (NEW Phase-5 check).
++    # Exercises the ACTUAL shipped sm_90 path via pure-Python dispatch APIs —
++    # no nvcc, no GPU.  dispatch.py imports cleanly on CPU without _ops.
++    _phase5f_sm90_production(rep)
++
++
++def _phase5f_sm90_production(rep: Report) -> None:
++    """Pure-Python consistency check for the production sm_90 L3-REAL path."""
++    try:
++        from grokking_optimizers import dispatch as dp
++
++        # (1) fused_train_step must be callable.
++        if not callable(dp.fused_train_step):
++            rep.add(Check("5", "sm_90 fused_train_step callable",
++                          FAIL, "dispatch.fused_train_step is not callable"))
++            return
++        rep.add(Check("5", "sm_90 fused_train_step callable", PASS))
++
++        # (2) _FUSED_L3_REAL and _L3_WGMMA_CELLS must each be len 33.
++        n_l3_real = len(dp._FUSED_L3_REAL)
++        rep.add(Check("5", f"dispatch._FUSED_L3_REAL len 33",
++                      PASS if n_l3_real == 33 else FAIL,
++                      "" if n_l3_real == 33
++                      else f"got {n_l3_real}, want 33"))
++
++        n_wgmma = len(dp._L3_WGMMA_CELLS)
++        rep.add(Check("5", f"dispatch._L3_WGMMA_CELLS len 33",
++                      PASS if n_wgmma == 33 else FAIL,
++                      "" if n_wgmma == 33
++                      else f"got {n_wgmma}, want 33"))
++
++        # (3) For every (canonical_model, opt) in _FUSED_L3_REAL:
++        #     gemm_impl_for_cell == 'wgmma' AND has_l3_real == True.
++        # has_l3_real is called with arch=90 explicitly — this is a CPU-only
++        # check of the production sm_90 path; no GPU or detect_arch() needed.
++        bad_gemm: List[str] = []
++        bad_l3: List[str] = []
++        for (model, opt) in sorted(dp._FUSED_L3_REAL):
++            gemm = dp.gemm_impl_for_cell(model, opt, "bf16")
++            if gemm != "wgmma":
++                bad_gemm.append(f"{model}+{opt}={gemm!r}")
++            if not dp.has_l3_real(model, opt, arch=90):
++                bad_l3.append(f"{model}+{opt}")
++        rep.add(Check("5", "all _FUSED_L3_REAL cells gemm_impl=='wgmma'",
++                      PASS if not bad_gemm else FAIL,
++                      "" if not bad_gemm else f"{bad_gemm[:5]}"))
++        rep.add(Check("5", "all _FUSED_L3_REAL cells has_l3_real==True",
++                      PASS if not bad_l3 else FAIL,
++                      "" if not bad_l3 else f"{bad_l3[:5]}"))
++
++        # (4) All 7 SM90_REAL_TUS exist on disk.
++        miss = [p.name for p in SM90_REAL_TUS if not p.exists()]
++        rep.add(Check("5", f"sm_90 real TUs on disk ({len(SM90_REAL_TUS)})",
++                      PASS if not miss else FAIL,
++                      "" if not miss else f"missing: {miss}"))
++
++        # (5) Each *_real_adamw_tc_launcher.cu declares the entry-point function
++        #     and carries an `opt_id` switch.
++        launcher_tus = [p for p in SM90_REAL_TUS
++                        if p.name.endswith("_launcher.cu")]
++        bad_launcher: List[str] = []
++        for p in launcher_tus:
++            if not p.exists():
++                bad_launcher.append(f"{p.name} (missing)")
++                continue
++            text = p.read_text()
++            # Every launcher must have an opt_id switch dispatch.
++            if "switch" not in text or "opt_id" not in text:
++                bad_launcher.append(f"{p.name} (no opt_id switch)")
++        rep.add(Check("5", "sm_90 launchers have opt_id switch",
++                      PASS if not bad_launcher else FAIL,
++                      "" if not bad_launcher else f"{bad_launcher}"))
++
++    except Exception as exc:  # noqa: BLE001
++        rep.add(Check("5", "sm_90 production path consistency",
++                      FAIL, f"{type(exc).__name__}: {exc}"[:300]))
++
+ 
+ # ---------------------------------------------------------------------------
+ # PHASE 6 — report

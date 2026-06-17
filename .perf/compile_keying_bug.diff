@@ -1,0 +1,262 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..c18bd14 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -5772,6 +5772,26 @@ _VALIDATION_REQUIRED_ORIGINS: frozenset = frozenset({
+ _VALIDATION_PASS_STATES: frozenset = frozenset({"ok", "deterministic"})
+ 
+ 
++def _emitted_source_key(ckey: str, origin: str) -> str:
++    """SINGLE SOURCE OF TRUTH for the ``spec._emitted_sources`` composite key.
++
++    Phase C0.0 keying-bug fix — the emitted-source stash (``_variant_macros``,
++    the polyhedral feeder, the synth/polyhedral stamps) and the winner-swap in
++    ``build_jit`` MUST agree on the same key, or the swap silently no-ops and a
++    GENERATED winner ships a TEMPLATE build under its validated timing (the
++    exact #16/P0-3 false-green these gates exist to stop).
++
++    Before this fix ``_variant_macros`` stashed the emitter source under the
++    BARE ``config_key`` while ``build_jit`` read the composite ``"<ckey>:synth"``
++    — the keys differed, so the swap could NEVER fire for an emitter-produced
++    winner. Routing the emitter stash AND the polyhedral feeder read through
++    this one helper makes the stash key == the swap-read key by construction;
++    the ``stash_key_matches_swap_read_key`` self-test asserts it can never
++    silently drift again.
++    """
++    return f"{ckey}:{origin}"
++
++
+ def pick_winner(all_trials: List[Dict[str, Any]], *,
+                 strict_numerics: bool = False) -> Optional[Dict[str, Any]]:
+     """Lowest timing across all stages, after numerical-validation filtering.
+@@ -12191,11 +12211,18 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
+     Stream 6 hook: when ``spec.enable_emitter`` is True, the device-side
+     call routes through ``grokking_optimizers.codegen.emit_variant_source``
+     to render a per-variant source file. The emitted path is stashed on
+-    ``spec._emitted_sources[config_key]`` so the (Stream 10-owned)
+-    ``_make_variant_timer`` can swap it into its ``sources`` list without
+-    a signature change. Residual host-side macros are still appended to
+-    the cflags so host code that needs them keeps working. On any
+-    emitter failure we fall through to the legacy macros-only path.
++    ``spec._emitted_sources[_emitted_source_key(config_key, ORIGIN_SYNTH)]``
++    (i.e. the composite ``"<ckey>:synth"`` key) so BOTH the polyhedral feeder
++    AND ``build_jit``'s winner-swap — which read the same composite key — can
++    recover the emitted source. Phase C0.0 keying-bug fix: the prior bare
++    ``config_key`` stash did NOT match ``build_jit``'s ``"<ckey>:synth"`` read,
++    so a generated (emitter-produced) winner could never be swapped into the
++    final build and would silently ship a TEMPLATE build under its timing —
++    the exact #16/P0-3 false-green. The emitter is the generative source path
++    whose winner is stamped ``origin=ORIGIN_SYNTH`` (#16), so it stashes under
++    the synth key the swap reads. Residual host-side macros are still appended
++    to the cflags so host code that needs them keeps working. On any emitter
++    failure we fall through to the legacy macros-only path.
+     """
+     # Stream 3 — if arch wasn't passed explicitly, lift it off spec.
+     if arch is None and spec is not None:
+@@ -12215,7 +12242,19 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
+             emitted_path, residual = emit_variant_source(
+                 config, dims, spec.optimizer, spec.arch, spec.out_dir,
+                 template_overrides=overrides)
+-            spec._emitted_sources[config_key(config)] = emitted_path
++            # Phase C0.0 keying-bug fix — stash on the COMPOSITE
++            # "<ckey>:synth" key (via the single-source-of-truth helper) so the
++            # winner-swap in build_jit (which reads the same key) can recover
++            # this emitter-produced source when it wins. The prior bare
++            # config_key stash silently no-op'd the swap → a generated winner
++            # shipped a TEMPLATE build under its validated timing (#16/P0-3
++            # false-green). Byte-identical on the real path today: no emitter/
++            # synth origin has ever won (the generative back-ends are
++            # non-functional), so the stashed value is never consumed by the
++            # swap yet — this only makes the swap CORRECT for when one does.
++            spec._emitted_sources[
++                _emitted_source_key(config_key(config), ORIGIN_SYNTH)
++            ] = emitted_path
+             macros_only = resolve_macros(config, dims, target)
+             return macros_only + residual
+         except Exception as _swexc:
+@@ -12631,7 +12670,14 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                         f"for {ckey[:24]}: legality is heuristic; every "
+                         f"polyhedral variant is gated behind the strict "
+                         f"on-device oracle (#16/#20).\n")
+-                emitted_source = (spec._emitted_sources or {}).get(ckey)
++                # Phase C0.0 keying-bug fix — the emitter (_variant_macros)
++                # now stashes under the composite "<ckey>:synth" key, so the
++                # polyhedral feeder reads the SAME key (via the shared helper)
++                # to pick up the rendered source it transforms. Keeping both on
++                # the helper means the feeder can never silently drift off the
++                # emitter's stash key.
++                emitted_source = (spec._emitted_sources or {}).get(
++                    _emitted_source_key(ckey, ORIGIN_SYNTH))
+                 if emitted_source is not None and Path(emitted_source).exists():
+                     _transformed = _polyhedral_expand_variant(
+                         spec, Path(emitted_source), report)
+@@ -12677,7 +12723,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+         if poly_source is not None:
+             variant_sources = [poly_source]
+             _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
+-            spec._emitted_sources[f"{ckey}:polyhedral"] = poly_source
++            spec._emitted_sources[
++                _emitted_source_key(ckey, ORIGIN_POLYHEDRAL)] = poly_source
+             report.write(
+                 f"    [polyhedral] {ckey[:24]}: building transformed schedule "
+                 f"{poly_source.name} (origin=polyhedral — needs oracle PASS "
+@@ -12692,7 +12739,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                     f"{type(exc).__name__}: {exc}\n")
+                 synth_path = None
+             if synth_path is not None:
+-                spec._emitted_sources[f"{ckey}:synth"] = synth_path
++                spec._emitted_sources[
++                    _emitted_source_key(ckey, ORIGIN_SYNTH)] = synth_path
+                 if spec.synth_codegen_prefer_synth_over_template:
+                     # Synth-only: replace template-driven sources with
+                     # the synthesised file. The existing _torch_load
+@@ -14309,7 +14357,13 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
+     final_sources = sources
+     won_ckey = tuned.get("config_key")
+     if won_ckey and _LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH:
+-        synth_src = (spec._emitted_sources or {}).get(f"{won_ckey}:synth")
++        # Phase C0.0 keying-bug fix — read under the SAME composite key the
++        # emitter / synth stash wrote, via the single-source-of-truth helper.
++        # Stash key (_variant_macros, _try_synth_codegen) == this swap-read key
++        # by construction; the stash_key_matches_swap_read_key self-test pins
++        # it so the swap can never again silently miss and ship a template.
++        synth_src = (spec._emitted_sources or {}).get(
++            _emitted_source_key(won_ckey, ORIGIN_SYNTH))
+         if synth_src and Path(synth_src).is_file():
+             final_sources = [Path(synth_src)]
+             report.write(
+@@ -18511,19 +18565,86 @@ def _self_test_fastmath_integration(run) -> None:
+         import inspect
+         bjsrc = inspect.getsource(build_jit)
+         # The swap branch detects a synth winner by origin and resolves the
+-        # stashed source under the SAME "<ckey>:synth" key the timer wrote.
++        # stashed source under the SAME composite key the timer wrote — now via
++        # the single-source-of-truth helper _emitted_source_key (Phase C0.0),
++        # so the two halves cannot drift onto different suffixes.
+         assert "_LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH" in bjsrc, \
+             "build_jit must detect a synth winner via _LAST_VARIANT_ORIGIN"
+-        assert 'f"{won_ckey}:synth"' in bjsrc, \
+-            "build_jit must resolve the synth source under '<ckey>:synth'"
++        assert "_emitted_source_key(won_ckey, ORIGIN_SYNTH)" in bjsrc, \
++            "build_jit must resolve the synth source via _emitted_source_key"
+         assert "final_sources = [Path(synth_src)]" in bjsrc, \
+             "build_jit must build the synth source, not the template"
+-        # Keying agreement: the timer stash and the final swap must use the
+-        # identical "<ckey>:synth" suffix, or the lookup silently misses and
+-        # the winner ships a template build.
++        # Keying agreement: the timer stash and the final swap must resolve to
++        # the IDENTICAL composite key, or the lookup silently misses and the
++        # winner ships a template build. Both route through the same helper.
+         tsrc = inspect.getsource(_make_variant_timer)
+-        assert 'f"{ckey}:synth"' in tsrc, \
+-            "timer must stash under the same '<ckey>:synth' key"
++        assert "_emitted_source_key(ckey, ORIGIN_SYNTH)" in tsrc, \
++            "timer must stash the synth source via _emitted_source_key"
++        assert "_emitted_source_key(config_key(config), ORIGIN_SYNTH)" \
++            in inspect.getsource(_variant_macros), \
++            "_variant_macros must stash the emitter source via _emitted_source_key"
++
++    def test_emitted_source_stash_key_matches_swap_read_key():
++        """Phase C0.0 keying-bug guard — the key ``_variant_macros`` STASHES a
++        GENERATED (emitter/synth) source under MUST equal the key
++        ``build_jit``'s winner-swap READS, or the swap silently no-ops and a
++        generated winner ships a TEMPLATE build under its validated timing (the
++        #16/P0-3 false-green these gates exist to stop).
++
++        This was a real LATENT bug: ``_variant_macros`` stashed on the BARE
++        ``config_key`` while ``build_jit`` read the composite ``"<ckey>:synth"``
++        — the keys differed, so the swap could NEVER fire. Both sites now route
++        through the single-source-of-truth ``_emitted_source_key`` helper. This
++        test BEHAVIORALLY runs the emitter and asserts the actually-stashed key
++        is byte-identical to the swap-read key, so the two can never silently
++        drift apart again (a literal-only assertion would miss a helper that
++        computed different strings)."""
++        # Behavioral round-trip: run the emitter, recover the stashed key, and
++        # prove build_jit would read THAT key for a synth-origin winner.
++        try:
++            import jinja2  # noqa: F401
++        except ImportError:
++            # No jinja2 → the emitter path can't render; fall back to the pure
++            # contract check (the helper is the only key producer either way).
++            ck = "deadbeefdeadbeef"
++            assert _emitted_source_key(ck, ORIGIN_SYNTH) == f"{ck}:synth", \
++                "the composite key helper must produce '<ckey>:synth'"
++            return
++        td = Path(tempfile.mkdtemp())
++        try:
++            spec = BuildSpec(
++                optimizer="adamw", model="mamba", arch="sm_90a",
++                out_dir=td, enable_emitter=True)
++            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
++            cfg = {d["name"]: d["values"][0] for d in sm90_dims}
++            _variant_macros(cfg, sm90_dims, "device", spec=spec)
++            ck = config_key(cfg)
++            # The key the emitter ACTUALLY stashed under.
++            stash_key = _emitted_source_key(ck, ORIGIN_SYNTH)
++            assert stash_key in spec._emitted_sources, (
++                f"emitter did not stash under the swap-read key {stash_key!r}; "
++                f"present keys: {list(spec._emitted_sources)}")
++            # The key build_jit's swap would READ for a synth-origin winner
++            # (won_ckey == ck). Computed via the SAME helper build_jit calls —
++            # asserting equality pins stash-key == swap-read-key by construction.
++            won_ckey = ck
++            swap_read_key = _emitted_source_key(won_ckey, ORIGIN_SYNTH)
++            assert stash_key == swap_read_key, (
++                f"STASH/SWAP KEY MISMATCH: emitter stashed {stash_key!r} but "
++                f"build_jit reads {swap_read_key!r} — the swap would silently "
++                f"no-op and ship a template under the generated winner's timing")
++            # And the bare config_key MUST NOT be the stash key (the exact
++            # pre-fix bug): a regression to the bare key would re-open the
++            # silent no-op.
++            assert ck not in spec._emitted_sources, (
++                "emitter stashed under the BARE config_key — build_jit reads "
++                "the composite key, so the swap would silently no-op")
++            # Cross-origin sanity: the polyhedral stash/read key is distinct
++            # from the synth one (no accidental collision between origins).
++            assert _emitted_source_key(ck, ORIGIN_POLYHEDRAL) != stash_key, \
++                "synth and polyhedral composite keys must not collide"
++        finally:
++            shutil.rmtree(td)
+ 
+     def test_origin_constants_single_source_of_truth():
+         """Defect-1.6 — no stray origin string literal outside the constant
+@@ -18596,6 +18717,8 @@ def _self_test_fastmath_integration(run) -> None:
+         test_fastmath_winner_reapplies_flags_in_final_build)
+     run("synth_winner_swaps_source_in_final_build",
+         test_synth_winner_swaps_source_in_final_build)
++    run("emitted_source_stash_key_matches_swap_read_key",
++        test_emitted_source_stash_key_matches_swap_read_key)
+     run("origin_constants_single_source_of_truth",
+         test_origin_constants_single_source_of_truth)
+     run("mandate_features_have_nontest_callsites",
+@@ -20404,9 +20527,18 @@ def _self_test_codegen(run) -> None:
+             flags = _variant_macros(cfg, sm90_dims, "device", spec=spec)
+             assert isinstance(flags, list)
+             ck = config_key(cfg)
+-            assert ck in spec._emitted_sources, \
+-                f"emitted_sources missing {ck}: {spec._emitted_sources}"
+-            assert spec._emitted_sources[ck].exists()
++            # Phase C0.0 keying-bug fix — the emitter stashes under the
++            # COMPOSITE "<ckey>:synth" key (the one build_jit's swap reads), NOT
++            # the bare config_key. Assert the composite key, and assert the bare
++            # key is ABSENT so a regression back to the silent-no-op stash is
++            # caught here.
++            ekey = _emitted_source_key(ck, ORIGIN_SYNTH)
++            assert ekey in spec._emitted_sources, \
++                f"emitted_sources missing {ekey}: {spec._emitted_sources}"
++            assert spec._emitted_sources[ekey].exists()
++            assert ck not in spec._emitted_sources, \
++                ("emitter stashed under the BARE config_key — the swap reads "
++                 "the composite key, so this would silently no-op (regression)")
+             # When enable_emitter=False, behavior is unchanged.
+             spec2 = BuildSpec(optimizer="adamw", model="mamba",
+                               arch="sm_90a", out_dir=td)
+@@ -21837,7 +21969,7 @@ def _self_test_math_drift_guard(run) -> None:
+ # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
+ # any other), so the value is the grand total reported on the final
+ # ``[self-test] N passed, M failed`` line.
+-_SELF_TEST_EXPECTED_COUNT: int = 231
++_SELF_TEST_EXPECTED_COUNT: int = 232
+ 
+ 
+ def _self_test() -> int:

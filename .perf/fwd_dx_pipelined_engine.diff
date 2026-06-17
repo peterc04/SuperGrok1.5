@@ -1,0 +1,516 @@
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index e87c359..98b8eb1 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -408,6 +408,21 @@ struct DecTcSmem {
+ #endif
+ };
+ 
++// ── DESIGN-TOURNAMENT entry (b): the fwd/dX tile-call trailing arg that hands the
++//    producer/consumer engine its mbarrier words. Expands to `, sm.pipe_bars` ONLY
++//    under PIPE=2 and to NOTHING otherwise — so the shipped PIPE=0|1 fwd/bwd tile
++//    calls are TEXTUALLY UNCHANGED (the tile functions' `pipeBars` param defaults to
++//    nullptr, unreferenced in their non-engine path → byte-identical PTX). Mirrors
++//    the SG_DEC_FINE_* macro idiom. `sm` is the kernel's __shared__ DecTcSmem local;
++//    this macro is only ever used inside fused_decoder_megakernel_tc where `sm` is
++//    in scope. The dW + optimizer-tail calls do NOT take it (dW never enters the
++//    ring; the tail has no GEMM) — only the 4 fwd/bwd tile call sites use it.
++#if SG_TUNED_DEC_FWD_PIPE == 2
++#define SG_DEC_PIPE_BARS_ARG , sm.pipe_bars
++#else
++#define SG_DEC_PIPE_BARS_ARG
++#endif
++
+ // ── DEEP-RING SMEM ALLOCATION GATE (decoder fwd/dX deeper-ring lever) ─────────
+ // The static __shared__ DecTcSmem (kernel `sm`, below) is hard-capped at 48 KB on
+ // H100 (the per-CTA STATIC smem limit; the larger 228 KB/SM budget is reachable
+@@ -431,7 +446,14 @@ struct DecTcSmem {
+ // is the SUFFICIENT condition — every config that can bust 48 KB does so only at
+ // S≥3 (S=2 is static-safe at every legal tile: measured max S=2 = 25.64 KB at
+ // TILE_M=256/TILE_N=128/IL=4, and PIPE=1 requires STAGES≥2 so a PIPE=1/S=2 build
+-// still takes the static path here). Routing a sub-48 KB S=3 config (e.g. the
++// still takes the static path here). NOTE the `SG_TUNED_DEC_FWD_PIPE &&` operand is
++// VALUE-AGNOSTIC: it is truthy for BOTH PIPE=1 (entry a, deeper ring) and PIPE=2
++// (entry b, the producer/consumer mbarrier engine — DESIGN-TOURNAMENT), so the
++// deeper PIPE=2 ring (STAGES≥3) ALSO routes to dynamic smem here. PIPE=2's extra
++// 2·Depth·8 ≤ 64 B of mbarrier words (DecTcSmem::pipe_bars) ride inside the same
++// allocation (static at Depth=2: sizeof 18096 B < 48 KB; dynamic at Depth≥3:
++// 26304 B @ S=3, 34512 B @ S=4 — both placed at 1 CTA/SM under the 227 KB cap).
++// Routing a sub-48 KB S=3 config (e.g. the
+ // default-tile S=3 = 25.64 KB) through dynamic smem is harmless (dynamic alloc +
+ // the exact-size opt-in + the ≥1-CTA cert are valid at any size ≤ the dynamic
+ // cap); the gate trades a tiny launch-path change on the deep ring for keeping
+@@ -458,7 +480,8 @@ static_assert(sizeof(DecTcSmem) <= 48 * 1024,
+               "DecTcSmem exceeds the 48 KB STATIC __shared__ cap with the deep-ring "
+               "dynamic-smem gate OFF — this build would hit the runtime 'too many "
+               "resources requested for launch'. Enable the deep ring "
+-              "(SG_TUNED_DEC_FWD_PIPE=1) or widen SG_DEC_TC_DYNAMIC_SMEM's gate.");
++              "(SG_TUNED_DEC_FWD_PIPE=1 or =2 with STAGES>2) or widen "
++              "SG_DEC_TC_DYNAMIC_SMEM's gate.");
+ #endif
+ // DecTcSmem's strongest member alignment is 16 B (alignas(16) on sA, which is the
+ // first member and therefore governs the whole object's alignment). The dynamic
+@@ -823,19 +846,19 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+         float nll;
+         if constexpr (kSamCoupled)
+             nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
+-                                                     tok.targets, sm.sA, sm.sB, sm.red);
++                                                     tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+         else
+             nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
+-                                            sm.sA, sm.sB, sm.red);
++                                            sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c1 = clock64();
+ #endif
+         if constexpr (kSamCoupled)
+             dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
+-                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+         else
+             dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
+-                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+ #ifdef SG_DEC_PROFILE
+         __syncthreads(); unsigned long long _c2 = clock64();
+         if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+@@ -1035,9 +1058,9 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+                 const int g0 = ti * nrows_tile;
+                 const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+                 dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
+-                                                   tok.targets, sm.sA, sm.sB, sm.red);
++                                                   tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+                 dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
+-                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
++                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+                 __syncthreads();
+             }
+             bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index dd25f46..52c60b6 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -223,15 +223,44 @@ static_assert(kDecTcStages >= 1 && kDecTcStages <= 2,
+ // double-buffer) so the engine is byte-identical. When ON it is the FWD_STAGES
+ // knob (2..4). The dW path is UNAFFECTED (it never takes the ring — lambda
+ // sources, DecTileSrcIsGmem=false — so it keeps kDecTcStages regardless).
++//
++// ── DESIGN-TOURNAMENT: PIPE is now a 3-way SELECTOR (0/1/2), NOT a scale. The
++//    three modes are INDEPENDENT ALTERNATIVES the main loop GPU-gates and keeps
++//    the FASTER (they are never merged):
++//      PIPE=0  OFF — the shipped S=2 ring VERBATIM → byte-identical PTX.
++//      PIPE=1  entry (a): the SAME all-threads-stage / WG0-compute ring DEEPENED
++//              to FWD_STAGES slots (more cp.async groups in flight; the deeper-
++//              prefetch lever). Loose overlap — staging + MMA share the 256
++//              threads; the cp.async WAIT is still on the consumer's critical path.
++//      PIPE=2  entry (b): the validated producer/consumer mbarrier ENGINE
++//              (tile_pipeline.cuh choreography, transcribed here over the EXISTING
++//              ring tiles + the M-atom-interleave + the bit-identical issue_k).
++//              WG0 is a PURE producer (cp.async + mbarrier arrive), WG1 a PURE
++//              consumer (mbarrier wait + wgmma). The producer runs up to Depth
++//              stages AHEAD of the consumer, so the cp.async drain is HIDDEN
++//              behind the consumer's in-flight wgmmas (TRUE drain-hiding — the
++//              regime the fine profiler proved fwd/dX live in: ring WAIT 43% fwd /
++//              56% dX dominates WGMMA). NOT a repeat of the P0 dW failure: dW was
++//              ~97%-staging / ~3%-MMA (nothing to hide behind, and the split stole
++//              the staging threads); fwd/dX are the OPPOSITE (drain/latency-bound,
++//              contiguous cp.async, real MMA share). PARITY: see the engine body —
++//              the overlap reorders LOADS only; the wgmma ISSUE sequence and the
++//              ascending-k fp32 accumulation are bit-identical to PIPE=0.
+ constexpr int kDecFwdPipe = SG_TUNED_DEC_FWD_PIPE;
+-static_assert(kDecFwdPipe == 0 || kDecFwdPipe == 1,
+-              "SG_TUNED_DEC_FWD_PIPE must be 0 (off, byte-identical) or 1 (deeper fwd/dX ring)");
++static_assert(kDecFwdPipe == 0 || kDecFwdPipe == 1 || kDecFwdPipe == 2,
++              "SG_TUNED_DEC_FWD_PIPE must be 0 (off, byte-identical), 1 (entry-a deeper "
++              "fwd/dX ring), or 2 (entry-b producer/consumer mbarrier engine)");
++// Is the producer/consumer mbarrier engine selected (entry b)? A compile-time bool
++// the engine + DecTcSmem branch on; false (PIPE 0|1) → not one mbarrier byte emitted.
++constexpr bool kDecFwdPipeEngine = (kDecFwdPipe == 2);
+ // PIPE=0 → inherit kDecTcStages VERBATIM (1 or 2; preserves the serial S=1 build
+-// and the byte-identical S=2 default). PIPE=1 → the FWD_STAGES knob (asserted
+-// 2..4 below; <2 is not a real ring, >4 blows the smem budget).
++// and the byte-identical S=2 default). PIPE=1 OR 2 → the FWD_STAGES knob (asserted
++// 2..4 below; <2 is not a real ring, >4 blows the smem budget). Both deeper modes
++// share the SAME ring DEPTH (the producer/consumer engine's Depth == the deeper
++// ring's slot count), so the sA/sB allocation is identical for PIPE 1 vs 2.
+ constexpr int kDecFwdStages = kDecFwdPipe ? SG_TUNED_DEC_FWD_STAGES : kDecTcStages;
+ static_assert(kDecFwdPipe == 0 || (kDecFwdStages >= 2 && kDecFwdStages <= 4),
+-              "SG_TUNED_DEC_FWD_STAGES must be 2..4 when SG_TUNED_DEC_FWD_PIPE=1 "
++              "SG_TUNED_DEC_FWD_STAGES must be 2..4 when SG_TUNED_DEC_FWD_PIPE=1|2 "
+               "(smem-capped; >1 for a real ring). PIPE=0 inherits GEMM_STAGES (1|2).");
+ // The widest ring any call site uses, for the DecTcSmem sA/sB allocation: fwd/dX
+ // take kDecFwdStages; dW takes kDecTcStages. Spell the max out (covers the S=1
+@@ -647,14 +676,23 @@ template <> struct DecTileSrcIsGmem<DecGmemTileSrcB> { static constexpr bool val
+ // selftest's existing 9-arg calls still compile AND the shipped PTX is byte-
+ // identical (an unreferenced trailing defaulted arg is dropped by the optimizer;
+ // PTX-verified OFF-vs-baseline).
++// `pipeBars` (default nullptr) is the producer/consumer mbarrier-words base for the
++// PIPE=2 engine (entry b) — 2·RS `unsigned long long` words (full[RS] then empty[RS]),
++// carved from the kernel's DecTcSmem::pipe_bars. It is dereferenced ONLY inside the
++// `if constexpr (kDecFwdPipeEngine)` sub-branch (PIPE=2), which is compiled OUT for
++// PIPE 0|1 — so the nullptr the wrappers pass on the shipped build is UNREFERENCED
++// and dropped by the optimizer (byte-identical PTX, like prof_phase). dW + the TP
++// fp32-W overloads + the selftest's 9-arg calls leave it null (they never take the
++// ring → !kRingAsync → the engine sub-branch is unreachable for them).
+ template <int N, int MaxAtomsM, typename SrcA, typename SrcB, typename Out>
+ __device__ void tc_gemm_block_unpipelined(
+         int mbase0, int m_atoms, int n_real, int k_steps,
+         SrcA srcA, SrcB srcB, Out out,
+         __nv_bfloat16* smemA, __nv_bfloat16* smemB,
++        unsigned long long* pipeBars = nullptr,
+         int prof_phase = -1) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+-    (void)prof_phase;
++    (void)prof_phase; (void)pipeBars;
+     const int tid = threadIdx.x;
+     const int nthreads = blockDim.x;            // 256
+     const bool in_wg0 = (tid < 128);
+@@ -819,7 +857,135 @@ __device__ void tc_gemm_block_unpipelined(
+                 }
+                 decprim::cp_async_commit();
+             };
+-            if constexpr (RS <= 2) {
++            if constexpr (kDecFwdPipeEngine) {
++                // ══════════════════════════════════════════════════════════════
++                //  DESIGN-TOURNAMENT entry (b): PRODUCER/CONSUMER mbarrier ENGINE
++                //  (SG_TUNED_DEC_FWD_PIPE=2). The validated tile_pipeline.cuh
++                //  choreography, transcribed here over the EXISTING ring tiles
++                //  (smemA/smemB), the M-atom-interleave (acc[kIL]), and the
++                //  bit-identical issue_k — so the only thing that changes vs the
++                //  PIPE=0|1 ring is the THREAD SPLIT and the cross-warpgroup
++                //  handoff: WG0 is the CONSUMER (wgmma into acc[]; owns the
++                //  epilogue, like every other branch's `in_wg0`), WG1 is the
++                //  PURE PRODUCER (cp.async-stages each k-tile + arrives `full`).
++                //  The producer runs up to RS stages AHEAD of the consumer, gated
++                //  only by the `empty` barrier, so the cp.async DRAIN is hidden
++                //  behind the consumer's in-flight wgmmas (DRAIN-HIDING — the
++                //  regime the fine profiler proved fwd/dX live in).
++                //
++                //  PARITY BY CONSTRUCTION: the consumer issues issue_k(g_atoms,k,RS)
++                //  in ASCENDING k (k=0 overwrite / k>0 accumulate) into the SAME
++                //  acc[ai] fragments as PIPE=0 — the wgmma ISSUE SEQUENCE and the
++                //  fp32 accumulation order are bit-identical. The producer stages
++                //  the SAME 16B chunks into the SAME canonical Major-K smem offsets
++                //  the PIPE=0 stage_k_async writes; only WHEN a tile lands changes
++                //  (a LOAD reorder). No ragged/atomic reduce: each acc[ai] is owned
++                //  by one consumer thread, summed serially. dW/TP/selftest never
++                //  reach here (!kRingAsync). Identical to the unpipelined kchain
++                //  because the consumer issues the SAME ss-wgmma sequence in the
++                //  SAME order (tile_pipeline.cuh DESIGN gate c).
++                //
++                //  Barriers: 2·RS words in pipeBars — full[0..RS) then empty[0..RS).
++                //  Each expects a FULL WARPGROUP (128) of arrivals per phase (the
++                //  tile_pipeline contract: a per-warp elect_one would give 4
++                //  arrivals on a count-1 barrier and DEADLOCK the parity wait). The
++                //  consumer arrives `empty` (releases a slot); the producer arrives
++                //  `full` (publishes a slot) after its own cp_async_wait_group<0> +
++                //  one fence.proxy.async (the portable wait_group handoff — the
++                //  mbarrier is the cross-warpgroup ready SIGNAL, not the tx counter).
++                auto bar_full  = [&] (int s) { return wgs::Mbarrier(pipeBars + s); };
++                auto bar_empty = [&] (int s) { return wgs::Mbarrier(pipeBars + RS + s); };
++                // Init the 2·RS barriers (thread 0), each expecting 128 arrivals.
++                if (tid == 0) {
++                    #pragma unroll
++                    for (int s = 0; s < RS; ++s) { bar_full(s).init(128); bar_empty(s).init(128); }
++                }
++                __syncthreads();   // barriers initialized + visible before any arrive
++
++                // Producer-side stager: stage k-tile `kk` into slot kk%RS using ONLY
++                // WG1's 128 threads (the producer warpgroup). SAME chunk math /
++                // SAME canonical Major-K destination offsets as stage_k_async — only
++                // the thread stride is the 128-wide producer group (tid_wg ∈ 0..127),
++                // NOT all 256. (stage_k_async strides over 256 threads, so it is the
++                // PIPE 0|1 transport; the producer/consumer split needs a 128-wide
++                // producer.) Followed by cp_async_commit() (the caller drains+arrives).
++                auto produce_ktile = [&] (int kk) {
++                    const int sl = kk % RS;
++                    const int kb = kk * wgs::kWgmmaAtomK;
++                    constexpr int kAChunks = kIL * wgs::kWgmmaAtomM * 2;
++                    constexpr int kChunks  = kAChunks + N * 2;
++                    #pragma unroll 1
++                    for (int v = tid_wg; v < kChunks; v += 128) {
++                        if (v < kAChunks) {
++                            const int ai = v / (wgs::kWgmmaAtomM * 2);
++                            if (ai < g_atoms) {
++                                const int r  = v - ai * (wgs::kWgmmaAtomM * 2);
++                                const int mn = r >> 1, half = r & 1;
++                                decprim::cp_async_cg_16(
++                                    smemA + ((int64_t)sl * kIL + ai) * kDecTcSmemA1
++                                          + half * (wgs::kWgmmaAtomM * 8) + mn * 8,
++                                    srcA.chunk16(gbase + ai * wgs::kWgmmaAtomM + mn, kb, half));
++                            }
++                        } else {
++                            const int r  = v - kAChunks;
++                            const int mn = r >> 1, half = r & 1;
++                            __nv_bfloat16* dst = smemB + (int64_t)sl * kDecTcSmemB1
++                                               + half * (N * 8) + mn * 8;
++                            if (srcB.row_valid(mn)) {
++                                decprim::cp_async_cg_16(dst, srcB.chunk16(mn, kb, half));
++                            } else {
++                                uint4 z; z.x = z.y = z.z = z.w = 0u;
++                                *reinterpret_cast<uint4*>(dst) = z;
++                            }
++                        }
++                    }
++                    decprim::cp_async_commit();
++                };
++
++                if (!in_wg0) {
++                    // ── PRODUCER (WG1): stage every k-tile in ascending k. With RS
++                    //    buffering it runs up to RS stages ahead; for kk>=RS the slot
++                    //    was used by kk-RS, so wait on `empty` before overwriting it
++                    //    (WAR-safe: the consumer arrives empty only after wgmma kk-RS
++                    //    drained). Each stage: produce → drain own cp.async →
++                    //    fence.proxy.async → all-128-producer arrive `full`.
++                    unsigned emptyp[RS];
++                    #pragma unroll
++                    for (int s = 0; s < RS; ++s) emptyp[s] = 0u;
++                    #pragma unroll 1
++                    for (int kk = 0; kk < k_steps; ++kk) {
++                        const int sl = kk % RS;
++                        if (kk >= RS) { bar_empty(sl).wait(emptyp[sl]); emptyp[sl] ^= 1u; }
++                        SG_FINE_TIC(); produce_ktile(kk);                  SG_FINE_ACC(_f_issue);
++                        SG_FINE_TIC(); decprim::cp_async_wait_group<0>();  SG_FINE_ACC(_f_wait);
++                        wgs::fence_async_proxy();
++                        bar_full(sl).arrive();   // publish slot sl (all 128 producers)
++                    }
++                } else {
++                    // ── CONSUMER (WG0): wgmma over each staged k-tile in ascending k
++                    //    into acc[] (k=0 overwrite / k>0 accumulate — bit-identical to
++                    //    PIPE=0). Wait `full` before issuing, drain the wgmma, then
++                    //    all-128-consumer arrive `empty` to release the slot. ONE
++                    //    wgmma_fence before the chain (accumulators were just touched).
++                    unsigned fullp[RS];
++                    #pragma unroll
++                    for (int s = 0; s < RS; ++s) fullp[s] = 0u;
++                    wgs::wgmma_fence();
++                    #pragma unroll 1
++                    for (int k = 0; k < k_steps; ++k) {
++                        const int sl = k % RS;
++                        SG_FINE_TIC(); bar_full(sl).wait(fullp[sl]); fullp[sl] ^= 1u; SG_FINE_ACC(_f_wait);
++                        SG_FINE_TIC();
++                        issue_k(g_atoms, k, RS);
++                        wgs::wgmma_commit_group();
++                        wgs::wgmma_wait_group<0>();   // drain wgmma k → slot k%RS free
++                        SG_FINE_ACC(_f_wgmma);
++                        bar_empty(sl).arrive();       // release slot sl (all 128 consumers)
++                    }
++                }
++                // The shared epilogue below stores acc[] from `in_wg0` = the CONSUMER
++                // warpgroup (WG0 owns the fragments here), so it is correct as-is.
++            } else if constexpr (RS <= 2) {
+                 // ── ORIGINAL S=2 DOUBLE-BUFFER RING (verbatim; byte-identical when
+                 //    PIPE=0). One prefetch tile in flight; full drain + barrier per k.
+                 //    (RS<=2 also covers the dead RS=1 case — kRingAsync needs S>1, so
+@@ -959,7 +1125,7 @@ __device__ void tc_gemm_block_unpipelined(
+ #else
+     (void)mbase0; (void)m_atoms; (void)n_real; (void)k_steps;
+     (void)srcA; (void)srcB; (void)out; (void)smemA; (void)smemB;
+-    (void)prof_phase;
++    (void)prof_phase; (void)pipeBars;
+ #endif
+ }
+ 
+@@ -985,11 +1151,16 @@ __device__ void tc_gemm_block_unpipelined(
+ // identical deterministic rounding the old on-read accessor performed, so the
+ // staged operand VALUES are bit-identical. Both operands are flat-gmem K-major
+ // → the engine's cp.async double-buffered ring stages them (RING).
++// `pipeBars` (default nullptr): the PIPE=2 producer/consumer mbarrier-words base
++// (DecTcSmem::pipe_bars). Forwarded to the engine; dereferenced ONLY in its PIPE=2
++// sub-branch (compiled out for PIPE 0|1 → the nullptr default is unreferenced and
++// dropped → byte-identical). The fwd/dX driver threads sm.pipe_bars under
++// #if SG_TUNED_DEC_FWD_PIPE == 2; on the shipped build it passes nothing (default).
+ template <int N>
+ __device__ __forceinline__ void dectc_gemm_fwd(
+         const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+         __nv_bfloat16* __restrict__ Yout, int Kin, int Nout,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
+     const int k_steps = Kin / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+@@ -1003,7 +1174,7 @@ __device__ __forceinline__ void dectc_gemm_fwd(
+         auto out  = [&] (int m, int n, float v) {
+             Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_FWD);
+     }
+ }
+ 
+@@ -1014,7 +1185,7 @@ template <int N>
+ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+         const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+         float* __restrict__ Yf32, int Kin, int Nout,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
+     const int k_steps = Kin / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+@@ -1024,7 +1195,7 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+         DecGmemTileSrcB srcB{W + (int64_t)n0 * Kin, Kin, Nout - n0};
+         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_FWD);
+     }
+ }
+ 
+@@ -1040,7 +1211,7 @@ template <int N>
+ __device__ __forceinline__ void dectc_gemm_dx_f32(
+         const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __restrict__ WT,
+         float* __restrict__ dXf32, int Kin, int Nout,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
+     const int k_steps = Nout / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Kin; n0 += N) {
+         const int n_real = (Kin - n0) < N ? (Kin - n0) : N;
+@@ -1048,7 +1219,7 @@ __device__ __forceinline__ void dectc_gemm_dx_f32(
+         DecGmemTileSrcB srcB{WT + (int64_t)n0 * Nout, Nout, Kin - n0};
+         auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_DX);
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_DX);
+     }
+ }
+ 
+@@ -1073,9 +1244,10 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+             int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+-        // fp32-W (TP) lambda sources → !kRingAsync (no stamp); tag kept for intent.
++        // fp32-W (TP) lambda sources → !kRingAsync (no stamp; never reaches the
++        // PIPE=2 engine) → pipeBars=nullptr; tag kept for intent.
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_FWD);
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, /*pipeBars=*/nullptr SG_DEC_FINE_FWD);
+     }
+ }
+ template <int N>
+@@ -1091,9 +1263,10 @@ __device__ __forceinline__ void dectc_gemm_dx_f32(
+         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+             int nn = n0 + n; return nn < Kin ? __float2bfloat16(W[(int64_t)k * Kin + nn]) : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
+-        // fp32-W (TP) lambda sources → !kRingAsync (no stamp); tag kept for intent.
++        // fp32-W (TP) lambda sources → !kRingAsync (no stamp; never reaches the
++        // PIPE=2 engine) → pipeBars=nullptr; tag kept for intent.
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB SG_DEC_FINE_DX);
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, /*pipeBars=*/nullptr SG_DEC_FINE_DX);
+     }
+ }
+ 
+@@ -1336,7 +1509,8 @@ __device__ float dectc_forward_tile(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        unsigned long long* pipeBars = nullptr) {
+     const int nsamp = nrows / dec::kSeq;
+     // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+@@ -1353,7 +1527,7 @@ __device__ float dectc_forward_tile(
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+-        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB);
++        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB, pipeBars);
+         __syncthreads();
+         // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+         // matches the bf16-faithful oracle qkv = bf(x_in @ bf(in_w)^T + in_b)).
+@@ -1373,7 +1547,7 @@ __device__ float dectc_forward_tile(
+         __syncthreads();
+         // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+-                                            sc.work, dec::kD, dec::kD, sA, sB);
++                                            sc.work, dec::kD, dec::kD, sA, sB, pipeBars);
+         __syncthreads();
+         // r1 = Xin + a + out_b → work (fp32). out_b folded here (the GEMM did W only)
+         // — matches the oracle a = ctx_b @ out_w^T + out_b kept fp32 through r1.
+@@ -1393,7 +1567,7 @@ __device__ float dectc_forward_tile(
+         // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+         // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
+-                                            sc.work, dec::kD, dec::kDff, sA, sB);
++                                            sc.work, dec::kD, dec::kDff, sA, sB, pipeBars);
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
+             const int r = idx / dec::kDff, j = idx % dec::kDff;
+@@ -1404,7 +1578,7 @@ __device__ float dectc_forward_tile(
+         __syncthreads();
+         // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
+-                                            sc.work, dec::kDff, dec::kD, sA, sB);
++                                            sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);
+         __syncthreads();
+         // r2 = x1 + ff2 + ff2_b → work (fp32). x1 lives in the dedicated fp32 buffer
+         // (no bf16 round). ff2_b folded here — matches the oracle r2 = x1 + (ff2 + ff2_b).
+@@ -1574,7 +1748,8 @@ __device__ void dectc_backward_tile(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        unsigned long long* pipeBars = nullptr) {
+     const int nsamp = nrows / dec::kSeq;
+     // LN-vec partial slots (dense order; see kLnVecTensorIdx).
+     float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+@@ -1669,7 +1844,7 @@ __device__ void dectc_backward_tile(
+         // ff2 dX: dgact = dff2 @ ff2_w  (N=dff, K=d). fp32 → tw? need a [nrows,dff] buffer.
+         //   Use sc.work (currently dr2, no longer needed — dx1 saved in work2, dff2 in acts).
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, wb.ff2_wT[li],
+-                                           sc.work, dec::kDff, dec::kD, sA, sB);  // dgact [nrows,dff]
++                                           sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);  // dgact [nrows,dff]
+         __syncthreads();
+         // dff0 = dgact * gelu'(ff0pre) → dY_ff0 acts (bf16) AND keep fp32 in sc.work for dX.
+         for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
+@@ -1681,7 +1856,7 @@ __device__ void dectc_backward_tile(
+         // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
+         //   → sc.x1 (free now — fwd x1 consumed); then add to work2.
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, wb.ff0_wT[li],
+-                                           sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB);  // dx1_ffn [nrows,d]
++                                           sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB, pipeBars);  // dx1_ffn [nrows,d]
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+             work2[idx] += sc.x1[idx];   // dx1 = residual + FFN path
+@@ -1699,7 +1874,7 @@ __device__ void dectc_backward_tile(
+         __syncthreads();
+         // out_proj dX: dctx = da @ out_w  (N=d, K=d). fp32 → sc.work (dctx [nrows,d]).
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, wb.out_wT[li],
+-                                           sc.work, dec::kD, dec::kD, sA, sB);  // dctx
++                                           sc.work, dec::kD, dec::kD, sA, sB, pipeBars);  // dctx
+         __syncthreads();
+         // attention bwd: (qkv[li], attn[li], dctx=work) → dqkv [nrows,3d] fp32 into
+         //   work2 (3d=384 ≤ dff=512, fits). Then → dY_qkv acts (bf16, in_proj dW operand).
+@@ -1710,7 +1885,7 @@ __device__ void dectc_backward_tile(
+         // in_proj dX: dx_in_attn = dqkv @ in_w  (output width Kin=d, contract Nout=3d).
+         //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, wb.in_wT[li],
+-                                           sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB);  // dx_in_attn
++                                           sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB, pipeBars);  // dx_in_attn
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+             sc.dh[idx] += sc.work[idx];   // dx_in = residual (in dh) + attn path
+@@ -1742,15 +1917,17 @@ __device__ __noinline__ float dectc_forward_tile_outlined(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tok_ids,
+         const int* __restrict__ tgt_ids,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+-    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red);
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        unsigned long long* pipeBars = nullptr) {
++    return dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok_ids, tgt_ids, sA, sB, red, pipeBars);
+ }
+ __device__ __noinline__ void dectc_backward_tile_outlined(
+         const DecWeights& w, const DecWBf& wb, int g0, int nrows, int B, const DecActs& acts,
+         const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+         float* __restrict__ lnvec, float* __restrict__ work2,
+-        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+-    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red);
++        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
++        unsigned long long* pipeBars = nullptr) {
++    dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red, pipeBars);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════

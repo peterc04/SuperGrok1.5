@@ -1,0 +1,1283 @@
+diff --git a/csrc/bindings/dispatch.cpp b/csrc/bindings/dispatch.cpp
+index d8717c8..563e523 100644
+--- a/csrc/bindings/dispatch.cpp
++++ b/csrc/bindings/dispatch.cpp
+@@ -236,7 +236,11 @@ struct FusedScratch {
+  torch::Tensor g_arrived;    // int32 [1] (reinterpreted as unsigned)
+  torch::Tensor g_generation; // int32 [1] (reinterpreted as unsigned)
+  torch::Tensor sizes;        // int32 [1] = n  (constant per n)
+- torch::Tensor offsets;      // int32 [1] = 0  (constant)
++ // BUG-INT32 fix: offsets is now int64 so cumulative element offsets >2^31
++ // are representable. Currently n_tasks=1 and the single offset is 0, so
++ // values fit int32 today — int64 storage is numerically identical. Widens
++ // the ABI ahead of multi-tensor layouts targeting 1B+ params.
++ torch::Tensor offsets;      // int64 [1] = 0  (constant; BUG-INT32 fix)
+  torch::Tensor acts;         // float [numel(params)] proxy buffer
+ };
+ 
+@@ -252,12 +256,14 @@ inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int64_t n) {
+  if (it == cache.end()) {
+  auto opts_i =
+  torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
++ auto opts_i64 =
++ torch::TensorOptions().device(params.device()).dtype(torch::kInt64);
+  FusedScratch s;
+  s.g_next = torch::zeros({1}, opts_i);
+  s.g_arrived = torch::zeros({1}, opts_i);
+  s.g_generation = torch::zeros({1}, opts_i);
+  s.sizes = torch::full({1}, n, opts_i); // constant for this n
+- s.offsets = torch::zeros({1}, opts_i); // constant
++ s.offsets = torch::zeros({1}, opts_i64); // constant; int64 (BUG-INT32 fix)
+  s.acts = torch::zeros_like(params);
+  it = cache.emplace(key, std::move(s)).first;
+  } else {
+@@ -331,15 +337,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
+  float* v = m + n;
+  float* extra = m + 2 * n;
+ 
+- // The megakernel ABI (PersistentContext.n_tasks, the int32 sizes/offsets
+- // tensors) is 32-bit per the layout-identical mirror struct and the
+- // generated launchers. The fused indices are being widened by the fused
+- // agent; until the device-side N is int64, fail loudly rather than feed a
+- // truncated count into the kernel (which would silently process the wrong
+- // task range). This gate fires only for params with > 2^31-1 elements.
++ // sizes[] is int32 (n_tasks count is int32, no single tensor exceeds int32).
++ // offsets[] is now int64 (BUG-INT32 fix) — cumulative offsets >2^31 are safe.
++ // PersistentContext.n_tasks is still int32; guard that the element count fits.
++ // This gate fires for params with > 2^31-1 elements (single-tensor layout).
+  TORCH_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+  "fused_step: param has ", n, " elements, exceeding the int32 "
+- "megakernel ABI (PersistentContext.n_tasks / sizes / offsets). "
++ "megakernel ABI (PersistentContext.n_tasks / sizes). "
+  "Use the per-op path for params with > 2^31-1 elements.");
+ 
+  fused::sm90::PersistentContext ctx{
+@@ -359,7 +363,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
+  bool found = false;
+  cudaError_t err = fused::sm90::dispatch_sm90_cell(
+  model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
+- sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, /*step=*/1,
++ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int64_t>(), lr, /*step=*/1,
+  stream, &found);
+ 
+  if (found) {
+@@ -392,10 +396,10 @@ void fused_step(const std::string& model, const std::string& optimizer,
+  }
+  float* m = state.data_ptr<float>();
+  float* v = m + n; float* extra = m + 2 * n;
+- // int32 megakernel ABI gate (mirror of the sm_90 path).
++ // sizes[] is int32; offsets[] is int64 (BUG-INT32 fix). Guard n_tasks (int32).
+  TORCH_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+  "fused_step: param has ", n, " elements, exceeding the int32 "
+- "megakernel ABI. Use the per-op path for > 2^31-1 elements.");
++ "megakernel ABI (n_tasks/sizes). Use the per-op path for > 2^31-1 elements.");
+  fused::gfx942_mega::PersistentContext ctx{
+  sc.g_next.data_ptr<int>(),
+  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
+@@ -406,7 +410,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
+  bool found = false;
+  hipError_t herr = fused::gfx942_mega::dispatch_gfx942_cell(
+  model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
+- sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, 1, stream, &found);
++ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int64_t>(), lr, 1, stream, &found);
+  if (found) {
+  if (herr != hipSuccess)
+  throw std::runtime_error(
+diff --git a/csrc/fused/gfx942/fused_dispatch_table.inc b/csrc/fused/gfx942/fused_dispatch_table.inc
+index 83ebbaf..668515e 100644
+--- a/csrc/fused/gfx942/fused_dispatch_table.inc
++++ b/csrc/fused/gfx942/fused_dispatch_table.inc
+@@ -40,7 +40,7 @@ inline hipError_t dispatch_gfx942_cell(
+  const std::string& model, const std::string& optimizer,
+  PersistentContext ctx, float* params, const float* input,
+  float* acts, float* grad, float* m, float* v, float* extra,
+- const int* sizes, const int* offsets, float lr, int step,
++ const int* sizes, const int64_t* offsets, float lr, int step,
+  hipStream_t stream, bool* found) {
+  *found = true;
+  if (model == "transformer_decoder" && optimizer == "adamw")
+diff --git a/csrc/fused/gfx942/fused_megakernel.hip.hpp b/csrc/fused/gfx942/fused_megakernel.hip.hpp
+index cbb0fdd..0132725 100644
+--- a/csrc/fused/gfx942/fused_megakernel.hip.hpp
++++ b/csrc/fused/gfx942/fused_megakernel.hip.hpp
+@@ -76,7 +76,7 @@ template <OptId Opt>
+ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
+                                        float* __restrict__ params,
+                                        const float* __restrict__ grad,
+-                                       const int* sizes, const int* offsets,
++                                       const int* sizes, const int64_t* offsets,
+                                        int step, const FusedOptState& st) {
+     __shared__ int task_slot;
+     TaskQueue q = ctx.queue();
+@@ -85,7 +85,7 @@ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
+         const int n = sizes[t];
+         // #2 int64: off (tensor element offset into the global blob) can exceed
+         // 2^31; rebase the slice pointers in 64-bit. Behavior-preserving.
+-        const long long off = (long long)offsets[t];
++        const long long off = offsets[t]  // BUG-INT32 fix: int64_t array;
+         const FusedOptState ts = rebase_state<Opt>(st, off);
+         float* __restrict__ p = params + off;
+         const float* __restrict__ g = grad + off;
+@@ -129,7 +129,7 @@ __device__ void fused_backward_optimizer_stage(
+         const PersistentContext& ctx,
+         float* __restrict__ params,
+         const float* __restrict__ acts,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         int step, const FusedOptState& st) {
+     __shared__ int task_slot;
+     __shared__ float smem_grad[kGradTile];
+@@ -137,7 +137,7 @@ __device__ void fused_backward_optimizer_stage(
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+         const int n = sizes[t];
+-        const long long off = (long long)offsets[t];   // #2 int64 base
++        const long long off = offsets[t]  // BUG-INT32 fix: int64_t array;   // #2 int64 base
+         for (int c0 = 0; c0 < n; c0 += kGradTile) {
+             const int chunk = (n - c0 < kGradTile) ? (n - c0) : kGradTile;
+             const long long chunk_base = off + c0;
+@@ -178,7 +178,7 @@ fused_megakernel(PersistentContext ctx,
+                  float* __restrict__ acts,
+                  float* __restrict__ grad,
+                  const int* __restrict__ sizes,
+-                 const int* __restrict__ offsets,
++                 const int64_t* __restrict__ offsets,
+                  float lr, int step, FusedOptState st) {
+     GridBarrier bar = ctx.barrier();
+ 
+@@ -226,7 +226,7 @@ template <ModelId M, OptId Opt, FuseTier Tier>
+ hipError_t launch_fused_megakernel(
+         PersistentContext ctx,
+         float* params, const float* input, float* acts, float* grad,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, FusedOptState st, hipStream_t stream) {
+     int dev = 0;
+     hipError_t err = hipGetDevice(&dev);
+diff --git a/csrc/fused/gfx942/mega_mamba3_adamw.hip b/csrc/fused/gfx942/mega_mamba3_adamw.hip
+index 45fe1a8..8da25aa 100644
+--- a/csrc/fused/gfx942/mega_mamba3_adamw.hip
++++ b/csrc/fused/gfx942/mega_mamba3_adamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_grokadamw.hip b/csrc/fused/gfx942/mega_mamba3_grokadamw.hip
+index 7e3800d..7dc8924 100644
+--- a/csrc/fused/gfx942/mega_mamba3_grokadamw.hip
++++ b/csrc/fused/gfx942/mega_mamba3_grokadamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_grokfast.hip b/csrc/fused/gfx942/mega_mamba3_grokfast.hip
+index e55b9ad..6cadb09 100644
+--- a/csrc/fused/gfx942/mega_mamba3_grokfast.hip
++++ b/csrc/fused/gfx942/mega_mamba3_grokfast.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_lion.hip b/csrc/fused/gfx942/mega_mamba3_lion.hip
+index c146efe..9d439ed 100644
+--- a/csrc/fused/gfx942/mega_mamba3_lion.hip
++++ b/csrc/fused/gfx942/mega_mamba3_lion.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_looksam.hip b/csrc/fused/gfx942/mega_mamba3_looksam.hip
+index 039686d..dc3daf5 100644
+--- a/csrc/fused/gfx942/mega_mamba3_looksam.hip
++++ b/csrc/fused/gfx942/mega_mamba3_looksam.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_muon.hip b/csrc/fused/gfx942/mega_mamba3_muon.hip
+index 7ae7820..eb51ecf 100644
+--- a/csrc/fused/gfx942/mega_mamba3_muon.hip
++++ b/csrc/fused/gfx942/mega_mamba3_muon.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_neuralgrok.hip b/csrc/fused/gfx942/mega_mamba3_neuralgrok.hip
+index bd955aa..03cce08 100644
+--- a/csrc/fused/gfx942/mega_mamba3_neuralgrok.hip
++++ b/csrc/fused/gfx942/mega_mamba3_neuralgrok.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_prodigy.hip b/csrc/fused/gfx942/mega_mamba3_prodigy.hip
+index 4201c93..9f61616 100644
+--- a/csrc/fused/gfx942/mega_mamba3_prodigy.hip
++++ b/csrc/fused/gfx942/mega_mamba3_prodigy.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_supergrok11.hip b/csrc/fused/gfx942/mega_mamba3_supergrok11.hip
+index bd6a9e5..0ff762c 100644
+--- a/csrc/fused/gfx942/mega_mamba3_supergrok11.hip
++++ b/csrc/fused/gfx942/mega_mamba3_supergrok11.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_supergrok15.hip b/csrc/fused/gfx942/mega_mamba3_supergrok15.hip
+index 34c00db..4c48578 100644
+--- a/csrc/fused/gfx942/mega_mamba3_supergrok15.hip
++++ b/csrc/fused/gfx942/mega_mamba3_supergrok15.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_mamba3_supergrok2.hip b/csrc/fused/gfx942/mega_mamba3_supergrok2.hip
+index ea7d4b2..ae983b1 100644
+--- a/csrc/fused/gfx942/mega_mamba3_supergrok2.hip
++++ b/csrc/fused/gfx942/mega_mamba3_supergrok2.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_mamba3_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_adamw.hip b/csrc/fused/gfx942/mega_transformer_decoder_adamw.hip
+index 4de1904..55d2ce9 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_adamw.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_adamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_grokadamw.hip b/csrc/fused/gfx942/mega_transformer_decoder_grokadamw.hip
+index 8117954..1d7a2fc 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_grokadamw.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_grokadamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_grokfast.hip b/csrc/fused/gfx942/mega_transformer_decoder_grokfast.hip
+index 77a25a5..2e9752d 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_grokfast.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_grokfast.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_lion.hip b/csrc/fused/gfx942/mega_transformer_decoder_lion.hip
+index 7a91f3c..800700a 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_lion.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_lion.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_looksam.hip b/csrc/fused/gfx942/mega_transformer_decoder_looksam.hip
+index f892fa9..b23824b 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_looksam.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_looksam.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_muon.hip b/csrc/fused/gfx942/mega_transformer_decoder_muon.hip
+index fce46d4..9aab2bc 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_muon.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_muon.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_neuralgrok.hip b/csrc/fused/gfx942/mega_transformer_decoder_neuralgrok.hip
+index c56ad47..698d29a 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_neuralgrok.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_neuralgrok.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_prodigy.hip b/csrc/fused/gfx942/mega_transformer_decoder_prodigy.hip
+index 972d7ee..099406a 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_prodigy.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_prodigy.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_supergrok11.hip b/csrc/fused/gfx942/mega_transformer_decoder_supergrok11.hip
+index 21e1906..9befe31 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_supergrok11.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_supergrok11.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_supergrok15.hip b/csrc/fused/gfx942/mega_transformer_decoder_supergrok15.hip
+index bb160aa..8813ff9 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_supergrok15.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_supergrok15.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_transformer_decoder_supergrok2.hip b/csrc/fused/gfx942/mega_transformer_decoder_supergrok2.hip
+index 9442dbd..8d5a555 100644
+--- a/csrc/fused/gfx942/mega_transformer_decoder_supergrok2.hip
++++ b/csrc/fused/gfx942/mega_transformer_decoder_supergrok2.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_transformer_decoder_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_adamw.hip b/csrc/fused/gfx942/mega_vit_adamw.hip
+index 9fbd04a..96da105 100644
+--- a/csrc/fused/gfx942/mega_vit_adamw.hip
++++ b/csrc/fused/gfx942/mega_vit_adamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_grokadamw.hip b/csrc/fused/gfx942/mega_vit_grokadamw.hip
+index 5fe6264..8274ab2 100644
+--- a/csrc/fused/gfx942/mega_vit_grokadamw.hip
++++ b/csrc/fused/gfx942/mega_vit_grokadamw.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_grokfast.hip b/csrc/fused/gfx942/mega_vit_grokfast.hip
+index b94caa3..21b0f7a 100644
+--- a/csrc/fused/gfx942/mega_vit_grokfast.hip
++++ b/csrc/fused/gfx942/mega_vit_grokfast.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_lion.hip b/csrc/fused/gfx942/mega_vit_lion.hip
+index f24d4b9..95db149 100644
+--- a/csrc/fused/gfx942/mega_vit_lion.hip
++++ b/csrc/fused/gfx942/mega_vit_lion.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_looksam.hip b/csrc/fused/gfx942/mega_vit_looksam.hip
+index 3416e27..38f5282 100644
+--- a/csrc/fused/gfx942/mega_vit_looksam.hip
++++ b/csrc/fused/gfx942/mega_vit_looksam.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_muon.hip b/csrc/fused/gfx942/mega_vit_muon.hip
+index 2209d56..b329917 100644
+--- a/csrc/fused/gfx942/mega_vit_muon.hip
++++ b/csrc/fused/gfx942/mega_vit_muon.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_neuralgrok.hip b/csrc/fused/gfx942/mega_vit_neuralgrok.hip
+index 4a7d51b..5ce1b78 100644
+--- a/csrc/fused/gfx942/mega_vit_neuralgrok.hip
++++ b/csrc/fused/gfx942/mega_vit_neuralgrok.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_prodigy.hip b/csrc/fused/gfx942/mega_vit_prodigy.hip
+index 6518619..bb1a4d8 100644
+--- a/csrc/fused/gfx942/mega_vit_prodigy.hip
++++ b/csrc/fused/gfx942/mega_vit_prodigy.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_supergrok11.hip b/csrc/fused/gfx942/mega_vit_supergrok11.hip
+index 80c5ff6..762b6ac 100644
+--- a/csrc/fused/gfx942/mega_vit_supergrok11.hip
++++ b/csrc/fused/gfx942/mega_vit_supergrok11.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_supergrok15.hip b/csrc/fused/gfx942/mega_vit_supergrok15.hip
+index 18513ea..339ddd7 100644
+--- a/csrc/fused/gfx942/mega_vit_supergrok15.hip
++++ b/csrc/fused/gfx942/mega_vit_supergrok15.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/mega_vit_supergrok2.hip b/csrc/fused/gfx942/mega_vit_supergrok2.hip
+index 57eab7d..13d3059 100644
+--- a/csrc/fused/gfx942/mega_vit_supergrok2.hip
++++ b/csrc/fused/gfx942/mega_vit_supergrok2.hip
+@@ -34,7 +34,7 @@ namespace sg { namespace fused { namespace gfx942_mega {
+ hipError_t mega_vit_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+diff --git a/csrc/fused/gfx942/model_stages.hip.hpp b/csrc/fused/gfx942/model_stages.hip.hpp
+index 1a20b18..19d7ffe 100644
+--- a/csrc/fused/gfx942/model_stages.hip.hpp
++++ b/csrc/fused/gfx942/model_stages.hip.hpp
+@@ -65,17 +65,16 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
+                                      const float* __restrict__ params,
+                                      const float* __restrict__ input,
+                                      float* __restrict__ acts,
+-                                     const int* sizes, const int* offsets) {
++                                     const int* sizes, const int64_t* offsets) {
+     __shared__ int task_slot;
+     __shared__ float red[256];
+     TaskQueue q = ctx.queue();
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+-        const int n = sizes[t], off = offsets[t];
+-        // int64 base (#2): off+i can exceed 2^31 once the param blob crosses
+-        // ~2 Gi elements; the global index is computed in 64-bit. Behavior-
+-        // preserving (same element, wider index type).
+-        const long long base64 = (long long)off;
++        const int n = sizes[t];
++        // BUG-INT32 fix: read offset directly into long long from int64_t array.
++        // No int intermediate — avoids truncation above 2^31 cumulative elements.
++        const long long base64 = (long long)offsets[t];
+         float acc = 0.0f;
+         for (int i = threadIdx.x; i < n; i += blockDim.x) {
+             const float p = params[base64 + i];
+@@ -119,13 +118,14 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
+                                       const float* __restrict__ params,
+                                       const float* __restrict__ acts,
+                                       float* __restrict__ grad,
+-                                      const int* sizes, const int* offsets) {
++                                      const int* sizes, const int64_t* offsets) {
+     __shared__ int task_slot;
+     TaskQueue q = ctx.queue();
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+-        const int n = sizes[t], off = offsets[t];
+-        const long long base64 = (long long)off;   // #2 int64 global index base
++        const int n = sizes[t];
++        // BUG-INT32 fix: int64_t array, no truncating int intermediate.
++        const long long base64 = (long long)offsets[t];
+         for (int i = threadIdx.x; i < n; i += blockDim.x) {
+             const long long gi = base64 + i;
+             const float x = params[gi];
+diff --git a/csrc/fused/sm_90/fused_dispatch_table.inc b/csrc/fused/sm_90/fused_dispatch_table.inc
+index 399e785..b4ad874 100644
+--- a/csrc/fused/sm_90/fused_dispatch_table.inc
++++ b/csrc/fused/sm_90/fused_dispatch_table.inc
+@@ -43,7 +43,7 @@ inline cudaError_t dispatch_sm90_cell(
+  const std::string& model, const std::string& optimizer,
+  PersistentContext ctx, float* params, const float* input,
+  float* acts, float* grad, float* m, float* v, float* extra,
+- const int* sizes, const int* offsets, float lr, int step,
++ const int* sizes, const int64_t* offsets, float lr, int step,
+  cudaStream_t stream, bool* found) {
+  *found = true;
+  if (model == "transformer_decoder" && optimizer == "adamw")
+diff --git a/csrc/fused/sm_90/fused_megakernel.cuh b/csrc/fused/sm_90/fused_megakernel.cuh
+index 1068c32..7ae4267 100644
+--- a/csrc/fused/sm_90/fused_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_megakernel.cuh
+@@ -102,19 +102,19 @@ template <OptId Opt>
+ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
+                                        float* __restrict__ params,
+                                        const float* __restrict__ grad,
+-                                       const int* sizes, const int* offsets,
++                                       const int* sizes, const int64_t* offsets,
+                                        int step, const FusedOptState& st) {
+     __shared__ int task_slot;
+     TaskQueue q = ctx.queue();
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+         const int n = sizes[t];
+-        // #2 int64: off is the tensor's element offset into the global param
+-        // blob and can exceed 2^31; rebase the slice pointers in 64-bit so the
+-        // base address is correct past 2 Gi elements. The within-tensor index
+-        // (base/i below) is bounded by n (an int) but apply_optimizer takes an
+-        // int64_t idx so the addition never truncates. Behavior-preserving.
+-        const int64_t off = (int64_t)offsets[t];
++        // BUG-INT32 fix: offsets[] is now int64_t so the cumulative element
++        // offset is read without truncation even above 2^31 elements (latent
++        // above ~2.1B cumulative params). Sizes stay int — no single tensor
++        // exceeds int32 — but cumulative offsets can. Behavior-preserving at
++        // current scales (values fit int32 today; int64 storage is identical).
++        const int64_t off = offsets[t];
+         // #6: rebase only the pointers Opt uses to this tensor's slice.
+         const FusedOptState ts = rebase_state<Opt>(st, off);
+         float* __restrict__ p = params + off;
+@@ -181,7 +181,7 @@ __device__ void fused_backward_optimizer_stage(
+         const PersistentContext& ctx,
+         float* __restrict__ params,
+         const float* __restrict__ acts,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         int step, const FusedOptState& st) {
+     __shared__ int task_slot;
+     __shared__ float smem_grad[kGradTile];
+@@ -189,7 +189,7 @@ __device__ void fused_backward_optimizer_stage(
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+         const int n = sizes[t];
+-        const int64_t off = (int64_t)offsets[t];   // #2 int64 base
++        const int64_t off = offsets[t];   // BUG-INT32 fix: int64_t array, no cast needed
+         // Tile the tensor; each tile's grad lives in SMEM, consumed in place by
+         // the optimizer (no global grad write/read for this tensor).
+         for (int c0 = 0; c0 < n; c0 += kGradTile) {
+@@ -248,7 +248,7 @@ fused_megakernel(PersistentContext ctx,
+                  float* __restrict__ acts,
+                  float* __restrict__ grad,
+                  const int* __restrict__ sizes,
+-                 const int* __restrict__ offsets,
++                 const int64_t* __restrict__ offsets,
+                  float lr, int step, FusedOptState st) {
+     GridBarrier bar = ctx.barrier();
+ 
+@@ -321,7 +321,7 @@ template <ModelId M, OptId Opt, FuseTier Tier>
+ cudaError_t launch_fused_megakernel(
+         PersistentContext ctx,
+         float* params, const float* input, float* acts, float* grad,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, FusedOptState st, cudaStream_t stream) {
+     int dev = 0;
+     cudaError_t err = cudaGetDevice(&dev);
+diff --git a/csrc/fused/sm_90/mega_mamba3_adamw.cu b/csrc/fused/sm_90/mega_mamba3_adamw.cu
+index f763c42..9fe5d4e 100644
+--- a/csrc/fused/sm_90/mega_mamba3_adamw.cu
++++ b/csrc/fused/sm_90/mega_mamba3_adamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_grokadamw.cu b/csrc/fused/sm_90/mega_mamba3_grokadamw.cu
+index e73c977..ec241fc 100644
+--- a/csrc/fused/sm_90/mega_mamba3_grokadamw.cu
++++ b/csrc/fused/sm_90/mega_mamba3_grokadamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_grokfast.cu b/csrc/fused/sm_90/mega_mamba3_grokfast.cu
+index c6c4398..cb9e6d2 100644
+--- a/csrc/fused/sm_90/mega_mamba3_grokfast.cu
++++ b/csrc/fused/sm_90/mega_mamba3_grokfast.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_lion.cu b/csrc/fused/sm_90/mega_mamba3_lion.cu
+index 9544f1a..31dfadd 100644
+--- a/csrc/fused/sm_90/mega_mamba3_lion.cu
++++ b/csrc/fused/sm_90/mega_mamba3_lion.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_looksam.cu b/csrc/fused/sm_90/mega_mamba3_looksam.cu
+index a45ffbe..51fea19 100644
+--- a/csrc/fused/sm_90/mega_mamba3_looksam.cu
++++ b/csrc/fused/sm_90/mega_mamba3_looksam.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_muon.cu b/csrc/fused/sm_90/mega_mamba3_muon.cu
+index a901b8c..9e0c577 100644
+--- a/csrc/fused/sm_90/mega_mamba3_muon.cu
++++ b/csrc/fused/sm_90/mega_mamba3_muon.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_neuralgrok.cu b/csrc/fused/sm_90/mega_mamba3_neuralgrok.cu
+index 86df10e..cf52231 100644
+--- a/csrc/fused/sm_90/mega_mamba3_neuralgrok.cu
++++ b/csrc/fused/sm_90/mega_mamba3_neuralgrok.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_prodigy.cu b/csrc/fused/sm_90/mega_mamba3_prodigy.cu
+index 6f578ad..1360b3c 100644
+--- a/csrc/fused/sm_90/mega_mamba3_prodigy.cu
++++ b/csrc/fused/sm_90/mega_mamba3_prodigy.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_supergrok11.cu b/csrc/fused/sm_90/mega_mamba3_supergrok11.cu
+index 4725220..9e34871 100644
+--- a/csrc/fused/sm_90/mega_mamba3_supergrok11.cu
++++ b/csrc/fused/sm_90/mega_mamba3_supergrok11.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_supergrok15.cu b/csrc/fused/sm_90/mega_mamba3_supergrok15.cu
+index 873796b..eb5e8d3 100644
+--- a/csrc/fused/sm_90/mega_mamba3_supergrok15.cu
++++ b/csrc/fused/sm_90/mega_mamba3_supergrok15.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_mamba3_supergrok2.cu b/csrc/fused/sm_90/mega_mamba3_supergrok2.cu
+index ae5676f..ea7c17a 100644
+--- a/csrc/fused/sm_90/mega_mamba3_supergrok2.cu
++++ b/csrc/fused/sm_90/mega_mamba3_supergrok2.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_mamba3_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_adamw.cu b/csrc/fused/sm_90/mega_transformer_decoder_adamw.cu
+index 4fbb781..425e187 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_adamw.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_adamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.cu b/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.cu
+index 9e57391..5ba8179 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_grokfast.cu b/csrc/fused/sm_90/mega_transformer_decoder_grokfast.cu
+index fdf141a..eff8392 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_grokfast.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_grokfast.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_lion.cu b/csrc/fused/sm_90/mega_transformer_decoder_lion.cu
+index d75a324..80e1a8b 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_lion.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_lion.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_looksam.cu b/csrc/fused/sm_90/mega_transformer_decoder_looksam.cu
+index f98ba6f..19b0f3b 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_looksam.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_looksam.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_muon.cu b/csrc/fused/sm_90/mega_transformer_decoder_muon.cu
+index 761ef93..1d5e7e3 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_muon.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_muon.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.cu b/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.cu
+index 030b6b2..d621aa9 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_prodigy.cu b/csrc/fused/sm_90/mega_transformer_decoder_prodigy.cu
+index f9dfc3b..7a1e66a 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_prodigy.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_prodigy.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.cu b/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.cu
+index d85573b..7520e59 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.cu b/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.cu
+index 3c84148..c6ce3c6 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.cu b/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.cu
+index 4fb3ba2..290d927 100644
+--- a/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.cu
++++ b/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_transformer_decoder_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_adamw.cu b/csrc/fused/sm_90/mega_vit_adamw.cu
+index 9164aab..1e8404d 100644
+--- a/csrc/fused/sm_90/mega_vit_adamw.cu
++++ b/csrc/fused/sm_90/mega_vit_adamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_adamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_grokadamw.cu b/csrc/fused/sm_90/mega_vit_grokadamw.cu
+index 138b8a0..e67827c 100644
+--- a/csrc/fused/sm_90/mega_vit_grokadamw.cu
++++ b/csrc/fused/sm_90/mega_vit_grokadamw.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_grokadamw(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_grokfast.cu b/csrc/fused/sm_90/mega_vit_grokfast.cu
+index e8879d6..0058db7 100644
+--- a/csrc/fused/sm_90/mega_vit_grokfast.cu
++++ b/csrc/fused/sm_90/mega_vit_grokfast.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_grokfast(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_lion.cu b/csrc/fused/sm_90/mega_vit_lion.cu
+index 87292d8..68e66e7 100644
+--- a/csrc/fused/sm_90/mega_vit_lion.cu
++++ b/csrc/fused/sm_90/mega_vit_lion.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_lion(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_looksam.cu b/csrc/fused/sm_90/mega_vit_looksam.cu
+index a007aaf..98639c8 100644
+--- a/csrc/fused/sm_90/mega_vit_looksam.cu
++++ b/csrc/fused/sm_90/mega_vit_looksam.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_looksam(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_muon.cu b/csrc/fused/sm_90/mega_vit_muon.cu
+index 97814ef..0958341 100644
+--- a/csrc/fused/sm_90/mega_vit_muon.cu
++++ b/csrc/fused/sm_90/mega_vit_muon.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_muon(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_neuralgrok.cu b/csrc/fused/sm_90/mega_vit_neuralgrok.cu
+index 2efa1ed..46847da 100644
+--- a/csrc/fused/sm_90/mega_vit_neuralgrok.cu
++++ b/csrc/fused/sm_90/mega_vit_neuralgrok.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_neuralgrok(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_prodigy.cu b/csrc/fused/sm_90/mega_vit_prodigy.cu
+index 55b4340..a6fc08d 100644
+--- a/csrc/fused/sm_90/mega_vit_prodigy.cu
++++ b/csrc/fused/sm_90/mega_vit_prodigy.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_prodigy(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_supergrok11.cu b/csrc/fused/sm_90/mega_vit_supergrok11.cu
+index 1316401..39d02f3 100644
+--- a/csrc/fused/sm_90/mega_vit_supergrok11.cu
++++ b/csrc/fused/sm_90/mega_vit_supergrok11.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_supergrok11(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_supergrok15.cu b/csrc/fused/sm_90/mega_vit_supergrok15.cu
+index c6bca6c..5604f0b 100644
+--- a/csrc/fused/sm_90/mega_vit_supergrok15.cu
++++ b/csrc/fused/sm_90/mega_vit_supergrok15.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_supergrok15(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/mega_vit_supergrok2.cu b/csrc/fused/sm_90/mega_vit_supergrok2.cu
+index d5a5a10..0bc82f0 100644
+--- a/csrc/fused/sm_90/mega_vit_supergrok2.cu
++++ b/csrc/fused/sm_90/mega_vit_supergrok2.cu
+@@ -21,7 +21,7 @@ namespace sg { namespace fused { namespace sm90 {
+ cudaError_t mega_vit_supergrok2(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {
+     FusedOptState st;
+     st.exp_avg = m;
+diff --git a/csrc/fused/sm_90/model_stages.cuh b/csrc/fused/sm_90/model_stages.cuh
+index 2a170fb..3372501 100644
+--- a/csrc/fused/sm_90/model_stages.cuh
++++ b/csrc/fused/sm_90/model_stages.cuh
+@@ -83,17 +83,17 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
+                                      const float* __restrict__ params,
+                                      const float* __restrict__ input,
+                                      float* __restrict__ acts,
+-                                     const int* sizes, const int* offsets) {
++                                     const int* sizes, const int64_t* offsets) {
+     __shared__ int task_slot;
+     TaskQueue q = ctx.queue();
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+-        const int n = sizes[t], off = offsets[t];
+-        // int64 base (#2): off is an int element offset into the global param
+-        // blob; off+i can exceed 2^31 once the blob crosses ~2 Gi elements, so
+-        // the global index is computed in 64-bit. Behavior-preserving — same
+-        // element addressed, only the index type widens (no value change).
+-        const int64_t base64 = (int64_t)off;
++        const int n = sizes[t];
++        // BUG-INT32 fix: read offset directly into int64_t — no int intermediate.
++        // Cumulative param offsets can exceed 2^31 at >2.1B params; reading into
++        // an int first would truncate before the int64_t cast. Sizes stay int
++        // (no single tensor exceeds int32). Behavior-preserving at current scales.
++        const int64_t base64 = offsets[t];
+         // Row context: mean-square (decoder/mamba) or mean (vit) over the slab.
+         float acc = 0.0f;
+         for (int i = threadIdx.x; i < n; i += blockDim.x) {
+@@ -147,7 +147,7 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
+                                       const float* __restrict__ params,
+                                       const float* __restrict__ acts,
+                                       float* __restrict__ grad,
+-                                      const int* sizes, const int* offsets) {
++                                      const int* sizes, const int64_t* offsets) {
+     // Backward tail (#3): direct register-local form. The former version staged
+     // the upstream adjoint into __shared__ up_stage[tid] and read it back in the
+     // very next statement of the SAME thread — a smem write+read that shares
+@@ -159,8 +159,9 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
+     TaskQueue q = ctx.queue();
+     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
+          t = q.next_block(&task_slot)) {
+-        const int n = sizes[t], off = offsets[t];
+-        const int64_t base64 = (int64_t)off;   // #2 int64 global index base
++        const int n = sizes[t];
++        // BUG-INT32 fix: read offset directly into int64_t (no int intermediate).
++        const int64_t base64 = offsets[t];   // cumulative offset, int64
+         for (int i = threadIdx.x; i < n; i += blockDim.x) {
+             const int64_t gi = base64 + i;
+             grad[gi] = acts[gi] * model_activation_grad<M>(params[gi]);
+diff --git a/grokking_optimizers/megakernel_codegen.py b/grokking_optimizers/megakernel_codegen.py
+index 5cab4d5..523610d 100644
+--- a/grokking_optimizers/megakernel_codegen.py
++++ b/grokking_optimizers/megakernel_codegen.py
+@@ -207,7 +207,7 @@ namespace sg {{ namespace fused {{ namespace sm90 {{
+ cudaError_t {sym}(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets,
++        const int* sizes, const int64_t* offsets,
+         float lr, int step, cudaStream_t stream) {{
+     FusedOptState st;
+     st.exp_avg = m;
+@@ -279,7 +279,7 @@ namespace sg {{ namespace fused {{ namespace gfx942_mega {{
+ hipError_t {sym}(
+         PersistentContext ctx, float* params, const float* input, float* acts,
+         float* grad, float* m, float* v, float* extra,
+-        const int* sizes, const int* offsets, float lr, int step,
++        const int* sizes, const int64_t* offsets, float lr, int step,
+         hipStream_t stream) {{
+     int dev = 0; hipError_t err = hipGetDevice(&dev);
+     if (err != hipSuccess) return err;
+@@ -342,6 +342,35 @@ def verify():
+ '''
+ 
+ 
++def check_total_params(total: int, label: str = "") -> None:
++    """Guard: assert that the CUMULATIVE parameter count fits a signed int32.
++
++    The megakernel offset arrays are now int64_t (BUG-INT32 fix), so this
++    guard is no longer a hard correctness requirement — offsets will not
++    overflow. However, it is kept as a best-practice assertion that fires
++    loudly when a layout configuration approaches a regime the fp64 gate
++    cannot exercise, serving as a documentation anchor.
++
++    Call this from setup.py / build scripts when the total parameter count
++    for a given model configuration is known::
++
++        from grokking_optimizers.megakernel_codegen import check_total_params
++        check_total_params(sum(p.numel() for p in model.parameters()),
++                           label="decoder-1B")
++    """
++    _INT32_MAX = (1 << 31) - 1
++    if total > _INT32_MAX:
++        import warnings
++        warnings.warn(
++            f"megakernel_codegen: total param count {total:,}{' (' + label + ')' if label else ''} "
++            f"exceeds int32 ceiling ({_INT32_MAX:,}). The offset arrays are "
++            f"int64_t (BUG-INT32 fix), so correctness is maintained, but the "
++            f"fp64 gate runs at ~101M params and cannot exercise this regime. "
++            f"Ensure the fp64 gate is re-baselining at the actual scale.",
++            stacklevel=2,
++        )
++
++
+ def emit_cell(model: str, optimizer: str, arch: str) -> str:
+     """Emit the megakernel source string for ONE (model, optimizer, arch) cell,
+     at the solver-chosen tier. Raises if the solver finds the cell infeasible
+@@ -436,7 +465,7 @@ def write_all(root: str = "csrc/fused") -> List[str]:
+ 
+ _CELL_LAUNCHER_SIG = (
+     "PersistentContext, float*, const float*, float*, float*, float*, float*, "
+-    "float*, const int*, const int*, float, int, cudaStream_t")
++    "float*, const int*, const int64_t*, float, int, cudaStream_t")
+ 
+ 
+ def dispatch_table_sm90() -> str:
+@@ -467,7 +496,7 @@ def dispatch_table_sm90() -> str:
+     lines.append(" const std::string& model, const std::string& optimizer,")
+     lines.append(" PersistentContext ctx, float* params, const float* input,")
+     lines.append(" float* acts, float* grad, float* m, float* v, float* extra,")
+-    lines.append(" const int* sizes, const int* offsets, float lr, int step,")
++    lines.append(" const int* sizes, const int64_t* offsets, float lr, int step,")
+     lines.append(" cudaStream_t stream, bool* found) {")
+     lines.append(" *found = true;")
+     for model, opt, sym in syms:
+@@ -485,7 +514,7 @@ def dispatch_table_sm90() -> str:
+ 
+ _GFX942_CELL_SIG = (
+     "PersistentContext, float*, const float*, float*, float*, float*, float*, "
+-    "float*, const int*, const int*, float, int, hipStream_t")
++    "float*, const int*, const int64_t*, float, int, hipStream_t")
+ 
+ 
+ def dispatch_table_gfx942() -> str:
+@@ -513,7 +542,7 @@ def dispatch_table_gfx942() -> str:
+     lines.append(" const std::string& model, const std::string& optimizer,")
+     lines.append(" PersistentContext ctx, float* params, const float* input,")
+     lines.append(" float* acts, float* grad, float* m, float* v, float* extra,")
+-    lines.append(" const int* sizes, const int* offsets, float lr, int step,")
++    lines.append(" const int* sizes, const int64_t* offsets, float lr, int step,")
+     lines.append(" hipStream_t stream, bool* found) {")
+     lines.append(" *found = true;")
+     for model, opt, sym in syms:

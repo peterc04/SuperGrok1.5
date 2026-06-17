@@ -1,0 +1,457 @@
+diff --git a/csrc/fused/sm_90/fused_vit_megakernel.cuh b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+index abd6458..42bc0e1 100644
+--- a/csrc/fused/sm_90/fused_vit_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+@@ -576,10 +576,16 @@ fused_vit_megakernel_tc(PersistentContext ctx,
+     }
+     bar.sync();   // B0
+ 
+-    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
+-    //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
+-    //    dY, dh0, LN-vec partials). Barrier-free within the tile. ──
+-    const int nrows_tile = vittc::kTileM;
++    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over (sub-)tiles
++    //    of kVitP1SubtileRows rows; for its tile it runs fwd (→ acts X, NLL) then
++    //    bwd (→ acts dY, dh0, LN-vec partials). Barrier-free within the tile. The
++    //    B1 load-imbalance knob (SG_TUNED_VIT_P1_SUBTILE_S) sets the sub-tile to S
++    //    whole samples (kSeq·S rows): S=64 ⇒ kVitP1SubtileRows==kTileM==1088 ⇒
++    //    this loop is BYTE-IDENTICAL to the whole-1088-tile schedule (n_tiles=16
++    //    at B=1024); S<64 grows n_tiles ~64/S× so the idle CTAs (116/132 at B1024)
++    //    pick up P1 work and the B1 spin collapses. The tile boundary stays a
++    //    whole-sample boundary (attention stays in-tile). ──
++    const int nrows_tile = vittc::kVitP1SubtileRows;
+     const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
+     float nll_acc = 0.0f;
+ #ifdef SG_VIT_PROFILE
+diff --git a/csrc/fused/sm_90/mega_vit_real_adamw_tc.cu b/csrc/fused/sm_90/mega_vit_real_adamw_tc.cu
+index b60c14e..b5282eb 100644
+--- a/csrc/fused/sm_90/mega_vit_real_adamw_tc.cu
++++ b/csrc/fused/sm_90/mega_vit_real_adamw_tc.cu
+@@ -68,8 +68,13 @@ gemm_fwd_kernel(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __rest
+         auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+             int nn = n0 + n; return nn < Nout ? W[(int64_t)nn * Kin + k] : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { if (m < M) D[(int64_t)m * Nout + n0 + n] = v; };
++        // The micro-gate exercises full tiles (M=kTileM=17·64, no pad) and self-
++        // guards `out` with m<M, so the engine's m_real row-guard (present only
++        // when the P1 sub-tile knob is ON) is a no-op here. SG_VIT_DW_MREAL_ARG
++        // expands to nothing when the knob is OFF (byte-identical) and to a
++        // no-op upper bound when ON (so the TU still compiles at S<64).
+         vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/vittc::kAtomsM>(
+-            0, m_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++            0, m_atoms, n_real, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+     }
+ #else
+     (void)X; (void)W; (void)D; (void)Kin; (void)Nout;
+@@ -89,7 +94,7 @@ gemm_dx_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
+     auto srcB = [&] (int n, int k) -> __nv_bfloat16 { return W[(int64_t)k * N + n]; };
+     auto out  = [&] (int m, int n, float v) { if (m < M) dX[(int64_t)m * N + n] = v; };
+     vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/vittc::kAtomsM>(
+-        0, m_atoms, /*n_real=*/N, k_steps, srcA, srcB, out, sA, sB);
++        0, m_atoms, /*n_real=*/N, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+ #else
+     (void)dY; (void)W; (void)dX; (void)Nout;
+ #endif
+@@ -109,7 +114,7 @@ gemm_dw_kernel(const __nv_bfloat16* __restrict__ dY, const __nv_bfloat16* __rest
+     auto srcB = [&] (int n, int k) -> __nv_bfloat16 { return X[(int64_t)k * N + n]; };
+     auto out  = [&] (int m, int n, float v) { if (m < Nout) dW[(int64_t)m * N + n] = v; };
+     vittc::tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/8>(
+-        0, m_atoms, /*n_real=*/N, k_steps, srcA, srcB, out, sA, sB);
++        0, m_atoms, /*n_real=*/N, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+ #else
+     (void)dY; (void)X; (void)dW; (void)Nout; (void)T;
+ #endif
+diff --git a/csrc/fused/sm_90/model_stage_vit_tc.cuh b/csrc/fused/sm_90/model_stage_vit_tc.cuh
+index 52691ba..878af14 100644
+--- a/csrc/fused/sm_90/model_stage_vit_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_vit_tc.cuh
+@@ -122,6 +122,48 @@ namespace wgs = ::sg::sm90::wgs;
+ #define SG_TUNED_VIT_GEMM_INTERLEAVE 2
+ #endif
+ 
++// ── P1 token-tile SUB-TILING (the B1 grid-barrier load-imbalance lever — #1 ViT
++//    perf item, 51.2% of the step at d2048/B1024). The token tile is locked at
++//    kTileM = LCM(kSeq=17, 64) = 1088 rows because a tile boundary must be BOTH a
++//    wgmma-m64-atom boundary AND a whole-sample (kSeq) boundary. At B=1024 that
++//    yields T=17408 → only n_tiles=16 P1 tiles, so 116 of 132 CTAs do ZERO P1
++//    work and spin at B1 the whole fwd+bwd. It is tile-count-vs-SM quantization,
++//    NOT intra-tile skew.
++//
++//    This knob decouples the P1 SCHEDULING granularity from the 1088 GEMM lock:
++//    P1 grid-strides over sub-tiles of S WHOLE samples (= kSeq·S rows) instead of
++//    whole 1088-row tiles, so n_tiles grows ~(64/S)× and the per-sample scalar
++//    surface (LN / head-CE / attention — the dominant cost; dW is only ~3%) is
++//    spread across up to ~64/S× more SMs. S MUST stay a whole-sample count
++//    (never split a 17-row sample across CTAs — that corrupts attention) and the
++//    sub-tile row count kSeq·S is in general NOT a multiple of 64, so the small
++//    bf16 GEMMs pad the M-dim up to ceil(rows/64)·64 atoms (the m_real row-guard
++//    below makes the pad rows inert + race-free).
++//
++//    DEFAULT 64 == kSamplesPerTile for TILE_M=1088 ⇒ sub-tile rows == kTileM ⇒
++//    the P1 loop, n_tiles, m_atoms (=17, a multiple of 64 rows), and the GEMM
++//    engine are ALL identical to the pre-knob kernel — the OFF build is
++//    BYTE-IDENTICAL (the m_real guard + runtime-m_atoms code is #if'd out
++//    entirely at S==64). Values {16,8,4} ENGAGE sub-tiling (S=16→64 active CTAs,
++//    S=8→128, S=4→all 132); sweep {16,8,4} (U-shaped curve — avoid S=1).
++//
++//    PARITY (knob ON, S<64): dW / biases / cls / pos grads are BYTE-IDENTICAL —
++//    P2 reads activations by GLOBAL token row and contracts ascending-k
++//    independent of P1 tiling, and each acts row is a pure per-row (sample-local,
++//    in-tile) function preserved by keeping the whole-sample invariant. The 10
++//    LN-affine (γ/β) grads + the loss are NOT byte-identical: they are VALID fp32
++//    REASSOCIATIONS — per-CTA partials are built tile-locally (gw[j]+=dgw / the
++//    per-tile nll_acc), so changing S regroups which global rows land in which
++//    CTA, hence the fp32 grouping of those sums shifts in the low bits. That is
++//    absorbed by the gate's 1e-4 fp32-reorder tol (the decoder already ships
++//    TILE_M 64/256 through the same gate). A/A/A bit-identity HOLDS because S is
++//    fixed across the 3 runs (a fixed deterministic partition of (cta,nCTA,
++//    n_tiles,T)). No atomics, no ragged reduce. ⇒ OFF = byte-identical; ON = a
++//    NEEDS-PARITY swept dim, the GPU fp64 + A/A/A gate is the arbiter.
++#ifndef SG_TUNED_VIT_P1_SUBTILE_S
++#define SG_TUNED_VIT_P1_SUBTILE_S 64
++#endif
++
+ namespace vittc {
+ 
+ constexpr int kVitDwSplitK = SG_TUNED_VIT_DW_SPLITK;
+@@ -180,6 +222,21 @@ constexpr int kAtomsM = kTileM / wgs::kWgmmaAtomM;   // stacked m64 atoms per ti
+ constexpr int kSamplesPerTile = kTileM / vit::kSeq;  // 64 for TILE_M=1088
+ constexpr int kPatchPerTile = kSamplesPerTile * vit::kNPatch;  // patch rows per tile
+ 
++// ── P1 sub-tile granularity (the B1 load-imbalance knob, see the SG_TUNED_VIT_
++//    P1_SUBTILE_S block above). kVitP1SubtileS = WHOLE samples a P1 sub-tile
++//    spans; kVitP1SubtileRows = kSeq·S = the sub-tile row count the megakernel
++//    grid-strides over. S==kSamplesPerTile (default 64) ⇒ rows==kTileM ⇒ the P1
++//    loop is byte-identical to the whole-1088-tile schedule (and the m_real
++//    row-guard / runtime-m_atoms paths #if out entirely). S<64 sub-tiles P1.
++constexpr int kVitP1SubtileS    = SG_TUNED_VIT_P1_SUBTILE_S;
++constexpr int kVitP1SubtileRows = vit::kSeq * kVitP1SubtileS;
++static_assert(kVitP1SubtileS >= 1 && kVitP1SubtileS <= kSamplesPerTile,
++              "SG_TUNED_VIT_P1_SUBTILE_S must be in [1, kSamplesPerTile] whole samples "
++              "(never split a kSeq-row sample across CTAs)");
++// Max m64 atoms ANY P1 (sub-)tile issues: ceil(kSeq·S / 64). At S=64 this is
++// kAtomsM (=17); for S<64 it bounds the runtime m_atoms the wrappers thread.
++constexpr int kVitP1MaxAtomsM = (kVitP1SubtileRows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
++
+ // One staged A(64×16) tile (bf16 element count). The M-atom-interleaved engine
+ // stages kIL of these per k-step (atom-in-group ai at smemA + ai·kVitTcSmemA1)
+ // sharing ONE B(N×16) tile; the smem arena (VitTcSmem.sA / the selftest arena)
+@@ -307,10 +364,39 @@ __device__ __forceinline__ void stage_kmajor_tile(
+ //  the valid column count for a ragged N-tile (pad operands are zero → inert).
+ //
+ //  Determinism: ascending-k, one CTA owns the tile end-to-end, no atomics.
++//
++//  M-ROW GUARD (`m_real`, the SHARED B1-subtile fix): for ANY P1 sub-tile of
++//  fewer than kSamplesPerTile whole samples the row count kSeq·S is NOT a
++//  multiple of 64, so m_atoms = ceil(rows/64) pads the M-dim. Without a guard
++//  srcA is read for ALL m_atoms*64 rows (the pad rows read into the NEXT tile's
++//  acts region — a cross-CTA read-before-write — and the last sub-tile reads
++//  past T), while `out` is gated only by col<n_real. `m_real` (the real row
++//  count, relative to mbase0==0 for the P1 callers) makes pad-row srcA reads
++//  return 0 and pad-row `out` writes skip → both the race and the over-read are
++//  eliminated cleanly. CRITICAL: this engine is SHARED with the dW (P2) callers
++//  and (at S==64) every P1 caller. The guard is gated on SG_TUNED_VIT_P1_SUBTILE_S
++//  < 64 so when the knob is OFF the parameter and both guard sites VANISH from
++//  the source — every existing caller (and the byte-identical S=64 build)
++//  compiles EXACTLY as before. When ON, the P1 wrappers pass m_real = real rows;
++//  the dW callers (which already self-guard `out` with m<Nout and read a
++//  transposed-K operand, not row-padded acts) would pass m_real = m_atoms*64 ⇒
++//  no-op — but they are never recompiled with the guard active in practice since
++//  only P1 wrappers add the parameter (see vittc_gemm_* below).
+ // ════════════════════════════════════════════════════════════════════════
++#if SG_TUNED_VIT_P1_SUBTILE_S < 64
++  // knob ON: real M-row guard threaded from the P1 wrappers
++  #define SG_VIT_GEMM_MREAL_PARAM      , int m_real
++  #define SG_VIT_GEMM_SRCA(r, kk)      (((r) < m_real) ? srcA((r), (kk)) : __float2bfloat16(0.f))
++  #define SG_VIT_GEMM_OUTVALID(rr)     (col < n_real && ((rr)) < m_real)
++#else
++  // knob OFF (default S=64): guard erased → byte-identical to the pre-knob engine
++  #define SG_VIT_GEMM_MREAL_PARAM
++  #define SG_VIT_GEMM_SRCA(r, kk)      srcA((r), (kk))
++  #define SG_VIT_GEMM_OUTVALID(rr)     (col < n_real)
++#endif
+ template <int N, int MaxAtomsM, typename SrcA, typename SrcB, typename Out>
+ __device__ void tc_gemm_block_unpipelined(
+-        int mbase0, int m_atoms, int n_real, int k_steps,
++        int mbase0, int m_atoms, int n_real, int k_steps SG_VIT_GEMM_MREAL_PARAM,
+         SrcA srcA, SrcB srcB, Out out,
+         __nv_bfloat16* smemA, __nv_bfloat16* smemB) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+@@ -360,7 +446,7 @@ __device__ void tc_gemm_block_unpipelined(
+                 const int mbase = gbase + ai * wgs::kWgmmaAtomM;
+                 stage_kmajor_tile<wgs::kWgmmaAtomM>(
+                     smemA + (int64_t)ai * kVitTcSmemA1, k * wgs::kWgmmaAtomK,
+-                    [&] (int mn, int kk) { return srcA(mbase + mn, kk); },
++                    [&] (int mn, int kk) { return SG_VIT_GEMM_SRCA(mbase + mn, kk); },
+                     tid, nthreads);
+             }
+             stage_kmajor_tile<N>(
+@@ -394,7 +480,7 @@ __device__ void tc_gemm_block_unpipelined(
+                 for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
+                     int row, col;
+                     wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
+-                    if (col < n_real) out(mbase + row, col, acc[ai].c[i]);
++                    if (SG_VIT_GEMM_OUTVALID(mbase + row)) out(mbase + row, col, acc[ai].c[i]);
+                 }
+             }
+         }
+@@ -403,8 +489,14 @@ __device__ void tc_gemm_block_unpipelined(
+ #else
+     (void)mbase0; (void)m_atoms; (void)n_real; (void)k_steps;
+     (void)srcA; (void)srcB; (void)out; (void)smemA; (void)smemB;
++  #if SG_TUNED_VIT_P1_SUBTILE_S < 64
++    (void)m_real;
++  #endif
+ #endif
+ }
++#undef SG_VIT_GEMM_MREAL_PARAM
++#undef SG_VIT_GEMM_SRCA
++#undef SG_VIT_GEMM_OUTVALID
+ 
+ // ════════════════════════════════════════════════════════════════════════
+ //  THIN ORIENTATION WRAPPERS over tc_gemm_block_unpipelined — the THREE
+@@ -413,7 +505,49 @@ __device__ void tc_gemm_block_unpipelined(
+ //  wgmma atom width; the fwd/dX loops N-tiles internally. Weights convert
+ //  fp32→bf16 ON READ (deterministic; no bf16 weight buffer needed). Kin is
+ //  padded to a multiple of kWgmmaAtomK by the caller (49→64 for patch_proj).
++//
++//  P1 SUB-TILE m_real PLUMBING: when the B1 sub-tile knob is ON (S<64) the P1
++//  callers pass a runtime m_real (= the sub-tile's real row count = kSeq·S, or
++//  the last sub-tile's residual) so the engine's M-row guard makes the pad rows
++//  inert. When OFF (S==64) the param + arg vanish ⇒ byte-identical signatures
++//  and engine calls. (The dW/patch-proj callers below do NOT use these wrappers;
++//  they call the engine directly with self-guarded `out` lambdas.)
+ // ════════════════════════════════════════════════════════════════════════
++#if SG_TUNED_VIT_P1_SUBTILE_S < 64
++  #define SG_VIT_P1_MREAL_PARAM         , int m_real
++  #define SG_VIT_P1_MREAL_ARG           , m_real
++  // fwd_f32 / dx_f32 historically hardcoded the compile-time kAtomsM; when ON they
++  // take the runtime m_atoms (ceil(sub-tile rows / 64)) instead.
++  #define SG_VIT_P1_MATOMS_PARAM_F32    , int m_atoms
++  #define SG_VIT_P1_MATOMS_ARG_F32      m_atoms
++#else
++  #define SG_VIT_P1_MREAL_PARAM
++  #define SG_VIT_P1_MREAL_ARG
++  #define SG_VIT_P1_MATOMS_PARAM_F32
++  #define SG_VIT_P1_MATOMS_ARG_F32      kAtomsM
++#endif
++
++// ── P1 tile-function CALL-SITE arg packs. A P1 sub-tile owns `nrows` rows; the
++//    GEMMs over it issue m_atoms_rt = ceil(nrows/64) atoms with m_real = nrows.
++//    At S==64 nrows==kTileM (a multiple of 64) so m_atoms_rt==kAtomsM and the
++//    guard is a no-op — these expand to the EXACT pre-knob call sites (literal
++//    kAtomsM for the bf16 qkv call; no extra args for fwd_f32 / dx_f32).
++#if SG_TUNED_VIT_P1_SUBTILE_S < 64
++  #define SG_VIT_P1_BF16_MA_MR   m_atoms_rt, nrows   // vittc_gemm_fwd: m_atoms, m_real
++  #define SG_VIT_P1_F32_MA_MR    , m_atoms_rt, nrows // vittc_gemm_*_f32: , m_atoms, m_real
++  // DIRECT engine calls (not via a wrapper). m_real is in ABSOLUTE row coords
++  // (the engine guards mbase0+row). patch_proj has mbase0==0 ⇒ m_real = the real
++  // patch-row count. The dW callers pass a nonzero mbase + already self-guard
++  // `out` with m<Nout and read transposed-K operands (never row-padded acts), so
++  // their guard is a strict no-op: m_real = 0x7fffffff keeps every existing dW row.
++  #define SG_VIT_PATCH_MREAL_ARG , npatch_rows
++  #define SG_VIT_DW_MREAL_ARG    , 0x7fffffff
++#else
++  #define SG_VIT_P1_BF16_MA_MR   kAtomsM
++  #define SG_VIT_P1_F32_MA_MR
++  #define SG_VIT_PATCH_MREAL_ARG
++  #define SG_VIT_DW_MREAL_ARG
++#endif
+ 
+ // (fwd) Y[M,Nout] = X[M,Kpad] @ W[Nout,Kin]ᵀ.  Tiles N over [0,Nout) in width-N
+ // atoms. M = m_atoms stacked atoms (kAtomsM for token tiles; fewer for the last
+@@ -423,7 +557,7 @@ template <int N>
+ __device__ __forceinline__ void vittc_gemm_fwd(
+         const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
+         __nv_bfloat16* __restrict__ Yout, int Kreal, int Kpad, int Nout,
+-        int m_atoms, __nv_bfloat16* sA, __nv_bfloat16* sB) {
++        int m_atoms SG_VIT_P1_MREAL_PARAM, __nv_bfloat16* sA, __nv_bfloat16* sB) {
+     const int k_steps = Kpad / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+         const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+@@ -434,7 +568,7 @@ __device__ __forceinline__ void vittc_gemm_fwd(
+         auto out  = [&] (int m, int n, float v) {
+             Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, m_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++            0, m_atoms, n_real, k_steps SG_VIT_P1_MREAL_ARG, srcA, srcB, out, sA, sB);
+     }
+ }
+ 
+@@ -445,7 +579,8 @@ __device__ __forceinline__ void vittc_gemm_fwd(
+ template <int N>
+ __device__ __forceinline__ void vittc_gemm_fwd_f32(
+         const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
+-        float* __restrict__ Yf32, int Kin, int Nout,
++        float* __restrict__ Yf32, int Kin, int Nout
++        SG_VIT_P1_MATOMS_PARAM_F32 SG_VIT_P1_MREAL_PARAM,
+         __nv_bfloat16* sA, __nv_bfloat16* sB) {
+     const int k_steps = Kin / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Nout; n0 += N) {
+@@ -455,7 +590,7 @@ __device__ __forceinline__ void vittc_gemm_fwd_f32(
+             int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
++            0, SG_VIT_P1_MATOMS_ARG_F32, n_real, k_steps SG_VIT_P1_MREAL_ARG, srcA, srcB, out, sA, sB);
+     }
+ }
+ 
+@@ -465,7 +600,8 @@ __device__ __forceinline__ void vittc_gemm_fwd_f32(
+ template <int N>
+ __device__ __forceinline__ void vittc_gemm_dx_f32(
+         const __nv_bfloat16* __restrict__ dY, const float* __restrict__ W,
+-        float* __restrict__ dXf32, int Kin, int Nout,
++        float* __restrict__ dXf32, int Kin, int Nout
++        SG_VIT_P1_MATOMS_PARAM_F32 SG_VIT_P1_MREAL_PARAM,
+         __nv_bfloat16* sA, __nv_bfloat16* sB) {
+     const int k_steps = Nout / wgs::kWgmmaAtomK;
+     for (int n0 = 0; n0 < Kin; n0 += N) {
+@@ -475,7 +611,7 @@ __device__ __forceinline__ void vittc_gemm_dx_f32(
+             int nn = n0 + n; return nn < Kin ? __float2bfloat16(W[(int64_t)k * Kin + nn]) : __float2bfloat16(0.f); };
+         auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+-            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
++            0, SG_VIT_P1_MATOMS_ARG_F32, n_real, k_steps SG_VIT_P1_MREAL_ARG, srcA, srcB, out, sA, sB);
+     }
+ }
+ 
+@@ -692,6 +828,11 @@ __device__ float vittc_forward_tile(
+         const int* __restrict__ tgt_ids,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+     const int nsamp = nrows / vit::kSeq;
++#if SG_TUNED_VIT_P1_SUBTILE_S < 64
++    // B1 sub-tile: nrows = kSeq·S is generally not a multiple of 64 → the linear
++    // GEMMs issue ceil(nrows/64) m64 atoms and guard pad rows with m_real=nrows.
++    const int m_atoms_rt = (nrows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
++#endif
+     const int npatch_rows = nsamp * vit::kNPatch;
+     const int gp0 = (g0 / vit::kSeq) * vit::kNPatch;   // first PATCH row of this tile
+     // ── Stage this tile's patches into X_patch (bf16) as patch token rows.
+@@ -723,7 +864,7 @@ __device__ float vittc_forward_tile(
+                 int nn = n0 + n; return (nn < vit::kD && k < vit::kPatch) ? __float2bfloat16(w.patch_w[(int64_t)nn * vit::kPatch + k]) : __float2bfloat16(0.f); };
+             auto out  = [&] (int m, int n, float v) { sc.work[(int64_t)m * vit::kD + n0 + n] = v; };
+             tc_gemm_block_unpipelined<SG_TUNED_TILE_N, /*MaxAtomsM=*/kAtomsM>(
+-                0, pm_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++                0, pm_atoms, n_real, k_steps SG_VIT_PATCH_MREAL_ARG, srcA, srcB, out, sA, sB);
+         }
+     }
+     __syncthreads();
+@@ -750,7 +891,7 @@ __device__ float vittc_forward_tile(
+         const VitWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * vit::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+-        vittc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], vit::kD, vit::kD, 3 * vit::kD, kAtomsM, sA, sB);
++        vittc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], vit::kD, vit::kD, 3 * vit::kD, SG_VIT_P1_BF16_MA_MR, sA, sB);
+         __syncthreads();
+         // add in_b (the fwd GEMM did W only; biases folded in scalar here for qkv).
+         for (int idx = threadIdx.x; idx < nrows * 3 * vit::kD; idx += blockDim.x) {
+@@ -769,7 +910,7 @@ __device__ float vittc_forward_tile(
+         __syncthreads();
+         // a = X_ctx @ out_w^T (+ out_b). fp32 → work.
+         vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * vit::kD, L.out_w,
+-                                            sc.work, vit::kD, vit::kD, sA, sB);
++                                            sc.work, vit::kD, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+         __syncthreads();
+         // r1 = Xin + a + out_b → work (fp32).
+         for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+@@ -787,7 +928,7 @@ __device__ float vittc_forward_tile(
+         // ff0 = X_x1 @ ff0_w^T (+ ff0_b). fp32 → work; pre-gelu bf16 → ff0pre;
+         // gelu(pre+b) → X_gact[li] (bf16).
+         vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * vit::kD, L.ff0_w,
+-                                            sc.work, vit::kD, vit::kDff, sA, sB);
++                                            sc.work, vit::kD, vit::kDff SG_VIT_P1_F32_MA_MR, sA, sB);
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * vit::kDff; idx += blockDim.x) {
+             const int r = idx / vit::kDff, j = idx % vit::kDff;
+@@ -798,7 +939,7 @@ __device__ float vittc_forward_tile(
+         __syncthreads();
+         // ff2 = X_gact @ ff2_w^T (+ ff2_b). fp32 → work.
+         vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * vit::kDff, L.ff2_w,
+-                                            sc.work, vit::kDff, vit::kD, sA, sB);
++                                            sc.work, vit::kDff, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+         __syncthreads();
+         // r2 = x1 + ff2 + ff2_b → work (fp32).
+         for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+@@ -966,6 +1107,10 @@ __device__ void vittc_backward_tile(
+         float* __restrict__ lnvec, float* __restrict__ work2,
+         __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+     const int nsamp = nrows / vit::kSeq;
++#if SG_TUNED_VIT_P1_SUBTILE_S < 64
++    // B1 sub-tile: dX GEMMs issue ceil(nrows/64) m64 atoms with m_real=nrows.
++    const int m_atoms_rt = (nrows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
++#endif
+     float* gn_n1w[vit::kLayers]; float* gn_n1b[vit::kLayers];
+     float* gn_n2w[vit::kLayers]; float* gn_n2b[vit::kLayers];
+     for (int li = 0; li < vit::kLayers; ++li) {
+@@ -1053,7 +1198,7 @@ __device__ void vittc_backward_tile(
+         __syncthreads();
+         // ff2 dX: dgact = dff2 @ ff2_w  (N=dff, K=d). fp32 → sc.work (dr2 no longer needed).
+         vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * vit::kD, L.ff2_w,
+-                                           sc.work, vit::kDff, vit::kD, sA, sB);  // dgact [nrows,dff]
++                                           sc.work, vit::kDff, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dgact [nrows,dff]
+         __syncthreads();
+         // dff0 = dgact * gelu'(ff0pre) → dY_ff0 (bf16) AND keep fp32 in sc.work for dX.
+         for (int idx = threadIdx.x; idx < nrows * vit::kDff; idx += blockDim.x) {
+@@ -1064,7 +1209,7 @@ __device__ void vittc_backward_tile(
+         __syncthreads();
+         // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32 → sc.x1.
+         vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * vit::kDff, L.ff0_w,
+-                                           sc.x1, /*Kin=*/vit::kD, /*Nout=*/vit::kDff, sA, sB);  // dx1_ffn [nrows,d]
++                                           sc.x1, /*Kin=*/vit::kD, /*Nout=*/vit::kDff SG_VIT_P1_F32_MA_MR, sA, sB);  // dx1_ffn [nrows,d]
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
+             work2[idx] += sc.x1[idx];   // dx1 = residual + FFN path
+@@ -1080,7 +1225,7 @@ __device__ void vittc_backward_tile(
+         __syncthreads();
+         // out_proj dX: dctx = da @ out_w  (N=d, K=d). fp32 → sc.work (dctx [nrows,d]).
+         vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * vit::kD, L.out_w,
+-                                           sc.work, vit::kD, vit::kD, sA, sB);  // dctx
++                                           sc.work, vit::kD, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dctx
+         __syncthreads();
+         // attention bwd (FULL): (qkv[li], attn[li], dctx=work) → dqkv [nrows,3d]
+         //   fp32 into work2 (3d=384 ≤ dff=512, fits). Then → dY_qkv (bf16).
+@@ -1091,7 +1236,7 @@ __device__ void vittc_backward_tile(
+         // in_proj dX: dx_in_attn = dqkv @ in_w (output width Kin=d, contract Nout=3d).
+         //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+         vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * vit::kD, L.in_w,
+-                                           sc.work, /*Kin=*/vit::kD, /*Nout=*/3 * vit::kD, sA, sB);  // dx_in_attn
++                                           sc.work, /*Kin=*/vit::kD, /*Nout=*/3 * vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dx_in_attn
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
+             sc.dh[idx] += sc.work[idx];   // dx_in = residual (in dh) + attn path
+@@ -1235,7 +1380,7 @@ __device__ __forceinline__ void vittc_dw_run_tile(
+         auto out  = [&] (int m, int n, float v) {
+             if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+-            mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++            mbase, g_atoms, n_real, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+         return;
+     }
+     const int k_steps = sp.K / wgs::kWgmmaAtomK;     // K = T or B (must be /16; padded by caller)
+@@ -1247,7 +1392,7 @@ __device__ __forceinline__ void vittc_dw_run_tile(
+     auto out  = [&] (int m, int n, float v) {
+         if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
+     tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+-        mbase, g_atoms, n_real, k_steps, srcA, srcB, out, sA, sB);
++        mbase, g_atoms, n_real, k_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+@@ -1383,7 +1528,7 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
+             int nn = n0 + n; if (nn >= Kin || gk >= Tp) return __float2bfloat16(0.f);
+             return X[(int64_t)gk * Kin + nn]; };
+         tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+-            mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
++            mbase, g_atoms, /*n_real=*/N, kc_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+         return;
+     }
+     // kind==0: A[m=out,k=t]=dY[t,out]; B[n=in,k=t]=X[t,in] (both transposed reads).
+@@ -1393,7 +1538,7 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
+     auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+         int nn = n0 + n; return nn < Kin ? X[(int64_t)(k0 * wgs::kWgmmaAtomK + k) * Kin + nn] : __float2bfloat16(0.f); };
+     tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kVitDwIL>(
+-        mbase, g_atoms, /*n_real=*/N, kc_steps, srcA, srcB, out, sA, sB);
++        mbase, g_atoms, /*n_real=*/N, kc_steps SG_VIT_DW_MREAL_ARG, srcA, srcB, out, sA, sB);
+ }
+ 
+ // Deterministic reduce: output work item gt (% nCTA) sums its G chunk-partials

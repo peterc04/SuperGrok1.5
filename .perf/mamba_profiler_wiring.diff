@@ -1,0 +1,845 @@
+diff --git a/csrc/fused/sm_90/fused_mamba_megakernel.cuh b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+index 7f8c0a2..49ba9f1 100644
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -233,12 +233,21 @@ fused_mamba_megakernel(PersistentContext ctx,
+     __shared__ int tok_s[mb::kSeq];   // this sample's token ids (broadcast)
+     __shared__ int tgt_s;
+     float nll_acc = 0.0f;              // fp32 slice accumulator (thread-0 holds it)
++#if SG_MB_TC_PROFILE
++    // Throwaway accumulator: the scalar megakernel is NOT the profiled path (the bench
++    // drives the TC kernel via tc_train_step / tc_profile_read; this scalar path has no
++    // readout). The sample fns require the profiler param when ON, so feed a dropped
++    // per-CTA accumulator just to type-check. NEVER read; the OFF build (param vanishes)
++    // is byte-identical regardless.
++    __shared__ MbProf prof_sh;
++    MbProf* _prof = &prof_sh;
++#endif
+     for (int b = b0; b < b1; ++b) {
+         if (threadIdx.x < mb::kSeq) tok_s[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+         if (threadIdx.x == 0) tgt_s = tok.targets[b];
+         __syncthreads();
+-        float nll = mb_forward_sample(w, tok_s, tgt_s, &sm);
+-        mb_backward_sample(w, g, tok_s, tgt_s, B, &sm);
++        float nll = mb_forward_sample(w, tok_s, tgt_s, &sm SG_MBPROF_ARG);
++        mb_backward_sample(w, g, tok_s, tgt_s, B, &sm SG_MBPROF_ARG);
+         if (threadIdx.x == 0) nll_acc += nll;   // fixed-order fp32 sum within slice
+         __syncthreads();   // sample boundary: all grad writes done before reuse
+     }
+@@ -387,21 +396,23 @@ cudaError_t launch_fused_mamba_megakernel(
+ #define SG_MBTC_LAUNCH_BOUNDS __launch_bounds__(SG_MB_TC_MEGA_BLOCK)
+ #endif
+ 
+-// ── PHASE PROFILER (default OFF; a separate measurement TU defines
+-//    SG_MB_TC_PROFILE to bracket P1-fwd/P1-bwd/P2/P3 with clock64() and write
+-//    per-CTA cumulative cycles to a profiling buffer carved from the workspace
+-//    tail). Production builds never define it → zero added code, zero ABI change.
+-#ifndef SG_MB_TC_PROFILE
+-#define SG_MB_TC_PROFILE 0
+-#endif
++// ── PHASE PROFILER (default OFF; the bench/measurement TU defines SG_MB_TC_PROFILE
++//    to bracket the scan / projection-GEMM / RMSNorm+SwiGLU surface, split fwd/bwd,
++//    + the P2 reduce + P3 opt tail). The SG_MB_TC_PROFILE macro itself + the in-kernel
++//    TIC/ACC primitives (SG_MBPROF_*) + the MbProf accumulator struct + the 8-slot
++//    layout live in model_stage_mamba3.cuh (so the sample/mixer/swiglu device fns can
++//    use them); see that header's "PER-PHASE clock64 PROFILER" block for the slot map.
++//    This file adds the FILE-SCOPE device buffer the per-CTA maxima land in + the
++//    kernel-side accumulate/atomicMax wiring (P1) + the P2/P3 brackets. Production
++//    builds never define it → zero added code, zero extra parameter, byte-identical PTX.
+ #if SG_MB_TC_PROFILE
+-#define SG_MBTC_PROF_SLOTS 8   // [p1fwd,p1bwd,p2,p3, p2-dwgemm,p2-reduce,p2-embed, witness]
+-#define SG_MBTC_PROF_TIC(v) do { __syncthreads(); if (threadIdx.x == 0) (v) = clock64(); } while (0)
+-#define SG_MBTC_PROF_ACC(slot, t0) do { __syncthreads(); \
+-    if (threadIdx.x == 0) prof[(int64_t)cta * SG_MBTC_PROF_SLOTS + (slot)] += (double)(clock64() - (t0)); } while (0)
+-#else
+-#define SG_MBTC_PROF_TIC(v) do {} while (0)
+-#define SG_MBTC_PROF_ACC(slot, t0) do {} while (0)
++// Per-phase clock64 maxima (cycles), MAX across CTAs = the critical-path duration per
++// phase (= the slowest CTA, which the host wall sees: the trailing grid barrier waits
++// for the last CTA). Mirrors the decoder's g_dec_prof_max. Slots (= SG_MBTC_PROF_SLOTS,
++// the model_stage_mamba3 ground truth): [0]SCAN_FWD [1]SCAN_BWD [2]PROJ_FWD [3]PROJ_BWD
++// [4]SURFACE_FWD [5]SURFACE_BWD [6]P2_REDUCE [7]P3_OPT. Read host-side via
++// cudaMemcpyFromSymbol (see mega_mamba_real_adamw_tc.cu tc_profile_read).
++__device__ unsigned long long g_mb_prof_max[SG_MBTC_PROF_SLOTS];
+ #endif
+ 
+ // ── Static smem arena. The M-atom-interleaved wgmma pipeline (task #24, decoder
+@@ -517,10 +528,13 @@ __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nC
+          + mb_tc_looksam_floats()                    // SAM 2nd-bwd scratch [sam_backup|sam_grad]
+          + mb_tc_muon_floats(nCTA)                   // Muon NS per-matrix scratch
+          + mb_tc_sg2_floats(nCTA)                    // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
+-#if SG_MB_TC_PROFILE
+-         + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
+-#endif
+          ;
++    // NOTE: the phase profiler (SG_MB_TC_PROFILE) now writes to the file-scope
++    // g_mb_prof_max device buffer (atomicMax-of-per-CTA-delta, decoder semantics),
++    // NOT a workspace tail carve — so the workspace size is profiler-independent
++    // (ON and OFF agree). This also avoids growing the d=1024 staged-opt scratch
++    // (BUG-04). The old '+= into workspace' carve was the half-built path the
++    // roadmap flagged; it is removed in favor of the device-buffer max.
+ }
+ 
+ template <OptId Opt>
+@@ -590,14 +604,21 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+ #if SG_MB_TC_PROFILE
+-    // 8-byte align the double accumulator: round the float offset up to an even
+-    // count so reinterpret_cast<double*> is aligned (past the SG2 scratch — the
+-    // phase-profiler is the LAST workspace term, mirroring mb_tc_workspace_floats).
+-    float* prof_f = sg2_ws_base + mb_tc_sg2_floats(nCTA);
+-    uintptr_t _pa = reinterpret_cast<uintptr_t>(prof_f);
+-    if (_pa & 0x7u) prof_f = reinterpret_cast<float*>((_pa + 7u) & ~uintptr_t(7u));
+-    double* prof = reinterpret_cast<double*>(prof_f);   // [nCTA*SLOTS], host-zeroed
+-    long long _pt = 0;
++    // Per-CTA phase accumulators (CTA-LOCAL, in shared smem). The sample fns sum each
++    // phase's clock64 delta into _prof->acc[] across the per-sample loop (decoder
++    // prof_fwd/prof_bwd style); the kernel then atomicMaxes each slot to the file-scope
++    // g_mb_prof_max ONCE per phase (max across CTAs = slowest-CTA critical path). The
++    // kernel's own P2/P3 phases stamp directly into this same _prof (slots 6/7). This
++    // is the atomicMax-of-per-step-delta semantics the roadmap mandates — NOT a '+=' into
++    // workspace (no workspace carve at all now → ON workspace == OFF workspace).
++    __shared__ MbProf prof_sh;
++    MbProf* _prof = &prof_sh;
++    if (threadIdx.x == 0) {
++        #pragma unroll
++        for (int s = 0; s < SG_MBTC_PROF_SLOTS; ++s) _prof->acc[s] = 0ull;
++    }
++    __syncthreads();
++    long long _pt = 0;   // kernel-side P2/P3 tick local
+ #endif
+ 
+     float* my_part = part_base + (int64_t)cta * total_p;   // this CTA's FULL grad partial
+@@ -619,21 +640,31 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+         __shared__ int tok_s[mb::kSeq];
+         __shared__ int tgt_s;
+         float nll_acc = 0.0f;
+-        SG_MBTC_PROF_TIC(_pt);
++        // P1 per-sample fwd+bwd. The fine phase split (scan-fwd/scan-bwd/proj-fwd/
++        // proj-bwd/surface-fwd/surface-bwd, slots 0-5) is accumulated INSIDE the sample
++        // fns into _prof->acc[] (via SG_MBPROF_ARG); summed across this CTA's samples.
+         for (int b = b0; b < b1; ++b) {
+             if (threadIdx.x < mb::kSeq) tok_s[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+             if (threadIdx.x == 0) tgt_s = tok.targets[b];
+             __syncthreads();
+-            float nll = mb_forward_sample(w, tok_s, tgt_s, &sm);
+-            mb_backward_sample(w, g, tok_s, tgt_s, B, &sm);
++            float nll = mb_forward_sample(w, tok_s, tgt_s, &sm SG_MBPROF_ARG);
++            mb_backward_sample(w, g, tok_s, tgt_s, B, &sm SG_MBPROF_ARG);
+             if (threadIdx.x == 0) nll_acc += nll;
+             __syncthreads();
+         }
+         if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+-        SG_MBTC_PROF_ACC(0, _pt);
+     }
++#if SG_MB_TC_PROFILE
++    // Publish this CTA's P1 fine-phase totals: max across CTAs (slowest-CTA critical
++    // path per phase). Slots 0-5 are the in-sample fine phases; 6/7 (P2/P3) are stamped
++    // below by the kernel. (atomicMax is on the file-scope device buffer, host-zeroed.)
++    if (threadIdx.x == 0) {
++        #pragma unroll
++        for (int s = 0; s < 6; ++s) atomicMax(&g_mb_prof_max[s], _prof->acc[s]);
++    }
++#endif
+     bar.sync();   // B1: all CTA full-grad partials + loss slots complete
+-    SG_MBTC_PROF_TIC(_pt);
++    SG_MBPROF_TIC(_pt);   // open P2_REDUCE (kernel-side; uses the _pt local)
+ 
+     // ── P2: deterministic cross-CTA reduce of the full-grad partial (work-steal
+     //    per-tensor; ascending CTA index → deterministic). ──
+@@ -658,9 +689,9 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+         *tok.loss_out = (float)(s / (double)B);
+     }
+     (void)loss_out;
+-    SG_MBTC_PROF_ACC(2, _pt);          // close P2 (full-grad reduce + loss)
++    SG_MBPROF_KERNEL_CLOSE(6, _pt);    // close P2_REDUCE (full-grad reduce + loss)
+     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+-    SG_MBTC_PROF_TIC(_pt);             // open P3 (optimizer tail)
++    SG_MBPROF_TIC(_pt);                // open P3_OPT (optimizer tail)
+ 
+     // ── P2.4 (LookSAM ONLY, SAM steps): the MODEL-COUPLED SAM 2nd backward that
+     //    produces st.sam_dir = g_sam − g (INTEGRATION-OPTSTAGES §6). PORT of the
+@@ -776,8 +807,12 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+                     if (threadIdx.x < mb::kSeq) tok_s2[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+                     if (threadIdx.x == 0) tgt_s2 = tok.targets[b];
+                     __syncthreads();
+-                    (void)mb_forward_sample(w, tok_s2, tgt_s2, &sm);
+-                    mb_backward_sample(w, g, tok_s2, tgt_s2, B, &sm);
++                    // SAM 2nd pass (SAM-coupled opts only). Feeds the same in-kernel _prof
++                    // accumulator; its slots 0-5 were already published at end-of-P1, so the
++                    // 2nd-pass deltas grow the (now-unread) per-CTA acc harmlessly — the
++                    // profiled path is AdamW (this branch is constexpr'd out of it).
++                    (void)mb_forward_sample(w, tok_s2, tgt_s2, &sm SG_MBPROF_ARG);
++                    mb_backward_sample(w, g, tok_s2, tgt_s2, B, &sm SG_MBPROF_ARG);
+                     __syncthreads();
+                 }
+             }
+@@ -1112,7 +1147,7 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+             sg2_meta_stages<MbSG2Dims, SG2Weights, float, float, /*BuildSort=*/true>(
+                 w2, t, stt, sc2, params, grad, st.sharpness, sg2_meta_ws);
+         }
+-        SG_MBTC_PROF_ACC(3, _pt);          // close P3 (SG2 owns the optimizer phase)
++        SG_MBPROF_KERNEL_CLOSE(7, _pt);    // close P3_OPT (SG2 owns the optimizer phase)
+         return;   // SG2 owns the whole optimizer phase; skip P3.
+     }
+ 
+@@ -1200,7 +1235,7 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+             }
+         }
+     }
+-    SG_MBTC_PROF_ACC(3, _pt);          // close P3
++    SG_MBPROF_KERNEL_CLOSE(7, _pt);    // close P3_OPT
+ }
+ 
+ // Launcher (static-smem; the decoder TC contract). ncta_cap>0 caps the launched
+diff --git a/csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu b/csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu
+index 62b61b1..0393beb 100644
+--- a/csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu
++++ b/csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu
+@@ -234,6 +234,31 @@ static std::vector<torch::Tensor> scalar_train_step(
+ }
+ #endif  // SG_MB_SCALAR_MEGAKERNEL
+ 
++#if SG_MB_TC_PROFILE
++// Diagnostic-only (SG_MB_TC_PROFILE; never shipped — the production _ops never sets
++// this flag, and the OFF build is byte-identical PTX). Read + reset the per-phase
++// clock64 maxima (cycles), 8 slots (the model_stage_mamba3 ground truth):
++//   [0]=SCAN_FWD [1]=SCAN_BWD [2]=PROJ_FWD [3]=PROJ_BWD
++//   [4]=SURFACE_FWD [5]=SURFACE_BWD [6]=P2_REDUCE [7]=P3_OPT.
++// Each slot is the MAX-across-CTAs of that CTA's per-step phase total (= the
++// slowest-CTA critical path the trailing grid barrier waits on). Call AFTER one
++// tc_train_step; divide by the SM clock (~1.98 GHz boost on H100) to get ms, or
++// read the RATIOS (the inserted __syncthreads perturb absolutes — ratios are
++// trustworthy, per the roadmap). Mirrors the decoder's tc_profile_read.
++static std::vector<int64_t> tc_profile_read() {
++    constexpr int kSlots = SG_MBTC_PROF_SLOTS;
++    unsigned long long h[kSlots];
++    for (int i = 0; i < kSlots; ++i) h[i] = 0ull;
++    cudaMemcpyFromSymbol(h, ::sg::fused::sm90::g_mb_prof_max, sizeof(h));
++    unsigned long long z[kSlots];
++    for (int i = 0; i < kSlots; ++i) z[i] = 0ull;
++    cudaMemcpyToSymbol(::sg::fused::sm90::g_mb_prof_max, z, sizeof(z));
++    std::vector<int64_t> out(kSlots);
++    for (int i = 0; i < kSlots; ++i) out[i] = (int64_t)h[i];
++    return out;
++}
++#endif  // SG_MB_TC_PROFILE
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
+     mm.def("tc_train_step", &tc_train_step,
+            "Fork-B tensor-core mamba fwd+bwd+AdamW step (in place); returns (loss, reduced grad)",
+@@ -264,4 +289,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
+     mm.attr("STATE") = (int)mb::kState;
+     mm.attr("VOCAB") = (int)mb::kVocab;
+     mm.attr("PHEAD") = (int)mb::kPHead;
++#if SG_MB_TC_PROFILE
++    mm.def("tc_profile_read", &tc_profile_read,
++           "diagnostic-only: per-phase clock64 maxima "
++           "[SCAN_FWD,SCAN_BWD,PROJ_FWD,PROJ_BWD,SURFACE_FWD,SURFACE_BWD,P2_REDUCE,P3_OPT] "
++           "(cycles), resets after read");
++    mm.attr("HAS_PROFILE") = true;
++#else
++    mm.attr("HAS_PROFILE") = false;
++#endif
+ }
+diff --git a/csrc/fused/sm_90/model_stage_mamba3.cuh b/csrc/fused/sm_90/model_stage_mamba3.cuh
+index c4a6211..9948d55 100644
+--- a/csrc/fused/sm_90/model_stage_mamba3.cuh
++++ b/csrc/fused/sm_90/model_stage_mamba3.cuh
+@@ -136,6 +136,79 @@ __device__ __forceinline__ float mb_softplus_grad(float x) {  // sigmoid(x)
+     return mb_sigmoid(x);
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  PER-PHASE clock64 PROFILER (default OFF; the bench/measurement TU defines
++//  SG_MB_TC_PROFILE=1 to bracket the scan / projection-GEMM / RMSNorm+SwiGLU
++//  surface inside mb_forward_sample / mb_backward_sample). Production builds
++//  never define it → zero added code, zero extra parameter, byte-identical PTX.
++//
++//  DESIGN — mirrors the decoder's g_dec_prof_max (fused_decoder_megakernel.cuh):
++//    a thread-0 clock64() delta per leaf, ACCUMULATED across the per-sample loop
++//    into a CTA-LOCAL accumulator (MbProf, in shared smem), then atomicMax'd ONCE
++//    per slot to the file-scope g_mb_prof_max device buffer at the end of P1. This
++//    is the atomicMax-of-per-step-delta semantics the roadmap mandates (NOT the
++//    half-built '+=' into a workspace buffer — that mixed ADD-then-MAX and merged
++//    P1-fwd with P1-bwd). The host (mega_mamba_real_adamw_tc.cu tc_profile_read)
++//    reads it via cudaMemcpyFromSymbol and resets it, exactly like the decoder.
++//
++//  The profiler pointer is threaded into the sample/mixer/swiglu functions via a
++//  GUARDED extra parameter (SG_MBPROF_PARAM / SG_MBPROF_ARG, the SG_DEC_PIPE_BARS_ARG
++//  idiom): when SG_MB_TC_PROFILE=0 the parameter, the struct, the device buffer, and
++//  every TIC/ACC vanish → the OFF build is byte-identical. The TIC/ACC pair takes a
++//  caller-declared `long long` tick local (decoder _c0/_c1 style) so sequential leaf
++//  brackets never collide and there is no nesting hazard. The __syncthreads() in
++//  TIC/ACC land at uniform CTA-cooperative control-flow points (every leaf already
++//  ends with __syncthreads()), so adding them is always-reached and hang-free; they
++//  perturb ABSOLUTE cycles (read RATIOS, per the roadmap), and only on the ON build.
++// ════════════════════════════════════════════════════════════════════════
++#ifndef SG_MB_TC_PROFILE
++#define SG_MB_TC_PROFILE 0
++#endif
++#if SG_MB_TC_PROFILE
++// Slot order (the device-side ground truth; mirrored in mamba_bench.MB_PHASE_NAMES
++// + the host reader). scan vs projection vs the RMSNorm/SwiGLU surface, split
++// fwd/bwd — the campaign's one question (scan-share vs projection-share):
++//   [0] SCAN_FWD     — mb_scan_fwd (the transcendental complex selective scan)
++//   [1] SCAN_BWD     — mb_scan_bwd (reverse-time two-adjoint recurrence)
++//   [2] PROJ_FWD     — the 5 forward projection-GEMM families: in_proj, x_proj,
++//                      dt_proj, out_proj, gate+up+down (all mb_linear / the in_proj
++//                      fused GEMM)
++//   [3] PROJ_BWD     — the projection-GEMM backwards: in_proj/x_proj/out_proj +
++//                      dt_proj (mb_linear_bwd) + gate/up/down (swiglu bwd GEMMs)
++//   [4] SURFACE_FWD  — RMSNorm fwd, BCNorm, SwiGLU elementwise, residual adds,
++//                      embed, final-norm + head + CE (the non-GEMM/non-scan fwd)
++//   [5] SURFACE_BWD  — RMSNorm bwd, BCNorm bwd, SwiGLU elementwise bwd, residual,
++//                      head/CE/final-norm bwd, embed bwd (the non-GEMM/non-scan bwd)
++//   [6] P2_REDUCE    — cross-CTA full-grad reduce + loss reduce (kernel P2)
++//   [7] P3_OPT       — the apply_optimizer<Opt> tail over the reduced grad (kernel P3)
++#define SG_MBTC_PROF_SLOTS 8
++struct MbProf { unsigned long long acc[SG_MBTC_PROF_SLOTS]; };
++// TIC: stamp the start tick into a caller local (thread 0). ACC: add the delta to
++// the CTA-local accumulator slot. Both fence first so the prior phase is complete.
++#define SG_MBPROF_TIC(v)        do { __syncthreads(); if (threadIdx.x == 0) (v) = clock64(); } while (0)
++#define SG_MBPROF_ACC(slot, v)  do { __syncthreads(); \
++    if (threadIdx.x == 0) _prof->acc[(slot)] += (unsigned long long)(clock64() - (v)); } while (0)
++#define SG_MBPROF_PARAM         , MbProf* __restrict__ _prof
++#define SG_MBPROF_ARG           , _prof
++#define SG_MBPROF_LOCAL(v)      long long v = 0
++#else
++#define SG_MBPROF_TIC(v)        do {} while (0)
++#define SG_MBPROF_ACC(slot, v)  do {} while (0)
++#define SG_MBPROF_PARAM
++#define SG_MBPROF_ARG
++#define SG_MBPROF_LOCAL(v)      do {} while (0)
++#endif
++// Kernel-side helper: close a kernel-phase slot (P2_REDUCE=6, P3_OPT=7) by adding its
++// _pt-bracketed delta to the per-CTA accumulator AND atomicMax-ing it to the file-scope
++// device buffer (the megakernel defines g_mb_prof_max). Used at the kernel's phase
++// boundaries / exit paths; no-op (byte-identical) when SG_MB_TC_PROFILE=0.
++#if SG_MB_TC_PROFILE
++#define SG_MBPROF_KERNEL_CLOSE(slot, v) do { SG_MBPROF_ACC(slot, v); \
++    if (threadIdx.x == 0) atomicMax(&g_mb_prof_max[(slot)], _prof->acc[(slot)]); } while (0)
++#else
++#define SG_MBPROF_KERNEL_CLOSE(slot, v) do {} while (0)
++#endif
++
+ // ── Per-CTA scratch for one sample. POD held in smem (one instance per CTA).
+ //    BOTH layers' forward activations are cached. The scan complex STATE is NOT
+ //    here (per-thread registers — the seq=8 exploit). ──────────────────────────
+@@ -779,8 +852,10 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+                             const float* __restrict__ xn,   // [kSeq,d] (mixer input)
+                             MambaSampleSmem::LayerAct* a,
+                             float* __restrict__ mix_out,     // [kSeq,d] OUT
+-                            MambaSampleSmem* sm) {
+-    // xz = in_proj(xn); split rows [0,d_inner)->x_in, [d_inner,2di)->z.
++                            MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    // xz = in_proj(xn); split rows [0,d_inner)->x_in, [d_inner,2di)->z. [PROJ_FWD]
++    SG_MBPROF_TIC(_pf);
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+         const int s = idx / mb::kDInner, o = idx % mb::kDInner;
+         const float* xr = xn + (int64_t)s * mb::kD;
+@@ -793,9 +868,11 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+         a->z[s][o] = a1;
+     }
+     __syncthreads();
+-    // x_proj(x_in) -> sm->xproj [kSeq,xproj]; split into the SSM params.
++    // x_proj(x_in) -> sm->xproj [kSeq,xproj]; split into the SSM params. [PROJ_FWD]
+     mb_linear(&a->x_in[0][0], mb::kDInner, mb::kDInner, L.x_proj_w, nullptr,
+               mb::kXProj, &sm->xproj[0][0], mb::kXProj);
++    SG_MBPROF_ACC(2, _pf);   // close PROJ_FWD: in_proj + x_proj
++    SG_MBPROF_TIC(_pf);      // open SURFACE_FWD: x_proj split routing
+     // route the splits into the LayerAct caches.
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kXProj; idx += blockDim.x) {
+         const int s = idx / mb::kXProj, o = idx % mb::kXProj;
+@@ -810,9 +887,13 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+         else a->Ci[s][o - mb::kOffCi] = v;
+     }
+     __syncthreads();
+-    // dt_pre = dt_proj(dt_lr) + bias  [kSeq, n_heads] (PER HEAD).
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: x_proj split routing
++    SG_MBPROF_TIC(_pf);      // open PROJ_FWD: dt_proj
++    // dt_pre = dt_proj(dt_lr) + bias  [kSeq, n_heads] (PER HEAD). [PROJ_FWD]
+     mb_linear(&a->dt_lr[0][0], mb::kDtRank, mb::kDtRank, L.dt_proj_w, L.dt_proj_b,
+               mb::kNHeads, &a->dt_pre[0][0], mb::kNHeads);
++    SG_MBPROF_ACC(2, _pf);   // close PROJ_FWD: dt_proj
++    SG_MBPROF_TIC(_pf);      // open SURFACE_FWD: BCNorm (RMSNorm over Nc) + biases
+     // BCNorm (RMSNorm over Nc) + biases -> Bbar=(Br2,Bi2), Cbar=(Cr2,-Ci2). The
+     //   normed output lands in sm->adj_a at WIDTH-kStateC stride (s*Nc+c), NOT the
+     //   [kSeq][kDInner] field stride — read it back with the same Nc stride.
+@@ -841,8 +922,12 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+         a->Cbar[s][c][1] = -(an[s * mb::kStateC + c] + L.Chat_bias[c]);   // Cbar imag = -(Ci2)
+     }
+     __syncthreads();
+-    // selective scan -> a->y_scan.
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: BCNorm
++    SG_MBPROF_TIC(_pf);      // open SCAN_FWD
++    // selective scan -> a->y_scan. [SCAN_FWD]
+     mb_scan_fwd(L.A_log, a, &a->y_scan[0][0]);
++    SG_MBPROF_ACC(0, _pf);   // close SCAN_FWD
++    SG_MBPROF_TIC(_pf);      // open SURFACE_FWD: gated skip
+     // y_gated = (y_scan + x_in*D) * silu(z) -> sm->adj_a ; out = out_proj(y_gated).
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+         const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+@@ -850,8 +935,11 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+         sm->adj_a[s][c] = yv * mb_silu(a->z[s][c]);
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: gated skip
++    SG_MBPROF_TIC(_pf);      // open PROJ_FWD: out_proj
+     mb_linear(&sm->adj_a[0][0], mb::kDInner, mb::kDInner, L.out_w, nullptr,
+               mb::kD, mix_out, mb::kD);
++    SG_MBPROF_ACC(2, _pf);   // close PROJ_FWD: out_proj
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+@@ -862,16 +950,23 @@ __device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
+                              const float* __restrict__ h1n,   // [kSeq,d]
+                              MambaSampleSmem::LayerAct* a,
+                              float* __restrict__ mlp_out,      // [kSeq,d] OUT
+-                             MambaSampleSmem* sm) {
++                             MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    SG_MBPROF_TIC(_pf);   // open PROJ_FWD: gate + up
+     mb_linear(h1n, mb::kD, mb::kD, L.gate_w, nullptr, mb::kDff, &a->g_pre[0][0], mb::kDff);
+     mb_linear(h1n, mb::kD, mb::kD, L.up_w,   nullptr, mb::kDff, &a->u_mlp[0][0], mb::kDff);
++    SG_MBPROF_ACC(2, _pf);   // close PROJ_FWD: gate + up
++    SG_MBPROF_TIC(_pf);      // open SURFACE_FWD: silu(gate)*up
+     // prod = silu(g_pre) * u -> sm->wff_a.
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+         const int s = idx / mb::kDff, o = idx % mb::kDff;
+         sm->wff_a[s][o] = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: silu(gate)*up
++    SG_MBPROF_TIC(_pf);      // open PROJ_FWD: down
+     mb_linear(&sm->wff_a[0][0], mb::kDff, mb::kDff, L.down_w, nullptr, mb::kD, mlp_out, mb::kD);
++    SG_MBPROF_ACC(2, _pf);   // close PROJ_FWD: down
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+@@ -879,7 +974,9 @@ __device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
+ //  + block_forward. Caches BOTH blocks' activations into sm->act[li]. Returns NLL.
+ // ════════════════════════════════════════════════════════════════════════
+ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
+-                                    int target, MambaSampleSmem* sm) {
++                                    int target, MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    SG_MBPROF_TIC(_pf);   // open SURFACE_FWD: embedding
+     // Embedding + positional -> layer_in[0].
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+         const int s = idx / mb::kD, j = idx % mb::kD;
+@@ -887,6 +984,7 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
+                               + w.pos[(int64_t)s * mb::kD + j];
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: embedding
+ 
+     for (int li = 0; li < mb::kLayers; ++li) {
+         const MambaWeights::Layer& L = w.layer[li];
+@@ -894,12 +992,15 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
+         float* hin = &sm->layer_in[li][0][0];   // block input (residual)
+         // --- mixer sub-block: h1 = hin + mixer(RMSNorm_mix(hin)) ---
+         // xhat written to throwaway scratch (adj_c) — only the recip is cached; the
+-        // backward recomputes xhat from the raw block input layer_in[li].
++        // backward recomputes xhat from the raw block input layer_in[li]. [SURFACE_FWD]
++        SG_MBPROF_TIC(_pf);
+         mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mixn_r[0],
+                        sm->red, mb::kD, mb::kD);   // xn -> sm->dr
++        SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: mixer RMSNorm
+         // mix_out written into adj_b at WIDTH-kD stride (s*kD+j); read it the same way.
+         float* mo = &sm->adj_b[0][0];
+-        mb_mixer_fwd(L, &sm->dr[0][0], a, mo, sm);   // mix_out -> sm->adj_b (kD-strided)
++        mb_mixer_fwd(L, &sm->dr[0][0], a, mo, sm SG_MBPROF_ARG);   // mix_out -> sm->adj_b (kD-strided)
++        SG_MBPROF_TIC(_pf);   // open SURFACE_FWD: mixer residual add
+         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+             const int s = idx / mb::kD, j = idx % mb::kD;
+             a->h1[s][j] = hin[s * mb::kD + j] + mo[s * mb::kD + j];   // h1 = x + mixer_out
+@@ -909,15 +1010,19 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
+         // xhat throwaway (adj_c); backward recomputes from the raw h1.
+         mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mlpn_r[0],
+                        sm->red, mb::kD, mb::kD);   // h1n -> sm->dr
+-        mb_swiglu_fwd(L, &sm->dr[0][0], a, mo, sm);  // mlp_out -> sm->adj_b (kD-strided)
++        SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: mixer residual + mlp RMSNorm
++        mb_swiglu_fwd(L, &sm->dr[0][0], a, mo, sm SG_MBPROF_ARG);  // mlp_out -> sm->adj_b (kD-strided)
++        SG_MBPROF_TIC(_pf);   // open SURFACE_FWD: mlp residual add
+         float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0] : &sm->final_in[0][0];
+         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+             const int s = idx / mb::kD, j = idx % mb::kD;
+             dst[s * mb::kD + j] = a->h1[s][j] + mo[s * mb::kD + j];   // h2 = h1 + mlp_out
+         }
+         __syncthreads();
++        SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: mlp residual add
+     }
+ 
++    SG_MBPROF_TIC(_pf);   // open SURFACE_FWD: final norm + head + CE
+     // Final RMSNorm (LAST position) + head -> logits -> NLL.
+     const float* hlast = &sm->final_in[mb::kSeq - 1][0];
+     float ss = 0.0f;
+@@ -946,6 +1051,7 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
+     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) es += __expf(sm->logits[o] - lmax);
+     es = mb_block_sum(es, sm->red);
+     float logz = lmax + __logf(es);
++    SG_MBPROF_ACC(4, _pf);   // close SURFACE_FWD: final norm + head + CE
+     return logz - sm->logits[target];
+ }
+ 
+@@ -962,7 +1068,9 @@ __device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGra
+                             MambaSampleSmem::LayerAct* a,
+                             const float* __restrict__ dmix_out,  // [kSeq,d]
+                             float* __restrict__ dxn,         // [kSeq,d] OUT
+-                            MambaSampleSmem* sm) {
++                            MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: recompute y_gated
+     // Recompute y_gated -> sm->adj_a (out_proj input). y_gated = (y_scan + x_in*D)*silu(z).
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+         const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+@@ -970,9 +1078,13 @@ __device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGra
+         sm->adj_a[s][c] = yv * mb_silu(a->z[s][c]);
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: recompute y_gated
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: out_proj
+     // out_proj bwd: dW_out += dmix_out^T @ y_gated ; dy_gated = dmix_out @ out_w -> adj_c.
+     mb_linear_bwd(dmix_out, mb::kD, &sm->adj_a[0][0], mb::kDInner, L.out_w,
+                   mb::kDInner, mb::kD, G.out_w, nullptr, &sm->adj_c[0][0], mb::kDInner, true);
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: out_proj
++    SG_MBPROF_TIC(_pf);      // open SURFACE_BWD: gate+skip + scan-dy stage
+     // gate+skip bwd. y_gated=y_skip*silu(z); y_skip=y_scan + x_in*D.
+     //   dy_skip = dy_gated*sz ; dsz = dy_gated*y_skip ; dz = dsz*silu'(z).
+     //   dy_scan = dy_skip ; dx_in(D-path) = dy_skip*D ; dD += Σ dy_skip*x_in.
+@@ -1010,22 +1122,30 @@ __device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGra
+     float* ddt_pre_s = &sm->wff_a[0][0];                          // [kSeq,n_heads]
+     float* dA_mod_s  = &sm->wff_a[0][0] + mb::kSeq * mb::kNHeads;  // [kSeq,n_heads]
+     float* du_lam_s  = dA_mod_s + mb::kSeq * mb::kNHeads;          // [kSeq,n_heads]
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: gate+skip + scan-dy stage
++    SG_MBPROF_TIC(_pf);      // open SCAN_BWD
+     mb_scan_bwd(L.A_log, a, &sm->adj_b[0][0],
+                 &sm->adj_c[0][0],      // dx_in (scan path) SET (dy_gated consumed)
+                 ddt_pre_s, dA_mod_s, du_lam_s,
+                 &sm->dBbar[0][0][0], &sm->dCbar[0][0][0], &sm->dtheta[0][0],
+                 G.A_log, sm->red);
++    SG_MBPROF_ACC(1, _pf);   // close SCAN_BWD
++    SG_MBPROF_TIC(_pf);      // open SURFACE_BWD: dx_in D-path fold
+     // dx_in total = scan-path (adj_c) + D-path (dy_skip*D, dy_skip in adj_b) -> adj_c.
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
+         const int s = idx / mb::kDInner, c = idx % mb::kDInner;
+         sm->adj_c[s][c] += sm->adj_b[s][c] * L.D[c];   // dx_in = scan + D path
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: dx_in D-path fold
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: dt_proj
+     // dt_proj bwd: dW_dt += ddt_pre^T @ dt_lr ; db_dt += Σ ddt_pre ;
+     //   ddt_lr = ddt_pre @ dt_proj_w -> staged into sm->xproj[:, kOffDtLr..dt_rank).
+     mb_linear_bwd(ddt_pre_s, mb::kNHeads, &a->dt_lr[0][0], mb::kDtRank, L.dt_proj_w,
+                   mb::kDtRank, mb::kNHeads, G.dt_proj_w, G.dt_proj_b,
+                   &sm->xproj[0][mb::kOffDtLr], mb::kXProj, true);
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: dt_proj
++    SG_MBPROF_TIC(_pf);      // open SURFACE_BWD: dA_mod/dtheta/du_lam staging + BCNorm bwd
+     // dA_mod -> xproj[:, kOffAmod..) ; dtheta (smem) -> xproj[:, kOffThet..) ;
+     // du_lam -> xproj[:, kOffULam..).  (theta is a direct slice of x_proj output.)
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kNHeads; idx += blockDim.x) {
+@@ -1101,11 +1221,15 @@ __device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGra
+     mb_rmsnorm_bwd_rawx(anb, &a->Ci[0][0], &a->Ci_r[0], L.Chat_norm_w,
+                         &sm->xproj[0][mb::kOffCi], G.Chat_norm_w, sm->red, mb::kStateC, mb::kXProj);
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: BCNorm bwd (4 streams)
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: x_proj
+     // x_proj is now fully assembled in sm->xproj (dt_lr|A_mod|theta|u_lam|Br|Bi|Cr|Ci).
+     //   x_proj bwd: dW_xproj += xproj^T @ x_in ; dx_in(x_proj path) = xproj @ x_proj_w
+     //   -> ADD to dx_in accumulator (sm->adj_c).
+     mb_linear_bwd(&sm->xproj[0][0], mb::kXProj, &a->x_in[0][0], mb::kDInner, L.x_proj_w,
+                   mb::kDInner, mb::kXProj, G.x_proj_w, nullptr, &sm->adj_c[0][0], mb::kDInner, false);
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: x_proj
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: in_proj (fused dW + dX)
+     // x_in fans into THREE: scan (in adj_c via dx_acc), x_proj (just added), D-skip
+     //   (the D-path: dy_skip*D was added to adj_c above). All folded into adj_c now.
+     //   dx_in = adj_c (complete). x_in = x_main (no SiLU) -> dx_main = dx_in.
+@@ -1141,6 +1265,7 @@ __device__ inline void mb_mixer_bwd(const MambaWeights::Layer& L, const MambaGra
+         }
+         __syncthreads();
+     }
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: in_proj
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+@@ -1153,16 +1278,22 @@ __device__ inline void mb_swiglu_bwd(const MambaWeights::Layer& L, const MambaGr
+                              MambaSampleSmem::LayerAct* a,
+                              const float* __restrict__ dmlp_out,  // [kSeq,d]
+                              float* __restrict__ dh1n,        // [kSeq,d] OUT
+-                             MambaSampleSmem* sm) {
++                             MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: recompute prod = silu(g_pre)*u
+     // recompute prod = silu(g_pre)*u -> sm->wff_a (down_proj input).
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+         const int s = idx / mb::kDff, o = idx % mb::kDff;
+         sm->wff_a[s][o] = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: recompute prod
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: down
+     // down_proj bwd: dW_down += dmlp_out^T @ prod ; dprod = dmlp_out @ down_w -> wff_b.
+     mb_linear_bwd(dmlp_out, mb::kD, &sm->wff_a[0][0], mb::kDff, L.down_w,
+                   mb::kDff, mb::kD, G.down_w, nullptr, &sm->wff_b[0][0], mb::kDff, true);
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: down
++    SG_MBPROF_TIC(_pf);      // open SURFACE_BWD: silu chain-rule (ds/du/dg_pre)
+     // ds = dprod*u ; du = dprod*s ; dg_pre = ds*silu'(g_pre). Stage dg_pre -> wff_a,
+     //   du -> wff_b (dprod consumed in place).
+     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDff; idx += blockDim.x) {
+@@ -1175,12 +1306,15 @@ __device__ inline void mb_swiglu_bwd(const MambaWeights::Layer& L, const MambaGr
+         sm->wff_b[s][o] = du;                                  // du
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: silu chain-rule
++    SG_MBPROF_TIC(_pf);      // open PROJ_BWD: gate + up
+     // gate_proj bwd: dW_gate += dg_pre^T @ h1n ; dx_gate = dg_pre @ gate_w -> dh1n (SET).
+     mb_linear_bwd(&sm->wff_a[0][0], mb::kDff, h1n, mb::kD, L.gate_w,
+                   mb::kD, mb::kDff, G.gate_w, nullptr, dh1n, mb::kD, true);
+     // up_proj bwd: dW_up += du^T @ h1n ; dx_up = du @ up_w -> ADD to dh1n.
+     mb_linear_bwd(&sm->wff_b[0][0], mb::kDff, h1n, mb::kD, L.up_w,
+                   mb::kD, mb::kDff, G.up_w, nullptr, dh1n, mb::kD, false);
++    SG_MBPROF_ACC(3, _pf);   // close PROJ_BWD: gate + up
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════
+@@ -1190,7 +1324,9 @@ __device__ inline void mb_swiglu_bwd(const MambaWeights::Layer& L, const MambaGr
+ // ════════════════════════════════════════════════════════════════════════
+ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad& g,
+                                     const int* tokens_s, int target, int B,
+-                                    MambaSampleSmem* sm) {
++                                    MambaSampleSmem* sm SG_MBPROF_PARAM) {
++    SG_MBPROF_LOCAL(_pf);
++    SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: CE + head + final-norm bwd
+     // ── CE bwd: dlogits = (softmax - onehot)/B. ──
+     float lmax = -CUDART_INF_F;
+     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) lmax = fmaxf(lmax, sm->logits[o]);
+@@ -1242,6 +1378,7 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
+         __syncthreads();
+     }
+     // sm->dh = dL/d(final-block output) [kSeq,d], only last pos nonzero.
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: CE + head + final-norm bwd
+ 
+     for (int li = mb::kLayers - 1; li >= 0; --li) {
+         const MambaWeights::Layer& L = w.layer[li];
+@@ -1251,13 +1388,16 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
+         // h2 = h1 + mlp(mlp_norm(h1)). dh2 = sm->dh.
+         //   dh1 = dh2 (residual) + rmsnorm_bwd(swiglu_bwd(dh2)).
+         // recompute h1n = mlp_norm(h1) = (h1 * mlpn_r) * mlpn_w  (xhat from the raw h1).
++        SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: recompute h1n
+         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+             const int s = idx / mb::kD, j = idx % mb::kD;
+             sm->dr[s][j] = (a->h1[s][j] * a->mlpn_r[s]) * L.mlpn_w[j];   // h1n
+         }
+         __syncthreads();
++        SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: recompute h1n
+         // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n -> sm->fn_xhat (free: head done).
+-        mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
++        mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm SG_MBPROF_ARG);
++        SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: mlp_norm bwd + residual add
+         // rmsnorm_mlp bwd (raw-x variant: recompute xhat from h1 * mlpn_r). dh1n in
+         //   sm->fn_xhat; out dh1_mlpnorm -> sm->dr (ldDx=kD).
+         mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], &a->h1[0][0], &a->mlpn_r[0], L.mlpn_w,
+@@ -1275,8 +1415,10 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
+             sm->dr[s][j] = (hin[s * mb::kD + j] * a->mixn_r[s]) * L.mixn_w[j];   // xn
+         }
+         __syncthreads();
++        SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: mlp_norm bwd + residual + recompute xn
+         // mixer bwd: dmix_out = dh1 (sm->dh) ; xn in sm->dr ; out dxn -> sm->fn_xhat.
+-        mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
++        mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm SG_MBPROF_ARG);
++        SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: mixer_norm bwd + residual add
+         // rmsnorm_mix bwd (raw-x variant: recompute xhat from hin * mixn_r).
+         mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], hin, &a->mixn_r[0], L.mixn_w,
+                             &sm->dr[0][0], G.mixn_w, sm->red, mb::kD, mb::kD);
+@@ -1285,9 +1427,11 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
+             sm->dh[s][j] += sm->dr[s][j];   // dx = dh1(residual) + mixer_norm path
+         }
+         __syncthreads();
++        SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: mixer_norm bwd + residual add
+         // sm->dh now = grad wrt the previous block's output (or the embedding for li=0).
+     }
+ 
++    SG_MBPROF_TIC(_pf);   // open SURFACE_BWD: embedding bwd
+     // ── embedding backward: dh = grad wrt h0 [kSeq,d]. ──
+     for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+         #pragma unroll
+@@ -1298,6 +1442,7 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
+         }
+     }
+     __syncthreads();
++    SG_MBPROF_ACC(5, _pf);   // close SURFACE_BWD: embedding bwd
+ }
+ 
+ }}} // namespace sg::fused::sm90
+diff --git a/tuning/mamba_bench.py b/tuning/mamba_bench.py
+index 96be6c9..af56dc0 100644
+--- a/tuning/mamba_bench.py
++++ b/tuning/mamba_bench.py
+@@ -41,11 +41,20 @@ sys.path.insert(0, str(ROOT))
+ import torch  # noqa: E402
+ from torch.utils.cpp_extension import load  # noqa: E402
+ 
++SM_GHZ = 1.98  # H100 SM boost clock (nvidia-smi clocks.max.sm = 1980 MHz); mirrors vit_bench
+ _TC_TU = str(ROOT / "csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu")
+ 
+ 
+ def build_variant(d: int = 128, name: str | None = None, verbose: bool = False,
+-                  defines: list[str] | None = None):
++                  defines: list[str] | None = None, profile: bool = False):
++    """JIT-build the Mamba TC cell TU as a coexisting variant extension.
++
++    `profile=True` adds -DSG_MB_TC_PROFILE=1 (the in-kernel clock64 per-phase timers,
++    g_mb_prof_max [8 slots]; default OFF, NEVER on the production path) and selects a
++    distinct module name (suffix `_prof`) so the profiled + un-profiled variants coexist
++    in the torch-extensions build dir. The host pybind reader (tc_profile_read) is ALSO
++    gated on SG_MB_TC_PROFILE, so the flag is mirrored into extra_cflags as well.
++    Mirrors tuning/vit_bench.build_variant."""
+     bench = (d != 128)
+     flags = ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+              "-gencode=arch=compute_90a,code=sm_90a",
+@@ -56,6 +65,8 @@ def build_variant(d: int = 128, name: str | None = None, verbose: bool = False,
+         # bench drives uses the small static MbTcSmem). Mirrors the decoder bench.
+         flags.append("-DSG_MB_BENCH_LAYOUT=1")
+         flags.append("-DSG_MB_SCALAR_MEGAKERNEL=0")
++    if profile:
++        flags.append("-DSG_MB_TC_PROFILE=1")
+     suffix = ""
+     if defines:
+         for d_ in defines:
+@@ -66,17 +77,39 @@ def build_variant(d: int = 128, name: str | None = None, verbose: bool = False,
+     if name is None:
+         name = "mega_mamba_real_adamw_tc"
+         name += "_bench" if bench else "_prod"
++        if profile:
++            name += "_prof"
+         name += suffix
+     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
++    # The host side (the pybind module: tc_profile_read) is ALSO gated on
++    # SG_MB_TC_PROFILE, so mirror the flag into extra_cflags (mirrors vit_bench).
++    host_defs = ["-DSG_MB_TC_PROFILE=1"] if profile else []
+     mod = load(name=name, sources=[_TC_TU],
+                extra_include_paths=[str(ROOT)],
+                extra_cuda_cflags=flags,
+-               extra_cflags=["-O3", "-std=c++17"],
++               extra_cflags=["-O3", "-std=c++17", *host_defs],
+                verbose=verbose)
+     return mod
+ 
+ 
+-def measure(mod, d: int, B: int, reps: int, warmup: int, iters: int):
++# Slot order of g_mb_prof_max in fused_mamba_megakernel.cuh (the device-side header
++# comment in model_stage_mamba3.cuh is the ground truth). Mirrors vit_bench.VIT_PHASE_NAMES.
++# These split the campaign's one question — scan-share vs projection-share — apart from
++# the RMSNorm/SwiGLU/elementwise surface, fwd and bwd separately:
++#   [0] SCAN_FWD     — the transcendental complex selective scan (mb_scan_fwd)
++#   [1] SCAN_BWD     — the reverse-time two-adjoint scan recurrence (mb_scan_bwd)
++#   [2] PROJ_FWD     — the 5 fwd projection GEMMs: in_proj/x_proj/dt_proj/out_proj/gate+up+down
++#   [3] PROJ_BWD     — the projection-GEMM backwards (mb_linear_bwd + the in_proj/swiglu GEMMs)
++#   [4] SURFACE_FWD  — RMSNorm/BCNorm/SwiGLU-elementwise/residual/embed/head+CE (fwd)
++#   [5] SURFACE_BWD  — the same non-GEMM/non-scan surface (bwd)
++#   [6] P2_REDUCE    — the cross-CTA full-grad reduce + loss reduce (kernel P2)
++#   [7] P3_OPT       — the apply_optimizer<Opt> tail over the reduced grad (kernel P3)
++MB_PHASE_NAMES = ["SCAN_FWD", "SCAN_BWD", "PROJ_FWD", "PROJ_BWD",
++                  "SURFACE_FWD", "SURFACE_BWD", "P2_REDUCE", "P3_OPT"]
++
++
++def measure(mod, d: int, B: int, reps: int, warmup: int, iters: int,
++            profile: bool = False):
+     # VOCAB/P_HEAD/SEQ are d-INVARIANT (token range, head width, seq len), so the
+     # oracle constants are correct at every ladder width; the layout's D/DINNER scale.
+     from tests.hw.mamba_oracle import VOCAB, P_HEAD, SEQ
+@@ -125,9 +158,25 @@ def measure(mod, d: int, B: int, reps: int, warmup: int, iters: int):
+         fwd += 2.0 * T * d * di           # out_proj
+     fwd += 2.0 * B * P_HEAD * d           # head (M=B)
+     flops = 3.0 * fwd
+-    return {"d": d, "B": B, "total_params": total, "wall_ms": wall * 1e3,
+-            "steps_per_s": 1.0 / wall, "walls_ms": [w * 1e3 for w in walls],
+-            "gemm_flops_per_step": flops, "achieved_tf_s": flops / wall / 1e12}
++    res = {"d": d, "B": B, "total_params": total, "wall_ms": wall * 1e3,
++           "steps_per_s": 1.0 / wall, "walls_ms": [w * 1e3 for w in walls],
++           "gemm_flops_per_step": flops, "achieved_tf_s": flops / wall / 1e12}
++
++    if profile and getattr(mod, "HAS_PROFILE", False):
++        # reset, run a few steps, read the max-across-CTAs per phase (every step has
++        # ~identical work, so the accumulated max == one step's per-phase critical path).
++        # 8 slots, mapped by MB_PHASE_NAMES. Mirrors vit_bench.measure.
++        mod.tc_profile_read()  # reset
++        prof_reps = []
++        for _ in range(reps):
++            mod.tc_profile_read()  # reset before this rep
++            for _ in range(iters):
++                call()
++            torch.cuda.synchronize()
++            prof_reps.append(mod.tc_profile_read())
++        # median per slot across reps
++        res["phase_cycles"] = [int(statistics.median(s)) for s in zip(*prof_reps)]
++    return res
+ 
+ 
+ def main():
+@@ -137,19 +186,27 @@ def main():
+     ap.add_argument("--reps", type=int, default=5)
+     ap.add_argument("--warmup", type=int, default=8)
+     ap.add_argument("--iters", type=int, default=20)
++    ap.add_argument("--profile", action="store_true",
++                    help="build with -DSG_MB_TC_PROFILE=1 and read the per-phase clock64 "
++                         "split (g_mb_prof_max [8 slots], mapped by MB_PHASE_NAMES) — the "
++                         "scan-share vs projection-share arbiter. NOTE: at --d 1024 the "
++                         "staged-opt scratch is large (BUG-04); apply the BUG-04 gate or "
++                         "use --d 128.")
+     ap.add_argument("--verbose-build", action="store_true")
+     ap.add_argument("-D", dest="defines", action="append", default=[], metavar="KEY=VAL")
+     args = ap.parse_args()
+     assert args.B % 16 == 0, "B must be divisible by 16 (dW K-loop is 16-step atoms)"
+-    print(f"[mamba-bench] building variant: d={args.d} "
++    print(f"[mamba-bench] building variant: d={args.d} profile={args.profile} "
+           f"(SG_MB_BENCH_LAYOUT={'1' if args.d != 128 else 'unset'})"
+           + (f"  defines={args.defines}" if args.defines else ""), flush=True)
+     t0 = time.perf_counter()
+-    mod = build_variant(args.d, verbose=args.verbose_build, defines=args.defines)
++    mod = build_variant(args.d, verbose=args.verbose_build, defines=args.defines,
++                        profile=args.profile)
+     print(f"[mamba-bench] build {time.perf_counter()-t0:.1f}s  D={int(mod.D)} DINNER={int(mod.DINNER)} "
+           f"DTRANK={int(mod.DTRANK)} TILE_M={int(mod.TILE_M)} TOTAL={int(mod.TOTAL):,} "
+-          f"TILE_N={int(mod.TILE_N)}", flush=True)
+-    res = measure(mod, args.d, args.B, args.reps, args.warmup, args.iters)
++          f"TILE_N={int(mod.TILE_N)} HAS_PROFILE={getattr(mod, 'HAS_PROFILE', False)}", flush=True)
++    res = measure(mod, args.d, args.B, args.reps, args.warmup, args.iters,
++                  profile=args.profile)
+     print(f"\n[mamba-bench] d={res['d']}  B={res['B']}  params={res['total_params']:,}", flush=True)
+     print(f"  wall/step = {res['wall_ms']:.4f} ms  "
+           f"(median of {[f'{x:.3f}' for x in res['walls_ms']]})", flush=True)
+@@ -158,6 +215,30 @@ def main():
+           f"=> achieved {res['achieved_tf_s']:.3f} TF/s "
+           f"({100.0 * res['achieved_tf_s'] / 989.0:.2f}% of 989 TF/s bf16 dense roofline)",
+           flush=True)
++    if "phase_cycles" in res:
++        cyc = res["phase_cycles"]
++        tot = sum(cyc) or 1
++        # clock64 stamps measure the per-phase critical path on the SLOWEST CTA. The
++        # inserted __syncthreads perturb ABSOLUTE cycles (read RATIOS, per the roadmap).
++        summed_ms = tot / (SM_GHZ * 1e9) * 1e3
++        print(f"\n  [phase breakdown — clock64 critical-path, median of reps]  "
++              f"(summed-phase ~{summed_ms:.4f} ms vs wall {res['wall_ms']:.4f} ms; the "
++              f"__syncthreads in the ON build inflate absolutes — read the % ratios)", flush=True)
++        print(f"    {'phase':14s} {'cycles':>14s} {'ms':>10s}  {'% of summed':>12s}", flush=True)
++        for n, c in zip(MB_PHASE_NAMES, cyc):
++            ms = c / (SM_GHZ * 1e9) * 1e3
++            print(f"    {n:14s} {c:>14,d} {ms:>10.4f}  {100.0 * c / tot:>11.1f}%", flush=True)
++        print(f"    {'SUM':14s} {tot:>14,d} {summed_ms:>10.4f}  {'100.0':>11s}%", flush=True)
++        # The campaign's one question: scan vs projection share (fwd+bwd).
++        scan = cyc[0] + cyc[1]
++        proj = cyc[2] + cyc[3]
++        surf = cyc[4] + cyc[5]
++        print(f"  SCAN share = {100.0 * scan / tot:.1f}%  |  PROJECTION share = "
++              f"{100.0 * proj / tot:.1f}%  |  SURFACE share = {100.0 * surf / tot:.1f}%  "
++              f"(d={res['d']} measurement — extrapolate to 1.5B; NOT a 1.5B fact)", flush=True)
++        dom = MB_PHASE_NAMES[cyc.index(max(cyc))]
++        print(f"  DOMINANT phase = {dom} ({100.0 * max(cyc) / tot:.1f}% of summed-phase cycles)",
++              flush=True)
+     return res
+ 
+ 

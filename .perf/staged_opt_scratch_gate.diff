@@ -1,0 +1,619 @@
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index 12132e6..e42faf8 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -548,8 +548,11 @@ constexpr bool kDecStagedOptScratch = true;    // production: carve all 4 (opt-a
+ // UNCONDITIONALLY so the opt-agnostic host launcher (dec_tc_launcher_scratch)
+ // allocates one workspace that fits every OptId. Unused by AdamW/Lion/… (their
+ // P3 never touches this region), so adding it leaves those cells byte-identical.
+-__host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA) {
++// opt_id=-1 (default) means "no gate; return full size". The kernel passes
++// static_cast<int>(Opt) so host-sizer == device-carve under the opt_id gate.
++__host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA, int opt_id = -1) {
+     if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): Prodigy never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Prodigy) return 0;
+     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
+ }
+ // ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. IDENTICAL in
+@@ -562,8 +565,9 @@ __host__ __device__ __forceinline__ int64_t dec_tc_opt_reduce_floats(int nCTA) {
+ //    UNCONDITIONALLY (≈ 4·65536 + 512² + nCTA + 1 floats ≈ 2 MB) so the opt-agnostic
+ //    launcher (dec_tc_launcher_scratch) fits every OptId; unused by every non-Muon cell
+ //    (its P2.7/P3-2D branches are if-constexpr'd out → byte-identical). ──
+-__host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA) {
++__host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA, int opt_id = -1) {
+     if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): Muon NS never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Muon) return 0;
+     // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
+     return (int64_t)4 * dectc::kDecMuonMaxNumel
+          + (int64_t)dectc::kDecMuonMaxRows * dectc::kDecMuonMaxRows
+@@ -579,8 +583,13 @@ __host__ __device__ __forceinline__ int64_t dec_tc_muon_floats(int nCTA) {
+ //    every OptId; unused by every non-LookSAM cell (its phase is if-constexpr'd out
+ //    → byte-identical). nrm_partials(nCTA)+inv_norm(1) for the ‖g‖ reduction reuse
+ //    the loss workspace (sq_part/coef_bc, as GrokAdamW's P2.5 does), so no extra here. ──
+-__host__ __device__ __forceinline__ int64_t dec_tc_looksam_floats() {
++__host__ __device__ __forceinline__ int64_t dec_tc_looksam_floats(int opt_id = -1) {
+     if (!kDecStagedOptScratch) return 0;      // bench (adamw-only): LookSAM never runs
++    if (opt_id >= 0) {
++        const auto o = static_cast<OptId>(opt_id);
++        if (o != OptId::LookSAM && o != OptId::SuperGrok11 &&
++            o != OptId::SuperGrok15 && o != OptId::SuperGrok2) return 0;
++    }
+     return (int64_t)2 * kDecTotalElems;       // [sam_backup | sam_grad]
+ }
+ // ── SuperGrok2 compile-time dims = the race config (== SG2Dims defaults). The
+@@ -614,9 +623,10 @@ __host__ __device__ __forceinline__ int64_t dec_sg2_ws_stride_floats() {
+     return (int64_t)2 * kDecNumTensors
+          + sg2_ws_stride<DecSG2Dims>((int64_t)kDecSG2Nmax);
+ }
+-__host__ __device__ __forceinline__ int64_t dec_tc_sg2_floats(int nCTA) {
++__host__ __device__ __forceinline__ int64_t dec_tc_sg2_floats(int nCTA, int opt_id = -1) {
+     if (!kDecStagedOptScratch) return 0;     // bench (adamw-only): SG2 never runs — and
+         // its honestly-derived per-CTA stride (4d²·d_model floats) would OOM at d=1024.
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::SuperGrok2) return 0;
+     // +1 for the 8-byte realignment slack of sg2_ws_base (the per-CTA slice fronts an
+     // int64 row_off64 array; kDecTotalElems is odd, so the base may need a +1 bump).
+     return (int64_t)nCTA * dec_sg2_ws_stride_floats() + 1;
+@@ -629,29 +639,34 @@ __host__ __device__ __forceinline__ int64_t dec_tc_sg2_floats(int nCTA) {
+ // all four collapse to 0 (so the embed lists carve right after the dW partials, and
+ // the kernel's pointer chain — built from the SAME four gated helpers — lands embed_ws
+ // at the identical place); in production each returns its full size (byte-identical).
+-__host__ __device__ __forceinline__ int64_t dec_tc_staged_opt_floats(int nCTA) {
+-    return dec_tc_opt_reduce_floats(nCTA)     // STAGED-opt (Prodigy) reduce slots
+-         + dec_tc_muon_floats(nCTA)           // STAGED-opt (Muon) NS per-matrix scratch
+-         + dec_tc_looksam_floats()            // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
+-         + dec_tc_sg2_floats(nCTA);           // SuperGrok2 meta-net per-CTA scratch
++// opt_id=-1 (default) means "no gate; return aggregate for all opts". The kernel
++// passes static_cast<int>(Opt) so host-sizer == device-carve under the opt_id gate.
++__host__ __device__ __forceinline__ int64_t dec_tc_staged_opt_floats(int nCTA, int opt_id = -1) {
++    return dec_tc_opt_reduce_floats(nCTA, opt_id)  // STAGED-opt (Prodigy) reduce slots
++         + dec_tc_muon_floats(nCTA, opt_id)        // STAGED-opt (Muon) NS per-matrix scratch
++         + dec_tc_looksam_floats(opt_id)           // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
++         + dec_tc_sg2_floats(nCTA, opt_id);        // SuperGrok2 meta-net per-CTA scratch
+ }
+-__host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA) {
++// dec_tc_workspace_floats: host-side sizer. opt_id=-1 (default) sizes for the LARGEST
++// opt (all 4 staged-opt regions) — used when pre-allocating a shared launcher scratch
++// that must fit every OptId. Pass the actual opt_id to size only what that opt needs,
++// saving VRAM on the production non-SAM/non-Muon/non-SG2 path (~36 GB at 1.5B).
++__host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA, int opt_id = -1) {
+     return dec_tc_acts_floats(T, B)
+          + (int64_t)nCTA * dectc::dec_tile_scratch_total_f32()
+          + (int64_t)nCTA * dectc::kLnVecElems
+          + nCTA + 1
+-         + dec_tc_dw_part_floats()            // split-K dW partials (G>1)
+-         + dec_tc_staged_opt_floats(nCTA)     // STAGED-opt scratch (Prodigy|Muon|LookSAM|SG2);
+-                                              //   gated to 0 at bench width (adamw-only)
+-         + dectc::dec_wbf_floats()            // bf16 weight pre-stage cache (C1 + C1-T transposed section)
+-         + dectc::dec_embed_lists_floats(T)   // embedding token lists (row_start+perm)
+-         + dec_tc_dw_transpose_floats(T, B)   // CONTIGUOUS-TRANSPOSE dW scratch (carve-LAST; 0 unless
+-                                              //   SG_TUNED_DEC_DW_STAGE=1 → byte-identical when off)
+-         + 4                                  // realign slack: <=3 floats to 16B-align the wbf cache
+-                                              //   base (cp.async RING) + 1 for the int32-lists realign
+-         + (dectc::kDecDwTransposeActive ? 8 : 0); // +<=7 floats to 16B-align the dW-transpose base
+-                                              //   (ONLY when active → the scalar default's size +
+-                                              //   every offset is byte-identical to before)
++         + dec_tc_dw_part_floats()                 // split-K dW partials (G>1)
++         + dec_tc_staged_opt_floats(nCTA, opt_id)  // STAGED-opt scratch (gated by bench + opt_id)
++         + dectc::dec_wbf_floats()                 // bf16 weight pre-stage cache (C1 + C1-T transposed section)
++         + dectc::dec_embed_lists_floats(T)         // embedding token lists (row_start+perm)
++         + dec_tc_dw_transpose_floats(T, B)         // CONTIGUOUS-TRANSPOSE dW scratch (carve-LAST; 0 unless
++                                                    //   SG_TUNED_DEC_DW_STAGE=1 → byte-identical when off)
++         + 4                                        // realign slack: <=3 floats to 16B-align the wbf cache
++                                                    //   base (cp.async RING) + 1 for the int32-lists realign
++         + (dectc::kDecDwTransposeActive ? 8 : 0);  // +<=7 floats to 16B-align the dW-transpose base
++                                                    //   (ONLY when active → the scalar default's size +
++                                                    //   every offset is byte-identical to before)
+ }
+ 
+ #ifdef SG_DEC_PROFILE
+@@ -716,65 +731,59 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+     const int kDwG    = dectc::kDecDwSplitK;
+     // STAGED-opt cross-CTA reduce slots (Prodigy d), carved AFTER the dW partials
+     // (matches dec_tc_workspace_floats's term order). Unused unless Opt==Prodigy.
++    // opt_id gate: returns 0 for non-Prodigy opts → opt_reduce is zero-width.
+     float* opt_reduce = dw_part + dec_tc_dw_part_floats();
+-    // Muon NS per-matrix scratch, carved AFTER the Prodigy reduce slots (matches
+-    // dec_tc_workspace_floats's term order — carving it LAST keeps every prior
+-    // region's offset unchanged, so the 5 already-green cells are byte-identical).
+-    // Unused unless Opt==Muon. Layout (mirrors the vit twin):
+-    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kDecMuonMaxNumel)
+-    //   [muon_A (kDecMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+-    float* muon_base = opt_reduce + dec_tc_opt_reduce_floats(nCTA);
+-    // LookSAM SAM 2nd-backward scratch, carved AFTER the Muon scratch (term order
+-    // matches dec_tc_workspace_floats — carving it LAST keeps every prior region's
+-    // offset unchanged, so the already-green cells are byte-identical). Layout:
+-    //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
+-    float* sam_backup = muon_base + dec_tc_muon_floats(nCTA);
++    // Muon NS per-matrix scratch. Derive muon_base via opt_id-gated sizer so host ==
++    // device carve: non-Prodigy → dec_tc_opt_reduce_floats(nCTA,Opt)=0.
++    float* muon_base = opt_reduce + dec_tc_opt_reduce_floats(nCTA, static_cast<int>(Opt));
++    // LookSAM SAM 2nd-backward scratch. Derive sam_backup via opt_id-gated sizer:
++    // non-Muon → dec_tc_muon_floats(nCTA,Opt)=0 → sam_backup=muon_base (zero-width).
++    float* sam_backup = muon_base + dec_tc_muon_floats(nCTA, static_cast<int>(Opt));
++    // sam_grad is kDecTotalElems past sam_backup; valid only inside the LookSAM
++    // if constexpr branch (never dereferenced on other opts).
+     float* sam_grad   = sam_backup + kDecTotalElems;
+-    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the LookSAM sam_grad (term
+-    // order matches dec_tc_workspace_floats — carving it LAST keeps every prior
+-    // region's offset unchanged, so the already-green cells are byte-identical).
+-    // Each CTA owns dec_sg2_ws_stride_floats() (row_off64 staging + meta-net scratch).
+-    // ALIGN to 8 bytes (even float offset): the per-CTA slice fronts an int64
+-    // row_off64 staging array; kDecTotalElems is odd so sam_grad+total lands on an
+-    // odd float offset (4-byte) → an int64 read there is a misaligned address. Round
+-    // up to the next even float. The carve term dec_tc_sg2_floats reserves the stride
+-    // per CTA; the +1 alignment slack fits within the acts/scratch headroom (the
+-    // workspace is over-sized) and dec_sg2_ws_stride_floats() is even, so every CTA
+-    // base stays 8-byte aligned. Unused unless Opt==SuperGrok2.
+-    float* sg2_ws_base = sam_grad + kDecTotalElems;
++    // SuperGrok2 meta-net per-CTA scratch. Derive sg2_ws_base via opt_id-gated sizer:
++    // non-SAM → dec_tc_looksam_floats(Opt)=0 → sg2_ws_base=sam_backup (zero-width).
++    // ALIGN to 8 bytes for the int64 row_off64 staging prefix. For non-SG2 opts the
++    // alignment bump is harmless (sg2_ws_base is never dereferenced for non-SG2).
++    float* sg2_ws_base = sam_backup + dec_tc_looksam_floats(static_cast<int>(Opt));
+     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+     // Embedding token-list scratch (counting-sort row_start[V+1] + perm[T]), carved
+-    // AFTER the SG2 region (term order matches dec_tc_workspace_floats — carving it
+-    // LAST keeps every prior region's offset unchanged → the green cells' non-embed
+-    // regions are byte-identical). int32 views over the float tail; 8-byte aligned so
+-    // the (future) widening to int is safe. Built in the P1 window (cta 0), consumed
+-    // in P2 — fenced by the already-present B1 barrier (no new barrier).
++    // AFTER the SG2 region. int32 views over the float tail; 8-byte aligned.
++    // Built in the P1 window (cta 0), consumed in P2 — fenced by the B1 barrier.
++    //
++    // wbf_f derivation: must be consistent with dec_tc_workspace_floats so that
++    //   host allocation == kernel's carve offset. Three cases:
++    //   (a) Bench (SG_DEC_BENCH_LAYOUT): all four staged-opt regions = 0 → use the
++    //       aggregate (which is 0) relative to opt_reduce (same as current bench path).
++    //   (b) Production, Opt==SuperGrok2: the sg2_ws_base alignment + sg2_floats stride
++    //       are load-bearing for the SG2 int64 row_off64 reads → use the existing chain.
++    //   (c) Production, Opt!=SG2: the opt_id gate makes dec_tc_sg2_floats(nCTA,Opt)=0,
++    //       so we derive wbf_f from the aggregate (like bench) — this IS provably the
++    //       same expression that dec_tc_workspace_floats(…,opt_id=Opt) uses, so host
++    //       size == kernel offset. (sg2_ws_base would point into unallocated space for
++    //       these opts if we used the chain, hence using the aggregate here instead.)
+ #if SG_DEC_BENCH_LAYOUT
+-    // Bench (adamw-only): the four staged-opt regions are gated to 0, so embed_ws is
+-    // the staged-opt block START (== opt_reduce) plus the aggregate (== 0 here). We
+-    // derive it from the SAME dec_tc_staged_opt_floats aggregate the host carve
+-    // (dec_tc_workspace_floats) uses, so the host size and this offset are provably the
+-    // identical expression at bench width — no reliance on the (collapsed) sg2_ws_base
+-    // chain. (opt_reduce == dw_part + dec_tc_dw_part_floats(); see its carve above.)
++    // Bench (adamw-only): all staged-opt regions are 0; aggregate == 0 → wbf follows
++    // immediately after dW partials (= opt_reduce). Identical to the original bench path.
+     float* wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA);
+-    // 16B-align the bf16 cache base: the cp.async RING streams it in 16-byte
+-    // chunks (gmem source alignment requirement). Bump <= 3 floats, covered by
+-    // dec_tc_workspace_floats' slack term; deterministic (the workspace base is
+-    // >=256B-aligned, so the bump depends only on the carve offsets).
+-    while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
+-    float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+ #else
+-    // Production: carve AFTER the (full-size) SG2 region via the existing chain
+-    // (the sg2_ws_base align bump + the dec_tc_sg2_floats stride are load-bearing
+-    // for the SG2 int64 row_off64 reads). The bf16 weight pre-stage cache (C1)
+-    // is interposed here; embed lists stay carve-LAST.
+-    float* wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA);
+-    // 16B-align the bf16 cache base for the cp.async RING (see the bench-branch
+-    // note; bump <= 3 floats, covered by dec_tc_workspace_floats' slack term).
++    // Production: use aggregate for non-SG2 (case c); use chain for SG2 (case b).
++    float* wbf_f;
++    if constexpr (Opt == OptId::SuperGrok2) {
++        // SG2: sg2_ws_base alignment + dec_tc_sg2_floats stride are load-bearing.
++        wbf_f = sg2_ws_base + dec_tc_sg2_floats(nCTA, static_cast<int>(Opt));
++    } else {
++        // Non-SG2: use the aggregate (same expression as dec_tc_workspace_floats uses);
++        // keeps host-sizer == device-carve for every non-SG2 opt_id.
++        wbf_f = opt_reduce + dec_tc_staged_opt_floats(nCTA, static_cast<int>(Opt));
++    }
++#endif
++    // 16B-align the bf16 cache base: the cp.async RING streams it in 16-byte chunks.
++    // Bump <= 3 floats, covered by dec_tc_workspace_floats' +4 slack term; deterministic.
+     while (((uintptr_t)wbf_f & 0xF) != 0) wbf_f += 1;
+     float* embed_ws = wbf_f + dectc::dec_wbf_floats();
+-#endif
+     if (((uintptr_t)embed_ws & 0x7) != 0) embed_ws += 1;         // → 8-byte aligned
+     int* embed_row_start = reinterpret_cast<int*>(embed_ws);     // [V+1]
+     int* embed_perm      = embed_row_start + (dec::kVocab + 1);  // [T]
+diff --git a/csrc/fused/sm_90/fused_mamba_megakernel.cuh b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+index 7f8c0a2..85c6405 100644
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -438,14 +438,40 @@ __host__ __device__ __forceinline__ int64_t mb_tc_acts_floats(int T) {
+ __host__ __device__ __forceinline__ int64_t mb_tc_dw_part_floats() {
+     return (mbtc::kMbDwSplitK > 1) ? mbtc::mb_dw_part_floats(mbtc::kMbDwSplitK) : 0;
+ }
++// ── BUG-04 / VRAM-GATE: The d-scaled BENCH layout (SG_MB_BENCH_LAYOUT=1) is
++// adamw-ONLY (mamba_bench.py drives OptId::AdamW exclusively — none of the four
++// staged optimizers ever runs in the bench TU), so carving them there is pure dead
++// weight. At bench width the SG2 region is pathological: mb_sg2_ws_stride_floats()
++// is O(Nmax·d_model) PER CTA and Nmax grows with d ⇒ ~199 GB over 132 CTAs at
++// d=1024, OOMing the 80 GB H100 (the SAME deep limit the decoder twin documents at
++// dec_tc_sg2_floats — SG2's per-CTA workspace DESIGN doesn't scale; a chunked/streamed
++// restructure is the documented deep item, out of scope here). So we GATE the four
++// regions OFF at bench width: honest scoping (the bench never touches them), NOT
++// correctness suppression. PRODUCTION is byte-identical — kMbStagedOptScratch is true
++// there, so every gated helper folds back to its original value (constexpr bool, -O3
++// inline). This mirrors the decoder's kDecStagedOptScratch (fused_decoder_megakernel.cuh)
++// and the vit's kVitStagedOptScratch (fused_vit_megakernel.cuh). ──
++// ── PRODUCTION opt_id GATE: In addition to the bench-width gate, each sizer accepts
++// an optional `int opt_id` (default -1 = no gate, return full size). When opt_id is
++// provided, regions not consumed by that OptId return 0, saving up to ~36 GB at 1.5B
++// on the production AdamW/Lion/Grokfast/Prodigy/NeuralGrok/GrokAdamW path. The
++// kernel's pointer-carve passes static_cast<int>(Opt) to stay byte-consistent with
++// the host sizer. Consumers are if-constexpr'd out → byte-identical kernel output. ──
++#if SG_MB_BENCH_LAYOUT
++constexpr bool kMbStagedOptScratch = false;   // bench: adamw-only → elide the 4 staged-opt carves
++#else
++constexpr bool kMbStagedOptScratch = true;    // production: carve all 4 (opt-agnostic launcher)
++#endif
+ // STAGED-optimizer cross-CTA reduction scratch (Prodigy d-estimate). Mirrors the
+ // decoder's dec_tc_opt_reduce_floats: the Prodigy P2.6 stage publishes per-CTA (r,s)
+ // slots (2*nCTA) + a reduced-d broadcast slot (1) — an owner-computes tree
+ // (opt_stages_precompute.cuh), NO float atomic. Sized for the LARGEST nCTA (one
+-// CTA/SM = #SMs); tiny (≤ 2*132+1 ≈ 1 KB) and carved UNCONDITIONALLY so the opt-
+-// agnostic cached launcher workspace fits every OptId. Unused by AdamW/Lion/… (their
+-// P3 never touches this region), so adding it leaves those cells byte-identical.
+-__host__ __device__ __forceinline__ int64_t mb_tc_opt_reduce_floats(int nCTA) {
++// CTA/SM = #SMs); tiny (≤ 2*132+1 ≈ 1 KB). Gated to 0 at bench width and when
++// opt_id is provided and is not Prodigy. Unused by AdamW/Lion/… (their P3 never
++// touches this region) → byte-identical for those cells.
++__host__ __device__ __forceinline__ int64_t mb_tc_opt_reduce_floats(int nCTA, int opt_id = -1) {
++    if (!kMbStagedOptScratch) return 0;     // bench (adamw-only): Prodigy never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Prodigy) return 0;
+     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
+ }
+ // ── LookSAM (STAGED in-kernel SAM 2nd backward) transient scratch — the Mamba twin of
+@@ -455,12 +481,17 @@ __host__ __device__ __forceinline__ int64_t mb_tc_opt_reduce_floats(int nCTA) {
+ //    subtract back) + (b) a SEPARATE g_sam grad buffer so the 2nd backward does NOT
+ //    clobber the first grad `grad` (sam_dir = g_sam − grad reads both). Both are total-
+ //    sized + transient (NOT persistent state — sam_dir itself persists in the `extra`
+-//    state slice, bound by the cell). Carved UNCONDITIONALLY (≈ 2·kMambaTotalElems)
+-//    so the opt-agnostic launcher fits every OptId; unused by every non-LookSAM cell
+-//    (its P2.4 phase is if-constexpr'd out → byte-identical). The ‖g‖ reduction reuses
+-//    the loss workspace (sq_part/ron_bc, as GrokAdamW's P2.5 / the decoder twin do), so
+-//    no extra here. ──
+-__host__ __device__ __forceinline__ int64_t mb_tc_looksam_floats() {
++//    state slice, bound by the cell). Gated to 0 at bench width and when opt_id is
++//    provided and is not LookSAM/SG11/SG15/SG2 (the SAM-coupled opts). Unused by every
++//    non-LookSAM cell (its P2.4 phase is if-constexpr'd out → byte-identical). The ‖g‖
++//    reduction reuses the loss workspace, so no extra here. ──
++__host__ __device__ __forceinline__ int64_t mb_tc_looksam_floats(int opt_id = -1) {
++    if (!kMbStagedOptScratch) return 0;      // bench (adamw-only): LookSAM never runs
++    if (opt_id >= 0) {
++        const auto o = static_cast<OptId>(opt_id);
++        if (o != OptId::LookSAM && o != OptId::SuperGrok11 &&
++            o != OptId::SuperGrok15 && o != OptId::SuperGrok2) return 0;
++    }
+     return (int64_t)2 * kMambaTotalElems;    // [sam_backup | sam_grad]
+ }
+ // ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch — the Mamba twin of
+@@ -469,11 +500,12 @@ __host__ __device__ __forceinline__ int64_t mb_tc_looksam_floats() {
+ //    weight + the per-CTA Frobenius-norm partials + inv_norm. The momentum buffer (muon_buf)
+ //    is NOT here — it PERSISTS across steps as optimizer state, bound to the m slice
+ //    (st.exp_avg). Largest mamba 2D weight: in_proj = 512×128 = 65536 numel; largest rows =
+-//    512 ⇒ A = 512×512 (mbtc::kMbMuonMaxNumel/kMbMuonMaxRows). Carved UNCONDITIONALLY (≈
+-//    4·65536 + 512² + nCTA + 1 floats ≈ 2 MB) so the opt-agnostic cached launcher workspace
+-//    fits every OptId; unused by every non-Muon cell (its P2.7/P3-2D branches are if-
+-//    constexpr'd out → byte-identical). ──
+-__host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA) {
++//    512 ⇒ A = 512×512 (mbtc::kMbMuonMaxNumel/kMbMuonMaxRows). Gated to 0 at bench width
++//    and when opt_id is provided and is not Muon. Unused by every non-Muon cell (its
++//    P2.7/P3-2D branches are if-constexpr'd out → byte-identical). ──
++__host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA, int opt_id = -1) {
++    if (!kMbStagedOptScratch) return 0;     // bench (adamw-only): Muon NS never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Muon) return 0;
+     // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
+     return (int64_t)4 * mbtc::kMbMuonMaxNumel
+          + (int64_t)mbtc::kMbMuonMaxRows * mbtc::kMbMuonMaxRows
+@@ -486,10 +518,9 @@ __host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA) {
+ //    in_proj weight — which bounds every tensor's intermediates + the in-kernel
+ //    segmented-sort key/idx/perm/unsort), PLUS a row_off64 staging prefix
+ //    (kMambaNumTensors int64 = 2*N floats — the adapter that builds SG2State.row_off
+-//    (const int64_t*) from the __constant__ int kMambaOffsets). Carved UNCONDITIONALLY
+-//    (carve-LAST) so the opt-agnostic cached launcher workspace fits every OptId;
+-//    unused by every non-SG2 cell (its P3-SG2 phase is if-constexpr'd out →
+-//    byte-identical). ──
++//    (const int64_t*) from the __constant__ int kMambaOffsets). Gated to 0 at bench
++//    width and when opt_id is provided and is not SuperGrok2. Unused by every non-SG2
++//    cell (its P3-SG2 phase is if-constexpr'd out → byte-identical). ──
+ using MbSG2Dims = SG2Dims<>;
+ // max(kMambaSizes), re-derived from the layout table (mamba3_layout.cuh) so the SAME
+ // SG2 tail is correctly sized at ANY ladder width — was a d=128-pinned 65536 (in_proj
+@@ -499,24 +530,38 @@ __host__ __device__ __forceinline__ int64_t mb_sg2_ws_stride_floats() {
+     return (int64_t)2 * kMambaNumTensors
+          + sg2_ws_stride<MbSG2Dims>((int64_t)kMbSG2Nmax);
+ }
+-__host__ __device__ __forceinline__ int64_t mb_tc_sg2_floats(int nCTA) {
++__host__ __device__ __forceinline__ int64_t mb_tc_sg2_floats(int nCTA, int opt_id = -1) {
++    if (!kMbStagedOptScratch) return 0;     // bench (adamw-only): SG2 never runs — and
++        // its honestly-derived per-CTA stride (O(Nmax·d_model)) would OOM at d=1024.
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::SuperGrok2) return 0;
+     // +1 for the 8-byte realignment slack of sg2_ws_base (kMambaTotalElems is odd, so
+     // the per-CTA int64 row_off64 prefix may need a +1 bump to land 8-byte aligned).
+     return (int64_t)nCTA * mb_sg2_ws_stride_floats() + 1;
+ }
+-__host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA) {
++// AGGREGATE of the four STAGED-opt scratch regions, in the kernel's carve order. This
++// is the SINGLE source the host workspace size (mb_tc_workspace_floats) AND the kernel's
++// internal offset derivations are both derived from, keeping host-sizer == device-carve
++// under the kMbStagedOptScratch gate and the opt_id runtime gate. opt_id=-1 means
++// "no gate; return aggregate for all opts" (used when pre-sizing for the largest opt).
++__host__ __device__ __forceinline__ int64_t mb_tc_staged_opt_floats(int nCTA, int opt_id = -1) {
++    return mb_tc_opt_reduce_floats(nCTA, opt_id)   // STAGED-opt (Prodigy) reduce slots
++         + mb_tc_looksam_floats(opt_id)            // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
++         + mb_tc_muon_floats(nCTA, opt_id)         // STAGED-opt (Muon) NS per-matrix scratch
++         + mb_tc_sg2_floats(nCTA, opt_id);         // SuperGrok2 meta-net per-CTA scratch
++}
++// mb_tc_workspace_floats: host-side sizer. opt_id=-1 (default) sizes for the LARGEST
++// opt (all 4 staged-opt regions) — used when pre-allocating a shared launcher scratch
++// that must fit every OptId. Pass the actual opt_id to size only what that opt needs,
++// saving VRAM on the production non-SAM/non-Muon/non-SG2 path (~36 GB at 1.5B).
++__host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA, int opt_id = -1) {
+     (void)T;
+     // MAMBA-3 scalar design: the per-CTA partial is the FULL grad [total] (not the
+     // acts + tile-scratch + dW-split + non-GEMM-partial of the old wgmma Fork-B).
+     // Layout order MUST match the kernel's pointer derivations:
+-    //   [nCTA*total | loss(nCTA) | loss_out(1) | opt_reduce(2nCTA+1) |
+-    //    sam_backup+sam_grad(2*total) | muon | sg2 (| profiler)].
++    //   [nCTA*total | loss(nCTA) | loss_out(1) | opt_reduce | looksam | muon | sg2 (| profiler)].
+     return (int64_t)nCTA * kMambaTotalElems          // per-CTA FULL grad partial
+          + nCTA + 1                                  // loss slots + reduced loss
+-         + mb_tc_opt_reduce_floats(nCTA)             // STAGED-opt (Prodigy) reduce slots
+-         + mb_tc_looksam_floats()                    // SAM 2nd-bwd scratch [sam_backup|sam_grad]
+-         + mb_tc_muon_floats(nCTA)                   // Muon NS per-matrix scratch
+-         + mb_tc_sg2_floats(nCTA)                    // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
++         + mb_tc_staged_opt_floats(nCTA, opt_id)     // STAGED-opt scratch (gated by bench + opt_id)
+ #if SG_MB_TC_PROFILE
+          + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
+ #endif
+@@ -563,37 +608,35 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+     (void)dw_part;
+     // STAGED-opt (Prodigy P2.6) cross-CTA reduce slots: [r slots | s slots | reduced d]
+     // = 2*nCTA+1. Carved after the loss slot (dw_part is zero-width here).
++    // opt_id gate: returns 0 for non-Prodigy opts → opt_reduce == loss_out+1 but the
++    // region is zero-width, so the next pointer (sam_backup) lands at opt_reduce.
+     float* opt_reduce = loss_out + 1;
+-    // LookSAM SAM 2nd-backward scratch, carved AFTER the Prodigy reduce slots (mamba has
+-    // NO Muon region — unlike the decoder/vit twins — so this follows opt_reduce; term
+-    // order matches mb_tc_workspace_floats). Carving it here keeps every prior region's
+-    // offset unchanged, so the already-green cells are byte-identical. Layout:
+-    //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
+-    float* sam_backup = opt_reduce + mb_tc_opt_reduce_floats(nCTA);
++    // LookSAM SAM 2nd-backward scratch, carved AFTER the Prodigy reduce slots.
++    // Layout: [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM/SG*.
++    // Derive sam_backup via the opt_id-gated sizer so host-sizer == device-carve:
++    //   non-SAM opts → mb_tc_opt_reduce_floats(nCTA,Opt)=0 → sam_backup=opt_reduce.
++    float* sam_backup = opt_reduce + mb_tc_opt_reduce_floats(nCTA, static_cast<int>(Opt));
++    // sam_grad is computed as sam_backup + kMambaTotalElems for use inside the
++    // if constexpr(Opt==LookSAM) branch; for non-SAM opts this address is "past"
++    // the workspace end but is never dereferenced (if-constexpr'd out).
+     float* sam_grad   = sam_backup + kMambaTotalElems;
+-    // Muon NS per-matrix scratch, carved AFTER the LookSAM sam scratch (term order matches
+-    // mb_tc_workspace_floats — carving it LAST [before the optional profiler] keeps every
+-    // prior region's offset unchanged, so the already-green mamba cells are byte-identical).
+-    // Unused unless Opt==Muon. Layout (mirrors the decoder/vit twins):
+-    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kMbMuonMaxNumel)
+-    //   [muon_A (kMbMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+-    float* muon_base  = sam_grad + kMambaTotalElems;
+-    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the Muon NS scratch (term order
+-    // matches mb_tc_workspace_floats — carving it LAST [before the optional profiler]
+-    // keeps every prior region's offset unchanged, so the already-green mamba cells are
+-    // byte-identical). Each CTA owns mb_sg2_ws_stride_floats() (row_off64 staging +
+-    // meta-net scratch). ALIGN to 8 bytes (even float offset): the per-CTA slice fronts
+-    // an int64 row_off64 staging array; kMambaTotalElems is odd so sam_grad+total lands
+-    // on an odd float offset (4-byte) → an int64 read there is misaligned. Round up to
+-    // the next even float (the carve reserves +1 slack). Unused unless Opt==SuperGrok2.
+-    float* sg2_ws_base = muon_base + mb_tc_muon_floats(nCTA);
++    // Muon NS per-matrix scratch, carved AFTER the LookSAM region. Derive muon_base via
++    // mb_tc_looksam_floats(Opt) so host-sizer == device-carve:
++    //   non-SAM opts → mb_tc_looksam_floats(Opt)=0 → muon_base=sam_backup (zero-width).
++    // Unused unless Opt==Muon (P2.7/P3-2D branches are if-constexpr'd out).
++    float* muon_base  = sam_backup + mb_tc_looksam_floats(static_cast<int>(Opt));
++    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the Muon NS scratch. Derive
++    // sg2_ws_base via mb_tc_muon_floats(nCTA,Opt):
++    //   non-Muon opts → mb_tc_muon_floats(nCTA,Opt)=0 → sg2_ws_base=muon_base.
++    // ALIGN to 8 bytes for the int64 row_off64 staging prefix. Unused unless Opt==SG2.
++    float* sg2_ws_base = muon_base + mb_tc_muon_floats(nCTA, static_cast<int>(Opt));
+     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+ #if SG_MB_TC_PROFILE
+     // 8-byte align the double accumulator: round the float offset up to an even
+     // count so reinterpret_cast<double*> is aligned (past the SG2 scratch — the
+     // phase-profiler is the LAST workspace term, mirroring mb_tc_workspace_floats).
+-    float* prof_f = sg2_ws_base + mb_tc_sg2_floats(nCTA);
++    float* prof_f = sg2_ws_base + mb_tc_sg2_floats(nCTA, static_cast<int>(Opt));
+     uintptr_t _pa = reinterpret_cast<uintptr_t>(prof_f);
+     if (_pa & 0x7u) prof_f = reinterpret_cast<float*>((_pa + 7u) & ~uintptr_t(7u));
+     double* prof = reinterpret_cast<double*>(prof_f);   // [nCTA*SLOTS], host-zeroed
+diff --git a/csrc/fused/sm_90/fused_vit_megakernel.cuh b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+index 2e272a4..1b11496 100644
+--- a/csrc/fused/sm_90/fused_vit_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+@@ -418,8 +418,11 @@ constexpr bool kVitStagedOptScratch = true;    // production: carve all 4 (opt-a
+ // nCTA (one CTA/SM = #SMs); tiny (≤ 2*132+1 floats) and carved UNCONDITIONALLY so
+ // the opt-agnostic launcher allocates one workspace fitting every OptId. Unused by
+ // AdamW/Lion/… (their P3 never touches it) → those cells stay byte-identical.
+-__host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA) {
++// opt_id=-1 (default) means "no gate; return full size". The kernel passes
++// static_cast<int>(Opt) so host-sizer == device-carve under the opt_id gate.
++__host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA, int opt_id = -1) {
+     if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): Prodigy never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Prodigy) return 0;
+     return (int64_t)2 * nCTA + 1;            // [r slots | s slots | reduced d]
+ }
+ // ── Muon (STAGED grid-cooperative Newton-Schulz) per-matrix scratch. The NS chain
+@@ -433,8 +436,9 @@ __host__ __device__ __forceinline__ int64_t vit_tc_opt_reduce_floats(int nCTA) {
+ //    kVitMuonMaxNumel = max over 2D weights of rows*cols; kVitMuonMaxRows = max rows.
+ static constexpr int kVitMuonMaxNumel = vit::kDff * vit::kD;     // 512*128 = 65536 (ff0/ff2)
+ static constexpr int kVitMuonMaxRows  = vit::kDff;               // 512 (ff0 rows)
+-__host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
++__host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA, int opt_id = -1) {
+     if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): Muon never runs
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::Muon) return 0;
+     // X + AX + AAX + orth (each maxNumel) + A (maxRows²) + nrm_partials(nCTA) + inv_norm(1)
+     return (int64_t)4 * kVitMuonMaxNumel
+          + (int64_t)kVitMuonMaxRows * kVitMuonMaxRows
+@@ -452,8 +456,13 @@ __host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
+ //    every OptId; unused by every non-LookSAM cell (its P2.4 phase is if-constexpr'd
+ //    out → byte-identical). The ‖g‖ reduction reuses the loss workspace (sq_part/ron_bc,
+ //    as GrokAdamW's P2.5 / the decoder twin do), so no extra here. ──
+-__host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats() {
++__host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats(int opt_id = -1) {
+     if (!kVitStagedOptScratch) return 0;      // bench (adamw-only): LookSAM never runs
++    if (opt_id >= 0) {
++        const auto o = static_cast<OptId>(opt_id);
++        if (o != OptId::LookSAM && o != OptId::SuperGrok11 &&
++            o != OptId::SuperGrok15 && o != OptId::SuperGrok2) return 0;
++    }
+     return (int64_t)2 * kVitTotalElems;       // [sam_backup | sam_grad]
+ }
+ // ── SuperGrok2 — the ViT twin of dec_tc_sg2_floats. Weights from HBM; the only SG2
+@@ -468,22 +477,27 @@ __host__ __device__ __forceinline__ int64_t vit_sg2_ws_stride_floats() {
+     return (int64_t)2 * kVitNumTensors
+          + sg2_ws_stride<VitSG2Dims>((int64_t)kVitSG2Nmax);
+ }
+-__host__ __device__ __forceinline__ int64_t vit_tc_sg2_floats(int nCTA) {
++__host__ __device__ __forceinline__ int64_t vit_tc_sg2_floats(int nCTA, int opt_id = -1) {
+     if (!kVitStagedOptScratch) return 0;     // bench (adamw-only): SG2 never runs — and
+         // its honestly-derived per-CTA stride (O(Nmax·d_model)) would OOM at large d.
++    if (opt_id >= 0 && static_cast<OptId>(opt_id) != OptId::SuperGrok2) return 0;
+     // +1 for the 8-byte realignment slack of sg2_ws_base (kVitTotalElems is odd).
+     return (int64_t)nCTA * vit_sg2_ws_stride_floats() + 1;
+ }
+-__host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA) {
++// vit_tc_workspace_floats: host-side sizer. opt_id=-1 (default) sizes for the LARGEST
++// opt (all 4 staged-opt regions) — used when pre-allocating a shared launcher scratch
++// that must fit every OptId. Pass the actual opt_id to size only what that opt needs,
++// saving VRAM on the production non-SAM/non-Muon/non-SG2 path (~36 GB at 1.5B).
++__host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA, int opt_id = -1) {
+     return vit_tc_acts_floats(T, B)
+          + (int64_t)nCTA * vittc::vit_tile_scratch_total_f32()
+          + (int64_t)nCTA * vittc::kLnVecElems
+          + nCTA + 1
+-         + vit_tc_dw_part_floats()           // split-K dW partials (G>1)
+-         + vit_tc_opt_reduce_floats(nCTA)    // STAGED-opt (Prodigy) reduce slots
+-         + vit_tc_muon_floats(nCTA)          // STAGED-opt (Muon) NS per-matrix scratch
+-         + vit_tc_looksam_floats()           // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
+-         + vit_tc_sg2_floats(nCTA);          // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
++         + vit_tc_dw_part_floats()                 // split-K dW partials (G>1)
++         + vit_tc_opt_reduce_floats(nCTA, opt_id)  // STAGED-opt (Prodigy) reduce slots
++         + vit_tc_muon_floats(nCTA, opt_id)        // STAGED-opt (Muon) NS per-matrix scratch
++         + vit_tc_looksam_floats(opt_id)           // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
++         + vit_tc_sg2_floats(nCTA, opt_id);        // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
+ }
+ 
+ #ifdef SG_VIT_PROFILE
+@@ -527,25 +541,22 @@ fused_vit_megakernel_tc(PersistentContext ctx,
+     const int kDwG    = vittc::kVitDwSplitK;
+     // STAGED-opt cross-CTA reduce slots (Prodigy d), carved AFTER the dW partials
+     // (matches vit_tc_workspace_floats's term order). Unused unless Opt==Prodigy.
++    // opt_id gate: returns 0 for non-Prodigy opts → opt_reduce is zero-width.
+     float* opt_reduce = dw_part + vit_tc_dw_part_floats();
+-    // Muon NS per-matrix scratch, carved AFTER the Prodigy reduce slots (matches
+-    // vit_tc_workspace_floats's term order). Unused unless Opt==Muon. Layout:
+-    //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kVitMuonMaxNumel)
+-    //   [muon_A (kVitMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
+-    float* muon_base = opt_reduce + vit_tc_opt_reduce_floats(nCTA);
+-    // LookSAM SAM 2nd-backward scratch, carved AFTER the Muon scratch (term order
+-    // matches vit_tc_workspace_floats — carving it LAST keeps every prior region's
+-    // offset unchanged, so the already-green cells are byte-identical). Layout:
+-    //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
+-    float* sam_backup = muon_base + vit_tc_muon_floats(nCTA);
++    // Muon NS per-matrix scratch. Derive muon_base via opt_id-gated sizer so host ==
++    // device carve: non-Prodigy → vit_tc_opt_reduce_floats(nCTA,Opt)=0.
++    float* muon_base = opt_reduce + vit_tc_opt_reduce_floats(nCTA, static_cast<int>(Opt));
++    // LookSAM SAM 2nd-backward scratch. Derive sam_backup via opt_id-gated sizer:
++    // non-Muon → vit_tc_muon_floats(nCTA,Opt)=0 → sam_backup=muon_base (zero-width).
++    float* sam_backup = muon_base + vit_tc_muon_floats(nCTA, static_cast<int>(Opt));
++    // sam_grad is kVitTotalElems past sam_backup; valid only inside the LookSAM
++    // if constexpr branch (never dereferenced on other opts).
+     float* sam_grad   = sam_backup + kVitTotalElems;
+-    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the LookSAM sam_grad (term
+-    // order matches vit_tc_workspace_floats — carve-LAST keeps every prior region's
+-    // offset unchanged, so the already-green cells are byte-identical). ALIGN to 8
+-    // bytes (the per-CTA slice fronts an int64 row_off64 staging array; kVitTotalElems
+-    // is odd so sam_grad+total lands on an odd float offset → an int64 read there is
+-    // misaligned). Round up to the next even float. Unused unless Opt==SuperGrok2.
+-    float* sg2_ws_base = sam_grad + kVitTotalElems;
++    // SuperGrok2 meta-net per-CTA scratch. Derive sg2_ws_base via opt_id-gated sizer:
++    // non-SAM → vit_tc_looksam_floats(Opt)=0 → sg2_ws_base=sam_backup (zero-width).
++    // ALIGN to 8 bytes for the int64 row_off64 staging prefix. For non-SG2 opts the
++    // alignment bump is harmless (sg2_ws_base is never dereferenced for non-SG2).
++    float* sg2_ws_base = sam_backup + vit_tc_looksam_floats(static_cast<int>(Opt));
+     if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+     (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
+ 
+diff --git a/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu b/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+index 47c9255..3407ab1 100644
+--- a/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
++++ b/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+@@ -120,7 +120,9 @@ cudaError_t mega_decoder_real_adamw_tc(
+     int nCTA = n_sms;
+     if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+ 
+-    const int64_t need = dec_tc_workspace_floats(T, B, nCTA);
++    // Pass opt_id so the sizer elides staged-opt regions not used by this opt,
++    // saving VRAM on the production AdamW/Lion/Grokfast/… path (~36 GB at 1.5B).
++    const int64_t need = dec_tc_workspace_floats(T, B, nCTA, opt_id);
+     DecTcLauncherScratch& sc = dec_tc_launcher_scratch(dev, need);
+ 
+     // Re-point the ctx counters at THIS TU's cached counters (dispatch.cpp built
+@@ -315,7 +317,7 @@ cudaError_t mega_decoder_sg2_tc(
+     int nCTA = n_sms;
+     if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+ 
+-    const int64_t need = dec_tc_workspace_floats(T, B, nCTA);
++    const int64_t need = dec_tc_workspace_floats(T, B, nCTA, static_cast<int>(OptId::SuperGrok2));
+     DecTcLauncherScratch& sc = dec_tc_launcher_scratch(dev, need);
+     ctx.g_next_task   = sc.g_next;
+     ctx.g_arrived     = sc.g_arrived;
+diff --git a/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu b/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+index 1cd4f2c..0e226cf 100644
+--- a/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
++++ b/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+@@ -112,7 +112,10 @@ cudaError_t mega_mamba_real_adamw_tc(
+     int nCTA = mb_tc_launched_nctas<OptId::AdamW>(dev, ncta_cap);
+     if (nCTA <= 0) { nCTA = n_sms; if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap; }
+ 
+-    const int64_t need = mb_tc_workspace_floats(T, nCTA);
++    // Pass opt_id so the sizer elides staged-opt regions not used by this opt,
++    // saving ~36 GB at 1.5B on the production AdamW/Lion/Grokfast/… path. The cached
++    // scratch grows but never shrinks, so switching from AdamW→LookSAM reallocates.
++    const int64_t need = mb_tc_workspace_floats(T, nCTA, opt_id);
+     MbTcLauncherScratch& sc = mb_tc_launcher_scratch(dev, need);
+ 
+     // Re-point the ctx counters at THIS TU's cached counters (the TC launcher zeroes
+@@ -313,7 +316,7 @@ cudaError_t mega_mamba_sg2_tc(
+     int nCTA = mb_tc_launched_nctas<OptId::SuperGrok2>(dev, ncta_cap);
+     if (nCTA <= 0) { nCTA = n_sms; if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap; }
+ 
+-    const int64_t need = mb_tc_workspace_floats(T, nCTA);
++    const int64_t need = mb_tc_workspace_floats(T, nCTA, static_cast<int>(OptId::SuperGrok2));
+     MbTcLauncherScratch& sc = mb_tc_launcher_scratch(dev, need);
+     ctx.g_next_task  = sc.g_next;
+     ctx.g_arrived    = sc.g_arrived;
+diff --git a/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu b/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+index bb896a1..6eefd9a 100644
+--- a/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
++++ b/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+@@ -85,7 +85,9 @@ cudaError_t mega_vit_real_adamw_tc(
+     int nCTA = n_sms;
+     if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+ 
+-    const int64_t need = vit_tc_workspace_floats(T, B, nCTA);
++    // Pass opt_id so the sizer elides staged-opt regions not used by this opt,
++    // saving VRAM on the production AdamW/Lion/Grokfast/… path (~36 GB at 1.5B).
++    const int64_t need = vit_tc_workspace_floats(T, B, nCTA, opt_id);
+     VitTcLauncherScratch& sc = vit_tc_launcher_scratch(dev, need);
+ 
+     ctx.g_next_task  = sc.g_next;
+@@ -237,7 +239,7 @@ cudaError_t mega_vit_sg2_tc(
+     int nCTA = n_sms;
+     if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+ 
+-    const int64_t need = vit_tc_workspace_floats(T, B, nCTA);
++    const int64_t need = vit_tc_workspace_floats(T, B, nCTA, static_cast<int>(OptId::SuperGrok2));
+     VitTcLauncherScratch& sc = vit_tc_launcher_scratch(dev, need);
+     ctx.g_next_task  = sc.g_next;
+     ctx.g_arrived    = sc.g_arrived;

@@ -1,0 +1,173 @@
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index d907183..1ffd63b 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -202,6 +202,48 @@ namespace wgs = ::sg::sm90::wgs;
+ #define SG_DEC_PROFILE_FWD_FINE 0
+ #endif
+ 
++// ── P1 fp32-EPILOGUE FUSION (perf-lever #1; .perf/perf_lever_impl_design.json).
++//    Folds the inter-GEMM scalar epilogue post-loops in dectc_forward_tile into
++//    the GEMM out() lambda (relocates the per-element add/gelu/round to WG0's
++//    fragment-decode after wgmma_wait_group<0> drains — NO reduction-order
++//    change, the fp32 accumulator the lambda receives is the SAME value the
++//    standalone fp32-output store wrote). The maxed tc_gemm_block_unpipelined
++//    engine is REUSED unchanged; only the out() accessor differs.
++//
++//    SG_TUNED_DEC_EPI_FUSE (0/1): MASTER enable. 0 (DEFAULT, revert-safe) → the
++//      original standalone GEMM + separate epilogue post-loops run unchanged →
++//      BYTE-IDENTICAL PTX to every shipped build (sha256-verified, same compile
++//      path). 1 → the two folds below are active (each still independently
++//      gateable via its sub-knob).
++//
++//    TWO INDEPENDENT FOLDS (each defaults to the master but overrides alone, so a
++//    fold-A gate-RED reverts A and KEEPS B: -DSG_TUNED_DEC_EPI_FUSE=1
++//    -DSG_TUNED_DEC_EPI_FUSE_A=0):
++//      • FOLD B — SG_TUNED_DEC_EPI_FUSE_B: ff0_b + dec_gelu + X_gact (the ff0
++//        epilogue, sites ~1572-1577). BYTE-IDENTICAL transport-only: the fwd-f32
++//        GEMM (dectc_gemm_fwd_f32) already emits the exact fp32 wgmma accumulator
++//        v; pre = v + ff0_b[j] is the SAME fp32 add, only relocated into the
++//        lambda — the ff0pre bf16 round and the gelu→X_gact bf16 round are
++//        bit-for-bit the post-loop's (no atomics, CTA-local fragment order, the
++//        sc.work materialization is NOT relied upon — but sc.work IS still written
++//        below for the bwd; see the wrapper). LN reduce sc.work UNTOUCHED.
++//      • FOLD A — SG_TUNED_DEC_EPI_FUSE_A: in_b qkv-bias (the in_proj epilogue,
++//        sites ~1534-1538). A sub-bf16-ULP single-vs-double-round CHANGE:
++//        shipping path is bf16(bf16(x@w^T) + in_b) (double round); the fold makes
++//        it bf16(x@w^T_fp32 + in_b) (single round) — the ABSORBABLE direction
++//        TOWARD the pinned oracle qkv = bf(x_in @ bf(in_w)^T + in_b). The fp64 +
++//        A/A/A gate is the ARBITER regardless (cf. the IL=4 reject); fold A must
++//        land within 1e-4 and pass A/A/A bit-determinism or it reverts ALONE.
++#ifndef SG_TUNED_DEC_EPI_FUSE
++#define SG_TUNED_DEC_EPI_FUSE 0   // DEFAULT OFF → byte-identical PTX
++#endif
++#ifndef SG_TUNED_DEC_EPI_FUSE_A
++#define SG_TUNED_DEC_EPI_FUSE_A SG_TUNED_DEC_EPI_FUSE   // in_b fold (parity-bearing); revert alone via -D...=0
++#endif
++#ifndef SG_TUNED_DEC_EPI_FUSE_B
++#define SG_TUNED_DEC_EPI_FUSE_B SG_TUNED_DEC_EPI_FUSE   // ff0_b+gelu fold (byte-identical); revert alone via -D...=0
++#endif
++
+ namespace dectc {
+ 
+ // dW staging-method selector (see the SG_TUNED_DEC_DW_STAGE macro doc above).
+@@ -1199,6 +1241,69 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+     }
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════
++//  P1-EPILOGUE-FUSION wrappers (SG_TUNED_DEC_EPI_FUSE). Mirror the two fwd
++//  wrappers above EXACTLY (same engine, same DecGmemTileSrcA/B, same RING) —
++//  ONLY the out() accessor folds the post-loop scalar work in.  Compiled in only
++//  when the corresponding sub-knob is set; the OFF build never instantiates them
++//  (templates → zero codegen) → byte-identical PTX. ════════════════════════════
++#if SG_TUNED_DEC_EPI_FUSE_A
++// FOLD A: (fwd) qkv[M,Nout] = bf16( X@W^T + bias ).  SINGLE round of (acc + bias)
++// — vs the shipped post-loop's bf16(bf16(X@W^T) + bias) DOUBLE round. The engine
++// is byte-identical to dectc_gemm_fwd; only the bf16-output lambda adds bias[n0+n]
++// to the fp32 accumulator BEFORE the one __float2bfloat16 round. `bias` is the
++// per-output-column [Nout] fp32 bias (L.in_b). Absorbable-direction toward the
++// oracle bf(x@bf(w)^T + in_b); gate-arbitrated.
++template <int N>
++__device__ __forceinline__ void dectc_gemm_fwd_bias(
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
++        __nv_bfloat16* __restrict__ Yout, const float* __restrict__ bias,
++        int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        DecGmemTileSrcA srcA{X, Kin};
++        DecGmemTileSrcB srcB{W + (int64_t)n0 * Kin, Kin, Nout - n0};
++        auto out  = [&] (int m, int n, float v) {
++            Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v + bias[n0 + n]); };
++        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_FWD);
++    }
++}
++#endif // SG_TUNED_DEC_EPI_FUSE_A
++
++#if SG_TUNED_DEC_EPI_FUSE_B
++// FOLD B: (fwd-f32 + ff0 epilogue) ff0[M,Nout] = X@W^T (fp32 accumulator v).
++// pre = v + ff0_b[n0+n]; ff0pre[m,j] = bf16(pre); X_gact[(g0+m),j] = bf16(gelu(pre)).
++// BYTE-IDENTICAL: v is the exact fp32 accumulator the standalone fp32 store
++// emitted, so pre is the SAME fp32 value sc.work[idx]+ff0_b[j] computed; both bf16
++// rounds are the post-loop's bit-for-bit. ff0pre uses LOCAL tile rows (sc.ff0pre,
++// row stride Nout); X_gact uses GLOBAL rows (acts.X_gact, row stride Nout, base
++// offset g0) — hence g0 + the two distinct row strides are passed explicitly.
++template <int N>
++__device__ __forceinline__ void dectc_gemm_fwd_f32_ff0fuse(
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
++        __nv_bfloat16* __restrict__ ff0pre, __nv_bfloat16* __restrict__ Xgact,
++        const float* __restrict__ ff0_b, int g0, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        DecGmemTileSrcA srcA{X, Kin};
++        DecGmemTileSrcB srcB{W + (int64_t)n0 * Kin, Kin, Nout - n0};
++        auto out  = [&] (int m, int n, float v) {
++            const int j = n0 + n;
++            const float pre = v + ff0_b[j];
++            ff0pre[(int64_t)m * Nout + j]            = __float2bfloat16(pre);
++            Xgact [(int64_t)(g0 + m) * Nout + j]     = __float2bfloat16(dec_gelu(pre));
++        };
++        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_FWD);
++    }
++}
++#endif // SG_TUNED_DEC_EPI_FUSE_B
++
+ // (dX) dX[M,Kin] = dY[M,Nout] @ W[Nout,Kin].  N(wgmma) = Kin (the in_dim, tiled
+ // by width N). K = Nout (the contracted out_dim). The B operand is staged from
+ // the TRANSPOSED cache section (C1-T, dec_wbf_bind's *_wT): srcB(n=kin, k=out)
+@@ -1527,6 +1632,13 @@ __device__ float dectc_forward_tile(
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
++#if SG_TUNED_DEC_EPI_FUSE_A
++        // FOLD A (in_b): single-round bf16(acc + in_b) inside the GEMM out() —
++        // absorbable-direction toward the oracle qkv = bf(x_in @ bf(in_w)^T + in_b)
++        // (vs the #else double-round bf16(bf16(acc)+in_b)). Gate-arbitrated.
++        dectc_gemm_fwd_bias<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], L.in_b, dec::kD, 3 * dec::kD, sA, sB, pipeBars);
++        __syncthreads();
++#else
+         dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB, pipeBars);
+         __syncthreads();
+         // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+@@ -1537,6 +1649,7 @@ __device__ float dectc_forward_tile(
+             sc.qkv[li][idx] = __float2bfloat16(v);
+         }
+         __syncthreads();
++#endif
+         // attention → ctx (work fp32) + attn[li] weights.
+         dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+         // ctx bf16 → X_ctx[li] (out_proj input + its dW operand).
+@@ -1566,6 +1679,19 @@ __device__ float dectc_forward_tile(
+         // ff0 = X_x1 @ ff0_w^T (+ ff0_b)  (N=dff, K=d). fp32 → work; (pre+b) bf16 →
+         // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+         // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
++#if SG_TUNED_DEC_EPI_FUSE_B
++        // FOLD B (ff0_b+gelu+X_gact): BYTE-IDENTICAL transport-only. The fp32
++        // accumulator v fed to the lambda == the value the standalone fp32 store
++        // wrote into sc.work, so pre = v + ff0_b[j] is the SAME fp32 add, the two
++        // bf16 rounds bit-for-bit the post-loop's. sc.work is NOT written for the
++        // ff0 result (it is dead between here and the ff2 GEMM that overwrites it;
++        // the bwd reads sc.ff0pre, not sc.work) — the LN sc.work materialization is
++        // untouched. ff0pre uses LOCAL rows; X_gact uses GLOBAL rows (g0+m).
++        dectc_gemm_fwd_f32_ff0fuse<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
++                                            sc.ff0pre[li], acts.X_gact[li], L.ff0_b, g0,
++                                            dec::kD, dec::kDff, sA, sB, pipeBars);
++        __syncthreads();
++#else
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
+                                             sc.work, dec::kD, dec::kDff, sA, sB, pipeBars);
+         __syncthreads();
+@@ -1576,6 +1702,7 @@ __device__ float dectc_forward_tile(
+             acts.X_gact[li][(int64_t)(g0 + r) * dec::kDff + j] = __float2bfloat16(dec_gelu(pre));
+         }
+         __syncthreads();
++#endif
+         // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
+                                             sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);

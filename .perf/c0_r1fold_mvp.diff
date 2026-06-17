@@ -1,0 +1,138 @@
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index d907183..588a4cb 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -189,6 +189,33 @@ namespace wgs = ::sg::sm90::wgs;
+ #define SG_TUNED_DEC_FWD_STAGES 4 // BAKED with PIPE=1 (STAGES>2 → dynamic-smem path; gated 11/11 x 3 seeds @ 618ms/6.477%)
+ #endif
+ 
++// ── out_proj r1 EPILOGUE-FOLD knob (Level-2 C0 MVP, #27; 2026-06-17). The
++//    out_proj fwd GEMM (dectc_gemm_fwd_f32, fp32-output) writes a = X_ctx @ out_w^T
++//    to sc.work, then a SEPARATE smem write+read pass + __syncthreads computes
++//    r1 = a + Xin + out_b in place (the per-element residual+bias add). That pass
++//    is PURE POINTWISE over the SAME (row,col) index space — no reduction, no
++//    reassociation — so it folds losslessly into the GEMM's out() epilogue
++//    accessor (SynthEpiR1, below). The GEMM stores RAW fp32 (no bf16 round), so
++//    the folded write is the BYTE-IDENTICAL fp32 value at the same address →
++//    C1-clean (bit-identical) BY CONSTRUCTION.
++//
++//    SG_TUNED_DEC_EPI_R1 is a PERF lever, NOT a correctness toggle:
++//      UNDEFINED (DEFAULT, revert-safe) → the existing fp32-output lambda + the
++//        separate :1554 pass + its __syncthreads — BYTE-IDENTICAL PTX (the
++//        SynthEpiR1 functor + the fused wrapper are #ifdef-gated OUT, so no new
++//        symbol exists in the OFF build).
++//      DEFINED (=1) → the residual+bias is folded into the out_proj epilogue via
++//        SynthEpiR1; the separate pass AND one __syncthreads per layer are removed
++//        (one fewer nrows*d smem write+read pass + one fewer barrier per layer).
++//    OFF keeps sc.work materialized identically (LN's per-row read mapping is
++//    untouched → dec_block_sum input order preserved → no fp32 drift); ON only
++//    changes WHERE the byte-identical r1 value is written (in the GEMM epilogue
++//    vs a trailing pass). Discoverable via the #ifndef SG_TUNED_* guard scan.
++#ifndef SG_TUNED_DEC_EPI_R1
++// DEFAULT: undefined → OFF (byte-identical). Define =1 (e.g. -DSG_TUNED_DEC_EPI_R1=1)
++// to fold the r1 residual+bias into the out_proj fwd GEMM epilogue.
++#endif
++
+ // ── fwd/dX FINE sub-phase profiler (campaign P1-fwd/dX diagnosis; 2026-06-16).
+ //    Splits the coarse P1_fwd (slot 0) / P1_bwd (slot 1) clock64 regions into
+ //    fine sub-counters INSIDE the GEMM engine's cp.async ring, so the main loop
+@@ -1199,6 +1226,73 @@ __device__ __forceinline__ void dectc_gemm_fwd_f32(
+     }
+ }
+ 
++#ifdef SG_TUNED_DEC_EPI_R1
++// ════════════════════════════════════════════════════════════════════════
++//  Level-2 C0 MVP (#27, SG_TUNED_DEC_EPI_R1): r1 residual+bias EPILOGUE FOLD.
++//
++//  SynthEpiR1 is the Out-shaped functor (matching `typename Out`, the engine's
++//  out(m,n,v) accessor contract at :687/:1100) that REPLACES both the OFF-path
++//  fp32-output lambda (`Yf32[m*Nout+n0+n] = v`) AND the separate :1554 pass
++//  (`sc.work[r*d+j] += bf2f(Xin[r*d+j]) + out_b[j]`) in ONE epilogue store. It
++//  folds the per-element residual + per-column bias into the out_proj fwd GEMM's
++//  epilogue, eliminating a full nrows*d smem write+read pass and one
++//  __syncthreads per layer.
++//
++//  BIT-IDENTITY BY CONSTRUCTION (C1-clean): the engine calls out(m, col, v) with
++//  the SAME raw fp32 accumulator `v` the OFF lambda writes (no bf16 round on this
++//  path — dectc_gemm_fwd_f32 stores raw fp32), at the SAME flat address
++//  work[m*d + col] (d == Nout here). For valid rows it computes the SAME pointwise
++//  expression as the OFF pass, with the SAME operand grouping:
++//      work[m*d+col] = v + (bf2f(Xin[m*d+col]) + out_b[col])
++//  — pure pointwise over the identical (row,col) space, no reduction, no
++//  reassociation. The `n0` global-column offset is folded into `col_base` so
++//  out_b/Xin index the GLOBAL column (n0+n), exactly as the GEMM write does.
++//
++//  ROW GUARD (m < nrows): the GEMM epilogue emits ALL kTileM rows, but the OFF
++//  separate pass touches only the nrows VALID rows; padding rows [nrows,kTileM)
++//  get the raw GEMM value `v` from the OFF lambda. acts.X_in[li] is sized exactly
++//  [T,d] (dec_acts_bind, no tile padding), so reading Xin for m>=nrows of a
++//  ragged last tile would be OUT OF BOUNDS. The guard writes raw `v` for those
++//  rows — byte-identical to the OFF path AND OOB-safe. (Padding rows are never
++//  consumed downstream: dectc_ln_fwd_tile iterates s<nrows.)
++template <int N>
++struct SynthEpiR1 {
++    float* __restrict__               work;     // sc.work base ([kTileM, d])
++    const __nv_bfloat16* __restrict__ Xin;      // acts.X_in[li] + g0*d ([nrows, d])
++    const float* __restrict__         out_b;    // L.out_b ([d])
++    int                               d;        // = Nout (out_proj N == kD)
++    int                               nrows;    // valid rows in this tile
++    int                               col_base; // current n-tile global column (n0)
++    __device__ __forceinline__ void operator()(int m, int n, float v) const {
++        const int col = col_base + n;
++        const int64_t off = (int64_t)m * d + col;
++        if (m < nrows) work[off] = v + (__bfloat162float(Xin[off]) + out_b[col]);
++        else           work[off] = v;   // padding row: raw GEMM (== OFF lambda)
++    }
++};
++
++// out_proj fwd GEMM with the r1 residual+bias FOLDED into the epilogue. Mirrors
++// dectc_gemm_fwd_f32 (bf16-W, C1 cache B operand, RING-staged) — only the Out
++// accessor differs (SynthEpiR1 instead of the raw fp32 lambda). Writes the
++// byte-identical r1 = a + Xin + out_b into work[ [nrows], d ] in one pass.
++template <int N>
++__device__ __forceinline__ void dectc_gemm_fwd_f32_epi_r1(
++        const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
++        float* __restrict__ work, const __nv_bfloat16* __restrict__ Xin,
++        const float* __restrict__ out_b, int nrows, int Kin, int Nout,
++        __nv_bfloat16* sA, __nv_bfloat16* sB, unsigned long long* pipeBars = nullptr) {
++    const int k_steps = Kin / wgs::kWgmmaAtomK;
++    for (int n0 = 0; n0 < Nout; n0 += N) {
++        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
++        DecGmemTileSrcA srcA{X, Kin};
++        DecGmemTileSrcB srcB{W + (int64_t)n0 * Kin, Kin, Nout - n0};
++        SynthEpiR1<N> out{work, Xin, out_b, Nout, nrows, n0};
++        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
++            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB, pipeBars SG_DEC_FINE_FWD);
++    }
++}
++#endif  // SG_TUNED_DEC_EPI_R1
++
+ // (dX) dX[M,Kin] = dY[M,Nout] @ W[Nout,Kin].  N(wgmma) = Kin (the in_dim, tiled
+ // by width N). K = Nout (the contracted out_dim). The B operand is staged from
+ // the TRANSPOSED cache section (C1-T, dec_wbf_bind's *_wT): srcB(n=kin, k=out)
+@@ -1545,6 +1639,7 @@ __device__ float dectc_forward_tile(
+             acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+         }
+         __syncthreads();
++#ifndef SG_TUNED_DEC_EPI_R1
+         // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+                                             sc.work, dec::kD, dec::kD, sA, sB, pipeBars);
+@@ -1556,6 +1651,17 @@ __device__ float dectc_forward_tile(
+             sc.work[(int64_t)r * dec::kD + j] += __bfloat162float(Xin[(int64_t)r * dec::kD + j]) + L.out_b[j];
+         }
+         __syncthreads();
++#else
++        // a = X_ctx @ out_w^T, with r1 = a + Xin + out_b FOLDED into the out_proj
++        // epilogue (SynthEpiR1) — one fewer nrows*d smem write+read pass and one
++        // fewer __syncthreads per layer than the OFF path. The byte-identical r1
++        // value lands in sc.work (valid rows); the lone __syncthreads below
++        // publishes work before dectc_ln_fwd_tile reads it across rows/threads.
++        dectc_gemm_fwd_f32_epi_r1<SG_TUNED_TILE_N>(
++            acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
++            sc.work, Xin, L.out_b, nrows, dec::kD, dec::kD, sA, sB, pipeBars);
++        __syncthreads();
++#endif
+         // n1(r1) → x1 (fp32) + caches[li]; then bf16 → X_x1[li] (ff0 input + dW operand).
+         dectc_ln_fwd_tile(sc.work, L.n1_w, L.n1_b, nrows, sc.x1, sc.n1x[li], sc.n1i[li], red);
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {

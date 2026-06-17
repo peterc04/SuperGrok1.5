@@ -1,0 +1,396 @@
+--- /workspace/SuperGrok1.5/OPTIMIZATION_LEDGER.md	2026-06-17 01:17:42.291472296 +0000
++++ OPTIMIZATION_LEDGER.md	2026-06-17 04:54:46.106209886 +0000
+@@ -165,4 +165,140 @@
+ %-roofline [#24]; #23 tiered-spill doesn't react to parsed spill bytes) + the Level-2 superopt is
+ ~70% scaffold. Fix plan + priorities in COMPILE_AUDIT.md.
+ 
++---
++
++## Track F — session 2026-06-17 (BAKE + correctness + housekeeping)
++
++### (a) Decoder PIPE=1/STAGES=4 BAKED: **KEEP shipped** (commit `5c73b5d`) + PIPE=2 design-tournament: **REVERT** (2026-06-17)
++
++`a89f6f1` committed the deeper cp.async ring engine but left the default at PIPE=0 — the +1.49× win
++existed in source but was NOT in the shipped `_ops.so`. This commit (`5c73b5d`) bakes PIPE=1/STAGES=4
++as the default, so the win actually lands in the product binary.
++
++**Gate result (final tournament):** PIPE=2 (the producer/consumer mbarrier engine, commit `74260dd`) was
++the design-tournament challenger. Measured @ d=2048/B=16384 × 3 seeds:
++
++| Config | 3-seed mean | Roofline |
++|---|---|---|
++| PIPE=1/STAGES=4 (champion, `5c73b5d`) | **618.33 ms** | 6.477% |
++| PIPE=2 depth=2 (challenger, `74260dd`) | **857 ms** | ~4.5% |
++
++**PIPE=2 REVERT: 857 vs 618 ms, +38.6% slower on all 3 seeds. fp64+A/A/A gate passed both.**
++
++**Mechanistic WHY for PIPE=2 losing:** the producer/consumer ring splits the available threads
++between a "producer" warp-group (stages async loads) and a "consumer" warp-group (runs wgmma). The
++fwd/dX kernel is DRAIN-bound — cp.async WAIT accounts for 43% fwd / 56% dX of in-ring time. Splitting
++threads halves the producer throughput servicing the already-slow drain, so the bottleneck (the drain)
++gets more starved, not less. The PIPE=1 mechanism (simply deepening the ring from S=2 to S=4, keeping
++the full thread complement) hides drain latency by keeping more in-flight loads simultaneously without
++partitioning threads. PIPE=2 adds ring + mbarrier coordination overhead on top of a now-slower drain.
++The mechanism CONTRASTS with the P0 dW-pipeline REVERT (`Ledger:50-52`): dW was staging-bound → the
++staging bottleneck got worse when you split threads → the same failure mode.
++
++**Cumulative decoder timeline at bake:** dW-staging (1889→920 ms) × fwd/dX deeper ring (920→618 ms)
++= 1889→618 ms ≈ **3.05× from session start**; roofline 2.08% → 6.475%. Now in the shipped binary.
++
++---
++
++### (b) 5 adversarially-verified-safe audit cleanups: **KEEP** (commit `eff3e78`) (2026-06-17)
++
++Five zero-quality-loss fixes from an 8-agent codebase audit. Gate: self-test 265/265, nvcc clean,
++FusedScratch untouched. **fp64+A/A/A-gate pending the combined _ops rebuild (flagged in commit);
++revert if gate reds.** The 5 fixes:
++
++| Fix | What | Mechanistic WHY it is safe |
++|---|---|---|
++| `has_kernels` probe | Corrected to check the 2 real registered symbols (was falsely `False` on a healthy build) | Pure probe logic fix; no kernel code changed. |
++| ~750 MB scratch reclaimed | Removed write-only `.workspace`/`.n_ctas` from `Decoder/ViT/MambaScratch` | The fields were written but never read back; the workspace allocation was live, so removing them reclaims ~750 MB of HBM per step with zero semantic change (bit-identical). |
++| `grad-hooks` fail-fast | `fail-fast` at construction instead of silently passing | Eliminates silent failure; caught at construction rather than at step time. |
++| Decoder mirror test | `test_decoder_kernel_mirror_matches_oracle` added (CPU) | Closes the decoder structural-aliasing coverage gap; no runtime code changed. |
++| Orphan artifact removal | `git rm csrc/scan/mamba_scan_adapter.cuh` + fix `affine2x2.h` comment | Dead file (496 lines) removed; comment was stale. No live code path referenced it. |
++
++**Why all 5 are quality-neutral:** adversarially verified by 2 skeptic agents before applying. The
++FusedScratch change is the most load-bearing — confirmed byte-identical because the `.workspace` fields
++were allocate-write-never-read (verified by grep of every consumer across all 3 megakernels).
++
++---
++
++### (c) SG11 correctness fix: **KEEP** (commit `51098e0`) (2026-06-17)
++
++**GATE-BLIND CORRECTNESS BUG — found by the 30-agent megakernel bug-hunt (`.perf/megakernel_bug_hunt.json`).**
++
++The L3-TC staged SuperGrok11 gate in `opt_stages_precompute.cuh` computed
++`cos(grad, MU)` (the SharpnessMetaNet output, a scaled/clipped momentum) instead of the canonical
++`cos(grad, MOMENTUM)` (the raw Adam `exp_avg`) in all 3 SG11 megakernel cells
++(decoder/vit/mamba). The gate is `sigmoid(gate_temp * cos_sim)` and scales the entire
++`(1-gate) * alpha * mu` smart-gradient term every step — so every SG11 training trajectory since the
++staged path was introduced was using the wrong algorithm.
++
++**Why it was GATE-BLIND (both conditions had to co-occur):**
++1. **Co-wrong oracle:** the fp64 oracle in `test_opt_stages.py` and `test_l3tc_tail_gate.py` was written
++   to mirror the kernel formula (computing `cos(grad, mu)`) rather than the canonical algorithm. Kernel
++   == oracle → parity always passed. This is the classical "test-the-implementation-not-the-spec" trap.
++2. **Step-1 coincidence:** at step 1 the SharpnessMetaNet `rescale=0` makes `mu ≈ 0` AND `exp_avg=0`,
++   so `den_m ≈ 0 → cos = 0 → gate = sigmoid(0) = 0.5` in BOTH formulations. The single-step fp64 gate
++   is incapable of distinguishing `cos(grad, mu)` from `cos(grad, momentum)` at step 1.
++   Divergence only appears once `rescale ≠ 0` and momentum accumulates (many training steps in, at scale).
++
++**Fix:** routed the staged Sweep-A reduction through canonical `algo::sg11_sweep_a_step` (the single
++source that accumulates over `momentum` and writes `mu` in one pass) + `sg11_finalize_gate`. Call sites
++now pass `st.exp_avg` (the start-of-step momentum, captured before `sg11_sweep_b_step` writes it).
++Removed the now-unneeded `__syncthreads`. De-mirrored the oracles (both test files now encode
++`cos(grad, momentum)` from first principles). Extended `check_math_single_source.py` with a
++cosine-reinline scan on `opt_stages_precompute.cuh` + `#include` assert.
++
++**Gate (parity-BREAKING, intentional — corrected operand):**
++- OLD kernel FAILS warm-up gate (gate diff 0.74–0.92 vs momentum reference).
++- NEW kernel PASSES all 3 SG11 cells × 3 seeds (diff ≤ 8.6e-3 vs momentum; ~100× separation from mu).
++- Full 33-cell gate GREEN × 3 seeds (no regression to non-SG11 cells).
++- A/A/A bit-identical.
++- Gated with a WARM-UP step (nonzero `exp_avg`) to defeat the step-1 coincidence.
++
++**Drift-audit result:** the 23-agent `optimizer_drift_audit.json` audit of all 11 optimizers'
++L3-TC staged paths confirms SG11 was the only optimizer with this class of drift. The fix is now
++canonical; no other optimizer carries an active SG11-class wrong-operand divergence.
++
++**Follow-up (load-bearing, NOT yet done):** `run_sg11_warmup_gate` is CLI-only. Wire it into a
++pytest-collected hw test (oracle-trust-audit queue item) so the cos-operand class is
++CI-regression-guarded. Without this, a future regression to `cos(grad, mu)` would again be gate-blind.
++
++---
++
++## Forward pointers — captured analysis roadmaps + on-return queue
++
++### Captured roadmaps in `.perf/*.json` (read these before picking any new lever)
++
++| File | What it captures | Key finding |
++|---|---|---|
++| `megakernel_bug_hunt.json` | 30-agent adversarial bug hunt across all 3 megakernels | 2 confirmed bugs: SG11-GATE-COS-OPERAND (fixed, KEEP above) + its drift-guard gap (closes via `check_math_single_source.py`) |
++| `optimizer_drift_audit.json` | 23-agent L3-TC staged-path vs canonical audit, all 11 optimizers | **0 additional active drifts**; SG11 was the only one. GrokAdamW EMA/amplification re-inline is on the watch-list. |
++| `perf_lever_sweep_roadmap.json` | 59-agent exhaustive adversarial lever discovery across decoder/ViT/mamba | 2 of 18 survived adversarial verification; 16 refuted. Ranked queue + dead-wells listed. |
++| `perf_lever_impl_design.json` | Decoder P1-epilogue-fusion design spec | Foldable subset is a minority of the 24–26% uninstrumented P1 residual; build ONLY after the re-profile (rank 2 in the roadmap) confirms the share. |
++| `oracle_trust_audit.json` | 3 gate-trustworthiness gaps | RG1: `run_sg11_warmup_gate` not in pytest (CI-blind); RG4: autotune hook's d=128 vs d=2048 scale lie; SG2 oracle de-mirror + fidelity-probe voting. |
++| `test_coverage_gap_audit.json` | 6 high-sev gate-coverage gaps | Gate-hardening workstream; the SG11 fix is not CI-regression-guarded without RG1. |
++| `vram_efficiency_audit.json` | Byte-identical ~36 GB VRAM opt_id workspace-gate | Thread `opt_id` into the 3 `*_tc_workspace_floats` sizers (LookSAM/SG2/Muon → 0 off-path). High-value, cheap. |
++| `scale_correctness_audit.json` | 2 confirmed / 24 total scale-correctness items | Capture; review on return. |
++| `needs_care_unblock_plan.json` | CI re-anchor + `mma.cuh` dead-weight plan | Low-urgency (local-only, no CI running). |
++| `phase2_bringup_plan.json` | 8×H100 PP bringup readiness | `dec_tc_bind_workspace` shared helper needed. |
++| `phase2_fix_authoring_spec.json` | PP fix-authoring spec | Authored helper design. |
++
++### On-return serial GPU queue (owner decides keep/commit; single H100; gate one at a time)
++
++1. **Review `.perf/batch/` output** — the 12h autonomous batch recorded decoder re-profile +
++   autotuner sweep results. Re-gate autotuner winners at d=2048 before trusting (batch runs
++   at d=128 / RG4 scale lie in effect until oracle-trust-audit closes).
++2. **Bake ViT B1 winner** — `SG_TUNED_VIT_P1_SUBTILE_S` knob (commit `fda3454`); the batch
++   agent swept SUBTILE_S ∈ {16,8,4} @ d=2048/B=1024. Gate the winner + commit if green.
++3. **VRAM opt_id workspace-gate** (`vram_efficiency_audit.json`) — byte-identical ~36 GB;
++   thread `opt_id` into the 3 `*_tc_workspace_floats` sizers. Gate = PTX-diff + A/A/A on AdamW.
++4. **Decoder P1-epilogue-fusion** (`perf_lever_impl_design.json`, knob `SG_TUNED_DEC_EPI_FUSE`) —
++   only after the re-profile confirms the foldable share clears the relevance floor.
++5. **Gate-hardening workstream** (`oracle_trust_audit.json` + `test_coverage_gap_audit.json`) —
++   RG1: wire `run_sg11_warmup_gate` into pytest (LOAD-BEARING; SG11 fix not CI-guarded without it);
++   RG4: reconcile autotune hook d=2048-vs-d=128 scale lie; de-mirror SG2 CSA oracle; anchor SG11
++   fp64 oracle operand.
++6. **C0-MVP r1-fold** (`.perf/c0_r1fold_mvp.diff`, byte-identical OFF) + mamba profiler wiring
++   → then M0 + M1 (pending mamba profiler showing projections are a meaningful share).
++7. **CI-unblock** (`needs_care_unblock_plan.json`) — LOW-urgency (local-only).
++
+ *Maintained going forward: every future apply→gate→verdict lands here with its measured numbers + the mechanistic why.*
+--- /workspace/SuperGrok1.5/COMPILE_AUDIT.md	2026-06-16 22:34:11.641702141 +0000
++++ COMPILE_AUDIT.md	2026-06-17 04:55:46.531363428 +0000
+@@ -23,6 +23,9 @@
+ ---
+ ## P0 — BLOCKERS (correctness / fake-green). Fix before trusting any autotuned winner.
+ 
++> **RESOLVED markers:** P0 items 1–4 were fixed in commit `af9b720` (2026-06-16). See
++> RESOLVED notes inline.
++
+ 1. **fp64 oracle NOT wired into the winner path.** `pick_winner` (6659–6701) accepts winners
+    on a *same-dtype strict-fp32 self-consistency* oracle (`_capture_reference_output` 13816,
+    `_compare_outputs` 13878 `np.allclose`) + a 3× same-size determinism tag — never the fp64
+@@ -31,6 +34,10 @@
+    out-of-band hardware gate, not the tuner.** FIX: inject an fp64+A/A/A hook (like `tune_hook`)
+    that re-checks the top-K candidate winners at production scale (d=2048) and demotes any
+    failure to ineligible — make fp64 a hard precondition of `pick_winner`.
++   > **RESOLVED `af9b720`:** `BuildSpec.correctness_hook` seam added (mirrors `tune_hook`);
++   > `pick_winner` top-K demotion loop installed; default hook runs `test_l3tc_tail_gate.run_cell_gate`
++   > (fp64 parity + A/A/A) at d=2048 on the top-K fastest candidates. 10 new self-tests; 252/252 pass.
++   > GPU end-to-end hook-body verify pending the next autotune run.
+ 
+ 2. **Polyhedral / CUTLASS / CK winners ship the TEMPLATE while reporting a generated origin
+    (fake-green).** `build_jit`'s final source-swap (17183) checks ONLY `== ORIGIN_SYNTH`; a
+@@ -39,22 +46,32 @@
+    `enable_polyhedral=True` (17276) + the mirror (17509) force-enables it. FIX: generalize 17183
+    to any `origin in _VALIDATION_REQUIRED_ORIGINS` with a stashed `_emitted_sources[ckey:origin]`;
+    reuse the synth warn-and-fall-back-to-template branch (17191).
++   > **RESOLVED `af9b720`:** `build_jit` source-swap generalized `ORIGIN_SYNTH` →
++   > `_SOURCE_GENERATING_ORIGINS {synth, polyhedral, cutlass, ck}`. A generated-origin winner
++   > can no longer ship the template.
+ 
+ 3. **IL=4 determinism trap OPEN by default.** `pick_winner` only *enforces* the `deterministic`
+    tag when `strict_numerics=True` (6696); the default path lets a `non_deterministic` config
+    (atomicAdd / IL=4 reduction-order) that merely clears `np.allclose` WIN. FIX: reject
+    `numerical_status == "non_deterministic"` unconditionally (it's already measured for free);
+    reserve the opt-out for an explicit `--allow-nondeterministic`. (Also default `strict_numerics=True`.)
++   > **RESOLVED `af9b720`:** `pick_winner` now rejects `numerical_status == "non_deterministic"` by
++   > default; `--allow-nondeterministic` opt-out added.
+ 
+ 4. **Fast-math cache signature drops version-gated flags → stale `.so` can win post-upgrade.**
+    `fm_sig` (14118) omits `_version_gated_flags_for_hash` that the main `build_sig` folds in
+    (15226). After a gate-crossing compiler upgrade a stale fast-math `.so` is re-served as a
+    trial and (fast-math being a validation-required origin) can win on stale timing. FIX: fold
+    the version-gated tuples into `fm_sig` exactly as the main path does.
++   > **RESOLVED `af9b720`:** `fm_sig` now folds `_version_gated_flags_for_hash` identically to
++   > the main `build_sig`.
+ 
+ ---
+ ## P1 — MAXIMALITY (the owner philosophy). High leverage; mostly turning ON what exists.
+ 
++> **RESOLVED markers:** P1 items 5–7 were fixed in commit `ad45a88` (2026-06-17). See
++> RESOLVED notes inline. Items 8–9 remain open.
++
+ 5. **The CLI INVERTS "maximal".** A plain `python -m grokking_optimizers.compile -O adamw -M
+    decoder` runs with **PGO, device-PGO, emitter, synth, polyhedral, runtime-specialization,
+    transfer-learning all OFF** and `pruner=none` — the seven `store_true` flags + pruner default
+@@ -63,6 +80,9 @@
+    flags (`--no-X`, `default=None`, pass `getattr(args,X,None)`) so absent → build()'s True
+    survives — exactly how `--cost-model`/`--multi-fidelity` already do it. Also `--pruner`
+    default → `hyperband` (or pick one source of truth: build()=hyperband vs BuildSpec=none).
++   > **RESOLVED `ad45a88`:** CLI tri-state for the 5 PROVEN layers (pgo/device-pgo/emitter/
++   > runtime-spec/transfer-learning) + `pruner` default → `hyperband`. synth/polyhedral remain
++   > opt-in (scaffold, #27). Default invocation is now maximal.
+ 
+ 6. **#24 roofline objective ABSENT.** The objective is raw `timing_ms` end-to-end (Optuna
+    `minimize`, 6335; winner `min(key=timing_ms)`, 6701). No per-arch peak-TFLOP, no
+@@ -71,6 +91,10 @@
+    compute achieved-TF in the timer; switch the objective to maximize %-roofline; flag a winner
+    that lands below a ceiling threshold (so a structurally-capped 2–4% result is surfaced, not
+    reported as "tuned"). [#24]
++   > **RESOLVED `ad45a88`:** per-arch `peak_tf` + achieved-TF + %-roofline + sub-ceiling flag
++   > added on the winner. Objective stays raw-ms (secondary); roofline reported as a secondary
++   > metric. GPU-verify follow-ups flagged in-code: analytic FLOP scaling, ptxas last-wins
++   > ordering, Blackwell `peak_tf`.
+ 
+ 7. **#23 tiered register-spill mgmt — PARTIAL, nothing reacts.** The hard parts exist — a
+    `maxrregcount` cap sweep (2568) and a working ptxas spill-bytes parser (`_parse_ptxas_v_stderr`
+@@ -82,6 +106,11 @@
+    `--def-load-cache`/`-Xptxas -dlcm`/`--register-usage-level` *tuned dims* (today pinned base
+    constants, 12083–12155). Add the genuinely-uncapped maxrregcount point (sentinel → omit flag;
+    today `0` is aliased to `=255`, different SASS). [#23 + B-flag-resolution]
++   > **RESOLVED `ad45a88`:** `pick_winner` demotes spilling trials below clean; `spill_stores` /
++   > `stack_frame` added as measured cost-model features; `--register-usage-level` / `--def-load-cache`
++   > promoted to tuned dims; uncapped-maxrregcount sentinel added. self-test 265/265 (+13, including the
++   > audit-promised `feature_dim` guard). Canonical build byte-identical (new dims' first values = prior
++   > bases). GPU-verify follow-up: ptxas last-wins ordering.
+ 
+ 8. **Byte-identical "untuned build" claims are FALSE.** The sm_90 builder's first/canonical
+    values diverge from the kernel `#define` defaults: `dec_dw_splitk` 4 vs **1**, `vit_dw_splitk`
+@@ -89,6 +118,9 @@
+    build is therefore NOT the committed default — it would NOT reproduce the dW `splitk=1` KEEP.
+    FIX: reorder each value list so the first element equals the in-kernel default. (Direct,
+    safe, protects the landed dW win.)
++   > **RESOLVED `ad45a88`:** value lists reordered so first element = in-kernel default for all
++   > affected dims (dec_dw_splitk, vit_dw_splitk, cons_regs, prod_regs). No-JSON build is now
++   > byte-identical to the committed defaults. Protects the dW KEEP.
+ 
+ 9. **SASS is not in scope as inspection.** PTX/ptxas flags are tuned, but `cuobjdump
+    --dump-sass`/`nvdisasm` is never run (`--sass-only` only trims the fatbin). SASS *rewriting* is
+--- /workspace/SuperGrok1.5/AUTOTUNE_LINKAGE.md	2026-06-09 22:44:56.512806294 +0000
++++ AUTOTUNE_LINKAGE.md	2026-06-17 04:57:17.123839048 +0000
+@@ -18,22 +18,32 @@
+    setup.py TunedBuildExtension  --reads JSON, injects per-TU nvcc flags-->  _ops*.so
+ ```
+ 
+-The five SAFE per-TU dims are applied: `-DSG_TUNED_BLOCK_SIZE`,
+-`-DSG_TUNED_VEC_WIDTH`, `-DSG_TUNED_UNROLL`, `-DSG_TUNED_ASYNC_DEPTH`, and
+-`--maxrregcount=N` (only when N>0). They go onto each optimizer's CUDA TUs
+-(`csrc/backends/cuda/sm_90/launch_<opt>.cu` and the megakernel cells
+-`csrc/fused/sm_90/mega_<model>_<opt>.cu`). The per-optimizer kernel header
+-`kernels/sm_90/<opt>_sm90.cuh` is `#include`d by `launch_<opt>.cu`, so flags on
+-the launcher TU reach the kernel body. Bindings (`*.cpp`), model-only TUs
+-(`models/<model>.cu`), and common/header TUs get **no** per-optimizer flags and
+-keep their in-header defaults. (`cluster_shape` and the feature macros — TMA /
+-WGMMA / fp8 / swizzle — are component-scoped and riskier; they are phase-2 and
+-are **not** emitted by this pass.)
++The SAFE per-TU dims applied are the macros listed in `grokking_optimizers/_tuned_inject.py`
++`MACROS` table: `SG_TUNED_MEGA_BLOCK`, `SG_TUNED_TILE_M`, `SG_TUNED_TILE_N`,
++`SG_TUNED_DEC_DW_SPLITK`, `SG_TUNED_VIT_DW_SPLITK`, `SG_TUNED_MB_DW_SPLITK`,
++`SG_TUNED_PROD_REGS`, `SG_TUNED_CONS_REGS`, plus `--maxrregcount=N` (only when N>0).
++They go onto the **fused megakernel TUs** (`csrc/fused/sm_90/mega_<model>_real_adamw_tc*.cu`
++and `sg2_meta_tail.cu`) which are the actual product CUDA TUs.
++
++> **NOTE (doc reconciliation 2026-06-17):** an earlier version of this doc referred to
++> `csrc/backends/cuda/sm_90/launch_<opt>.cu` files and `kernels/sm_90/<opt>_sm90.cuh`
++> per-optimizer headers. **Neither exists in the current tree.** The per-optimizer eager
++> headers (`grokking_optimizers/kernels/sm_90/*_sm90.cuh`) were deleted in Task #10
++> (pure L3-TC path); there are no `launch_<opt>.cu` standalone TUs. The production path
++> is the fused megakernel: the 3 `mega_<model>_real_adamw_tc.cu` TUs plus their launchers
++> and `sg2_meta_tail.cu`. The old `SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL / ASYNC_DEPTH`
++> macros were guards in those deleted headers and are no longer read by any committed kernel
++> (dead `-D` flags). The live macros and TU paths are those in `_tuned_inject.py:MACROS` and
++> `optimizer_for_source()`. The `AUTOTUNE_LINKAGE.md` § Source of truth note in `_tuned_inject.py`
++> gives the authoritative reference.
++
++Bindings (`*.cpp`), model-only TUs (the substrate headers), and common TUs get **no**
++per-optimizer flags and keep their in-header defaults. (`cluster_shape` and the feature macros —
++TMA / WGMMA / fp8 / swizzle — are component-scoped and riskier; they are phase-2 and are
++**not** emitted by this pass.)
+ 
+ > If `_kernel_tuned.json` is absent the build is **byte-identical to before**:
+-> every kernel uses its `#ifndef SG_TUNED_*` default (block 256 / vec 4 /
+-> unroll 1 / async_depth 2; nvcc's own register allocator). A one-line notice
+-> is printed.
++> every kernel uses its `#ifndef SG_TUNED_*` default. A one-line notice is printed.
+ 
+ ---
+ 
+@@ -66,14 +76,14 @@
+ Optimizers: `adamw grokadamw grokfast lion looksam muon neuralgrok prodigy
+ supergrok11 supergrok15 supergrok2`. Models (short): `decoder vit mamba`.
+ 
+-> **One winner per `(arch, optimizer)` — model is LAST-WINS.** The JSON schema
+-> is `{arch: {optimizer: {...}}}` (no model dimension), so tuning the same
+-> optimizer on a *second* model overwrites the first, and that single winner is
+-> applied to ALL of that optimizer's TUs — its `launch_<opt>.cu` AND every
+-> `mega_<model>_<opt>` megakernel cell across all models. If you tune `decoder`
+-> then `vit` for `adamw`, only `vit`'s `adamw` winner survives. Pick the model
+-> whose launch params you want shipped (the `"model"` field in each entry
+-> records which sweep produced it).
++> **One winner per `(arch, model, optimizer)` — schema `{arch: {model: {optimizer: {...}}}}`**
++> (per `_tuned_inject.py` #12 nested schema). Each `mega_<model>_<opt>` megakernel cell gets
++> ITS model's winner; the shared `sg2_meta_tail.cu` and other shared TUs fall back to a
++> deterministic model's winner via `optimizer_for_source()`. Tuning the same optimizer on
++> two models no longer last-wins (the OLD flat schema was `{arch: {optimizer: {...}}}`; it
++> is still read for backward compatibility and migrated in-place on the next `export_winner`
++> write). Pick the model whose launch params you want shipped (the `"model"` field in each
++> entry records which sweep produced it).
+ 
+ A convenience loop:
+ 
+@@ -235,4 +245,3 @@
+   `-DSG_TUNED_*` macros + `--maxrregcount`; AMD's equivalent VGPR cap
+   (`-amdgpu-max-num-vgprs`) and TPU Pallas kwargs are out of scope for this
+   per-TU nvcc pass.
+-```
+--- /workspace/SuperGrok1.5/grokking_optimizers/kernels/README.md	2026-06-09 01:08:15.645234339 +0000
++++ kernels_README.md	2026-06-17 04:56:52.835988459 +0000
+@@ -11,32 +11,45 @@
+ 
+ ## Relationship to Production Kernels
+ 
+-**These headers are NOT compiled by the build system.** The production pipeline is:
++**These headers are NOT compiled by the build system and are NOT on the production path.**
++The current production pipeline (as of 2026-06-17 / Task #10, pure L3-TC path) is:
+ 
+ ```
+-csrc/algorithms/*.h          (vendor-neutral elementwise math)
++csrc/algorithms/*.h              (vendor-neutral elementwise math)
+     |
+     v
+-csrc/backends/cuda/sm_90/launch_*.cu     (CUDA launch glue, namespace sg::sm90)
+-csrc/backends/hip/gfx942/launch_*.hip.cpp (HIP launch glue,  namespace sg::gfx942)
++csrc/fused/sm_90/
++  mega_decoder_real_adamw_tc.cu  (fused megakernel TU — decoder)
++  mega_vit_real_adamw_tc.cu      (fused megakernel TU — ViT)
++  mega_mamba_real_adamw_tc.cu    (fused megakernel TU — Mamba-3)
++  sg2_meta_tail.cu               (SuperGrok2 meta-network tail)
+     |
+     v
+-csrc/bindings/helpers.h      (SG_DISPATCH macro -> runtime arch dispatch)
++csrc/bindings/dispatch.cpp       (pybind11 bindings + SG_DISPATCH)
+     |
+     v
+-grokking_optimizers/_ops      (pybind11 extension module)
++grokking_optimizers/_ops*.so     (pybind11 extension module)
+ ```
+ 
++> **NOTE (2026-06-17):** an earlier version of this diagram showed
++> `csrc/backends/cuda/sm_90/launch_<opt>.cu` files as the production TUs.
++> Those **do not exist** — the per-optimizer eager launch TUs were removed in
++> Task #10 when the product switched to the pure L3-TC fused megakernel path.
++> The `csrc/backends/cuda/sm_90/` directory now contains only the wgmma/tile-pipeline
++> substrate headers (`wgmma.cuh`, `tile_pipeline.cuh`, `mma.cuh`, etc.) plus a
++> standalone selftest TU (`wgmma_selftest.cu`). There are no `launch_<opt>.cu` files.
++
+ These reference headers use `namespace grokking::sm90` / `grokking::gfx942` (not
+-the `sg::` namespace expected by `SG_DISPATCH`). They serve as:
++the `sg::` namespace used by the fused megakernel). They serve as:
+ 
+ 1. **Arch-specific algorithm specifications** with NanPolicy, gradient clipping,
+    and prefetch-pipelined variants that the vendor-neutral `csrc/algorithms/*.h`
+    does not express.
+ 2. **Codegen self-test targets** for `compile.py`'s autotuner and synth-GEMM
+    emitter.
+-3. **Migration templates** for converting `csrc/backends/` launch files from
+-   ATen-based dispatch to hand-written `__global__` kernels.
++3. **Reference implementations** for verifying the correctness of the fused
++   megakernel optimizer tails (the per-op kernel path was the original single-source
++   before the L3-TC staged inlining; these headers preserve that reference).
+ 
+ ## Kernel Header Contract
+ 
+@@ -113,10 +126,16 @@
+ 
+ ## Wiring to Production (Future)
+ 
+-To promote a reference header to production:
++The current production path does not use these headers directly — the optimizer math
++is inlined into the fused megakernel via the `csrc/algorithms/*.h` canonical headers
++and `csrc/fused/sm_90/opt_components.cuh` / `opt_stages_precompute.cuh`. The reference
++headers here serve as the specification; any future per-op eager dispatch path would use
++them as templates.
++
++If a future path promotes a reference header to a standalone compiled TU:
+ 
+ 1. Change namespace from `grokking::<arch>` to `sg::<arch>`
+ 2. Add the source file to `setup.py` source globs
+ 3. Add `grokking_optimizers/kernels/<arch>` to `include_dirs`
+-4. Have the `csrc/backends/.../launch_*` files `#include` the header
+-5. Verify with `cuobjdump -sass` / `roc-obj` that expected instructions emit
++4. Wire calls from `csrc/bindings/dispatch.cpp` through a new `SG_DISPATCH` entry
++5. Verify with `cuobjdump --dump-sass` / `roc-obj` that expected instructions emit

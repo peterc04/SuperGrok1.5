@@ -1,0 +1,709 @@
+diff --git a/csrc/fused/sm_90/fused_decoder_megakernel.cuh b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+index 98b8eb1..12132e6 100644
+--- a/csrc/fused/sm_90/fused_decoder_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_decoder_megakernel.cuh
+@@ -1449,8 +1449,14 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
+             if constexpr (Opt == OptId::SuperGrok11) {
+                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                            : st.sg_phi_b2;
++                // Pass st.exp_avg (start-of-step momentum, base ptr — indexed by
++                // off+i inside, consistent with grad/mu/sharpness) as the gate's
++                // 2nd cosine operand: SG11 gate = sigmoid(gate_temp·cos(grad,momentum)).
++                // The precompute runs BEFORE apply_optimizer<SG11> (sg11_sweep_b_step)
++                // writes exp_avg, so st.exp_avg here IS the start-of-step momentum —
++                // exactly the canonical Sweep A operand.
+                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
+-                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
++                    st.mu, grad, st.sharpness, st.exp_avg, sg_sW1, sg_sb1, sg_sW2,
+                     b2, st.sg_rescale, off, n, st.gate_temp);
+                 ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
+                 __syncthreads();         // mu(T) fully written + gate broadcast before apply
+diff --git a/csrc/fused/sm_90/fused_mamba_megakernel.cuh b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+index 7f15102..7f8c0a2 100644
+--- a/csrc/fused/sm_90/fused_mamba_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_mamba_megakernel.cuh
+@@ -1156,8 +1156,11 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
+             if constexpr (Opt == OptId::SuperGrok11) {
+                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                            : st.sg_phi_b2;
++                // st.exp_avg = start-of-step momentum (base ptr, indexed by off+i) —
++                // the gate's 2nd cosine operand: sigmoid(gate_temp·cos(grad,momentum)).
++                // Precompute runs BEFORE the apply (sg11_sweep_b_step) writes exp_avg.
+                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
+-                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
++                    st.mu, grad, st.sharpness, st.exp_avg, sg_sW1, sg_sb1, sg_sW2,
+                     b2, st.sg_rescale, off, n, st.gate_temp);
+                 ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
+                 __syncthreads();         // mu(T) fully written + gate broadcast before apply
+diff --git a/csrc/fused/sm_90/fused_vit_megakernel.cuh b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+index 42bc0e1..2e272a4 100644
+--- a/csrc/fused/sm_90/fused_vit_megakernel.cuh
++++ b/csrc/fused/sm_90/fused_vit_megakernel.cuh
+@@ -1087,8 +1087,11 @@ fused_vit_megakernel_tc(PersistentContext ctx,
+             if constexpr (Opt == OptId::SuperGrok11) {
+                 const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                            : st.sg_phi_b2;
++                // st.exp_avg = start-of-step momentum (base ptr, indexed by off+i) —
++                // the gate's 2nd cosine operand: sigmoid(gate_temp·cos(grad,momentum)).
++                // Precompute runs BEFORE the apply (sg11_sweep_b_step) writes exp_avg.
+                 const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
+-                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
++                    st.mu, grad, st.sharpness, st.exp_avg, sg_sW1, sg_sb1, sg_sW2,
+                     b2, st.sg_rescale, off, n, st.gate_temp);
+                 ts.gate = g8;            // per-tensor gate=sigmoid(gate_temp·cos) the apply tail reads
+                 __syncthreads();         // mu(T) fully written + gate broadcast before apply
+diff --git a/csrc/fused/sm_90/opt_stages_precompute.cuh b/csrc/fused/sm_90/opt_stages_precompute.cuh
+index 7488c32..d269052 100644
+--- a/csrc/fused/sm_90/opt_stages_precompute.cuh
++++ b/csrc/fused/sm_90/opt_stages_precompute.cuh
+@@ -469,15 +469,17 @@ __device__ inline void muon_ns_combine_phase(int64_t numel,
+ //
+ //   mu(T)   — per ELEMENT: mu[idx] = rescale * sg11_phi_forward(grad[idx],
+ //             sharpness[idx], ...). Per-TENSOR weight set (W1,b1,W2,b2).
+-//   gate(T) — per TENSOR: cosine of (grad, mu) over THIS tensor, block tree
++//   gate(T) — per TENSOR: cosine of (grad, MOMENTUM) over THIS tensor, block tree
+ //             (block_reduce_sum_f32, primitives.cuh:125). NO cross-CTA, NO atomic.
++//             The 2nd cosine operand is the START-OF-STEP momentum (st.exp_avg),
++//             NOT mu — the canonical SG11 signal (supergrok11.h:22-29,64).
+ //
+-// gate FORMULA — the CANONICAL sg11_finalize_gate (algorithms/supergrok11.h).
+-// compute_cosine_gate_fused (supergrok11_sm90.cuh) computes
+-//   num=Σ sg·mu; den_g=Σ sg·sg; den_m=Σ mu·mu;
++// gate FORMULA — the CANONICAL sg11_finalize_gate (algorithms/supergrok11.h), fed
++// the cos(grad, momentum) accumulators from the canonical sg11_sweep_a_step:
++//   num=Σ g·m; den_g=Σ g·g; den_m=Σ m·m;   (m = start-of-step momentum/exp_avg)
+ //   cos  = num / sqrt(den_g*den_m + 1e-12);
+ //   gate = sigmoid(gate_temp · cos)
+-// with sg == grad here. The cosine SIGNAL is what distinguishes SG11 from SG15's
++// The cosine SIGNAL is what distinguishes SG11 from SG15's
+ // sigmoid-of-accuracy gate; only the FINAL squashing is the sigmoid, using the
+ // plumbed gate_temp (the historical impl did a bare clamp and IGNORED gate_temp —
+ // now corrected in lock-step across the canonical, per-op, this stage, the python
+@@ -506,8 +508,12 @@ __device__ __forceinline__ void sg_stage_phi_weights(
+     __syncthreads();
+ }
+ 
+-// SG11 per-tensor body: write mu(T) to global, barrier, compute the per-tensor
+-// gate(T) = sigmoid(gate_temp · cos(grad, mu)) (reading the mu just written).
++// SG11 per-tensor body: write mu(T) to global AND compute the per-tensor
++// gate(T) = sigmoid(gate_temp · cos(grad, MOMENTUM)) — the canonical SG11 gate
++// SIGNAL (supergrok11.h:22-29, sg11_finalize_gate:64). The cosine's 2nd operand
++// is the START-OF-STEP momentum (exp_avg) the caller passes in, NOT the mu just
++// written: SG11's gate is cos_sim(grad, momentum), distinct from SG15's host
++// accuracy scalar. mu is STILL written here (the apply tail's smart_grad reads it).
+ // Returns the gate on EVERY thread (broadcast through the reduction smem) so the
+ // caller binds st.gate before apply_optimizer<SuperGrok11>. The phi weights are
+ // already in SMEM (sW1/sb1/sW2 from sg_stage_phi_weights). `off`/`n` is the
+@@ -518,32 +524,28 @@ __device__ inline float sg11_precompute_mu_and_gate_for_tensor(
+         float* __restrict__ mu_blob,
+         const float* __restrict__ grad,
+         const float* __restrict__ sharpness,
++        const float* __restrict__ momentum,
+         const float* sW1, const float* sb1, const float* sW2,
+         float b2, float rescale,
+         int64_t off, int n, float gate_temp) {
+-    // mu(T): canonical meta-net forward (supergrok11.h:37-55) * rescale
+-    // (supergrok11_sm90.cuh:130), written to global mu_blob.
++    // Fused mu(T) write + gate(T) cosine accumulation, routed through the CANONICAL
++    // sg11_sweep_a_step (algorithms/supergrok11.h:88-105 — the single source for
++    // Sweep A): for each element it writes mu_out[gi]=rescale·phi(g,sharpness) and
++    // accumulates the cos(grad, momentum) reductions
++    //   num += g·m;  den_g += g·g;  den_m += m·m  (m = start-of-step exp_avg).
++    // mu(T) = canonical meta-net forward (supergrok11.h:37-55) · rescale
++    // (supergrok11_sm90.cuh:130). momentum is an INPUT indexed by gi (each thread
++    // its OWN i=threadIdx.x stride indices), so no __syncthreads() is needed before
++    // the reduction (the OLD form read the just-written mu_blob and DID need one;
++    // reading the momentum input instead removes that dependency).
++    float num = 0.0f, den_g = 0.0f, den_m = 0.0f;
+     for (int i = threadIdx.x; i < n; i += blockDim.x) {
+         const int64_t gi = off + i;
+         const float g = grad[gi];
+         const float s = sharpness[gi];
+-        const float phi = algo::sg11_phi_forward<H>(g, s, sW1, sb1, sW2, b2);
+-        mu_blob[gi] = rescale * phi;
+-    }
+-    // Barrier: every thread's mu writes for THIS tensor must be visible to the
+-    // gate reduction below (same block, so __syncthreads suffices — block-scope
+-    // visibility, no grid barrier).
+-    __syncthreads();
+-    // gate(T): sigmoid(gate_temp · cos(grad, mu)), block tree. sg == grad (alpha=0
+-    // path, bindings.cpp:1408). gate_temp is the plumbed gate_temperature.
+-    float num = 0.0f, den_g = 0.0f, den_m = 0.0f;
+-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+-        const int64_t gi = off + i;
+-        const float sg = grad[gi];
+-        const float u  = mu_blob[gi];
+-        num   += sg * u;
+-        den_g += sg * sg;
+-        den_m += u  * u;
++        const float mu_val = rescale * algo::sg11_phi_forward<H>(g, s, sW1, sb1, sW2, b2);
++        algo::sg11_sweep_a_step<float>(
++            mu_blob, grad, sharpness, momentum, mu_val, gi, num, den_g, den_m);
+     }
+     // Deterministic block reductions (fixed thread count). Three separate trees
+     // (the live host fn does three independent .sum()s — same shape).
+@@ -554,7 +556,8 @@ __device__ inline float sg11_precompute_mu_and_gate_for_tensor(
+     den_m = prim::block_reduce_sum_f32(den_m);
+     // Canonical finalizer (sg11_finalize_gate, algorithms/supergrok11.h):
+     //   cos = num / sqrt(den_g*den_m + 1e-12); gate = sigmoid(gate_temp · cos).
+-    // Same single source compute_cosine_gate_fused calls — no re-inlined math.
++    // num/den_g/den_m are the cos(grad, MOMENTUM) accumulators from sg11_sweep_a_step
++    // above — the same single source compute_cosine_gate_fused calls, no re-inlined math.
+     return algo::sg11_finalize_gate(num, den_g, den_m, gate_temp);
+ }
+ 
+diff --git a/scripts/check_math_single_source.py b/scripts/check_math_single_source.py
+index 4a3d5dd..2a0a649 100644
+--- a/scripts/check_math_single_source.py
++++ b/scripts/check_math_single_source.py
+@@ -200,6 +200,48 @@ _REINLINE_PATTERNS = [
+     re.compile(r"/\s*bc1\s*\)\s*/\s*\(\s*sqrtf\s*\(.*?/\s*bc2"),
+ ]
+ 
++# ---------------------------------------------------------------------------
++# SG11 cosine-GATE re-inline detection (drift guard for the cos(grad,momentum)
++# signal).
++#
++# The SG11 gate's cosine reduction — num+=g·m; den_g+=g·g; den_m+=m·m — is the
++# canonical Sweep A (algorithms/supergrok11.h::sg11_sweep_a_step). The L3-TC staged
++# precompute (csrc/fused/sm_90/opt_stages_precompute.cuh) MUST obtain it by CALLING
++# sg11_sweep_a_step, never by re-inlining the per-element accumulation in its own
++# loop. A re-inlined reduction is EXACTLY how the historical cos(grad,mu) bug crept
++# in (the loop hard-coded `den_m += u*u` with u=mu, no momentum operand). So we scan
++# the precompute consumer for a loop-body `den_m += <x>*<x>` / `den_g += <x>*<x>`
++# accumulation; any match FAILS — the cosine math must come from the canonical call.
++# (The local `float num=0, den_g=0, den_m=0;` declarations + the three
++# block_reduce_sum_f32(...) finalizers are NOT accumulations and do not match.)
++_COSINE_REINLINE_PATTERNS = [
++    re.compile(r"\bden_m\s*\+=\s*[\w.\[\]]+\s*\*"),
++    re.compile(r"\bden_g\s*\+=\s*[\w.\[\]]+\s*\*"),
++]
++
++
++def _cosine_consumer_headers() -> list:
++    """Headers that compute the SG11 cosine gate and MUST route the reduction
++    through the canonical sg11_sweep_a_step (never re-inline it)."""
++    return ["csrc/fused/sm_90/opt_stages_precompute.cuh"]
++
++
++def scan_reinlined_cosine(path: str) -> list:
++    """Return list of (lineno, pattern, line) for a re-inlined SG11 cosine-gate
++    reduction in `path` (comments stripped first, so the doc lines that DESCRIBE
++    the canonical `den_m += m·m` are ignored)."""
++    body = _read(path)
++    if not body:
++        return []
++    hits = []
++    for lineno, raw in enumerate(body.splitlines(), 1):
++        code = re.sub(r"//.*$", "", raw)
++        for pat in _COSINE_REINLINE_PATTERNS:
++            if pat.search(code):
++                hits.append((lineno, pat.pattern, raw.strip()))
++                break
++    return hits
++
+ 
+ def _consumer_headers() -> list:
+     """Includable CUDA consumers that MUST obtain the Adam math by call, not by
+@@ -409,6 +451,24 @@ def check(structural_only: bool = False) -> list:
+                 f"call into csrc/algorithms/<opt>.h (e.g. <opt>_step / "
+                 f"<opt>_adam_tail), not be re-typed in the consumer.")
+ 
++    # (1c) SG11 cosine-gate re-inline detection: the staged precompute consumer MUST
++    # obtain the cos(grad,momentum) reduction from the canonical sg11_sweep_a_step,
++    # never re-inline `den_m += x*x` in its own loop (the path the cos(grad,mu) bug
++    # took). Also assert it #includes the canonical supergrok11.h.
++    for path in _cosine_consumer_headers():
++        if _canonical_header("supergrok11") not in _read(path):
++            failures.append(
++                f"[structural] {path} does NOT #include the canonical "
++                f"{_canonical_header('supergrok11')} (the SG11 cosine gate would "
++                f"reimplement the reduction → drift). Add the #include.")
++        for lineno, pat, line in scan_reinlined_cosine(path):
++            failures.append(
++                f"[cosine-re-inline] {path}:{lineno} re-inlines the SG11 cosine-gate "
++                f"reduction (matched /{pat}/): `{line}`. The cos(grad,MOMENTUM) "
++                f"accumulation MUST come from a call into algo::sg11_sweep_a_step "
++                f"(csrc/algorithms/supergrok11.h), not be re-typed in the consumer "
++                f"(re-inlining is exactly how the cos(grad,mu) bug crept in).")
++
+     if structural_only:
+         return failures
+ 
+diff --git a/tests/hw/test_l3tc_tail_gate.py b/tests/hw/test_l3tc_tail_gate.py
+index f50d4d7..cfd5d88 100644
+--- a/tests/hw/test_l3tc_tail_gate.py
++++ b/tests/hw/test_l3tc_tail_gate.py
+@@ -680,11 +680,18 @@ def _sg_pure_fp64_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, d
+ 
+ 
+ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+-                      loss, p_after, total, named0, cache, verbose):
++                      loss, p_after, total, named0, cache, verbose,
++                      sg11_warmup_state=None):
+     """Dedicated SuperGrok11/15 gate: validate the kernel vs the CANONICAL fp64 math its
+     apply_optimizer<SG> calls (ref_sg11_step/ref_sg15_step + ref_sg_phi_forward), plus the
+     SAM 2nd backward (sharpness) vs the PURE-fp64 oracle (RE-ANCHOR task #10). Returns
+-    (ok, detail)."""
++    (ok, detail).
++
++    sg11_warmup_state — None for the cold single-step gate (m=v=0 going in, step=1). For
++    the warm-up gate (test_sg11_gate_warmup_catches_momentum_bug) it is a tuple
++    (m_start, v_start, p_start, t_step): the post-warmup start-of-step state captured
++    BEFORE the gated step, so the reference's cos(grad, MOMENTUM) gate + Adam tail use the
++    exact same nonzero momentum the kernel's st.exp_avg holds at gate time."""
+     import math
+     import torch
+     from grokking_optimizers.dispatch import _opt_scalars_from, fused_train_step
+@@ -761,29 +768,45 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+     # ── (1a)+(1b) apply tail: params + m/v vs the canonical fp64 ref (ref_sg{11,15}_step) with
+     # the kernel's grad + the kernel's mu + the per-tensor gate. The kernel's apply consumes
+     # mu=k_mu (the precompute output) — so the reference uses k_mu too (the apply MATH is what
+-    # (1a/1b) isolate; (B) already validated mu separately). m/v start at 0 (zero-init cache).
++    # (1a/1b) isolate; (B) already validated mu separately).
++    #   * Start-of-step state (m/v going INTO this step): at step 1 the cache is zero-init, so
++    #     m_start=v_start=0. Under a WARM-UP (sg11_warmup_state passed in) the m/v slices are the
++    #     post-warmup state captured BEFORE this gated step — exactly the kernel's st.exp_avg/
++    #     exp_avg_sq at gate time.
++    #   * SG11 gate = sigmoid(gate_temp·cos(grad, MOMENTUM)) — the 2nd cosine operand is the
++    #     START-OF-STEP momentum (m_start), the canonical sg11_finalize_gate signal, NOT mu.
+     p_ref = torch.empty(total, device=dev, dtype=torch.float64)
+     m_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
+     v_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
+     p_before_t = torch.cat([p.data.reshape(-1).double() for _, p in named_ref])
++    ws = sg11_warmup_state            # None (cold step 1) or (m_start, v_start, p_start, t_step)
++    m_start_all = ws[0] if ws is not None else None
++    v_start_all = ws[1] if ws is not None else None
++    p_start_all = ws[2] if ws is not None else None
++    t_step = ws[3] if ws is not None else 1
+     for (n_, o, k, sh) in layout:
+         gt = grad[o:o + k].double()
+         mut = k_mu[o:o + k].double()
+-        pt = p_before_t[o:o + k]
++        pt = (p_start_all[o:o + k].double() if p_start_all is not None
++              else p_before_t[o:o + k])
+         zt = torch.zeros(k, dtype=torch.float64, device=dev)
++        m0 = m_start_all[o:o + k].double() if m_start_all is not None else zt
++        v0 = v_start_all[o:o + k].double() if v_start_all is not None else zt
+         if opt == "supergrok11":
+-            # per-tensor gate (the kernel's P2.45 finalizer sg11_finalize_gate):
+-            # cos = <g,mu>/sqrt(|g|²|mu|²+1e-12); gate = sigmoid(gate_temp·cos).
+-            num = (gt * mut).sum()
+-            den = torch.sqrt((gt * gt).sum() * (mut * mut).sum() + 1e-12)
++            # per-tensor gate (the kernel's finalizer sg11_finalize_gate):
++            # cos = <g,m_start>/sqrt(|g|²|m_start|²+1e-12); gate = sigmoid(gate_temp·cos).
++            # The 2nd operand is the START-OF-STEP MOMENTUM (m0), NOT mu — the canonical
++            # cos(grad,momentum) signal. At cold step 1 m0=0 ⇒ cos=0 ⇒ gate=0.5.
++            num = (gt * m0).sum()
++            den = torch.sqrt((gt * gt).sum() * (m0 * m0).sum() + 1e-12)
+             cos_t = float(num / den) if den > 0 else 0.0
+             gate_t = 1.0 / (1.0 + math.exp(-gate_temp * cos_t))
+-            pn, mn, vn = ref_sg11_step(pt, gt, zt, zt, mut, gate=gate_t, alpha=alpha,
+-                                       lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
++            pn, mn, vn = ref_sg11_step(pt, gt, m0, v0, mut, gate=gate_t, alpha=alpha,
++                                       lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=t_step)
+         else:
+-            pn, mn, vn = ref_sg15_step(pt, gt, zt, zt, mut, gate_global=gate_global,
++            pn, mn, vn = ref_sg15_step(pt, gt, m0, v0, mut, gate_global=gate_global,
+                                        alpha_base=alpha, alpha_max=alpha_max, lr=lr,
+-                                       beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
++                                       beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=t_step)
+         p_ref[o:o + k] = pn; m_ref_f[o:o + k] = mn; v_ref_f[o:o + k] = vn
+ 
+     def _rel(a, b):
+@@ -794,6 +817,14 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+     param_tol = spec.get("param_tol", 1e-4)
+     param_ok = param_rel < param_tol
+     state_ok = (m_rel < 1e-4 and v_rel < 1e-4)
++    # WARM-UP MODE: the sharpness (A) PURE-fp64 oracle is built against a FRESH-init
++    # model (start-of-run params), but the kernel's sharpness here was produced at the
++    # WARMED params — so (A) is not a meaningful comparison under warm-up (the gate's
++    # cos(grad,momentum) fix is validated by (1a)/(1b)/(B), which DO use the warmed
++    # start-of-step state; B uses the kernel's OWN sharpness). So (A) is informational
++    # under warm-up and the (2) A/A/A is owned by the warm-up caller (which re-runs the
++    # whole warm-up+gated sequence 3×, not a cold step-1 rebuild).
++    warmup_mode = sg11_warmup_state is not None
+     if verbose:
+         print(f"  (1a) params vs canonical SG: max-rel={param_rel:.3e} (tol {param_tol:.0e}) "
+               f"{'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
+@@ -801,11 +832,18 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+               f"{'OK' if state_ok else 'FAIL'}", flush=True)
+         print(f"  (A) sharpness vs PURE-fp64 2nd backward: rel={sharp_rel:.3e} "
+               f"(tol {sharp_tol:.0e}, bf16-TC vs ground-truth fp64 floor) "
+-              f"{'OK' if sharp_ok else 'FAIL'}", flush=True)
++              f"{'OK' if sharp_ok else ('INFO(warmup)' if warmup_mode else 'FAIL')}",
++              flush=True)
+         print(f"  (B) mu vs rescale·phi(g,sharpness): rel={mu_rel:.3e} (tol {mu_tol:.0e}) "
+               f"{'OK' if mu_ok else 'FAIL'}  [rescale={float(rescale):.3g} alpha={alpha:.3g} "
+               f"gate_global={gate_global:.3g}]", flush=True)
+-    tail_ok = param_ok and state_ok and sharp_ok and mu_ok
++    # The gate-momentum fix is carried by (1a)+(1b)+(B). Under warm-up, (A) is
++    # informational (fresh-model oracle vs warmed kernel) and the A/A/A (2) is the
++    # caller's; the cold single-step gate keeps the full (A)+(2) teeth.
++    tail_ok = param_ok and state_ok and mu_ok and (sharp_ok or warmup_mode)
++    if warmup_mode:
++        return (tail_ok, dict(param_rel=param_rel, sharp_rel=sharp_rel, mu_rel=mu_rel,
++                              m_rel=m_rel, v_rel=v_rel, loss=loss))
+ 
+     # ── (2) A/A/A determinism: re-run the production step 3× from the SAME init.
+     def _one():
+@@ -841,6 +879,186 @@ def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+                     loss=loss, det=det_ok)
+ 
+ 
++def run_sg11_warmup_gate(cell_key, warmup_steps=2, verbose=True):
++    """WARM-UP SG11 gate — the divergence-exercising check the cold single-step gate is
++    BLIND to (in the worst case mu≈0 ∧ momentum=0 at step 1 ⇒ cos(grad,mu)==cos(grad,
++    momentum)==gate(0.5) — the two formulations COINCIDE). After ≥1 warm-up step BOTH
++    mu≠0 AND momentum (exp_avg)≠0, so the BUGGY cos(grad,mu) gate and the CANONICAL
++    cos(grad,momentum) gate genuinely differ.
++
++    Runs `warmup_steps` real L3-TC steps (shared state_cache so exp_avg accumulates),
++    captures the start-of-step m/v/p going INTO the gated step (= the kernel's
++    st.exp_avg/exp_avg_sq/params at gate time), then runs the gated step and validates
++    the kernel vs the CORRECTED cos(grad,momentum) reference (_run_sg_cell_gate with
++    sg11_warmup_state). Returns (ok, detail). detail carries:
++      * gate_div — max |gate_momentum − gate_mu| over tensors (>0 proves the warm-up
++        exercises the divergence the bug lives in; the OLD kernel computes the gate_mu
++        column and must FAIL this corrected reference).
++      * mom_norm — the start-of-step momentum L2 norm (must be ≫0 — a live warm-up)."""
++    import math
++    from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
++                                              canonicalize_model, fused_train_step,
++                                              _opt_scalars_from)
++    spec = _CELLS[cell_key]
++    model, opt = spec["model"], spec["opt"]
++    assert opt == "supergrok11", f"{cell_key}: warmup gate is SG11-only"
++    g, c, m, data, dev = _build_cell(model)
++    canon = canonicalize_model(model)
++    assert has_l3_real(canon, opt), f"{cell_key}: not L3-REAL"
++    assert gemm_impl_for_cell(canon, opt, "bf16") == "wgmma", f"{cell_key}: not wgmma"
++    tx, ty = data[0], data[1]
++    # Build the live optimizer with a LARGE meta-net rescale so the gate-dependent
++    # smart_grad term (1−gate)·alpha·mu, mu=rescale·phi, is well ABOVE the param
++    # tolerance (1e-4). With the default rescale=0.1 the mu term is too small to move
++    # params measurably, so a wrong gate (cos(grad,mu) vs cos(grad,momentum)) hides
++    # under the tolerance even when the gates diverge by ~0.8 — the param check would
++    # falsely PASS the OLD kernel. A big rescale makes the gate genuinely load-bearing.
++    import torch as _t
++    opt_obj = spec["factory"](g, m.parameters(), c)
++    with _t.no_grad():
++        opt_obj.meta_net.rescale.fill_(2.0)
++    opt_obj._weights_dirty = True
++    named0 = [(n, p) for n, p in m.named_parameters() if p.requires_grad]
++    total = sum(p.numel() for _, p in named0)
++
++    def _flat_params():
++        out = torch.empty(total, device=dev); o = 0
++        for _, p in named0:
++            k = p.numel(); out[o:o + k].copy_(p.data.reshape(-1)); o += k
++        return out
++
++    # ── WARM-UP: run `warmup_steps` real steps so exp_avg (momentum) becomes nonzero.
++    cache = {}
++    for s in range(1, warmup_steps + 1):
++        fused_train_step(canon, opt, m, opt_obj, tx, ty, state_cache=cache,
++                         step=s, return_grad=False, gemm_impl="wgmma")
++
++    # Start-of-step state going INTO the gated step (= the kernel's st.exp_avg/
++    # exp_avg_sq/params at gate time): the cache m/v slices + the live (warmed) params.
++    kstate = cache[canon]["state"]
++    m_start = kstate[0:total].clone()
++    v_start = kstate[total:2 * total].clone()
++    p_start = _flat_params()
++    mom_norm = float(m_start.norm())
++    t_step = warmup_steps + 1
++
++    # ── GATED step (step = warmup_steps+1) on the SAME cache (so it reads the warmed
++    # momentum), capturing the TC-reduced grad + post-step params (the kernel's gate
++    # now uses cos(grad, m_start)).
++    loss, grad = fused_train_step(canon, opt, m, opt_obj, tx, ty, state_cache=cache,
++                                  step=t_step, return_grad=True, gemm_impl="wgmma")
++    p_after = _flat_params()
++
++    # ── (A)/(B) THE DIRECT GATE SURFACE — recover the kernel's ACTUAL per-tensor gate
++    # and compare it to BOTH formulations. This is the load-bearing instrument: the
++    # post-Adam params and even the m-state are heavily damped (β1·m0 + 0.1·smart_grad,
++    # then v-normalized), so a wrong gate is washed out below the 1e-4 param/state
++    # tolerance even when the two gate FORMULATIONS differ by ~0.8. The gate itself is
++    # NOT damped, so recovering it exposes the bug cleanly.
++    #
++    # The kernel wrote k_m = β1·m0 + (1−β1)·smart_grad with smart_grad = g + (1−gate)·
++    # alpha·mu and a per-TENSOR scalar gate. So smart_grad_kernel = (k_m − β1·m0)/(1−β1),
++    # and (1−gate)·alpha = <smart_grad_kernel − g, mu> / <mu, mu> (least-squares over the
++    # tensor since gate is one scalar). gate_kernel = 1 − that/alpha. Compare to:
++    #   gate_momentum = sigmoid(gate_temp·cos(grad, m0))   — CANONICAL (FIXED kernel)
++    #   gate_mu       = sigmoid(gate_temp·cos(grad, k_mu)) — BUGGY     (OLD kernel)
++    scalars = _opt_scalars_from(opt_obj, t_step)
++    gate_temp = float(scalars.get("gate_temp", 5.0))
++    alpha = float(scalars["alpha"]); beta1 = float(scalars["beta1"])
++    k_mu = kstate[2 * total:3 * total]
++    k_m = kstate[0:total]
++    off = 0; gate_div = 0.0
++    err_vs_momentum = 0.0   # |gate_kernel − gate_momentum|  → ~0 for FIXED, large for OLD
++    err_vs_mu = 0.0         # |gate_kernel − gate_mu|        → ~0 for OLD,   large for FIXED
++    for n_, p in named0:
++        k = p.numel()
++        gt = grad[off:off + k].double()
++        mut = k_mu[off:off + k].double()
++        m0 = m_start[off:off + k].double()
++        km = k_m[off:off + k].double()
++        m0b = m_start[off:off + k].double()
++        def _gate(b):
++            num = (gt * b).sum()
++            den = torch.sqrt((gt * gt).sum() * (b * b).sum() + 1e-12)
++            cos = float(num / den) if den > 0 else 0.0
++            return 1.0 / (1.0 + math.exp(-gate_temp * cos))
++        g_mom = _gate(m0); g_mu = _gate(mut)
++        gate_div = max(gate_div, abs(g_mom - g_mu))
++        # Recover the kernel's gate from the m-state (per-tensor least-squares).
++        sg_k = (km - beta1 * m0b) / (1.0 - beta1)
++        denom = float((mut * mut).sum())
++        if denom > 1e-20 and alpha > 1e-12:
++            one_minus_gate = float(((sg_k - gt) * mut).sum()) / (denom * alpha)
++            gate_kernel = 1.0 - one_minus_gate
++            err_vs_momentum = max(err_vs_momentum, abs(gate_kernel - g_mom))
++            err_vs_mu = max(err_vs_mu, abs(gate_kernel - g_mu))
++        off += k
++
++    # ── Validate the FIXED kernel vs the CORRECTED cos(grad,momentum) reference, with
++    # the warmed start-of-step state threaded through (m0=m_start, gate uses momentum).
++    ok, detail = _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon,
++                                   opt_obj, grad, loss, p_after, total, named0, cache,
++                                   verbose, sg11_warmup_state=(m_start, v_start, p_start, t_step))
++    detail["gate_div"] = gate_div
++    detail["mom_norm"] = mom_norm
++    detail["gate_err_vs_momentum"] = err_vs_momentum
++    detail["gate_err_vs_mu"] = err_vs_mu
++    # (A)/(B) VERDICT on the direct gate surface: the kernel's recovered gate must match
++    # the CANONICAL cos(grad,momentum) (FIXED) and NOT the buggy cos(grad,mu) (OLD).
++    # The recovery sg_k=(k_m−β1·m0)/(1−β1) amplifies the bf16 m-state floor by 1/(1−β1)
++    # (≈10×), so the FIXED kernel lands at err_vs_momentum≈1e-4..1e-3 — a few×1e-3 floor.
++    # The OLD kernel sits at err_vs_momentum≈0.74..0.92 (and err_vs_mu≈1e-3). The two
++    # regimes are separated by ~3 orders of magnitude, so generous bands (1e-2 / 1e-1)
++    # give a robust, floor-tolerant verdict with no risk of a flip either way.
++    gate_ok = (err_vs_momentum < 1e-2) and (err_vs_mu > 1e-1)
++
++    # ── (D) A/A/A determinism on the WARM-UP path: re-run the full warmup+gated
++    # sequence 3× from the SAME init; the gated-step params + mu must be bit-identical.
++    def _one_warm():
++        g2, c2, m2, data2, dev2 = _build_cell(model)
++        tx2, ty2 = data2[0], data2[1]
++        opt2 = spec["factory"](g2, m2.parameters(), c2)
++        with _t.no_grad():
++            opt2.meta_net.rescale.fill_(2.0)
++        opt2._weights_dirty = True
++        cc = {}
++        for s in range(1, warmup_steps + 1):
++            fused_train_step(canon, opt, m2, opt2, tx2, ty2, state_cache=cc,
++                             step=s, return_grad=False, gemm_impl="wgmma")
++        L, G = fused_train_step(canon, opt, m2, opt2, tx2, ty2, state_cache=cc,
++                                step=t_step, return_grad=True, gemm_impl="wgmma")
++        P = torch.empty(total, device=dev2); o = 0
++        for _, p in m2.named_parameters():
++            if p.requires_grad:
++                k = p.numel(); P[o:o + k].copy_(p.data.reshape(-1)); o += k
++        MU = cc[canon]["state"][2 * total:3 * total].clone()
++        return L, G.clone(), P, MU
++    LA, GA, PA, MA = _one_warm(); LB, GB, PB, MB = _one_warm()
++    det_ok = (LA == LB and torch.equal(GA, GB) and torch.equal(PA, PB)
++              and torch.equal(MA, MB))
++    detail["det"] = det_ok
++
++    if verbose:
++        print(f"  (WARMUP) steps={warmup_steps} mom_norm={mom_norm:.4e} "
++              f"gate_div(momentum vs mu)={gate_div:.4e} "
++              f"{'OK(divergent)' if gate_div > 1e-4 else 'WARN(coincident!)'}", flush=True)
++        print(f"  (A/B) recovered-gate: |gate_kernel−gate_momentum|={err_vs_momentum:.4e} "
++              f"(want <1e-2 → matches CANONICAL) |gate_kernel−gate_mu|={err_vs_mu:.4e} "
++              f"(want >1e-1 → NOT the bug) {'OK(cos grad,momentum)' if gate_ok else 'FAIL'}",
++              flush=True)
++        print(f"  (D) A/A/A determinism (warmup path): loss {LA:.6f}/{LB:.6f}  "
++              f"param-eq={torch.equal(PA, PB)} mu-eq={torch.equal(MA, MB)} "
++              f"{'OK' if det_ok else 'FAIL'}", flush=True)
++    # The warm-up MUST exercise the divergence (else (A) old-kernel-fails is vacuous).
++    assert mom_norm > 1e-6, f"{cell_key}: warm-up momentum ~0 — exp_avg did not accumulate"
++    assert gate_div > 1e-4, (
++        f"{cell_key}: cos(grad,momentum) and cos(grad,mu) gates COINCIDE "
++        f"(div={gate_div:.2e}) — the warm-up does not exercise the bug; the (A) "
++        f"old-kernel-fails demonstration would be vacuous. Strengthen the warm-up.")
++    detail["gate_ok"] = gate_ok
++    return (ok and det_ok and gate_ok), detail
++
++
+ def run_cell_gate(cell_key, verbose=True):
+     """Run gates (1)+(2) for one converted cell. Returns (ok, detail)."""
+     from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
+@@ -1258,10 +1476,27 @@ def test_l3tc_cell_gate(cell):
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--cell", default="", help="single cell e.g. lion/decoder")
++    ap.add_argument("--sg11-warmup", action="store_true",
++                    help="run the SG11 WARM-UP gate (cos(grad,momentum) divergence) "
++                         "for the supergrok11 cells instead of the cold step-1 gate")
++    ap.add_argument("--warmup-steps", type=int, default=2,
++                    help="number of warm-up steps before the gated step (default 2)")
+     args = ap.parse_args()
+     if not _gpu_ready():
+         print("SKIP: no built extension / GPU", flush=True)
+         return
++    if args.sg11_warmup:
++        cells = ([args.cell] if args.cell
++                 else [k for k in _CELLS if _CELLS[k]["opt"] == "supergrok11"])
++        n_ok = 0
++        for cell in cells:
++            print(f"[l3tc-gate WARMUP] {cell}", flush=True)
++            ok, _ = run_sg11_warmup_gate(cell, warmup_steps=args.warmup_steps,
++                                         verbose=True)
++            print(f"  => {'PASS' if ok else 'FAIL'}\n", flush=True)
++            n_ok += int(ok)
++        print(f"[l3tc-gate WARMUP] {n_ok}/{len(cells)} SG11 cells passed", flush=True)
++        sys.exit(0 if n_ok == len(cells) else 1)
+     cells = [args.cell] if args.cell else list(_CELLS)
+     n_ok = 0
+     for cell in cells:
+diff --git a/tests/hw/test_opt_stages.py b/tests/hw/test_opt_stages.py
+index 5347daf..98466c5 100644
+--- a/tests/hw/test_opt_stages.py
++++ b/tests/hw/test_opt_stages.py
+@@ -198,49 +198,48 @@ def _sg11_mu_mirror(grad, sharpness, W1, b1, W2, b2, rescale):
+     return (rescale * out).reshape(grad.shape)
+ 
+ 
+-def _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0):
++def _sg11_gate_mirror_fp32(grad, momentum, gate_temp=5.0):
+     """Mirror sg11_precompute_mu_and_gate_for_tensor's finalizer (== compute_cosine_
+     gate_fused == sg11_finalize_gate, algorithms/supergrok11.h) in fp32 with the
+-    block-tree reduction shape. sg == grad (the alpha=0 mu_metanet makes smart_grad
+-    == grad). Returns gate = sigmoid(gate_temp * cos(grad, mu)) (the cosine SIGNAL
+-    squashed by the temperature-scaled sigmoid, NOT a bare clamp)."""
++    block-tree reduction shape. The canonical SG11 gate SIGNAL is cos(grad,
++    MOMENTUM) (supergrok11.h:22-29,64 — the 2nd operand is the start-of-step
++    exp_avg, NOT mu; that distinguishes SG11 from the buggy cos(grad,mu)). Returns
++    gate = sigmoid(gate_temp * cos(grad, momentum)) (the cosine SIGNAL squashed by
++    the temperature-scaled sigmoid, NOT a bare clamp)."""
+     g = _f32(grad).flatten()
+-    u = _f32(mu).flatten()
+-    num = _block_tree_sum_fp32(g * u)
++    m = _f32(momentum).flatten()
++    num = _block_tree_sum_fp32(g * m)
+     den_g = _block_tree_sum_fp32(g * g)
+-    den_m = _block_tree_sum_fp32(u * u)
++    den_m = _block_tree_sum_fp32(m * m)
+     denom = math.sqrt(den_g * den_m + 1e-12)
+     cos = (num / denom) if denom > 0.0 else 0.0
+     return 1.0 / (1.0 + math.exp(-gate_temp * cos))
+ 
+ 
+-def _sg11_gate_oracle_fp64(grad, mu, gate_temp=5.0):
+-    """fp64 gate oracle: sigmoid(gate_temp * <g,mu>/sqrt(|g|^2 |mu|^2 + 1e-12))."""
++def _sg11_gate_oracle_fp64(grad, momentum, gate_temp=5.0):
++    """fp64 gate oracle: sigmoid(gate_temp * <g,m>/sqrt(|g|^2 |m|^2 + 1e-12)),
++    m == the start-of-step MOMENTUM (exp_avg) — the canonical cos(grad,momentum)
++    SIGNAL (supergrok11.h:29,64), NOT the co-wrong cos(grad,mu)."""
+     g = _f64(grad).flatten()
+-    u = _f64(mu).flatten()
+-    num = float((g * u).sum())
++    m = _f64(momentum).flatten()
++    num = float((g * m).sum())
+     den_g = float((g * g).sum())
+-    den_m = float((u * u).sum())
++    den_m = float((m * m).sum())
+     denom = math.sqrt(den_g * den_m + 1e-12)
+     cos = (num / denom) if denom > 0.0 else 0.0
+     return 1.0 / (1.0 + math.exp(-gate_temp * cos))
+ 
+ 
+ def test_sg11_cosine_gate_matches_fp64_oracle():
+-    """Per-tensor sigmoid-of-cosine gate (block tree) vs the fp64 oracle."""
++    """Per-tensor sigmoid-of-cos(grad, MOMENTUM) gate (block tree) vs the fp64
++    oracle. The cosine's 2nd operand is the start-of-step momentum (exp_avg), the
++    canonical SG11 signal — NOT mu."""
+     torch.manual_seed(2)
+-    H = 32
+-    W1 = torch.randn(H * 2, dtype=torch.float64) * 0.1
+-    b1 = torch.randn(H, dtype=torch.float64) * 0.1
+-    W2 = torch.randn(H, dtype=torch.float64) * 0.1
+-    b2 = 0.05
+-    rescale = 0.7
+     for sh in [(513,), (32, 24), (2000,)]:
+         grad = torch.randn(*sh, dtype=torch.float64) * 0.3
+-        sharp = (torch.randn(*sh, dtype=torch.float64) * 0.2).abs()
+-        mu = _sg11_mu_mirror(grad, sharp, W1, b1, W2, b2, rescale)
+-        gate_stage = _sg11_gate_mirror_fp32(grad, mu)
+-        gate_oracle = _sg11_gate_oracle_fp64(grad, mu)
++        momentum = torch.randn(*sh, dtype=torch.float64) * 0.25
++        gate_stage = _sg11_gate_mirror_fp32(grad, momentum)
++        gate_oracle = _sg11_gate_oracle_fp64(grad, momentum)
+         assert math.isclose(gate_stage, gate_oracle, rel_tol=1e-4, abs_tol=1e-6), (
+             f"sg11 gate {gate_stage} vs oracle {gate_oracle} shape={sh}")
+         assert 0.0 <= gate_stage <= 1.0
+@@ -254,29 +253,31 @@ def test_sg11_gate_applies_gate_temp():
+     1 for a positive cosine (a bare clamp would be temperature-invariant)."""
+     torch.manual_seed(3)
+     grad = torch.randn(400, dtype=torch.float64)
+-    mu = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)  # positive cos
++    # 2nd cosine operand = MOMENTUM (canonical SG11), correlated with grad ⇒ cos>0.
++    momentum = 0.5 * grad + 0.1 * torch.randn(400, dtype=torch.float64)
+     # (a) gate == sigmoid(gate_temp*cos), and DIFFERS from the bare clamped cosine.
+-    g = _f64(grad).flatten(); u = _f64(mu).flatten()
+-    cos = float((g * u).sum()) / math.sqrt(
+-        float((g * g).sum()) * float((u * u).sum()) + 1e-12)
++    g = _f64(grad).flatten(); m = _f64(momentum).flatten()
++    cos = float((g * m).sum()) / math.sqrt(
++        float((g * g).sum()) * float((m * m).sum()) + 1e-12)
+     clamped_cos = min(max(cos, 0.0), 1.0)
+-    gate5 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=5.0)
++    gate5 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=5.0)
+     assert math.isclose(gate5, 1.0 / (1.0 + math.exp(-5.0 * cos)),
+                         rel_tol=1e-4, abs_tol=1e-6)
+     assert not math.isclose(gate5, clamped_cos, rel_tol=1e-3, abs_tol=1e-3)
+     # (b) temperature is genuinely consumed: higher temp ⇒ gate closer to 1 (cos>0).
+-    gate1 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=1.0)
+-    gate20 = _sg11_gate_mirror_fp32(grad, mu, gate_temp=20.0)
++    gate1 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=1.0)
++    gate20 = _sg11_gate_mirror_fp32(grad, momentum, gate_temp=20.0)
+     assert gate1 < gate5 < gate20
+ 
+ 
+-def _sg11_mu_and_gate_for_tensor(grad_T, sharp_T, W1, b1, W2, b2, rescale):
++def _sg11_mu_and_gate_for_tensor(grad_T, sharp_T, mom_T, W1, b1, W2, b2, rescale):
+     """Mirror sg11_precompute_mu_and_gate_for_tensor: the PER-TENSOR fused body
+-    that writes mu(T) then computes gate(T). Returns (mu_T, gate_T). This is the
+-    single-drain Design B body — it sees ONLY tensor T (off/n slice), so its gate
+-    cannot depend on any other tensor's mu."""
++    that writes mu(T) then computes gate(T)=sigmoid(gate_temp·cos(grad_T, mom_T)).
++    Returns (mu_T, gate_T). This is the single-drain Design B body — it sees ONLY
++    tensor T (off/n slice), so its gate cannot depend on any other tensor's slice.
++    The gate's 2nd operand is the start-of-step momentum mom_T (canonical), not mu."""
+     mu_T = _sg11_mu_mirror(grad_T, sharp_T, W1, b1, W2, b2, rescale)
+-    gate_T = _sg11_gate_mirror_fp32(grad_T, mu_T)
++    gate_T = _sg11_gate_mirror_fp32(grad_T, mom_T)
+     return mu_T, gate_T
+ 
+ 
+@@ -298,17 +299,19 @@ def test_sg11_gate_is_per_tensor_not_cross_tensor():
+     # Tensor T plus several OTHER tensors that share the meta-net weights.
+     gT = torch.randn(321, dtype=torch.float64) * 0.4
+     sT = (torch.randn(321, dtype=torch.float64)).abs()
++    mT = torch.randn(321, dtype=torch.float64) * 0.3   # start-of-step momentum slice
+     others = [
+-        (torch.randn(k, dtype=torch.float64), (torch.randn(k, dtype=torch.float64)).abs())
++        (torch.randn(k, dtype=torch.float64), (torch.randn(k, dtype=torch.float64)).abs(),
++         torch.randn(k, dtype=torch.float64))
+         for k in (64, 999, 128)
+     ]
+     # gate(T) computed by the per-tensor body, with T alone.
+-    _, gate_alone = _sg11_mu_and_gate_for_tensor(gT, sT, W1, b1, W2, b2, rescale)
++    _, gate_alone = _sg11_mu_and_gate_for_tensor(gT, sT, mT, W1, b1, W2, b2, rescale)
+     # gate(T) computed by the same per-tensor body AFTER processing the others
+     # (the body only ever sees T's slice; the others change nothing for T).
+-    for go, so in others:
+-        _sg11_mu_and_gate_for_tensor(go, so, W1, b1, W2, b2, rescale)
+-    _, gate_after = _sg11_mu_and_gate_for_tensor(gT, sT, W1, b1, W2, b2, rescale)
++    for go, so, mo in others:
++        _sg11_mu_and_gate_for_tensor(go, so, mo, W1, b1, W2, b2, rescale)
++    _, gate_after = _sg11_mu_and_gate_for_tensor(gT, sT, mT, W1, b1, W2, b2, rescale)
+     assert gate_alone == gate_after, (
+         "SG11 gate(T) must be independent of other tensors — the no-barrier "
+         "single-drain design depends on this per-tensor independence.")
