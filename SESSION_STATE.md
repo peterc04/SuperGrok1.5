@@ -6,15 +6,17 @@
 > Resume: read this → `.perf/batch/` (the front-load output) → the `.perf/*.json` roadmaps → `git log`.
 
 ## Shipped + validated THIS session (committed, durable)
+- **ViT B1 sub-tile S=8 BAKED** (`b0d41f8`) — the **#1 lever, 4.02×** (5768→1434 ms @ d2048/B1024; B1_barrier 51.2%→41.9%). Sweep a2d8fe79: 36/36 gate calls clean (4 S × 3 seeds × 11 cells), A/A/A held. **Final confirm-build on return** (GPU busy w/ front-load).
+- **macro-table drift fix** (`319b96d`) — round-2 audit found `dec_dw_splitk` table=4 vs header=1 (the 06-16 ratchet) + dead `mb_dw_splitk` knob; a fake-green hole (drift guard not in `--self-test` path) hid it. Fixed across 5 files; guard now green; 265/0.
 - **decoder PIPE=1/STAGES=4 BAKED** — the +1.49× fwd/dX deeper-ring KEEP, now in the shipped `_ops` (gate: 619ms/6.466%, 33/33 × 3 seeds GREEN). PIPE=2 LOST its tournament.
 - **5 audit cleanups** (`eff3e78`) — has_kernels, ~750MB scratch-workspace removal, grad-hooks fail-fast, decoder-mirror test, scan-adapter removal. Gate-confirmed.
 - **SG11 correctness fix** (`51098e0`) — cos(grad,**mu**)→cos(grad,**momentum**) in the L3-TC staged gate (was gate-blind: co-wrong oracle + step-1 coincidence). Gated old-FAILS / new-PASSES (×3 seeds) / 33-cell GREEN / A/A/A. Found by the bug-hunt.
 - dead-artifact cleanup, GO-plan, 11 captured analysis roadmaps in `.perf/*.json`.
 
 ## In-flight (volatile; act on landing)
-- **ViT B1 flip-gate** (agent `a2e9168d`, sonnet) — the #1 perf lever (51%); sweeps SUBTILE_S∈{16,8,4} @ d2048/B1024. ON LANDING: **bake the winning `-DSG_TUNED_VIT_P1_SUBTILE_S` + commit** (or "OFF stays").
-- **scale-correctness-audit** (`we4dguzvd`) — capture on landing.
-- **author-fixes** (`w3w9n3npc`, WRITE worktree) — emits `.perf/ci_verify_all_reanchor.diff` + `.perf/c0_r1fold_mvp.diff`; apply+gate on return.
+- **ViT B1 flip-gate — LANDED + BAKED** (S=8, `b0d41f8`). DONE.
+- **12h FRONT-LOAD batch — RUNNING** (since 06:18 UTC): GPU-wait done, `autotuner_new_knobs.diff` skipped cleanly (drift-fix shifted its context — expected), `.STOP_TUNING` removed, decoder re-profile started → then the 22-cell existing-knob autotune sweep. Output → `.perf/batch/`. NOTE: the front-load deleted tracked `.STOP_TUNING` (restore on return to re-disable tuning).
+- **phase1-status-audit workflow** (`wcrdmvuvq`) — GPU-util / roofline / optimizer-readiness, refute-by-default. Synthesize answer on landing.
 
 ## The 12h FRONT-LOAD batch — `.perf/batch/run_12h_frontload.sh` (launched after ViT B1 frees the GPU)
 RECORDS to `.perf/batch/`, NO auto-commit. Steps: (1) preflight self-test (abort-guard); (2) `rm .STOP_TUNING`; (3) **decoder re-profile @618ms** (coarse + --fwd-fine) → `decoder_reprofile_*.txt` — re-grounds the STALE relevance gate (the 56.5% fwd/dX + 19% B1 were from the superseded 920ms build); (4) **autotuner sweep, 33 cells** (`-M -O --jit-only`, 24m/cell ≈13h) → winners in `grokking_optimizers/_kernel_tuned.json` + `autotune_*.log` + cost-model cache. **REVIEW CAVEAT:** the in-loop gate runs at d=128 (RG4) → RE-GATE winners at d=2048 before shipping.
