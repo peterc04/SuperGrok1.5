@@ -27,7 +27,7 @@ jobs:
     name: ruff lint + format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -49,7 +49,7 @@ jobs:
     name: py_compile (syntax, whole repo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -155,7 +155,7 @@ jobs:
     env:
       GROK_NO_AUTO_INSTALL: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -227,7 +227,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -295,7 +295,7 @@ jobs:
       matrix:
         arch: [sm_70, sm_90a, sm_120a, gfx942, gfx1201, tpu_v5p, tpu_v6e]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -321,7 +321,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -369,7 +369,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -399,7 +399,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -449,7 +449,7 @@ jobs:
     runs-on: macos-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -478,7 +478,7 @@ jobs:
     name: ruff lint (whole repo, non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -502,7 +502,7 @@ jobs:
     name: C++ structural sanity (no toolchain)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -563,7 +563,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -683,7 +683,7 @@ jobs:
           - sm_103
           - sm_120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -733,7 +733,7 @@ jobs:
           - { opt: muon,       model: mamba, arch: gfx942 }
           - { opt: adamw,      model: vit,   arch: tpu_v6e }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -764,7 +764,7 @@ jobs:
     env:
       FORCE_ARCH: "90"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -811,7 +811,7 @@ jobs:
     env:
       FORCE_ARCH: ${{ matrix.force_arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -853,7 +853,7 @@ jobs:
     env:
       FORCE_ARCH: "90"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -923,7 +923,7 @@ jobs:
     env:
       GROK_NO_AUTO_INSTALL: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -955,7 +955,7 @@ jobs:
     name: README ↔ tree consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -999,7 +999,7 @@ jobs:
     env:
       GROK_NO_AUTO_INSTALL: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1032,7 +1032,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1098,7 +1098,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive          # third_party/cutlass for the sm_90 TUs
       - uses: actions/setup-python@v5
@@ -1147,7 +1147,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang (AMDGPU target)
         run: |
           sudo apt-get update -qq
@@ -1204,7 +1204,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1226,7 +1226,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1265,7 +1265,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang + llvm (gfx942 ISA disassembly)
         run: |
           sudo apt-get update -qq
@@ -1303,7 +1303,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1333,7 +1333,7 @@ jobs:
     name: mypy (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1351,7 +1351,7 @@ jobs:
     name: bandit security scan (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1369,7 +1369,7 @@ jobs:
     name: pip-audit (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1394,7 +1394,7 @@ jobs:
     name: codespell (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1411,7 +1411,7 @@ jobs:
     name: yamllint (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1428,7 +1428,7 @@ jobs:
     name: actionlint (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run actionlint
         uses: raven-actions/actionlint@v2
         continue-on-error: true
@@ -1440,7 +1440,7 @@ jobs:
     name: shellcheck (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
       - name: shellcheck *.sh
@@ -1458,7 +1458,7 @@ jobs:
     name: markdown link check (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: lychee link checker
         uses: lycheeverse/lychee-action@v2
         with:
@@ -1473,7 +1473,7 @@ jobs:
     name: TODO/FIXME census (non-blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Count debt markers
         run: |
           echo "::group::TODO / FIXME / XXX / HACK markers"
@@ -1495,7 +1495,7 @@ jobs:
     runs-on: windows-latest
     needs: py_compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
