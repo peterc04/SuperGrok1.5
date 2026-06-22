@@ -1,0 +1,8 @@
+- [No functionality suppression](no-functionality-suppression.md) — fix components, never disable them; applies to all SG machinery + whole codebase
+- [H100 MPS max parallelism](h100-mps-max-parallelism.md) — owner wants hardware saturation: MPS daemon + 14-worker fleet = 88% util vs 33% without; quit kills daemon; pkill self-match gotcha
+- [Portable megakernel components](portable-megakernel-components.md) — all 33 model×opt cells from header-only portable components; contract at csrc/fused/COMPONENT_CONTRACT.md; no CUDA graphs
+- [H100 durable requirements](h100-durable-requirements.md) — standing specs: PTX-maximal kernels, AdamW-grade callability, hw max-parallelism, roofline metric, no CUDA graphs, no suppression; check before reporting anything done
+- [Fable 5 availability](fable-5-availability.md) — account has access; subagent spawner bug blocks it this session; CLAUDE_CODE_SUBAGENT_MODEL pinned to opus (do not delete); retest after claude update
+- [Megakernel validation ladder gaps](megakernel-validation-ladder-gaps.md) — CPU mirrors can't see stride bugs/races, only GPU-vs-fp64-oracle gates count; calibrated parity tolerances; ln(vocab)-pinned-loss debug signature; MPS kill -9 teardown wedge
+- [Owner status pings](owner-status-pings.md) — proactive status+ETA at every landing; explicit mi300x go-signal
+- [Overnight autonomous run](overnight-autonomous-run.md) — loop discipline for the unattended H100 campaign; the scale decision NOT to make while owner sleeps

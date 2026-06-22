@@ -1,0 +1,4 @@
+{"type":"started","key":"v2:c7c366b499e414f190455af8efe4b0bb1d669e0c5694f018ab95a3bae43a02ff","agentId":"a68597b8422f3dda7"}
+{"type":"started","key":"v2:af1101349ac46a8884f573a88dfafcee88e27d04aafd0ca5c7e0d06893da0577","agentId":"a1ba0631097f8eaf6"}
+{"type":"started","key":"v2:f567e690cbeb0fb97821efad5311a9960eb7becafb29094595395ca927fd19e3","agentId":"af30a39379980aed7"}
+{"type":"result","key":"v2:af1101349ac46a8884f573a88dfafcee88e27d04aafd0ca5c7e0d06893da0577","agentId":"a1ba0631097f8eaf6","result":"I'll wait for the build monitor to notify me of completion. The build is running with 224 workers and the monitor is armed to fire when `BUILD_EXIT=` or an error appears in the log. I'll hold until that notification arrives."}
