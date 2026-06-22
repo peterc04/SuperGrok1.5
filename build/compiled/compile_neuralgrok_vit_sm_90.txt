@@ -1,0 +1,222 @@
+# grokking_optimizers.compile — targeted build
+# Generated:        2026-06-17T06:25:44.916330
+# Optimizer:        neuralgrok
+# Model:            vit
+# Arch:             sm_90 (vendor=cuda)
+# CPU cores:        224 (ninja -j)
+# Out dir:          /workspace/SuperGrok1.5/build/compiled
+# Cache:            /workspace/SuperGrok1.5/build/compiled/.compile_cache.json
+# Runtime:          jit
+# Autotune:         True (mode=bayesian)
+# Bayesian trials:  auto (top_k=auto patience=auto max_tune_seconds=unbounded min_improvement=0.005 ei_floor=1e-06)
+# PGO:              True
+#   workload:       /workspace/SuperGrok1.5/grokking_optimizers/compile.py
+#   steps:          1000
+# Search space:     <full-programmatic>
+# AOT artefact dir: None
+# Debug symbols:    False
+# Profile:          True
+
+[preflight] arch=sm_90 vendor=cuda
+[preflight] CUDA_HOME=/usr/local/cuda-12.4
+[preflight] nvcc=/usr/local/cuda-12.4/bin/nvcc
+[preflight] Build cuda_12.4.r12.4/compiler.34097967_0
+[preflight] libcudart: /usr/local/cuda-12.4/lib64/libcudart.so
+[preflight] ninja=/usr/local/bin/ninja
+[preflight] g++=/usr/bin/g++
+[preflight] arch=sm_90 need CUDA>=12.0 have 12.4 — PASS
+[preflight] flag-probe: all 40 flags accepted by nvcc
+
+--- JIT AUTOTUNE PHASE ---
+  [jit] cache has no AOT entry; running AOT now.
+  [pgo] workload=/workspace/SuperGrok1.5/grokking_optimizers/compile.py steps=1000 hash=af4de596ea8d69e4
+
+  [pgo 1/3] building instrumented .so
+  module:    grokking_compiled_neuralgrok_vit_sm_90_pgo_instrument
+  build dir: /workspace/SuperGrok1.5/build/compiled/grokking_compiled_neuralgrok_vit_sm_90_pgo_instrument
+  sources:   6 files
+  host:      -O3 -std=c++17 -fPIC -fno-semantic-interposition -fvisibility=hidden -fdata-sections -ffunction-sections -fno-math-errno -fno-trapping-math -fomit-frame-pointer -funroll-loops -march=native -mtune=native -DWITH_CUDA -ggdb -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile -fprofile-update=atomic
+  device:    -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -lineinfo --generate-line-info --source-in-ptx -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DNDEBUG -Xcompiler -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile -Xcompiler -fprofile-update=atomic
+  ldflags:   -Wl,--as-needed -Wl,--gc-sections -Wl,-O3 -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile
+  [toolchain] nvcc 12.4
+  [toolchain] enabling -Xptxas --register-usage-level=10 (CUDA ≥12.3)
+  ccache:    /dev/shm/ccache
+  sccache:   /dev/shm/sccache
+
+========================================================================
+[build FAILURE summary] module=grokking_compiled_neuralgrok_vit_sm_90_pgo_instrument in 0.0s
+  First compiler error: CalledProcessError: Command '['g++-cached', '-v']' returned non-zero exit status 1.
+  Total compile errors detected: 0
+========================================================================
+
+[repro-state — §2A reproducible context]
+  arch:       sm_90
+  optimizer:  neuralgrok
+  model:      vit
+  fused_op_template:torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step
+  macro_prefix:SG_BUILD_
+  cross_host: False
+  cross_host_march:None
+  host_cflags:   -O3 -std=c++17 -fPIC -fno-semantic-interposition -fvisibility=hidden -fdata-sections -ffunction-sections -fno-math-errno -fno-trapping-math -fomit-frame-pointer -funroll-loops -march=native -mtune=native -DWITH_CUDA -ggdb -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile -fprofile-update=atomic
+  device_cflags: -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -lineinfo --generate-line-info --source-in-ptx -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DNDEBUG -Xcompiler -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile -Xcompiler -fprofile-update=atomic -Xptxas --register-usage-level=10 -Xptxas --def-load-cache=ca -Xptxas --def-store-cache=wb --threads 8 --diag-suppress=20012,20013
+  ldflags:       -Wl,--as-needed -Wl,--gc-sections -Wl,-O3 -fprofile-generate=/workspace/SuperGrok1.5/build/compiled/pgo_profile
+  include_paths: /workspace/SuperGrok1.5/csrc/bindings /workspace/SuperGrok1.5 /workspace/SuperGrok1.5/third_party/cutlass/include /workspace/SuperGrok1.5/third_party/cutlass/tools/util/include
+  sources (6):
+    /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp
+    /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/sg2_meta_tail.cu
+  env:
+    CUDA_HOME=/usr/local/cuda-12.4
+    CC=cc
+    CXX=g++-cached
+    CCACHE_DIR=/dev/shm/ccache
+    SCCACHE_DIR=/dev/shm/sccache
+    TORCH_CUDA_ARCH_LIST=9.0a
+
+[build FAILED after 0.0s]
+Command '['g++-cached', '-v']' returned non-zero exit status 1.
+
+[build FAILED — full traceback]
+Traceback (most recent call last):
+  File "/workspace/SuperGrok1.5/grokking_optimizers/compile.py", line 13274, in _torch_load
+    load(
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1312, in load
+    return _jit_compile(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1722, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1808, in _write_ninja_file_and_build_library
+    get_compiler_abi_compatibility_and_version(compiler)
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 358, in get_compiler_abi_compatibility_and_version
+    if not check_compiler_ok_for_platform(compiler):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 320, in check_compiler_ok_for_platform
+    version_string = subprocess.check_output([compiler, '-v'], stderr=subprocess.STDOUT, env=env).decode(*SUBPROCESS_DECODE_ARGS)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 466, in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['g++-cached', '-v']' returned non-zero exit status 1.
+
+[toolchain probe]
+  nvcc: /usr/local/cuda-12.4/bin/nvcc
+    -> nvcc: NVIDIA (R) Cuda compiler driver
+  hipcc: <NOT FOUND on PATH>
+  g++: /dev/shm/ccache-shim/g++
+    -> g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+  gcc: /dev/shm/ccache-shim/gcc
+    -> gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+  ld: /usr/bin/ld
+    -> GNU ld (GNU Binutils for Ubuntu) 2.38
+  ninja: /usr/local/bin/ninja
+    -> 1.13.0.git.kitware.jobserver-pipe-1
+
+[CUDA_HOME probe: /usr/local/cuda-12.4]
+  /usr/local/cuda-12.4: EXISTS
+  /usr/local/cuda-12.4/bin/nvcc: EXISTS
+  /usr/local/cuda-12.4/lib64/libcudart.so: EXISTS
+  /usr/local/cuda-12.4/include/cuda_runtime.h: EXISTS
+  [pgo 1/3] instrumented build FAILED
+  [pgo] aborting after pass 1 failure — see report for compiler errors
+  [pgo] aborting — instrumented build failed at pass 1; falling back to non-PGO AOT build
+  [pgo] see report above for compiler/workload errors
+  module:    grokking_compiled_neuralgrok_vit_sm_90
+  build dir: /workspace/SuperGrok1.5/build/compiled/grokking_compiled_neuralgrok_vit_sm_90
+  sources:   6 files
+  host:      -O3 -std=c++17 -fPIC -fno-semantic-interposition -fvisibility=hidden -fdata-sections -ffunction-sections -fno-math-errno -fno-trapping-math -fomit-frame-pointer -funroll-loops -march=native -mtune=native -DWITH_CUDA -ggdb -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1
+  device:    -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -lineinfo --generate-line-info --source-in-ptx -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DNDEBUG
+  ldflags:   -Wl,--as-needed -Wl,--gc-sections -Wl,-O3
+  [toolchain] nvcc 12.4
+  [toolchain] enabling -Xptxas --register-usage-level=10 (CUDA ≥12.3)
+  ccache:    /dev/shm/ccache
+  sccache:   /dev/shm/sccache
+
+========================================================================
+[build FAILURE summary] module=grokking_compiled_neuralgrok_vit_sm_90 in 0.0s
+  First compiler error: CalledProcessError: Command '['g++-cached', '-v']' returned non-zero exit status 1.
+  Total compile errors detected: 0
+========================================================================
+
+[repro-state — §2A reproducible context]
+  arch:       sm_90
+  optimizer:  neuralgrok
+  model:      vit
+  fused_op_template:torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step
+  macro_prefix:SG_BUILD_
+  cross_host: False
+  cross_host_march:None
+  host_cflags:   -O3 -std=c++17 -fPIC -fno-semantic-interposition -fvisibility=hidden -fdata-sections -ffunction-sections -fno-math-errno -fno-trapping-math -fomit-frame-pointer -funroll-loops -march=native -mtune=native -DWITH_CUDA -ggdb -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1
+  device_cflags: -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -lineinfo --generate-line-info --source-in-ptx -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DSG_BUILD_OPTIMIZER_NEURALGROK=1 -DSG_BUILD_MODEL_VIT=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DNDEBUG -Xptxas --register-usage-level=10 -Xptxas --def-load-cache=ca -Xptxas --def-store-cache=wb --threads 8 --diag-suppress=20012,20013
+  ldflags:       -Wl,--as-needed -Wl,--gc-sections -Wl,-O3
+  include_paths: /workspace/SuperGrok1.5/csrc/bindings /workspace/SuperGrok1.5 /workspace/SuperGrok1.5/third_party/cutlass/include /workspace/SuperGrok1.5/third_party/cutlass/tools/util/include
+  sources (6):
+    /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp
+    /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+    /workspace/SuperGrok1.5/csrc/fused/sm_90/sg2_meta_tail.cu
+  env:
+    CUDA_HOME=/usr/local/cuda-12.4
+    CC=cc
+    CXX=g++-cached
+    CCACHE_DIR=/dev/shm/ccache
+    SCCACHE_DIR=/dev/shm/sccache
+    TORCH_CUDA_ARCH_LIST=9.0a
+
+[build FAILED after 0.0s]
+Command '['g++-cached', '-v']' returned non-zero exit status 1.
+
+[build FAILED — full traceback]
+Traceback (most recent call last):
+  File "/workspace/SuperGrok1.5/grokking_optimizers/compile.py", line 13274, in _torch_load
+    load(
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1312, in load
+    return _jit_compile(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1722, in _jit_compile
+    _write_ninja_file_and_build_library(
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1808, in _write_ninja_file_and_build_library
+    get_compiler_abi_compatibility_and_version(compiler)
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 358, in get_compiler_abi_compatibility_and_version
+    if not check_compiler_ok_for_platform(compiler):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 320, in check_compiler_ok_for_platform
+    version_string = subprocess.check_output([compiler, '-v'], stderr=subprocess.STDOUT, env=env).decode(*SUBPROCESS_DECODE_ARGS)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 466, in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['g++-cached', '-v']' returned non-zero exit status 1.
+
+[toolchain probe]
+  nvcc: /usr/local/cuda-12.4/bin/nvcc
+    -> nvcc: NVIDIA (R) Cuda compiler driver
+  hipcc: <NOT FOUND on PATH>
+  g++: /dev/shm/ccache-shim/g++
+    -> g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+  gcc: /dev/shm/ccache-shim/gcc
+    -> gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+  ld: /usr/bin/ld
+    -> GNU ld (GNU Binutils for Ubuntu) 2.38
+  ninja: /usr/local/bin/ninja
+    -> 1.13.0.git.kitware.jobserver-pipe-1
+
+[CUDA_HOME probe: /usr/local/cuda-12.4]
+  /usr/local/cuda-12.4: EXISTS
+  /usr/local/cuda-12.4/bin/nvcc: EXISTS
+  /usr/local/cuda-12.4/lib64/libcudart.so: EXISTS
+  /usr/local/cuda-12.4/include/cuda_runtime.h: EXISTS
+  [pgo fallback] non-PGO build also FAILED
+
+[build] FAILED — no .so produced; see /workspace/SuperGrok1.5/build/compiled/compile_neuralgrok_vit_sm_90.txt for the full error log
+
+# Cache:    /workspace/SuperGrok1.5/build/compiled/.compile_cache.json
+# Final .so: None
