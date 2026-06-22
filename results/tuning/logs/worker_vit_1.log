@@ -1,0 +1,15 @@
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 22:38:45,884] Using an existing study with name 'adamw__vit' instead of creating a new one.
+[I 2026-06-10 22:38:46,536] Using an existing study with name 'neuralgrok__vit' instead of creating a new one.
+[I 2026-06-10 22:38:47,162] Using an existing study with name 'grokadamw__vit' instead of creating a new one.
+[I 2026-06-10 22:38:47,790] Using an existing study with name 'supergrok__vit' instead of creating a new one.
+[I 2026-06-10 22:38:48,882] Using an existing study with name 'supergrok15__vit' instead of creating a new one.
+[I 2026-06-10 22:38:50,582] Using an existing study with name 'supergrok2__vit' instead of creating a new one.
+[W 2026-06-10 22:39:01,576] It is taking longer than 10.0 seconds to acquire the lock file: /workspace/SuperGrok1.5/results/tuning/journal.log.lock Retrying...
+[I 2026-06-10 22:39:10,606] Using an existing study with name 'grokfast__vit' instead of creating a new one.
+[I 2026-06-10 22:39:11,354] Using an existing study with name 'muon__vit' instead of creating a new one.
+[I 2026-06-10 22:39:12,508] Using an existing study with name 'lion__vit' instead of creating a new one.
+[I 2026-06-10 22:39:13,945] Using an existing study with name 'looksam__vit' instead of creating a new one.
+[I 2026-06-10 22:39:14,578] Using an existing study with name 'prodigy__vit' instead of creating a new one.
+[worker 1] all studies at target — exiting

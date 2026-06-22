@@ -1,0 +1,89 @@
+"""Budget-aware FOREGROUND driver for tune_optimizers — NO repo source edits.
+
+Runtime-only monkeypatches (results/tuning/tune_optimizers.py stays byte-identical):
+  * T.CAPS[model]                  -> budget-sized step cap (the docstring's
+                                      "cheap fidelity axis").
+  * pruner n_startup_trials 12->N  -> median-pruning activates earlier so
+                                      hopeless trials die at the step-500 rung.
+                                      Sampler startup stays 12 (sampling unchanged).
+
+Run the WORKER directly in a foreground Bash call (the only execution mode this
+environment sustains; detached/background GPU procs get reaped). Completed/pruned
+trials persist to the Optuna journal; an interrupted trial just becomes an orphan
+RUNNING (swept later). Re-invoke across calls to accumulate trials.
+
+  python /workspace/_fg_runner.py --worker  --model mamba --worker-id 0 \
+      --trials-per-opt 3 --opts a,b,... --cap 700 --pruner-startup 4
+  python /workspace/_fg_runner.py --confirm --model mamba --top-k 1 --cap 700
+  python /workspace/_fg_runner.py --report  --model mamba --cap 700
+  python /workspace/_fg_runner.py --launch  --model decoder --workers 1 ...  (sync, no subprocs)
+"""
+import argparse
+import sys
+sys.path.insert(0, "/workspace/SuperGrok1.5")
+import tuning.tune_optimizers as T
+
+
+def install_patches(pruner_startup):
+    if pruner_startup is None:
+        return
+    import optuna
+
+    def get_study(opt, model, worker_seed=0):
+        return optuna.create_study(
+            study_name=f"{opt}__{model}",
+            storage=T.get_storage(),
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(
+                seed=10_000 + worker_seed, multivariate=True, n_startup_trials=12),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=pruner_startup, n_warmup_steps=490, interval_steps=1),
+            load_if_exists=True,
+        )
+    T.get_study = get_study
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="mamba", choices=list(T.CAPS))
+    ap.add_argument("--opts", default=",".join(T.OPTS))
+    ap.add_argument("--trials-per-opt", type=int, default=3)
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--worker-id", type=int, default=0)
+    ap.add_argument("--launch", action="store_true")
+    ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--top-k", type=int, default=1)
+    ap.add_argument("--cap", type=int, default=None)
+    ap.add_argument("--pruner-startup", type=int, default=None)
+    args = ap.parse_args()
+    args.opts = [o.strip() for o in args.opts.split(",") if o.strip()]
+    for o in args.opts:
+        assert o in T.SPACES, f"unknown optimizer {o}"
+
+    if args.cap is not None:
+        T.CAPS[args.model] = args.cap
+        print(f"[fg_runner] CAP[{args.model}] -> {args.cap}", flush=True)
+    install_patches(args.pruner_startup)
+    if args.pruner_startup is not None:
+        print(f"[fg_runner] pruner n_startup_trials -> {args.pruner_startup}", flush=True)
+
+    if args.worker:
+        T.mode_worker(args)
+    elif args.confirm:
+        T.mode_confirm(args)
+    elif args.report:
+        T.mode_report(args)
+    elif args.launch:
+        # Synchronous single-process launch (no subprocesses): just run the worker
+        # in-process, then report. Subprocess workers would NOT inherit our patches
+        # and would get reaped anyway.
+        T.mode_worker(args)
+        T.mode_report(args)
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()

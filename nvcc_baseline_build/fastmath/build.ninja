@@ -1,0 +1,38 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /usr/local/cuda/bin/nvcc
+
+cflags = -DTORCH_EXTENSION_NAME=_ops -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/workspace/SuperGrok1.5 -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/TH -isystem /usr/local/lib/python3.11/dist-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 -std=c++17 -fPIC -ffast-math -DWITH_CUDA -DWITH_CUTLASS -DNDEBUG
+post_cflags = 
+cuda_cflags = -DTORCH_EXTENSION_NAME=_ops -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/workspace/SuperGrok1.5 -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/TH -isystem /usr/local/lib/python3.11/dist-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 -std=c++17 --expt-relaxed-constexpr --use_fast_math -DWITH_CUDA -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DNDEBUG -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90a,code=compute_90a
+cuda_post_cflags = 
+cuda_dlink_post_cflags = 
+ldflags = -shared -L/usr/local/lib/python3.11/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build bindings.o: compile /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp
+build dispatch.o: compile /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp
+build mega_decoder_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+build mega_mamba_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+build mega_vit_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+build sg2_meta_tail.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/sg2_meta_tail.cu
+
+
+
+build _ops.so: link bindings.o dispatch.o mega_decoder_real_adamw_tc_launcher.cuda.o mega_mamba_real_adamw_tc_launcher.cuda.o mega_vit_real_adamw_tc_launcher.cuda.o sg2_meta_tail.cuda.o
+
+default _ops.so

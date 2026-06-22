@@ -1,0 +1,47 @@
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 05:29:59,076] Using an existing study with name 'adamw__decoder' instead of creating a new one.
+[I 2026-06-10 05:29:59,378] Using an existing study with name 'neuralgrok__decoder' instead of creating a new one.
+[I 2026-06-10 05:29:59,655] Using an existing study with name 'grokadamw__decoder' instead of creating a new one.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_file.py", line 206, in release
+    os.rename(self._lock_file, lock_rename_file)
+FileNotFoundError: [Errno 2] No such file or directory: '/workspace/SuperGrok1.5/results/tuning/journal.log.lock' -> '/workspace/SuperGrok1.5/results/tuning/journal.log.lock92aca754-98a5-4677-b039-863ac90757cb.rename'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/SuperGrok1.5/tuning/tune_optimizers.py", line 686, in <module>
+    main()
+  File "/workspace/SuperGrok1.5/tuning/tune_optimizers.py", line 674, in main
+    mode_worker(args)
+  File "/workspace/SuperGrok1.5/tuning/tune_optimizers.py", line 461, in mode_worker
+    studies = {o: get_study(o, args.model, worker_seed=wid) for o in args.opts}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/SuperGrok1.5/tuning/tune_optimizers.py", line 461, in <dictcomp>
+    studies = {o: get_study(o, args.model, worker_seed=wid) for o in args.opts}
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/SuperGrok1.5/tuning/tune_optimizers.py", line 393, in get_study
+    return optuna.create_study(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/optuna/_convert_positional_args.py", line 127, in converter_wrapper
+    return func(**kwargs)  # type: ignore[call-arg]
+           ^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/optuna/study/study.py", line 1323, in create_study
+    study_id = storage.create_new_study(direction_objects, study_name)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_storage.py", line 157, in create_new_study
+    self._write_log(
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_storage.py", line 145, in _write_log
+    self._backend.append_logs([{"op_code": op_code, "worker_id": worker_id, **extra_fields}])
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_file.py", line 104, in append_logs
+    with get_lock_file(self._lock):
+  File "/usr/lib/python3.11/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_file.py", line 314, in get_lock_file
+    lock_obj.release()
+  File "/usr/local/lib/python3.11/dist-packages/optuna/storages/journal/_file.py", line 209, in release
+    raise RuntimeError("Error: did not possess lock")
+RuntimeError: Error: did not possess lock

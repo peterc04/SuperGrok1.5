@@ -1,0 +1,440 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..393bda5 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -5131,7 +5131,21 @@ class BayesianEarlyStopper:
+           beat the running best.
+       (c) Coverage saturation: new-(dim_name, value) tuples per trial
+           < ``coverage_growth_floor``.
+-      (d) Wall-clock budget: ``time.time() - start_time > max_seconds``.
++      (d) Wall-clock TUNING budget: ``max_seconds``. POLICY (documented):
++          the budget is measured from the start of *tuning* (call
++          ``mark_tuning_start()`` once the warm-up / cache-load / seeding
++          work is done), NOT from stopper construction — so the per-run
++          fixed overhead (cost-model load, sibling-trial collection,
++          warm-start enqueue) is excluded. It is consulted ONLY between
++          trials (``should_stop()`` is called before each ``study.ask()``),
++          so it can never interrupt an in-flight compile. We stop launching
++          new trials once the remaining budget is smaller than the rolling
++          typical per-trial cost (``set_typical_trial_seconds()``) — i.e. we
++          do not start a trial we cannot finish, which keeps the budget
++          reflecting time actually spent tuning rather than expiring partway
++          through a doomed compile. At least one trial is always allowed to
++          complete (``_completed_trials``) so a too-tight budget still yields
++          a usable winner instead of zero results.
+       (e) Hard ceiling: ``trial_count >= max_trials`` — a SAFETY RAIL only
+           (default 1M). Mandate #13: this is NOT the primary stopping lever;
+           (a)/(b)/(c) govern convergence so the cap is essentially never the
+@@ -5152,7 +5166,20 @@ class BayesianEarlyStopper:
+         self.coverage_growth_floor = coverage_growth_floor
+         self.max_seconds = max_seconds
+         self.max_trials = max_trials
++        # Wall-clock TUNING budget anchor (criterion d). Set at construction
++        # as a safe default, but the driver should call ``mark_tuning_start()``
++        # once the per-run fixed overhead (cost-model load, sibling-trial
++        # collection, warm-start enqueue) is done so that overhead is NOT
++        # charged against ``max_seconds``.
+         self.start_time = time.time()
++        # Rolling estimate of the typical per-trial cost (compile + time), in
++        # seconds. Fed from the driver's ``progress_state["window"]``. When
++        # >0 we stop *launching* trials once the remaining budget is below
++        # this, so we never start a trial we can't finish before the budget.
++        self.typical_trial_seconds: float = 0.0
++        # Count of trials that have actually completed (observed). Used to
++        # guarantee at least one trial finishes even under a tiny budget.
++        self._completed_trials: int = 0
+         self.best = math.inf
+         self.last_improve_trial = 0
+         self.coverage_set: set = set()  # (dim_name, value) tuples
+@@ -5172,6 +5199,29 @@ class BayesianEarlyStopper:
+         # which is a stronger stopping signal than plateau alone.
+         self._cost_model_rejections: int = 0
+ 
++    def mark_tuning_start(self) -> None:
++        """Re-anchor the wall-clock TUNING budget (criterion d) to *now*.
++
++        The driver calls this once the per-run fixed overhead — cost-model
++        load, sibling-trial collection, warm-start enqueue, study creation —
++        is complete, so ``max_seconds`` measures time spent actually tuning
++        rather than including that one-off setup cost. Idempotent and a no-op
++        when no budget is set."""
++        self.start_time = time.time()
++
++    def set_typical_trial_seconds(self, seconds: float) -> None:
++        """Update the rolling per-trial-cost estimate (compile + time) used by
++        criterion (d) to avoid starting a trial that can't finish before the
++        wall-clock budget. Non-positive / non-finite inputs are ignored so a
++        cold-start (empty timing window) leaves the estimate at 0 — which
++        disables the deduction (budget then behaves as a plain elapsed cap)."""
++        try:
++            s = float(seconds)
++        except (TypeError, ValueError):
++            return
++        if math.isfinite(s) and s > 0:
++            self.typical_trial_seconds = s
++
+     @property
+     def patience(self) -> int:
+         if self._patience_override is not None:
+@@ -5181,6 +5231,11 @@ class BayesianEarlyStopper:
+     def observe(self, trial_value: float, trial_params: Dict[str, Any],
+                 *, was_pruned_by_cost_model: bool = False) -> None:
+         self.trial_count += 1
++        # Count trials that actually produced a finite timing — criterion (d)
++        # uses this to guarantee >=1 completed trial before the budget can
++        # halt launching, so a tiny ``max_seconds`` still yields a winner.
++        if math.isfinite(trial_value):
++            self._completed_trials += 1
+         prev_best = self.best
+         # (b) EI estimate: per-trial relative improvement over prev_best.
+         # First trial (prev_best == inf) records 0 — nothing to improve over.
+@@ -5216,11 +5271,25 @@ class BayesianEarlyStopper:
+         if self.trial_count >= self.max_trials:
+             self.stop_reason = f"hard_ceiling:{self.max_trials}"
+             return True
+-        # (d) wall-clock
+-        if self.max_seconds is not None:
++        # (d) wall-clock TUNING budget. Measured from ``start_time`` (which the
++        # driver re-anchors via ``mark_tuning_start()`` after fixed setup) and
++        # checked only here, before each ``study.ask()`` — so it never aborts
++        # an in-flight compile. We stop *launching* once the remaining budget
++        # is below the rolling typical per-trial cost (deducting compile time)
++        # so the budget reflects time actually spent tuning. At least one
++        # trial must complete first, so a tiny budget still produces a winner
++        # rather than expiring during (or before) the first compile.
++        if self.max_seconds is not None and self._completed_trials >= 1:
+             elapsed = time.time() - self.start_time
+-            if elapsed >= self.max_seconds:
+-                self.stop_reason = f"max_seconds:{int(elapsed)}s"
++            remaining = self.max_seconds - elapsed
++            margin = self.typical_trial_seconds  # 0 ⇒ plain elapsed cap
++            if remaining <= margin:
++                if margin > 0:
++                    self.stop_reason = (
++                        f"max_seconds:{int(elapsed)}s_of_{int(self.max_seconds)}s"
++                        f"_remaining<{margin:.0f}s_per_trial")
++                else:
++                    self.stop_reason = f"max_seconds:{int(elapsed)}s"
+                 return True
+         # Need a warm-up of at least patience+10 trials before other criteria fire
+         if self.trial_count < self.patience + 10:
+@@ -5274,6 +5343,9 @@ class BayesianEarlyStopper:
+             "ei_floor": self.ei_floor,
+             "coverage_growth_floor": self.coverage_growth_floor,
+             "max_seconds": self.max_seconds,
++            # Per-trial compile+time estimate used to deduct compile cost from
++            # the wall-clock budget (criterion d); 0 when no timings yet.
++            "typical_trial_seconds": self.typical_trial_seconds,
+             "max_trials": self.max_trials,
+             "trial_count": self.trial_count,
+             "best": self.best,
+@@ -5465,6 +5537,9 @@ def run_bayesian(
+     stopper: Optional["BayesianEarlyStopper"] = None,
+     stall_info: Optional[Dict[str, Any]] = None,
+     bias_max_enqueued: int = 25,
++    warm_start_configs: Optional[List[Dict[str, Any]]] = None,
++    warm_start_max_enqueued: int = 16,
++    trial_time_window: Optional[List[float]] = None,
+     stream: Optional[Any] = None,
+ ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+     """Run the TPE stage with multi-criterion early stopping.
+@@ -5478,6 +5553,23 @@ def run_bayesian(
+     runs until the stopper fires. When set, it acts as a hard cap on
+     top of the stopper's other criteria — useful for explicit
+     reproducible budgets (and for the ``--quick`` and self-test paths).
++
++    ``warm_start_configs`` (transfer learning): an optional list of
++    prior-winner config dicts from the NEAREST cached tunings (same
++    model / different arch, or same arch / different optimizer). Each is
++    validated against ``space[arch]["dims"]`` then ``study.enqueue_trial``-d
++    so it is actually *re-measured* on the current target before TPE starts
++    free sampling — unlike ``seed_trials`` (same model+arch siblings) which
++    are injected with their observed timing via ``add_trial``. We enqueue
++    rather than add_trial because timings are not portable across arch /
++    optimizer, but the *config* is a strong starting point. Capped at
++    ``warm_start_max_enqueued`` and de-duplicated. Degrades to a clean
++    cold-start when ``None`` / empty / no config survives validation.
++
++    ``trial_time_window``: optional shared list (the driver's
++    ``progress_state["window"]``) of recent per-trial wall-times (compile +
++    time, seconds). When supplied, its rolling median feeds the stopper's
++    wall-clock budget so compile time is deducted per trial (criterion d).
+     """
+     dims = space[arch]["dims"]
+     # Build a per-config feasibility predicate from the prefilter rules
+@@ -5571,12 +5663,85 @@ def run_bayesian(
+             # never break the autotune.
+             _debug_swallow('run_bayesian', _swexc)
+ 
++    # Transfer learning (warm start on the cache) — enqueue prior-winner
++    # configs from the NEAREST cached tunings so TPE *measures* them first.
++    # Unlike seed_trials (which inject a sibling's observed timing for the
++    # SAME model+arch), warm-start configs come from a DIFFERENT arch or
++    # optimizer where the timing isn't transferable, so we re-time the
++    # config on the real target via enqueue_trial. Fully best-effort and
++    # project-agnostic: each config is validated against this space's dims,
++    # de-duplicated, and capped; any failure degrades to plain cold-start.
++    if warm_start_configs:
++        dim_names_ws = [d["name"] for d in dims]
++        dim_value_sets_ws = {
++            d["name"]: [tuple(v) if isinstance(v, list) else v
++                        for v in d["values"]]
++            for d in dims}
++        seen_ws: set = set()
++        enq = 0
++        for raw_cfg in warm_start_configs:
++            if enq >= int(warm_start_max_enqueued):
++                break
++            if not isinstance(raw_cfg, dict):
++                continue
++            cfg_ws: Dict[str, Any] = {}
++            ok = True
++            for name in dim_names_ws:
++                if name not in raw_cfg:
++                    ok = False
++                    break
++                val = raw_cfg[name]
++                val = tuple(val) if isinstance(val, list) else val
++                if val not in dim_value_sets_ws[name]:
++                    ok = False
++                    break
++                cfg_ws[name] = val
++            if not ok:
++                continue
++            sig = tuple(sorted(cfg_ws.items()))
++            if sig in seen_ws:
++                continue
++            seen_ws.add(sig)
++            # enqueue_trial wants plain (JSON-ish) values; lists, not tuples.
++            enq_cfg = {k: (list(v) if isinstance(v, tuple) else v)
++                       for k, v in cfg_ws.items()}
++            try:
++                study.enqueue_trial(enq_cfg)
++                enq += 1
++            except Exception as _swexc:
++                # Duplicate / already-evaluated / malformed → skip; never
++                # break the autotune over a warm-start hint.
++                _debug_swallow('run_bayesian', _swexc)
++                continue
++
+     records: List[Dict[str, Any]] = []
+     # For progress reporting when no manual cap, use stopper's hard ceiling
+     # as the denominator — it'll never be reached, but the bar shows movement.
+     total_for_progress = n_trials if n_trials is not None else stopper.max_trials
+ 
++    # Wall-clock TUNING budget (criterion d) starts NOW — after study
++    # creation, seeding and warm-start enqueue — so that fixed setup cost is
++    # not charged against ``max_seconds``. No-op when no budget is set.
++    stopper.mark_tuning_start()
++
+     while True:
++        # Feed the rolling per-trial cost (compile + time) to the stopper so
++        # the wall-clock budget deducts compile time and stops launching a
++        # trial it can't finish (criterion d). ``trial_time_window`` is the
++        # driver's shared progress window; empty ⇒ estimate stays 0 (plain
++        # elapsed cap until the first timing lands).
++        if trial_time_window:
++            try:
++                w = sorted(float(x) for x in trial_time_window
++                           if isinstance(x, (int, float))
++                           and math.isfinite(float(x)))
++                if w:
++                    mid = len(w) // 2
++                    med = (w[mid] if len(w) % 2
++                           else 0.5 * (w[mid - 1] + w[mid]))
++                    stopper.set_typical_trial_seconds(med)
++            except Exception as _swexc:
++                _debug_swallow('run_bayesian', _swexc)
+         if n_trials is not None and len(records) >= n_trials:
+             if stopper.stop_reason is None:
+                 stopper.stop_reason = f"manual_n_trials:{n_trials}"
+@@ -8564,6 +8729,111 @@ def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
+     return sibling_trials
+ 
+ 
++def _entry_winner_config(cache: CompileCache,
++                         entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    """Return the WINNER config dict for a cache entry, or None.
++
++    Prefers the entry's chosen ``tuned_config`` (the config that was actually
++    selected + shipped). Falls back to the fastest recorded trial — from the
++    in-memory ``bayesian_trials`` list if present, else the .jsonl sidecar
++    pointed at by ``trial_log_path`` (v4 strips the in-memory list before
++    writing the main JSON, so cross-process warm-start must read the sidecar).
++    Best-effort: any read error yields None.
++    """
++    tuned = entry.get("tuned_config")
++    if isinstance(tuned, dict) and tuned:
++        return tuned
++    trials = entry.get("bayesian_trials") or []
++    if not trials:
++        tlp = entry.get("trial_log_path")
++        if tlp and cache.path is not None:
++            try:
++                trials = _read_trial_log_records(cache.path.parent / tlp)
++            except Exception as _swexc:
++                _debug_swallow('_entry_winner_config', _swexc)
++                trials = []
++    best_cfg: Optional[Dict[str, Any]] = None
++    best_ms = math.inf
++    for t in trials:
++        ms = t.get("timing_ms")
++        cfg = t.get("config")
++        if ms is None or not isinstance(cfg, dict):
++            continue
++        try:
++            ms_f = float(ms)
++        except (TypeError, ValueError):
++            continue
++        if math.isfinite(ms_f) and ms_f < best_ms:
++            best_ms = ms_f
++            best_cfg = cfg
++    return best_cfg
++
++
++def _warm_start_configs(spec: BuildSpec,
++                        cache: CompileCache) -> List[Dict[str, Any]]:
++    """Transfer learning, built on the CACHE — warm-start config seeds.
++
++    When tuning ``(optimizer, model, arch)`` with no exact cache hit, gather
++    the WINNER config from the NEAREST already-tuned neighbours so the
++    Bayesian search can re-measure them on the real target before free TPE
++    sampling. Two neighbour rings (the exact tuple is always skipped; the
++    same model+arch / different optimizer ring is handled separately by
++    ``_collect_sibling_trials`` as ``add_trial`` seeds):
++
++      ring 1 — SAME model, DIFFERENT arch  (same kernel, other silicon)
++      ring 2 — SAME arch,  DIFFERENT optimizer/model (same silicon)
++
++    Ring 1 is listed first because a config tuned for the same kernel tends
++    to transfer better across silicon than a config tuned for a different
++    kernel on the same silicon. Duplicates (by config signature) are dropped,
++    ring 1 winning ties. Returns ``[]`` when no neighbour exists — the caller
++    then degrades to a clean cold-start. Read-only over the cache; never
++    mutates cache state or correctness.
++    """
++    entries = cache._data.get("entries", {})
++    if not entries:
++        return []
++    self_key = cache.key(spec.optimizer, spec.model, spec.arch)
++    ring1: List[Dict[str, Any]] = []  # same model, diff arch
++    ring2: List[Dict[str, Any]] = []  # same arch, diff optimizer/model
++    for key, entry in entries.items():
++        if key == self_key or not isinstance(entry, dict):
++            continue
++        # Cache keys are "<opt>/<model>/<arch>"; split from the right so a
++        # model name containing '/' (defensive) still parses arch+model.
++        parts = key.split("/")
++        if len(parts) < 3:
++            continue
++        k_arch = parts[-1]
++        k_model = parts[-2]
++        same_model = (k_model == spec.model)
++        same_arch = (k_arch == spec.arch)
++        if same_model and same_arch:
++            continue  # exact (opt-sibling) — owned by _collect_sibling_trials
++        cfg = _entry_winner_config(cache, entry)
++        if not cfg:
++            continue
++        if same_model and not same_arch:
++            ring1.append(cfg)
++        elif same_arch and not same_model:
++            ring2.append(cfg)
++    out: List[Dict[str, Any]] = []
++    seen: set = set()
++    for cfg in ring1 + ring2:
++        try:
++            sig = tuple(sorted(
++                (k, tuple(v) if isinstance(v, list) else v)
++                for k, v in cfg.items()))
++        except Exception as _swexc:
++            _debug_swallow('_warm_start_configs', _swexc)
++            continue
++        if sig in seen:
++            continue
++        seen.add(sig)
++        out.append(cfg)
++    return out
++
++
+ # ---------------------------------------------------------------------------
+ # Source / flag resolution
+ # ---------------------------------------------------------------------------
+@@ -9630,7 +9900,16 @@ def _sccache_env() -> Dict[str, str]:
+     if sccache:
+         sc_dir = _writable_cache_dir("sccache")
+         if sc_dir is not None:
+-            out.setdefault("SCCACHE_DIR", str(sc_dir))
++            # Honour an inherited SCCACHE_DIR first (e.g. a persistent volume
++            # like /workspace/.sccache that survives instance restarts) so the
++            # compile-object cache is reused across runs — a large build-time
++            # win. Only fall back to the auto-detected (often /dev/shm,
++            # tmpfs-backed, wiped on restart) directory when the operator has
++            # NOT pinned one. ``setdefault`` then keeps any caller-supplied
++            # override on ``out`` in force.
++            out.setdefault(
++                "SCCACHE_DIR",
++                os.environ.get("SCCACHE_DIR") or str(sc_dir))
+             # If ccache didn't claim host wrappers, sccache takes them.
+             out.setdefault("CC",  f"{sccache} {os.environ.get('CC',  'cc')}")
+             out.setdefault("CXX", f"{sccache} {os.environ.get('CXX', 'c++')}")
+@@ -13154,7 +13433,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
+                 winning = _run_bayesian(spec, survivors, space, dims, timer,
+                                         cache, space_hash, report,
+                                         cost_model_state=cost_model_state,
+-                                        fastmath_sink=fastmath_sink)
++                                        fastmath_sink=fastmath_sink,
++                                        progress_state=progress_state)
+     finally:
+         if worker is not None:
+             try:
+@@ -13290,6 +13570,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+                   report,
+                   cost_model_state: Optional[Dict[str, Any]] = None,
+                   fastmath_sink: Optional[List[Dict[str, Any]]] = None,
++                  progress_state: Optional[Dict[str, Any]] = None,
+                   ) -> Optional[Dict[str, Any]]:
+     n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
+     # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
+@@ -13385,6 +13666,28 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+             report.write("  [bayesian] transfer-learning: no sibling "
+                          "trials available; cold-starting\n")
+ 
++    # Transfer learning (cache-backed warm start) — when there's no exact
++    # cache hit, seed the search with WINNER configs from the nearest cached
++    # tunings (same model/other arch, or same arch/other optimizer) so TPE
++    # re-measures those strong starting points on the real target first.
++    # These are ENQUEUED (re-timed), distinct from the same-model+arch
++    # sibling seeds above (injected with their timing via add_trial).
++    warm_start_cfgs: Optional[List[Dict[str, Any]]] = None
++    if spec.transfer_learning:
++        try:
++            wsc = _warm_start_configs(spec, cache)
++        except Exception as _swexc:
++            _debug_swallow('_run_bayesian', _swexc)
++            wsc = []
++        if wsc:
++            report.write(f"  [bayesian] transfer-learning: warm-starting "
++                         f"from {len(wsc)} nearest-neighbour winner "
++                         f"config(s)\n")
++            warm_start_cfgs = wsc
++        else:
++            report.write("  [bayesian] transfer-learning: no neighbour "
++                         "winners to warm-start from\n")
++
+     # Optuna study persistence (resumable across runs).
+     storage = (spec.out_dir
+                / f"optuna_{spec.optimizer}_{spec.model}_{spec.arch}.db")
+@@ -13553,6 +13856,12 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+             stopper=stopper,
+             stall_info=stall_info_for_bias,
+             bias_max_enqueued=25,
++            warm_start_configs=warm_start_cfgs,
++            # Shared per-trial timing window → lets the stopper deduct compile
++            # time from the wall-clock budget (criterion d). None when the
++            # driver didn't thread it (e.g. some self-test paths).
++            trial_time_window=(progress_state.get("window")
++                               if progress_state is not None else None),
+         )
+     finally:
+         close1()

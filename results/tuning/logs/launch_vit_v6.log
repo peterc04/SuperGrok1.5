@@ -1,0 +1,13 @@
+launched 6 workers (logs: /workspace/SuperGrok1.5/results/tuning/logs)
+all workers done
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 22:39:31,920] Using an existing study with name 'adamw__vit' instead of creating a new one.
+[I 2026-06-10 22:39:32,648] Using an existing study with name 'neuralgrok__vit' instead of creating a new one.
+[I 2026-06-10 22:39:33,301] Using an existing study with name 'grokadamw__vit' instead of creating a new one.
+[I 2026-06-10 22:39:33,965] Using an existing study with name 'supergrok__vit' instead of creating a new one.
+[I 2026-06-10 22:39:34,650] Using an existing study with name 'supergrok15__vit' instead of creating a new one.
+[I 2026-06-10 22:39:35,326] Using an existing study with name 'supergrok2__vit' instead of creating a new one.
+[I 2026-06-10 22:39:35,987] Using an existing study with name 'grokfast__vit' instead of creating a new one.
+[I 2026-06-10 22:39:36,653] Using an existing study with name 'muon__vit' instead of creating a new one.
+[I 2026-06-10 22:39:37,335] Using an existing study with name 'lion__vit' instead of creating a new one.

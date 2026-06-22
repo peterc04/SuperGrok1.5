@@ -1,0 +1,15 @@
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 22:38:52,706] Using an existing study with name 'adamw__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:10,090] Using an existing study with name 'neuralgrok__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:10,730] Using an existing study with name 'grokadamw__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:11,376] Using an existing study with name 'supergrok__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:12,541] Using an existing study with name 'supergrok15__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:14,260] Using an existing study with name 'supergrok2__decoder' instead of creating a new one.
+[W 2026-06-10 22:39:24,940] It is taking longer than 10.0 seconds to acquire the lock file: /workspace/SuperGrok1.5/results/tuning/journal.log.lock Retrying...
+[I 2026-06-10 22:39:28,955] Using an existing study with name 'grokfast__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:29,719] Using an existing study with name 'muon__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:30,366] Using an existing study with name 'lion__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:31,008] Using an existing study with name 'looksam__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:31,719] Using an existing study with name 'prodigy__decoder' instead of creating a new one.
+[worker 4] all studies at target — exiting

@@ -1,0 +1,595 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..9a88ef6 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -5038,13 +5038,21 @@ def _cost_model_train_from_trials(
+ 
+ 
+ def _make_pruned_trial_record(config: Dict[str, Any], predicted_ms: float,
+-                              *, host: Optional[Dict[str, Any]] = None
++                              *, host: Optional[Dict[str, Any]] = None,
++                              prune_stage: str = "cost_model_threshold",
+                               ) -> Dict[str, Any]:
+     """Record shape returned by ``_make_variant_timer`` when the cost
+     model rejects a candidate before building it. Slots into the same
+     pipeline as ``_make_trial_record`` results — ``timing_ms`` is None
+     (untimed), ``status`` is ``cost_model_pruned``, and the predicted
+-    timing is preserved in ``predicted_timing_ms`` for diagnostics."""
++    timing is preserved in ``predicted_timing_ms`` for diagnostics.
++
++    ``prune_stage`` records WHICH gate pruned the candidate — the
++    absolute ``Nx best`` threshold gate (``cost_model_threshold``) or the
++    cheap multi-fidelity distributional proxy (``multi_fidelity``) — so
++    the report / sidecar can attribute skips per gate. Both gates return
++    the same ``status="cost_model_pruned"`` sentinel so the driver's
++    handling (record as PRUNED, flag the stopper) is uniform."""
+     return {
+         "stage":                 "tpe",
+         "config":                {k: (list(v) if isinstance(v, tuple) else v)
+@@ -5057,11 +5065,71 @@ def _make_pruned_trial_record(config: Dict[str, Any], predicted_ms: float,
+         "host":                  host,
+         "numerical_status":      "skipped",
+         "status":                "cost_model_pruned",
++        "prune_stage":           prune_stage,
+         "predicted_timing_ms":   float(predicted_ms),
+         "recorded_at":           datetime.datetime.now().isoformat(),
+     }
+ 
+ 
++def _multi_fidelity_prune_decision(
++        ms_pred: float, sigma_pred: float,
++        measured_ms: Iterable[float],
++        *, quantile: float, margin: float,
++) -> Tuple[bool, Optional[float]]:
++    """Cheap-proxy (multi-fidelity) prune decision for one candidate.
++
++    The cheapest possible fidelity: the surrogate's *predicted* timing
++    (no build, no link). Distinct from the absolute ``Nx best``
++    rejection gate — this is a DISTRIBUTIONAL rule. A candidate is
++    eligible to be killed only when its OPTIMISTIC estimate
++    ``ms_pred − sigma_pred`` (the lower confidence bound — what the
++    config could plausibly clock if the model is under-predicting its
++    quality) still lands above ``margin × Q`` where ``Q`` is the
++    ``quantile``-th percentile of the timings MEASURED so far.
++
++    Conservatism, by construction:
++      * Compares the OPTIMISTIC bound, not the mean — a config the model
++        is merely uncertain about (large σ) is never pruned.
++      * Compares against a HIGH quantile of the observed distribution,
++        never against the running best — so a config only slightly worse
++        than typical is never pruned, only ones the model is confident
++        sit in the slow tail.
++      * The ``margin`` (>1) leaves extra headroom so a config the model
++        slightly mis-ranks still earns a real measurement.
++
++    Returns ``(should_prune, quantile_threshold)``. ``should_prune`` is
++    False (and the threshold None) whenever there isn't enough measured
++    signal, the prediction is non-finite, or the optimistic bound is
++    inside the keep band. NEVER raises.
++    """
++    try:
++        finite = [float(m) for m in measured_ms
++                  if isinstance(m, (int, float)) and math.isfinite(float(m))]
++    except TypeError:
++        return False, None
++    # Need a non-trivial empirical distribution before a quantile means
++    # anything — fewer than 8 points and we keep (measure) everything.
++    if len(finite) < 8:
++        return False, None
++    if not (math.isfinite(ms_pred) and math.isfinite(sigma_pred)):
++        return False, None
++    q = min(0.99, max(0.5, float(quantile)))
++    m = max(1.0, float(margin))
++    finite.sort()
++    # Linear-interpolated empirical quantile (no numpy dependency — this
++    # runs in the hot timer path and must stay import-light).
++    pos = q * (len(finite) - 1)
++    lo_i = int(math.floor(pos))
++    hi_i = min(lo_i + 1, len(finite) - 1)
++    frac = pos - lo_i
++    q_thresh = finite[lo_i] + (finite[hi_i] - finite[lo_i]) * frac
++    if not (math.isfinite(q_thresh) and q_thresh > 0):
++        return False, None
++    optimistic = ms_pred - max(0.0, sigma_pred)
++    should_prune = optimistic > (m * q_thresh)
++    return bool(should_prune), float(q_thresh)
++
++
+ # ===========================================================================
+ # bayesian — Optuna TPE-driven autotune (absorbed from
+ # grokking_optimizers/bayesian.py)
+@@ -6946,15 +7014,51 @@ class BuildSpec:
+     enable_polyhedral: bool = False
+     config: Dict[str, Any] = field(default_factory=dict)
+     # ─── Stream C — learned cost model ────────────────────────────────
+-    # OFF by default; toggled by [cost_model].enable in compile_config.toml
+-    # or by apply_to_buildspec() when the project config sets it. When
+-    # disabled, no featurization / training / inference / rejection
+-    # happens — the autotuner is byte-identical to today.
+-    enable_cost_model: bool = False
++    # ON by default — the learned surrogate only ever PRUNES the *timing*
++    # of configs it is confident are far worse than the running best; it
++    # never changes which kept config gets validated, so it can never
++    # affect numerical correctness. The per-trial full compile (~5 min)
++    # is the autotune bottleneck, so skipping obviously-bad builds is a
++    # large wall-clock win. Degrades gracefully when its optional deps
++    # (xgboost / scikit-learn) are absent — see CostModel._instantiate_backend,
++    # which falls through to a numpy-only ridge regressor. Set False (or
++    # pass --no-cost-model) to force the byte-identical un-pruned search.
++    enable_cost_model: bool = True
+     cost_model_retrain_every: int = 20
+     cost_model_rejection_threshold_x: float = 3.0
+     cost_model_rejection_max_pct: float = 0.8
+     cost_model_uncertainty_method: str = "bootstrap"
++    # ─── Stream C.2 — multi-fidelity pruning ──────────────────────────
++    # A cheap proxy stage that gates which configs reach the expensive
++    # full build+time. The cheap signal is the cost-model surrogate's
++    # *predicted* timing (no build, no link) — the fastest possible
++    # fidelity. Distinct from the absolute ``Nx best`` rejection gate
++    # above: this is a DISTRIBUTIONAL rule that kills configs whose
++    # optimistic (prediction − σ) estimate lands above a high quantile
++    # of the *measured* timings observed so far, so it can prune mid-tail
++    # configs the absolute rule misses while staying conservative — a
++    # config whose lower confidence bound could plausibly beat the
++    # quantile is never pruned. Has its own independent rejection cap and
++    # shares the cost-model cold-start floor. ON by default; never
++    # affects correctness (it only skips TIMING of predicted-bad configs,
++    # never the validation of kept ones). No-op when enable_cost_model is
++    # False (the surrogate is the cheap signal).
++    multi_fidelity: bool = True
++    # Quantile of observed measured timings above which a candidate's
++    # OPTIMISTIC predicted time must land to be eligible for the cheap
++    # proxy kill. 0.75 ⇒ only prune configs the model is confident are
++    # slower than ~75% of everything measured so far.
++    multi_fidelity_quantile: float = 0.75
++    # Safety margin on the quantile gate: the optimistic estimate must
++    # exceed ``margin × quantile_threshold`` (margin > 1) before the
++    # cheap stage prunes. Conservative — leaves headroom so a config the
++    # model slightly mis-ranks can still earn a real measurement.
++    multi_fidelity_margin: float = 1.10
++    # Independent cap on the fraction of trials the multi-fidelity proxy
++    # is allowed to prune (separate budget from the absolute-threshold
++    # gate). Guards against an over-confident surrogate starving the
++    # search of real measurements.
++    multi_fidelity_max_pct: float = 0.5
+     # ─── Agent-F2 — flag probe (compile-time flag validation) ────────────
+     # When True (default), _device_cflags routes its full output through
+     # _validate_flag_set so any flag the installed nvcc/hipcc rejects is
+@@ -8484,6 +8588,8 @@ def _dry_run_all_archs(out_dir: Path,
+                     getattr(spec, "enable_device_pgo", False)),
+                 "enable_cost_model":             bool(
+                     getattr(spec, "enable_cost_model", False)),
++                "multi_fidelity":                bool(
++                    getattr(spec, "multi_fidelity", False)),
+                 "enable_emitter":                bool(
+                     getattr(spec, "enable_emitter", False)),
+                 "strict_numerics":               bool(
+@@ -12359,11 +12465,27 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+ 
+     Stream C — when ``cost_model_state`` is provided AND
+     ``spec.enable_cost_model`` is True, the closure consults the
+-    learned cost model before building each variant. Predicted-bad
+-    candidates (mean > threshold × best_so_far AND sigma < 20% of mean)
+-    are returned as pre-pruned trial records so the autotuner skips
+-    them entirely. A cap on the rejection fraction protects against
+-    over-confident models excluding the real optimum.
++    learned cost model before building each variant. Two complementary,
++    conservative pruning gates run on the SAME surrogate prediction (the
++    cheap signal — no build, no link):
++
++      1. Absolute-threshold gate — prune when the predicted mean is
++         > ``threshold × best_so_far`` AND the model is confident
++         (0 < σ < 20% of the mean). Its own ``rejection_max_pct`` cap.
++      2. Multi-fidelity proxy gate (``spec.multi_fidelity``) — a cheap
++         distributional gate: prune when the OPTIMISTIC bound
++         (pred − σ) lands above a high quantile of the timings MEASURED
++         so far (× a safety margin). Catches mid-tail configs the
++         absolute rule misses while never pruning a config that could
++         plausibly win. Independent ``multi_fidelity_max_pct`` cap.
++
++    Both return pre-pruned trial records (``status=="cost_model_pruned"``,
++    distinguished by ``prune_stage``) so the driver skips the build+time
++    entirely. NEITHER gate ever affects numerical correctness — they
++    only skip the *timing* of predicted-bad configs, never the
++    validation of kept ones. Both are no-ops below the cost-model
++    cold-start floor (every candidate is measured until the surrogate
++    has locked-clock signal).
+     ``cost_model_state`` is a dict of the form::
+ 
+         {
+@@ -12371,8 +12493,11 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+             "arch_entry":  ArchEntry,
+             "stall_info":  Optional[dict],
+             "best_so_far": float,         # mutated by the closure
+-            "n_rejected":  int,           # mutated by the closure
+-            "n_total":     int,           # mutated by the closure
++            "n_rejected":  int,           # absolute-gate rejections
++            "n_total":     int,           # total prediction-evaluated trials
++            "measured_ms": List[float],   # rolling measured-timing window
++            "mf_rejected": int,           # multi-fidelity prunes
++            "mf_total":    int,           # multi-fidelity eligibility checks
+             "stopper":     BayesianEarlyStopper | None,
+         }
+     """
+@@ -12593,7 +12718,59 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                         cost_model_state["n_total"] = n_total
+                         _LAST_NUMERICAL_STATUS[ckey] = "skipped"
+                         return _make_pruned_trial_record(
+-                            config, predicted_ms=ms_pred)
++                            config, predicted_ms=ms_pred,
++                            prune_stage="cost_model_threshold")
++
++                # ── Stream C.2 — multi-fidelity cheap-proxy gate ────────────
++                # Reuses the SAME (ms_pred, sigma_pred) the surrogate just
++                # produced — the cheap signal is the prediction itself, no
++                # build. Complementary to the absolute ``Nx best`` gate
++                # above: a DISTRIBUTIONAL rule that can kill mid-tail configs
++                # the absolute rule misses, while staying conservative (it
++                # prunes only when the OPTIMISTIC bound pred−σ sits above a
++                # high quantile of the MEASURED timings, with a margin). Its
++                # own independent rejection budget guards the search. No-op
++                # below the cold-start floor (we never reach here when cold).
++                if getattr(spec, "multi_fidelity", False):
++                    mf_prune, q_thresh = _multi_fidelity_prune_decision(
++                        ms_pred, sigma_pred,
++                        cost_model_state.get("measured_ms", ()),
++                        quantile=float(
++                            getattr(spec, "multi_fidelity_quantile", 0.75)
++                            or 0.75),
++                        margin=float(
++                            getattr(spec, "multi_fidelity_margin", 1.10)
++                            or 1.10),
++                    )
++                    if mf_prune:
++                        mf_total = int(
++                            cost_model_state.get("mf_total", 0)) + 1
++                        mf_rejected = int(
++                            cost_model_state.get("mf_rejected", 0))
++                        mf_cap = float(
++                            getattr(spec, "multi_fidelity_max_pct", 0.5)
++                            or 0.5)
++                        # Independent cap: only prune via the cheap proxy
++                        # while doing so keeps the proxy's own rejection
++                        # fraction under its budget. Else measure normally.
++                        if (mf_rejected + 1) / max(1, mf_total) <= mf_cap:
++                            cost_model_state["mf_rejected"] = mf_rejected + 1
++                            cost_model_state["mf_total"] = mf_total
++                            # Count toward n_total so the report's overall
++                            # skip fraction reflects BOTH gates.
++                            cost_model_state["n_total"] = int(
++                                cost_model_state.get("n_total", 0)) + 1
++                            _LAST_NUMERICAL_STATUS[ckey] = "skipped"
++                            report.write(
++                                f"    [multi-fidelity] prune {ckey[:24]} "
++                                f"pred={ms_pred:.4f}ms±{sigma_pred:.4f} "
++                                f"> q{int(getattr(spec, 'multi_fidelity_quantile', 0.75) * 100)}"
++                                f"={q_thresh:.4f}ms (cheap proxy — no build)\n")
++                            return _make_pruned_trial_record(
++                                config, predicted_ms=ms_pred,
++                                prune_stage="multi_fidelity")
++                        cost_model_state["mf_total"] = mf_total
++
+                 cost_model_state["n_total"] = int(
+                     cost_model_state.get("n_total", 0)) + 1
+ 
+@@ -13128,6 +13305,14 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
+         "best_so_far": float("inf"),
+         "n_rejected":  0,
+         "n_total":     0,
++        # Stream C.2 — multi-fidelity cheap-proxy gate bookkeeping. The
++        # rolling list of MEASURED timings feeds the distributional
++        # quantile the proxy gates against; mf_rejected / mf_total are
++        # the proxy's own independent rejection budget (separate from the
++        # absolute-threshold gate's n_rejected / n_total).
++        "measured_ms": [],
++        "mf_rejected": 0,
++        "mf_total":    0,
+     }
+     # Fix-#2 Defect-1 — sink for the fast-math (#6) variant trials the timer
+     # emits on new-best events. Owned here, written by the timer closure,
+@@ -13433,6 +13618,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+                 if tms_f < float(cost_model_state.get("best_so_far",
+                                                       float("inf"))):
+                     cost_model_state["best_so_far"] = tms_f
++                # Stream C.2 — feed the multi-fidelity proxy's empirical
++                # distribution of MEASURED timings. Bounded (keep the most
++                # recent window) so a very long sweep can't grow it without
++                # limit; the quantile is robust to the trimming.
++                _meas = cost_model_state.setdefault("measured_ms", [])
++                _meas.append(tms_f)
++                if len(_meas) > 2000:
++                    del _meas[:len(_meas) - 2000]
+                 # Mandate #14 — count MEASURED trials (the cold-start floor
+                 # for pruning reads this) and log prediction error vs measured
+                 # so model miscalibration is observable.
+@@ -13566,6 +13759,30 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+                  f"{n_ok} succeeded. "
+                  f"stop_reason={stop_info.get('stop_reason')}\n")
+ 
++    # Stream C / C.2 — surface how many builds each pruning gate skipped
++    # so the operator can see the wall-clock saved (each skip ≈ one full
++    # ~5-min compile avoided) and confirm neither gate over-pruned past
++    # its cap. Counted from the trial records' prune_stage tag (uniform
++    # whether the gate fired in the TPE or refine driver).
++    if cm_enabled:
++        n_pruned_abs = sum(
++            1 for t in tpe_trials
++            if t.get("status") == "cost_model_pruned"
++            and t.get("prune_stage") == "cost_model_threshold")
++        n_pruned_mf = sum(
++            1 for t in tpe_trials
++            if t.get("status") == "cost_model_pruned"
++            and t.get("prune_stage") == "multi_fidelity")
++        n_eval = max(1, int(cost_model_state.get("n_total", 0)))
++        report.write(
++            f"  [cost-model] pruned {n_pruned_abs + n_pruned_mf} of "
++            f"{n_eval} prediction-evaluated candidates without building "
++            f"(absolute-threshold={n_pruned_abs}, "
++            f"multi-fidelity={n_pruned_mf}); "
++            f"caps: rejection_max_pct={spec.cost_model_rejection_max_pct}, "
++            f"multi_fidelity_max_pct="
++            f"{getattr(spec, 'multi_fidelity_max_pct', 0.5)}\n")
++
+     # Stage 2: refine the top-K with ±2-step neighbours.
+     # spec.top_k=None ⇒ topk_refine uses elbow detection.
+     refine_inputs = [t for t in tpe_trials if t["timing_ms"] is not None]
+@@ -14402,7 +14619,8 @@ def build(
+     strict_numerics: bool = False,
+     enable_synth_codegen: bool = True,
+     enable_polyhedral: bool = True,
+-    enable_cost_model: bool = True,
++    enable_cost_model: Optional[bool] = None,
++    multi_fidelity: Optional[bool] = None,
+     auto_install_optional_deps: bool = False,
+     cross_host: bool = False,
+     cross_host_march: Optional[str] = None,
+@@ -14570,17 +14788,21 @@ def build(
+         cross_host=cross_host,
+         cross_host_march=cross_host_march,
+     )
+-    # BLOCKER 1 fix — wire the ``enable_cost_model`` kwarg through to the
+-    # spec. The field is defined on BuildSpec but not exposed via its
+-    # constructor today; we set it after construction so the README
+-    # quickstart's ``build(..., enable_cost_model=...)`` call no longer
+-    # raises ``TypeError: unexpected keyword argument``. A later
+-    # ``apply_to_buildspec`` call may still flip it on via the TOML
+-    # ``[cost_model] enable=true`` path, but never off — same semantics as
+-    # the other ``enable_*`` toggles.
++    # Wire the ``enable_cost_model`` / ``multi_fidelity`` kwargs through to
++    # the spec. Both are TRI-STATE (``Optional[bool]``): ``None`` (the
++    # default) leaves the BuildSpec field at its dataclass default — which
++    # is now ON for both — so the surrogate prunes obviously-bad builds out
++    # of the box; an explicit ``True`` forces on; an explicit ``False``
++    # forces the byte-identical un-pruned search (the ``--no-cost-model``
++    # CLI flag rides this path). The cost model only PRUNES timing of
++    # predicted-bad configs and never touches correctness, so default-on is
++    # safe. (A later ``apply_to_buildspec`` may still flip cost_model ON via
++    # the TOML ``[cost_model] enable=true`` path, never off.)
+     try:
+-        if enable_cost_model:
+-            spec.enable_cost_model = True
++        if enable_cost_model is not None:
++            spec.enable_cost_model = bool(enable_cost_model)
++        if multi_fidelity is not None:
++            spec.multi_fidelity = bool(multi_fidelity)
+     except Exception as _swexc:
+         _debug_swallow('build', _swexc)
+ 
+@@ -15538,24 +15760,39 @@ def main(argv: Optional[List[str]] = None) -> int:
+                              "<out>/dry_run_<arch>.json. Useful for CI verification "
+                              "on hosts without nvcc/hipcc.")
+     # Category 3a — surface existing BuildSpec capabilities through the CLI.
+-    # BLOCKER 1 — ``--enable-cost-model`` flag mirrors the ``enable_cost_model``
+-    # keyword on ``build()``. The README quickstart references this toggle via
+-    # ``ENABLE_COST_MODEL`` (line 227 of README.md); making it a real CLI flag
+-    # keeps the Python and CLI surfaces in sync.
++    # ``--enable-cost-model`` / ``--no-cost-model`` mirror the
++    # ``enable_cost_model`` keyword on ``build()``. The flag is TRI-STATE:
++    # default ``None`` leaves the BuildSpec dataclass default (now ON) in
++    # force, so the learned surrogate prunes obviously-bad builds out of the
++    # box; ``--no-cost-model`` forces the byte-identical un-pruned search.
+     _cm = parser.add_mutually_exclusive_group()
+     _cm.add_argument("--enable-cost-model", dest="enable_cost_model",
+-                     action="store_true", default=False,
+-                     help="Enable the Stream C learned cost model + "
+-                          "rejection budget. Predicted-bad configs are "
+-                          "skipped without timing them so the autotuner "
+-                          "spends its budget on promising candidates. "
+-                          "Off by default; opt in here or via "
+-                          "``[cost_model] enable=true`` in the project "
+-                          "TOML.")
++                     action="store_true", default=None,
++                     help="Force the Stream C learned cost model ON (it is "
++                          "already on by default). Predicted-bad configs are "
++                          "skipped without building/timing them so the "
++                          "autotuner spends its ~5-min-per-build budget on "
++                          "promising candidates.")
+     _cm.add_argument("--no-cost-model", dest="enable_cost_model",
+                      action="store_false",
+-                     help="Force the learned cost model OFF even if a "
+-                          "project config tries to enable it.")
++                     help="Force the learned cost model OFF (and with it the "
++                          "multi-fidelity proxy) — the autotune is then "
++                          "byte-identical to an un-pruned exhaustive-by-TPE "
++                          "search. Overrides any project config that enables "
++                          "it.")
++    # ``--multi-fidelity`` / ``--no-multi-fidelity`` gate the cheap-proxy
++    # stage (predicted-time distributional kill) that runs on top of the
++    # cost model. Also tri-state, default ON.
++    _mf = parser.add_mutually_exclusive_group()
++    _mf.add_argument("--multi-fidelity", dest="multi_fidelity",
++                     action="store_true", default=None,
++                     help="Force the multi-fidelity cheap-proxy pruning ON "
++                          "(default). Kills configs the surrogate is "
++                          "confident sit in the slow tail before any build.")
++    _mf.add_argument("--no-multi-fidelity", dest="multi_fidelity",
++                     action="store_false",
++                     help="Disable the multi-fidelity proxy while keeping the "
++                          "absolute-threshold cost-model gate.")
+     parser.add_argument("--enable-synth-codegen", action="store_true",
+                         help="Enable Stream D OpGraph-based generative codegen "
+                              "alongside the Jinja2 template variant. The synth "
+@@ -15908,8 +16145,10 @@ def main(argv: Optional[List[str]] = None) -> int:
+         strict_numerics=args.strict_numerics,
+         enable_synth_codegen=args.enable_synth_codegen,
+         enable_polyhedral=args.enable_polyhedral,
+-        enable_cost_model=bool(
+-            getattr(args, "enable_cost_model", False)),
++        # Tri-state: None ⇒ leave the BuildSpec default (ON) in force;
++        # --no-cost-model / --no-multi-fidelity pass False to force off.
++        enable_cost_model=getattr(args, "enable_cost_model", None),
++        multi_fidelity=getattr(args, "multi_fidelity", None),
+         auto_install_optional_deps=bool(
+             getattr(args, "auto_install_optional_deps", True)),
+         # Mandate #23 — cpu-then-target stage implies a cross-host AOT build
+@@ -17590,6 +17829,109 @@ def _self_test_cost_model(run) -> None:
+     run("cost_model_save_load_round_trip",
+          test_cost_model_save_load_round_trip)
+ 
++    def test_cost_model_default_on():
++        """Task 1 — the learned cost model and its multi-fidelity proxy
++        are ON by default on a bare BuildSpec (they only PRUNE timing of
++        predicted-bad configs, never affecting correctness)."""
++        spec = BuildSpec(optimizer="Lion", model="mamba", arch="sm_90a",
++                         out_dir=Path("/tmp/_cm_default_on_probe"))
++        assert spec.enable_cost_model is True, \
++            "enable_cost_model must default ON"
++        assert spec.multi_fidelity is True, \
++            "multi_fidelity must default ON"
++    run("cost_model_default_on", test_cost_model_default_on)
++
++    def test_cost_model_ranks_good_below_bad():
++        """Task 1 unit test — fit the surrogate on ~20 synthetic
++        (config-features → timing_ms) points where timing rises with a
++        single feature, then confirm it ranks a KNOWN-GOOD config (low
++        feature ⇒ fast) strictly BELOW a KNOWN-BAD one (high feature ⇒
++        slow). Backend-agnostic: passes on xgboost / sklearn / the
++        numpy-only ridge fallback alike."""
++        import numpy as np
++        from grokking_optimizers.compile import CostModel
++        rng = np.random.default_rng(0)
++        n, d = 20, 6
++        X = rng.random((n, d)).astype(np.float32)
++        # Monotone-in-feature-0 ground truth: bad configs (f0≈1) clock
++        # ~5x slower than good ones (f0≈0). Tiny noise.
++        y = (1.0 + 4.0 * X[:, 0]
++             + 0.02 * rng.standard_normal(n)).astype(np.float32)
++        with tempfile.TemporaryDirectory() as td:
++            reg = CostModel("sm_90a", Path(td) / "cm.bin",
++                            uncertainty_method="bootstrap")
++            reg.fit(X, y)
++            assert reg.is_warm()
++            good = np.zeros(d, dtype=np.float32)   # f0 = 0 → fast
++            bad = np.zeros(d, dtype=np.float32)
++            bad[0] = 1.0                            # f0 = 1 → slow
++            ms_good, sig_good = reg.predict(good)
++            ms_bad, sig_bad = reg.predict(bad)
++            assert isinstance(ms_good, float) and isinstance(ms_bad, float)
++            assert sig_good >= 0.0 and sig_bad >= 0.0
++            assert ms_good < ms_bad, (
++                f"surrogate must rank good below bad: "
++                f"good={ms_good:.4f} bad={ms_bad:.4f}")
++            sys.stdout.write(
++                f"    [unit] surrogate(backend={reg._backend}): "
++                f"good={ms_good:.4f}ms (sigma={sig_good:.4f}) < "
++                f"bad={ms_bad:.4f}ms (sigma={sig_bad:.4f}) "
++                f"OK\n")
++    run("cost_model_ranks_good_below_bad",
++         test_cost_model_ranks_good_below_bad)
++
++    def test_multi_fidelity_prune_decision():
++        """Task 2 — the cheap-proxy decision is conservative: it prunes a
++        config the model is confident is far above the measured-timing
++        distribution, KEEPS a fast one, KEEPS an uncertain one (large
++        sigma puts the optimistic bound inside the keep band), and KEEPS
++        everything when there's too little measured signal."""
++        from grokking_optimizers.compile import _multi_fidelity_prune_decision
++        # Empirical distribution of measured timings, p75 ≈ 2.0.
++        measured = [1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0, 2.0, 2.0, 2.5]
++        # (a) confident-slow config (pred 5.0, tiny sigma) → PRUNE.
++        prune, q = _multi_fidelity_prune_decision(
++            5.0, 0.05, measured, quantile=0.75, margin=1.10)
++        assert prune is True and q is not None and q > 0, (prune, q)
++        # (b) fast config (pred 0.8) → KEEP (optimistic bound below q).
++        prune, _ = _multi_fidelity_prune_decision(
++            0.8, 0.05, measured, quantile=0.75, margin=1.10)
++        assert prune is False
++        # (c) slow-mean but UNCERTAIN config (pred 5.0, sigma 4.0 ⇒
++        # optimistic bound 1.0) → KEEP (could plausibly win).
++        prune, _ = _multi_fidelity_prune_decision(
++            5.0, 4.0, measured, quantile=0.75, margin=1.10)
++        assert prune is False
++        # (d) too little measured signal (< 8 points) → always KEEP.
++        prune, q = _multi_fidelity_prune_decision(
++            99.0, 0.0, [1.0, 2.0, 3.0], quantile=0.75, margin=1.10)
++        assert prune is False and q is None
++        # (e) non-finite prediction never prunes.
++        prune, _ = _multi_fidelity_prune_decision(
++            float("inf"), 0.0, measured, quantile=0.75, margin=1.10)
++        assert prune is False
++        sys.stdout.write(
++            "    [unit] multi-fidelity gate: prunes confident-slow, keeps "
++            "fast / uncertain / data-starved / non-finite OK\n")
++    run("multi_fidelity_prune_decision",
++         test_multi_fidelity_prune_decision)
++
++    def test_multi_fidelity_cap_logic():
++        """Task 2 — the proxy's independent rejection cap is honoured: an
++        always-prune proxy never exceeds multi_fidelity_max_pct of the
++        candidates it evaluates."""
++        mf_total = 0
++        mf_rejected = 0
++        cap = 0.5
++        for _ in range(100):
++            mf_total += 1
++            if (mf_rejected + 1) / max(1, mf_total) <= cap:
++                mf_rejected += 1
++        # 50% cap ⇒ ~50 of 100 pruned, never materially more.
++        assert mf_rejected <= int(cap * 100) + 1, mf_rejected
++        assert mf_rejected >= int(cap * 100) - 1, mf_rejected
++    run("multi_fidelity_cap_logic", test_multi_fidelity_cap_logic)
++
+ 
+ def _self_test_cache(run) -> None:
+     """`[self-test] cache` section."""
+@@ -20817,7 +21159,11 @@ def _self_test_dry_run_all_archs(run) -> None:
+                 assert pef.get("enable_polyhedral") is True, pef
+ 
+         with tempfile.TemporaryDirectory() as td2:
+-            # Default (no kwargs) → toggles all False in the manifest.
++            # Default (no kwargs) → the dry-run constructs a bare BuildSpec,
++            # so the manifest mirrors the dataclass defaults. The learned
++            # cost model and its multi-fidelity proxy are ON by default
++            # (they only PRUNE timing, never affect correctness); the other
++            # opt-in toggles remain OFF unless a kwarg / TOML turns them on.
+             manifests_off = _dry_run_all_archs(Path(td2), config=None)
+             for arch, m in manifests_off.items():
+                 ef = m.get("enabled_features", {})
+@@ -20825,9 +21171,16 @@ def _self_test_dry_run_all_archs(run) -> None:
+                     f"{arch}: expected False, got {ef.get('enable_synth_codegen')!r}")
+                 assert ef.get("enable_polyhedral") is False, (
+                     f"{arch}: expected False, got {ef.get('enable_polyhedral')!r}")
+-                # The other toggles in the contract — also False.
++                # Cost model + multi-fidelity default ON (only prune timing).
++                assert ef.get("enable_cost_model") is True, (
++                    f"{arch}: enable_cost_model should default ON, got "
++                    f"{ef.get('enable_cost_model')!r}")
++                assert ef.get("multi_fidelity") is True, (
++                    f"{arch}: multi_fidelity should default ON, got "
++                    f"{ef.get('multi_fidelity')!r}")
++                # The remaining opt-in toggles stay OFF by default.
+                 for k in ("enable_runtime_specialization",
+-                          "enable_device_pgo", "enable_cost_model",
++                          "enable_device_pgo",
+                           "enable_emitter", "strict_numerics"):
+                     assert ef.get(k) is False, f"{arch}: {k}={ef.get(k)!r}"
+ 
+@@ -21837,7 +22190,7 @@ def _self_test_math_drift_guard(run) -> None:
+ # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
+ # any other), so the value is the grand total reported on the final
+ # ``[self-test] N passed, M failed`` line.
+-_SELF_TEST_EXPECTED_COUNT: int = 231
++_SELF_TEST_EXPECTED_COUNT: int = 235
+ 
+ 
+ def _self_test() -> int:

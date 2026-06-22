@@ -1,0 +1,27 @@
+[07:51:57] enumerate files (excluding snapshot .git)
+[07:51:59]   total files: 27270
+[07:51:59] classify text vs binary
+[07:55:26]   text: 25257  binary: 2013
+[07:55:26] dedup text by content hash (collapses worktree duplicates)
+[07:58:01]   unique text files: 7416 (of 25257)
+[07:58:01] mega-grep: secrets
+[07:58:18]   secret hits: 0
+[07:58:18] mega-grep: PII
+[07:58:34]   pii hits: 164198
+[07:58:34] mega-grep: keywords (case-insensitive)
+[07:58:50]   keyword hits: 2036
+[07:58:50] strings-scan binaries for structured secrets/paths
+[07:59:15]   binary hits: 0
+[07:59:15] === hits by top-level area ===
+  94593 _snap/results
+  69554 claude_session_archive
+   2058 _snap/third_party
+     13 _snap/.claude
+      9 _snap/.perf
+      2 _snap/workspace_docs
+      2 _snap/ENV_SNAPSHOT.txt
+      1 _snap/requirements-lock.txt
+      1 _snap/build.log
+      1 _snap/SESSION_STATE.md
+[07:59:23] human-authored review candidates (excl cutlass): 935
+[07:59:23] PREP DONE -> manifests in /workspace/_scan

@@ -1,0 +1,524 @@
+Using pip 24.2 from /usr/local/lib/python3.11/dist-packages/pip (python 3.11)
+Obtaining file:///workspace/SuperGrok1.5
+  Checking if build backend supports build_editable: started
+  Running command Checking if build backend supports build_editable
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Running command Preparing editable metadata (pyproject.toml)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `authors = 'Peter C.'`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `authors` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `authors` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `classifiers` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+    corresp(dist, value, root_dir)
+    CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+    Compiler launcher: ccache -> /usr/bin/ccache
+    Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+  Building Grokking Optimizers C++/CUDA extension
+    CUDA version: 12.4
+    CUDA gencode archs (toolchain-probed): ['90a'] (+PTX 90)
+    NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+    CUTLASS enabled for archs: ['90a']
+  running dist_info
+  creating /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info
+  writing /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/PKG-INFO
+  writing dependency_links to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/dependency_links.txt
+  writing requirements to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/requires.txt
+  writing top-level names to /dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/top_level.txt
+  writing manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+  warning: no previously-included files matching '*.pyc' found anywhere in distribution
+  warning: no previously-included files matching '*.pyo' found anywhere in distribution
+  warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+  no previously-included directories found matching 'build'
+  no previously-included directories found matching 'dist'
+  no previously-included directories found matching '.git'
+  adding license file 'LICENSE'
+  writing manifest file '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers.egg-info/SOURCES.txt'
+  creating '/dev/shm/tmp/pip-modern-metadata-o3wsmly8/grokking_optimizers-3.0.0.dist-info'
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch>=2.0.0 in /usr/local/lib/python3.11/dist-packages (from grokking-optimizers==3.0.0) (2.4.1+cu124)
+Requirement already satisfied: filelock in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.13.1)
+Requirement already satisfied: typing-extensions>=4.8.0 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (4.15.0)
+Requirement already satisfied: sympy in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (1.12)
+Requirement already satisfied: networkx in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.2.1)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.1.3)
+Requirement already satisfied: fsspec in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (2024.2.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-cudnn-cu12==9.1.0.70 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (9.1.0.70)
+Requirement already satisfied: nvidia-cublas-cu12==12.4.2.65 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.2.65)
+Requirement already satisfied: nvidia-cufft-cu12==11.2.0.44 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (11.2.0.44)
+Requirement already satisfied: nvidia-curand-cu12==10.3.5.119 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (10.3.5.119)
+Requirement already satisfied: nvidia-cusolver-cu12==11.6.0.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (11.6.0.99)
+Requirement already satisfied: nvidia-cusparse-cu12==12.3.0.142 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.3.0.142)
+Requirement already satisfied: nvidia-nccl-cu12==2.20.5 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (2.20.5)
+Requirement already satisfied: nvidia-nvtx-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: nvidia-nvjitlink-cu12==12.4.99 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (12.4.99)
+Requirement already satisfied: triton==3.0.0 in /usr/local/lib/python3.11/dist-packages (from torch>=2.0.0->grokking-optimizers==3.0.0) (3.0.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.11/dist-packages (from jinja2->torch>=2.0.0->grokking-optimizers==3.0.0) (2.1.5)
+Requirement already satisfied: mpmath>=0.19 in /usr/local/lib/python3.11/dist-packages (from sympy->torch>=2.0.0->grokking-optimizers==3.0.0) (1.3.0)
+Building wheels for collected packages: grokking-optimizers
+  Building editable for grokking-optimizers (pyproject.toml): started
+  Running command Building editable for grokking-optimizers (pyproject.toml)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `authors = 'Peter C.'`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `authors` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `authors` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+  !!
+
+          ********************************************************************************
+          The following seems to be defined outside of `pyproject.toml`:
+
+          `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+          According to the spec (see the link below), however, setuptools CANNOT
+          consider this value unless `classifiers` is listed as `dynamic`.
+
+          https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+          To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+          remove the `[project]` table from your file and rely entirely on other means of
+          configuration.
+          ********************************************************************************
+
+  !!
+    _handle_missing_dynamic(dist, project_table)
+  /usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+    corresp(dist, value, root_dir)
+    CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+    Compiler launcher: ccache -> /usr/bin/ccache
+    Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+  Building Grokking Optimizers C++/CUDA extension
+    CUDA version: 12.4
+    CUDA gencode archs (toolchain-probed): ['90a'] (+PTX 90)
+    NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+    CUTLASS enabled for archs: ['90a']
+  running editable_wheel
+  creating /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info
+  writing /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/PKG-INFO
+  writing dependency_links to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/dependency_links.txt
+  writing requirements to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/requires.txt
+  writing top-level names to /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/top_level.txt
+  writing manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+  warning: no previously-included files matching '*.pyc' found anywhere in distribution
+  warning: no previously-included files matching '*.pyo' found anywhere in distribution
+  warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+  no previously-included directories found matching 'build'
+  no previously-included directories found matching 'dist'
+  no previously-included directories found matching '.git'
+  adding license file 'LICENSE'
+  writing manifest file '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers.egg-info/SOURCES.txt'
+  creating '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0.dist-info'
+  creating /dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0.dist-info/WHEEL
+  running build_py
+  running build_ext
+  /usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py:424: UserWarning: There are no /workspace/SuperGrok1.5/.build_tools/g++-cached version bounds defined for CUDA version 12.4
+    warnings.warn(f'There are no {compiler_name} version bounds defined for CUDA version {cuda_str_version}')
+    [sccache] nvcc wrapped via PYTORCH_NVCC = '/workspace/SuperGrok1.5/.build_tools/nvcc-cached' (cached _ops rebuilds).
+    [tuned-inject] no _kernel_tuned.json found; building with in-header kernel defaults. Run `python -m grokking_optimizers.compile ... --jit-only` to produce winners (see AUTOTUNE_LINKAGE.md).
+  building 'grokking_optimizers._ops' extension
+  creating /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings
+  creating /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90
+  Emitting ninja build file /dev/shm/tmp/tmplopbc353.build-temp/build.ninja...
+  Compiling objects...
+  Using envvar MAX_JOBS (224) as the number of workers...
+  [1/6] /workspace/SuperGrok1.5/.build_tools/g++-cached -MMD -MF /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/dispatch.o.d -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/dispatch.o -O3 -std=c++17 -DWITH_CUDA -DNDEBUG -ffast-math -funroll-loops -fPIC -DWITH_CUTLASS -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp:395:1: warning: multi-line comment [-Wcomment]
+    395 | //   python -m grokking_optimizers.megakernel_codegen --dispatch-table > \
+        | ^
+  [2/6] /workspace/SuperGrok1.5/.build_tools/g++-cached -MMD -MF /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/bindings.o.d -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/bindings.o -O3 -std=c++17 -DWITH_CUDA -DNDEBUG -ffast-math -funroll-loops -fPIC -DWITH_CUTLASS -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  [3/6] /workspace/SuperGrok1.5/.build_tools/nvcc-cached  -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/sg2_meta_tail.cu -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/sg2_meta_tail.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf', 912 bytes spill stores, 908 bytes spill loads
+  ptxas info    : 23 bytes gmem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9029sg2_meta_optimizer_megakernelINS1_7SG2DimsILi8ELi2ELi4ELi144ELi16ELi4ELi4ELi4ELi8ELi16ELi128ELi4EEEffEEvNS0_17PersistentContextENS1_10SG2WeightsENS1_8SG2StateENS1_10SG2ScalarsEPT0_PKT1_PKf
+      1104 bytes stack frame, 912 bytes spill stores, 908 bytes spill loads
+  ptxas info    : Used 128 registers, 1104 bytes cumulative stack size, 36116 bytes smem
+  ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+  ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 4 registers
+  [4/6] /workspace/SuperGrok1.5/.build_tools/nvcc-cached  -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 116 bytes spill stores, 188 bytes spill loads
+  ptxas info    : 23 bytes gmem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10896 bytes stack frame, 116 bytes spill stores, 188 bytes spill loads
+  ptxas info    : Used 255 registers, 10896 bytes cumulative stack size, 96 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 608 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 736 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 138 registers, 10640 bytes cumulative stack size, 176 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 145 registers, 10640 bytes cumulative stack size, 96 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 141 registers, 10640 bytes cumulative stack size, 304 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 139 registers, 10640 bytes cumulative stack size, 48 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 139 registers, 10640 bytes cumulative stack size, 48 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+      10640 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 136 registers, 10640 bytes cumulative stack size, 48 bytes smem
+  ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+  ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 4 registers
+  [5/6] /workspace/SuperGrok1.5/.build_tools/nvcc-cached  -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6672 bytes spill stores, 7756 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4632 bytes spill stores, 4788 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py', 48 bytes spill stores, 284 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy', 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : 23 bytes gmem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      2224 bytes stack frame, 6672 bytes spill stores, 7756 bytes spill loads
+  ptxas info    : Used 255 registers, 2224 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+      0 bytes stack frame, 4632 bytes spill stores, 4788 bytes spill loads
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+      0 bytes stack frame, 48 bytes spill stores, 284 bytes spill loads
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 25872 bytes smem
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+      0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 26000 bytes smem
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+      0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      1920 bytes stack frame, 6220 bytes spill stores, 6448 bytes spill loads
+  ptxas info    : Used 255 registers, 1920 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy
+      0 bytes stack frame, 4596 bytes spill stores, 4592 bytes spill loads
+  ptxas info    : Function properties for _ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25488 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25616 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+      800 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 800 bytes cumulative stack size, 25360 bytes smem
+  ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+  ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 4 registers
+  [6/6] /workspace/SuperGrok1.5/.build_tools/nvcc-cached  -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu -o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+    using sg::algorithms::adamw_step;
+          ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 18240 bytes spill stores, 18980 bytes spill loads
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf', 48 bytes spill stores, 116 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15900 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15908 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 15020 bytes spill stores, 15900 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 4 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 16 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 8 bytes spill stores, 16 bytes spill loads
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+  ptxas info    : 23 bytes gmem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE10EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      2272 bytes stack frame, 18240 bytes spill stores, 18980 bytes spill loads
+  ptxas info    : Used 255 registers, 2272 bytes cumulative stack size, 9704 bytes smem
+  ptxas info    : Function properties for _ZN2sg5fused4sm905vittc18vittc_forward_tileERKNS1_10VitWeightsEiiRKNS2_7VitActsERKNS2_14VitTileScratchEPKfPKiP13__nv_bfloat16SH_Pf
+      0 bytes stack frame, 48 bytes spill stores, 116 bytes spill loads
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE9EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      1456 bytes stack frame, 15020 bytes spill stores, 15900 bytes spill loads
+  ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 10212 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE8EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      1456 bytes stack frame, 15020 bytes spill stores, 15908 bytes spill loads
+  ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 10340 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE4EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      1456 bytes stack frame, 15020 bytes spill stores, 15900 bytes spill loads
+  ptxas info    : Used 255 registers, 1456 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE7EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      688 bytes stack frame, 8 bytes spill stores, 4 bytes spill loads
+  ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9828 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9956 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      688 bytes stack frame, 8 bytes spill stores, 16 bytes spill loads
+  ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      688 bytes stack frame, 8 bytes spill stores, 16 bytes spill loads
+  ptxas info    : Used 255 registers, 688 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+  ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+      672 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 255 registers, 672 bytes cumulative stack size, 9700 bytes smem
+  ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+  ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  ptxas info    : Used 4 registers
+  creating /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers
+  /workspace/SuperGrok1.5/.build_tools/g++-cached -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/bindings.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/bindings/dispatch.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o /dev/shm/tmp/tmplopbc353.build-temp/csrc/fused/sm_90/sg2_meta_tail.o -L/usr/local/lib/python3.11/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so
+  copying /dev/shm/tmp/tmp7akvrsj5.build-lib/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so -> grokking_optimizers
+  running egg_info
+  creating /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info
+  writing /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/PKG-INFO
+  writing dependency_links to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/dependency_links.txt
+  writing requirements to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/requires.txt
+  writing top-level names to /dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/top_level.txt
+  writing manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+  reading manifest template 'MANIFEST.in'
+  warning: no files found matching '*.cuh' under directory 'grokking_optimizers'
+  warning: no previously-included files matching '*.pyc' found anywhere in distribution
+  warning: no previously-included files matching '*.pyo' found anywhere in distribution
+  warning: no previously-included files matching '__pycache__/*' found anywhere in distribution
+  no previously-included directories found matching 'build'
+  no previously-included directories found matching 'dist'
+  no previously-included directories found matching '.git'
+  adding license file 'LICENSE'
+  writing manifest file '/dev/shm/tmp/tmplopbc353.build-temp/grokking_optimizers.egg-info/SOURCES.txt'
+  Editable install will be performed using a meta path finder.
+
+  Options like `package-data`, `include/exclude-package-data` or
+  `packages.find.exclude/include` may have no effect.
+
+  adding '__editable___grokking_optimizers_3_0_0_finder.py'
+  adding '__editable__.grokking_optimizers-3.0.0.pth'
+  creating '/dev/shm/tmp/pip-wheel-_gq_ud9w/.tmp-o3qlnf3g/grokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl' and adding '/dev/shm/tmp/tmp9eyfwcjogrokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl' to it
+  adding 'grokking_optimizers-3.0.0.dist-info/LICENSE'
+  adding 'grokking_optimizers-3.0.0.dist-info/METADATA'
+  adding 'grokking_optimizers-3.0.0.dist-info/WHEEL'
+  adding 'grokking_optimizers-3.0.0.dist-info/top_level.txt'
+  adding 'grokking_optimizers-3.0.0.dist-info/RECORD'
+  /usr/local/lib/python3.11/dist-packages/setuptools/command/editable_wheel.py:343: InformationOnly: Editable installation.
+  !!
+
+          ********************************************************************************
+          Please be careful with folders in your working directory with the same
+          name as your package as they may take precedence during imports.
+          ********************************************************************************
+
+  !!
+    with strategy, WheelFile(wheel_path, "w") as wheel_obj:
+  Building editable for grokking-optimizers (pyproject.toml): finished with status 'done'
+  Created wheel for grokking-optimizers: filename=grokking_optimizers-3.0.0-0.editable-cp311-cp311-linux_x86_64.whl size=12603 sha256=e84c15c8ca7d54b9ca8df21477f04087d3af922957729a6d855df1465a6ff761
+  Stored in directory: /dev/shm/tmp/pip-ephem-wheel-cache-k_1fycdj/wheels/05/84/a2/cc4100fa1b99cd58ff32e0df6e549e4591c3289b6e96ce9626
+Successfully built grokking-optimizers
+Installing collected packages: grokking-optimizers
+  Attempting uninstall: grokking-optimizers
+    Found existing installation: grokking-optimizers 3.0.0
+    Uninstalling grokking-optimizers-3.0.0:
+      Removing file or directory /usr/local/lib/python3.11/dist-packages/__editable__.grokking_optimizers-3.0.0.pth
+      Removing file or directory /usr/local/lib/python3.11/dist-packages/__editable___grokking_optimizers_3_0_0_finder.py
+      Removing file or directory /usr/local/lib/python3.11/dist-packages/__pycache__/__editable___grokking_optimizers_3_0_0_finder.cpython-311.pyc
+      Removing file or directory /usr/local/lib/python3.11/dist-packages/grokking_optimizers-3.0.0.dist-info/
+      Successfully uninstalled grokking-optimizers-3.0.0
+Successfully installed grokking-optimizers-3.0.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+
+[notice] A new release of pip is available: 24.2 -> 26.1.2
+[notice] To update, run: python -m pip install --upgrade pip

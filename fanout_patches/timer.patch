@@ -1,0 +1,757 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..757c24a 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -6910,6 +6910,28 @@ class BuildSpec:
+     # Stream 10 — per-variant numerical / differential validation
+     strict_numerics: bool = False     # require bit-identical determinism for winner
+     aot_so_path: Optional[Path] = None  # populated by build_aot; used by variant timer
++    # ─── Generic record-and-replay capture (OFF by default) ──────────────
++    # A "pkg.mod:fn" callable that runs ONE real iteration of the project's
++    # workload. When set AND no hand-written hook is in play, the autotuner
++    # runs it once under a torch op-interception shim, SNAPSHOTS the real
++    # kernel input tensors, and replays those snapshots as the synthesized
++    # inputs for the oracle / variant dumps — so a project whose kernel IS a
++    # torch op needs NO hand-written capture hook and no schema-synthesis. The
++    # op to intercept defaults to the resolved ``fused_op_template``; override
++    # via ``[capture].intercept_op`` in the project config. Absent (the
++    # default) ⇒ behaviour is byte-identical to today (schema-synthesis).
++    capture_workload: Optional[str] = None
++    # ─── Incremental per-variant build (OFF by default for safety) ───────
++    # When True, ``_torch_load`` for a variant reuses the AOT object files for
++    # TUs that the swept SG_TUNED macros DON'T touch and only recompiles the
++    # kernel TU(s) that actually read those macros. This is the biggest
++    # tuning-throughput lever (a variant rebuild touches one TU instead of the
++    # whole project). When the dependency analysis is uncertain (can't prove
++    # which TUs read the macros, or no committed sources are visible), it falls
++    # back to a full build — no correctness risk. Default OFF: byte-identical
++    # to today unless explicitly enabled via ``[build].incremental_variant`` or
++    # this field.
++    incremental_variant_build: bool = False
+     # ─── Stream A — portability (config-driven naming + layout) ──────
+     # All defaults below REPLICATE the historical SuperGrok-hardcoded
+     # values, so a build with no config file produces byte-identical
+@@ -11090,6 +11112,225 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
+     return lines
+ 
+ 
++# ---------------------------------------------------------------------------
++# Incremental per-variant build (BuildSpec.incremental_variant_build)
++# ---------------------------------------------------------------------------
++#
++# The biggest tuning-throughput lever: a variant differs from its siblings
++# ONLY in the swept ``-DSG_TUNED_*`` macros, which are read by a SMALL subset
++# of TUs (the kernel sources that ``#include`` a macro-reading header). The
++# other TUs (bindings, dispatch, non-kernel launchers) produce byte-identical
++# objects regardless of the macro value — recompiling them every variant is
++# pure waste.
++#
++# torch's ``cpp_extension.load`` applies ``extra_cflags`` GLOBALLY (one nvcc
++# command shared by all sources), so the macro tokens normally land on every
++# TU's command line and dirty every object. We confine them instead:
++#
++#   1. STRIP the ``-DSG_TUNED_*`` tokens from the global host/device flags, so
++#      the per-TU command string is now BYTE-STABLE across variants.
++#   2. Write those macros into a fixed-path header ``sg_tuned_variant.h`` in a
++#      SHARED, PERSISTENT build dir (re-used across the whole sweep).
++#   3. Replace each KERNEL TU with a thin, STABLE-named wrapper TU that
++#      ``#include``s ``sg_tuned_variant.h`` then the original source. Only the
++#      wrappers depend on the header; ninja's ``-MMD`` depfile tracking then
++#      recompiles ONLY the wrappers when the header content changes and SKIPS
++#      every macro-independent TU (byte-identical command, no header dep).
++#
++# Output is identical to passing ``-D`` globally (the macros reach exactly the
++# TUs that read them). If the dependency analysis is UNCERTAIN — no committed
++# source visible, the kernel-TU set is empty or is the whole source list, or
++# any IO fails — we return None and the caller does a normal full build. No
++# correctness risk: the fallback is the existing, proven path.
++
++_SG_TUNED_MACRO_RE = None
++
++
++def _split_sg_tuned_flags(flags: List[str]) -> Tuple[List[str], List[str]]:
++    """Partition ``flags`` into (non_tuned, tuned). A "tuned" flag is a
++    ``-DSG_TUNED_*[=...]`` define (the per-variant macros the sweep injects).
++    Pure / CPU-testable."""
++    tuned: List[str] = []
++    rest: List[str] = []
++    for f in flags:
++        if f.startswith("-DSG_TUNED_") or f.startswith("-D SG_TUNED_"):
++            tuned.append(f)
++        else:
++            rest.append(f)
++    return rest, tuned
++
++
++def _macros_to_header(tuned_flags: List[str]) -> str:
++    """Render ``-DNAME=VAL`` / ``-DNAME`` tokens as ``#define`` lines for the
++    shared variant header. Pure / CPU-testable."""
++    lines = ["// Auto-generated per-variant tuned macros "
++             "(incremental_variant_build).",
++             "// Regenerated each variant; ninja depfile tracking recompiles "
++             "only the kernel TUs that include this header.",
++             "#pragma once"]
++    for f in tuned_flags:
++        body = f[2:].lstrip()           # drop leading "-D" (and any space)
++        if "=" in body:
++            name, val = body.split("=", 1)
++            lines.append(f"#undef {name}")
++            lines.append(f"#define {name} {val}")
++        else:
++            lines.append(f"#undef {body}")
++            lines.append(f"#define {body} 1")
++    return "\n".join(lines) + "\n"
++
++
++def _transitive_reads_macro(src: Path, macro_stems: List[str],
++                            search_roots: List[Path],
++                            _seen: Optional[set] = None) -> Optional[bool]:
++    """True iff ``src`` or any file it transitively ``#include``s (resolved
++    within ``search_roots``) contains one of the ``macro_stems`` tokens.
++
++    Returns None when resolution is UNCERTAIN — an ``#include`` we cannot
++    locate on any search root (so we can't prove the TU is macro-independent
++    and must fall back to a full build). System ``<...>`` includes are ignored
++    (they never read project macros). Bounded by a visited-set."""
++    import re as _re
++    if _seen is None:
++        _seen = set()
++    src = Path(src)
++    rp = str(src.resolve())
++    if rp in _seen:
++        return False
++    _seen.add(rp)
++    try:
++        text = src.read_text(errors="ignore")
++    except OSError:
++        return None
++    for stem in macro_stems:
++        if stem in text:
++            return True
++    inc_re = _re.compile(r'^\s*#\s*include\s*"([^"]+)"', _re.MULTILINE)
++    for rel in inc_re.findall(text):
++        target: Optional[Path] = None
++        cand_dirs = [src.parent] + list(search_roots)
++        for d in cand_dirs:
++            c = (Path(d) / rel)
++            if c.is_file():
++                target = c
++                break
++        if target is None:
++            # Unresolvable local include — cannot prove independence.
++            return None
++        sub = _transitive_reads_macro(target, macro_stems, search_roots, _seen)
++        if sub is None:
++            return None
++        if sub:
++            return True
++    return False
++
++
++def _incremental_kernel_tus(sources: List[Path], tuned_flags: List[str],
++                            spec: "BuildSpec"
++                            ) -> Optional[List[Path]]:
++    """Dependency analysis for ``incremental_variant_build``.
++
++    Returns the subset of ``sources`` that transitively read one of the swept
++    ``SG_TUNED_*`` macros (the TUs that MUST recompile per variant), or None
++    when the analysis is uncertain / not worthwhile — in which case the caller
++    falls back to a full build (no correctness risk). None is returned when:
++
++      * there are no swept tuned macros (nothing to confine),
++      * any TU's include closure can't be fully resolved (can't prove a TU is
++        macro-independent),
++      * every TU reads the macros (no stable TU to reuse → no win),
++      * no TU reads the macros (the macros would be silently dropped — refuse
++        rather than change behaviour).
++    """
++    if not tuned_flags:
++        return None
++    # Macro stems to look for: the bare name (without -D / =VAL), plus the
++    # component/volume variants resolve_macros emits for tuple dims.
++    stems: List[str] = []
++    for f in tuned_flags:
++        body = f[2:].lstrip().split("=", 1)[0]
++        # A tuple dim emits FOO_0/_1/.../_VOLUME; match the FOO_ root so a TU
++        # reading any component counts as a kernel TU.
++        root = body
++        for suf in ("_VOLUME",):
++            if root.endswith(suf):
++                root = root[: -len(suf)]
++        # Strip a trailing _<digit> component index.
++        if root.rsplit("_", 1)[-1].isdigit():
++            root = root.rsplit("_", 1)[0]
++        stems.append(root)
++    stems = sorted(set(stems))
++    search_roots = [REPO_ROOT]
++    try:
++        for p in _include_paths(spec):
++            search_roots.append(Path(p))
++    except Exception:
++        return None
++    kernel: List[Path] = []
++    for s in sources:
++        res = _transitive_reads_macro(Path(s), stems, search_roots)
++        if res is None:
++            return None     # uncertain → full build
++        if res:
++            kernel.append(Path(s))
++    if not kernel or len(kernel) == len(sources):
++        # No reusable stable TU, or the macros reach nothing → no safe win.
++        return None
++    return kernel
++
++
++def _prepare_incremental_sources(
++        spec: "BuildSpec", sources: List[Path],
++        host_cflags: List[str], device_cflags: List[str],
++        shared_dir: Path, report
++) -> Optional[Tuple[List[Path], List[str], List[str], List[str]]]:
++    """Build the incremental variant inputs.
++
++    Returns ``(new_sources, new_host, new_device, extra_includes)`` where the
++    kernel TUs have been swapped for stable-named wrappers that ``#include`` a
++    regenerated ``sg_tuned_variant.h`` (written into ``shared_dir``), and the
++    ``-DSG_TUNED_*`` tokens have been stripped from the host/device flags.
++    Returns None to signal "fall back to a full build" (uncertain analysis or
++    any IO failure). Never raises."""
++    try:
++        _, tuned_host = _split_sg_tuned_flags(host_cflags)
++        _, tuned_device = _split_sg_tuned_flags(device_cflags)
++        tuned_all = list(dict.fromkeys(tuned_host + tuned_device))
++        kernel_tus = _incremental_kernel_tus(sources, tuned_all, spec)
++        if kernel_tus is None:
++            return None
++        shared_dir.mkdir(parents=True, exist_ok=True)
++        header = shared_dir / "sg_tuned_variant.h"
++        header.write_text(_macros_to_header(tuned_all))
++        kernel_set = {str(Path(k).resolve()) for k in kernel_tus}
++        new_sources: List[Path] = []
++        for s in sources:
++            if str(Path(s).resolve()) in kernel_set:
++                # Stable wrapper filename (per original TU): the path doesn't
++                # change across variants, so the only reason ninja recompiles
++                # it is the header content change (its depfile dependency).
++                wrap = shared_dir / f"_wrap_{Path(s).stem}{Path(s).suffix}"
++                wrap.write_text(
++                    f'#include "sg_tuned_variant.h"\n'
++                    f'#include "{Path(s).resolve()}"\n')
++                new_sources.append(wrap)
++            else:
++                new_sources.append(Path(s))
++        new_host, _ = _split_sg_tuned_flags(host_cflags)
++        new_device, _ = _split_sg_tuned_flags(device_cflags)
++        report.write(
++            f"  [incremental] reusing {len(sources) - len(kernel_tus)} "
++            f"unchanged TU object(s); recompiling {len(kernel_tus)} kernel TU"
++            f"(s) carrying {len(tuned_all)} SG_TUNED macro(s) "
++            f"[{', '.join(Path(k).name for k in kernel_tus)}].\n")
++        return new_sources, new_host, new_device, [str(shared_dir)]
++    except Exception as exc:
++        report.write(f"  [incremental] analysis/setup failed ({exc}); "
++                     f"falling back to a full build.\n")
++        _debug_swallow("_prepare_incremental_sources", exc)
++        return None
++
++
+ def _torch_load(spec: BuildSpec, sources: List[Path],
+                 host_cflags: List[str], device_cflags: List[str],
+                 ldflags: List[str], report,
+@@ -11108,6 +11349,29 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
+     build_dir = spec.out_dir / module_name
+     build_dir.mkdir(parents=True, exist_ok=True)
+ 
++    # ── Incremental per-variant build (OFF by default) ──────────────────
++    # Only attempted for VARIANT builds (module_suffix set → this is a sweep
++    # variant, not the AOT/PGO base) and only when the dependency analysis can
++    # confine the swept SG_TUNED macros to a strict subset of the TUs. When it
++    # applies, the wrappered kernel TUs + macro-independent TUs share ONE
++    # persistent ninja build dir (so ninja's incremental graph survives across
++    # variants and skips the unchanged TUs). Any uncertainty ⇒ None ⇒ the
++    # normal full build below runs unchanged (no correctness risk). The .so is
++    # still uniquely named per variant (module_name), so the timing subprocess
++    # loads the right artifact even though the build dir is shared.
++    extra_inc_incremental: List[str] = []
++    if getattr(spec, "incremental_variant_build", False) and module_suffix:
++        shared_dir = (spec.out_dir
++                      / f"grokking_incremental_{spec.optimizer}_"
++                        f"{spec.model}_{spec.arch}")
++        prepared = _prepare_incremental_sources(
++            spec, sources, host_cflags, device_cflags, shared_dir, report)
++        if prepared is not None:
++            sources, host_cflags, device_cflags, extra_inc_incremental = \
++                prepared
++            build_dir = shared_dir
++            build_dir.mkdir(parents=True, exist_ok=True)
++
+     report.write(f"  module:    {module_name}\n")
+     report.write(f"  build dir: {build_dir}\n")
+     report.write(f"  sources:   {len(sources)} files\n")
+@@ -11123,6 +11387,16 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
+         host_cflags = list(host_cflags) + extra_host
+     if extra_device:
+         device_cflags = list(device_cflags) + extra_device
++    # ldflags accumulation fix — the SAME ``ldflags`` list object is captured
++    # once by ``_make_variant_timer`` / the AOT path and handed to EVERY
++    # variant build. ``torch.utils.cpp_extension.load`` appends linker tokens
++    # (``-shared``, rpath entries, ...) onto ``extra_ldflags`` IN PLACE, so a
++    # shared list grows by those tokens on every call — the audit found this as
++    # quadratic ldflag duplication across the refine variants. Always build a
++    # NEW list here (``list(base) + additions``, never ``base += additions`` /
++    # in-place ``.extend``) so the caller's list is never mutated and each
++    # build starts from the same clean baseline. Pure-copy: no flag changes.
++    ldflags = list(ldflags)
+     overlay = {
+         "MAX_JOBS": NCPUS,
+         "NINJA_STATUS": "[%f/%t %es] ",
+@@ -11146,7 +11420,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
+                 extra_cflags=host_cflags,
+                 extra_cuda_cflags=device_cflags,
+                 extra_ldflags=ldflags,
+-                extra_include_paths=_include_paths(spec),
++                extra_include_paths=_include_paths(spec)
++                + extra_inc_incremental,
+                 build_directory=str(build_dir),
+                 verbose=spec.verbose,
+                 with_cuda=with_cuda,
+@@ -11889,10 +12164,27 @@ def _validate_against_regimes(
+     ``skipped``).
+ 
+     The dump / compare / determinism subprocess helpers are called by the same
+-    module-global names the self-tests mock, so this stays CPU-testable."""
++    module-global names the self-tests mock, so this stays CPU-testable.
++
++    Generic record-and-replay capture: when ``ref_state['replay_dir']`` is set,
++    the variant is dumped on the REAL snapshotted inputs (one fixed real draw —
++    not per-magnitude synthesis), so the multi-regime loop collapses to a
++    single replay comparison (the per-regime resolve_ref returns the same
++    replay oracle)."""
+     size = ref_state["size"]
+     dtype = ref_state["dtype"]
+     entry = ref_state.get("entry")
++    replay_dir = ref_state.get("replay_dir")
++    # Only forward ``replay_dir`` to the dump / determinism helpers when it is
++    # actually set, so the kwarg is absent on the default (synthesis) path —
++    # this keeps fixed-signature test doubles that mock these helpers working
++    # unchanged.
++    _replay_kw = {"replay_dir": replay_dir} if replay_dir is not None else {}
++    # In replay mode there is exactly ONE real input draw; collapse the
++    # adversarial-magnitude sweep to a single comparison (replaying the same
++    # real tensors across synthetic "regimes" would be redundant work).
++    if replay_dir is not None:
++        regimes = regimes[:1] or ["normal"]
+     max_rel_overall = 0.0
+     validated_any = False
+     for rg in regimes:
+@@ -11914,7 +12206,7 @@ def _validate_against_regimes(
+         dumped = _dump_variant_output(
+             variant_so, opt_class, size, dtype, out_dump,
+             fused_op_template=fused_op_template, entry=entry,
+-            regime=rg, seed=0)
++            regime=rg, seed=0, **_replay_kw)
+         if not (dumped and out_dump.exists()):
+             report.write(
+                 f"    [numerical] {label} {ckey[:24]} regime={rg}: dump "
+@@ -11942,7 +12234,7 @@ def _validate_against_regimes(
+     det = _check_determinism_3x(
+         variant_so, opt_class, size, dtype, dump_dir,
+         fused_op_template=fused_op_template, entry=entry,
+-        regime="normal", seed=0)
++        regime="normal", seed=0, **_replay_kw)
+     status = "deterministic" if det else "non_deterministic"
+     report.write(
+         f"    [numerical:3x] {label} {ckey[:24]} -> {status} "
+@@ -11951,8 +12243,200 @@ def _validate_against_regimes(
+     return status
+ 
+ 
++# ── Generic record-and-replay capture (BuildSpec.capture_workload) ────────
++# The subprocess body that runs ONE real iteration of the project's workload
++# under a torch op-interception shim, snapshots the FIRST call to the target
++# op's positional inputs to a directory, and writes a JSON manifest the
++# oracle / variant-dump subprocesses replay. Project-agnostic: a project whose
++# kernel IS a torch op needs no hand-written hook — just point
++# ``capture_workload`` at a callable that runs the kernel once.
++#
++# Placeholders the host substitutes:
++#   __WORKLOAD__   — "pkg.mod:fn" (or "pkg.mod.fn") dotted path
++#   __INTERCEPT__  — short op name to snapshot (e.g. fused_lion_simple_step)
++#   __SNAPDIR__    — output snapshot directory
++#   __AOT_SO__     — AOT .so to load so torch.ops.<ns>.<op> is registered
++_CAPTURE_PROBE = r"""
++import os, sys, json, importlib
++import numpy as np
++import torch
++
++_SNAPDIR = r'''__SNAPDIR__'''
++_WANT = '''__INTERCEPT__'''
++_AOT_SO = r'''__AOT_SO__'''
++os.makedirs(_SNAPDIR, exist_ok=True)
++
++# Load the AOT artifact so the project's torch.ops.<ns>.<op> are registered
++# before the workload runs (a workload that imports the package may rely on
++# the .so already being present).
++if _AOT_SO and os.path.exists(_AOT_SO):
++    try:
++        torch.ops.load_library(_AOT_SO)
++    except Exception as exc:
++        sys.stderr.write("capture: load_library failed: %r\n" % (exc,))
++
++
++class _CaptureDone(Exception):
++    pass
++
++
++def _op_short_name(func):
++    # __torch_dispatch__ receives an OpOverload; .name() => "ns::op.overload".
++    try:
++        nm = func.name()
++    except Exception:
++        nm = str(func)
++    nm = nm.split(".")[0] if "." in nm else nm   # drop .overload suffix
++    return nm.split("::")[-1]                     # drop ns:: prefix
++
++
++def _snapshot(args):
++    manifest = {"snapshot_idx": 0, "args": []}
++    chosen = None
++    for i, a in enumerate(args):
++        if isinstance(a, torch.Tensor):
++            fp = os.path.join(_SNAPDIR, "arg_%d.npy" % i)
++            np.save(fp, a.detach().to("cpu").float().numpy())
++            manifest["args"].append({"kind": "tensor", "file": "arg_%d.npy" % i,
++                                     "torch_dtype": str(a.dtype).split(".")[-1]})
++            # Prefer the first tensor that is mutated in place as the snapshot
++            # target; fall back to the first tensor.
++            if chosen is None:
++                chosen = i
++        elif isinstance(a, bool):
++            manifest["args"].append({"kind": "scalar", "py": "bool", "value": bool(a)})
++        elif isinstance(a, int):
++            manifest["args"].append({"kind": "scalar", "py": "int", "value": int(a)})
++        elif isinstance(a, float):
++            manifest["args"].append({"kind": "scalar", "py": "float", "value": float(a)})
++        else:
++            # Unknown / non-replayable positional (e.g. a list) — record None so
++            # the arity stays correct; replay reconstructs it as a 0.
++            manifest["args"].append({"kind": "scalar", "py": "none", "value": None})
++    manifest["snapshot_idx"] = chosen if chosen is not None else 0
++    with open(os.path.join(_SNAPDIR, "manifest.json"), "w") as fh:
++        json.dump(manifest, fh)
++
++
++class _InterceptMode(torch.utils._python_dispatch.TorchDispatchMode):
++    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
++        kwargs = kwargs or {}
++        if _op_short_name(func) == _WANT:
++            # Snapshot BEFORE running so an in-place op's inputs are pristine.
++            _snapshot(args)
++            out = func(*args, **kwargs)
++            raise _CaptureDone()
++        return func(*args, **kwargs)
++
++
++def _run_workload():
++    mod_attr = _WORKLOAD_DOTTED
++    if ":" in mod_attr:
++        mod_name, fn_name = mod_attr.split(":", 1)
++    else:
++        mod_name, fn_name = mod_attr.rsplit(".", 1)
++    mod = importlib.import_module(mod_name)
++    fn = getattr(mod, fn_name)
++    fn()
++
++
++_WORKLOAD_DOTTED = '''__WORKLOAD__'''
++try:
++    with _InterceptMode():
++        _run_workload()
++    # Workload finished without ever calling the target op.
++    sys.stderr.write("capture: target op %r never called by workload\n" % (_WANT,))
++    sys.exit(4)
++except _CaptureDone:
++    print("OK")
++    sys.exit(0)
++except SystemExit:
++    raise
++except Exception as exc:
++    import traceback
++    sys.stderr.write("capture: workload error: %r\n%s\n"
++                     % (exc, traceback.format_exc()))
++    sys.exit(5)
++"""
++
++
++def _capture_real_inputs(spec: "BuildSpec", aot_so_path: Path,
++                         snap_dir: Path, report,
++                         intercept_op: Optional[str] = None
++                         ) -> Optional[Path]:
++    """Generic record-and-replay capture (``BuildSpec.capture_workload``).
++
++    Runs ``spec.capture_workload`` ("pkg.mod:fn") for ONE iteration in a fresh
++    subprocess under a ``__torch_dispatch__`` op-interception shim, snapshots
++    the FIRST call to the target op's positional inputs to ``snap_dir`` (one
++    ``.npy`` per tensor arg + a ``manifest.json`` describing the full arg list
++    and the in-place/output ``snapshot_idx``), and returns ``snap_dir`` on
++    success. Returns ``None`` (so the caller falls back to schema-synthesis)
++    when no workload is configured, the manifest isn't produced, or the
++    subprocess fails — capture is OPTIONAL and must never break the sweep.
++
++    The op to intercept defaults to the short name of the resolved
++    ``fused_op_template`` (or an explicit ``[capture].intercept_op`` override);
++    matching is by short op name so it is robust to namespace/overload spelling.
++
++    Project-agnostic: a project whose kernel IS a torch op needs no
++    hand-written capture hook — replay supplies the oracle/variant dumps with
++    the REAL kernel inputs instead of synthesized ones.
++    """
++    workload = getattr(spec, "capture_workload", None)
++    if not workload:
++        return None
++    # Resolve which op to snapshot. Explicit override wins; else derive the
++    # short name from the configured fused-op template.
++    if intercept_op is None:
++        cap_cfg = ((getattr(spec, "config", None) or {}).get("capture", {})
++                   or {})
++        intercept_op = cap_cfg.get("intercept_op")
++    if intercept_op is None:
++        tmpl = getattr(spec, "fused_op_template", None) \
++            or _DEFAULT_FUSED_OP_TEMPLATE
++        dotted = _format_fused_op_template(tmpl, OPT_CLASS[spec.optimizer])
++        intercept_op = dotted.split(".")[-1]
++    snap_dir = Path(snap_dir)
++    snap_dir.mkdir(parents=True, exist_ok=True)
++    manifest = snap_dir / "manifest.json"
++    if manifest.exists():
++        # Re-use a prior capture (per-sweep, idempotent).
++        return snap_dir
++    script = (_CAPTURE_PROBE
++              .replace("__SNAPDIR__", str(snap_dir))
++              .replace("__INTERCEPT__", intercept_op)
++              .replace("__AOT_SO__", str(aot_so_path))
++              .replace("__WORKLOAD__", str(workload)))
++    report.write(
++        f"  [capture] record-and-replay: running workload {workload!r} once, "
++        f"intercepting op {intercept_op!r}.\n")
++    try:
++        r = subprocess.run([sys.executable, "-c", script],
++                           cwd=REPO_ROOT, env=child_env(),
++                           capture_output=True, text=True, timeout=600)
++    except Exception as exc:
++        report.write(f"  [capture] workload subprocess failed to launch "
++                     f"({exc}); falling back to schema-synthesis.\n")
++        return None
++    if r.returncode != 0 or not manifest.exists():
++        report.write(
++            f"  [capture] workload capture FAILED (rc={r.returncode}); "
++            f"falling back to schema-synthesis. "
++            f"stderr={r.stderr[-400:]!r}\n")
++        return None
++    try:
++        n_args = len(json.loads(manifest.read_text()).get("args", []))
++    except Exception:
++        n_args = -1
++    report.write(f"  [capture] snapshotted real inputs for op "
++                 f"{intercept_op!r} ({n_args} positional args) -> {snap_dir}\n")
++    return snap_dir
++
++
+ def _render_arg_construction(entry: Optional["DiscoveredEntry"],
+-                             size: int, regime: str, seed: int) -> str:
++                             size: int, regime: str, seed: int,
++                             replay_dir: Optional[Path] = None) -> str:
+     """Build the subprocess code that constructs the call arguments.
+ 
+     With a discovered ``entry`` (mandate #4/#11): one synthesized tensor per
+@@ -11960,7 +12444,36 @@ def _render_arg_construction(entry: Optional["DiscoveredEntry"],
+     schema order. Without an entry (grokking back-compat): the historical
+     Adam-style ``(param, grad, m, v, lr, b1, b2, eps, wd, step)`` arg list —
+     but with SYNTHESIZED inputs (#10) instead of the degenerate zeros/ones.
++
++    When ``replay_dir`` is given (generic record-and-replay capture, see
++    ``_capture_real_inputs``), the snapshotted REAL kernel inputs in that
++    directory are loaded and replayed INSTEAD of schema-synthesis — the
++    oracle and every variant dump then run on the exact tensors the real
++    workload fed the kernel. The replay branch is fully self-contained
++    (reads ``manifest.json`` + ``arg_*.npy``) so it needs no schema/entry.
+     """
++    # Generic capture (record-and-replay): replay the snapshotted real inputs.
++    if replay_dir is not None:
++        man = Path(replay_dir) / "manifest.json"
++        lines = [
++            f"# replay-capture: {man}",
++            "import json as _json",
++            f"_man = _json.load(open(r'''{man}'''))",
++            "call_args = []",
++            "for _a in _man['args']:",
++            "    if _a['kind'] == 'tensor':",
++            f"        _t = np.load(r'''{Path(replay_dir)}''' + '/' + _a['file'])",
++            "        _td = getattr(torch, _a.get('torch_dtype') or 'float32', "
++            "dtype)",
++            "        call_args.append(torch.from_numpy(_t).to("
++            "device='cuda', dtype=_td))",
++            "    elif _a.get('py') == 'none':",
++            "        call_args.append(0)",
++            "    else:",
++            "        call_args.append(_a['value'])",
++            "snapshot_idx = int(_man.get('snapshot_idx', 0))",
++        ]
++        return "\n        ".join(lines)
+     # #10 — record the reproducible input spec (n_tensors/n_scalars/regime/
+     # seed). Validates the regime (raises on a bad one) and documents the
+     # synthesis as a provenance header so a captured oracle is reproducible.
+@@ -12012,7 +12525,8 @@ def _capture_reference_output(aot_so_path: Path, opt_class: str,
+                               fused_op_template: Optional[str] = None,
+                               entry: Optional["DiscoveredEntry"] = None,
+                               regime: str = "normal",
+-                              seed: int = 0) -> Path:
++                              seed: int = 0,
++                              replay_dir: Optional[Path] = None) -> Path:
+     """Mandate #9/#10/#11 — capture the STRICT reference output.
+ 
+     ``aot_so_path`` MUST be a fast-math-OFF strict-math build of the
+@@ -12023,11 +12537,18 @@ def _capture_reference_output(aot_so_path: Path, opt_class: str,
+     to the historical Adam-style arg list (grokking back-compat) but still
+     uses synthesized inputs, never the degenerate zeros/ones.
+ 
++    When ``replay_dir`` is given (generic record-and-replay capture), the
++    REAL snapshotted kernel inputs in that directory are replayed instead of
++    synthesis — the oracle then reflects the exact inputs the real workload
++    fed the kernel. The cache filename carries a ``replay`` token so a prior
++    synthesized oracle is never reused for a replay capture (and vice-versa).
++
+     Cached per (opt, size, dtype, regime, seed). The seed is part of the key
+     so the reproducible regime is provenance-tracked (#10).
+     """
++    tag = "replay" if replay_dir is not None else regime
+     ref_path = out_dir / \
+-        f"ref_output_{opt_class}_{size}_{dtype}_{regime}_s{seed}.npy"
++        f"ref_output_{opt_class}_{size}_{dtype}_{tag}_s{seed}.npy"
+     if ref_path.exists():
+         return ref_path
+     out_dir.mkdir(parents=True, exist_ok=True)
+@@ -12035,7 +12556,8 @@ def _capture_reference_output(aot_so_path: Path, opt_class: str,
+     dotted = (entry.dotted_path if entry is not None
+               else _format_fused_op_template(tmpl, opt_class))
+     root_expr, attr_chain = _split_fused_op_dotted(dotted)
+-    arg_setup = _render_arg_construction(entry, size, regime, seed)
++    arg_setup = _render_arg_construction(entry, size, regime, seed,
++                                         replay_dir=replay_dir)
+     script = textwrap.dedent(f"""
+         import os, sys, numpy as np
+         {_DETERMINISM_PREAMBLE.strip()}
+@@ -12099,17 +12621,23 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
+                          fused_op_template: Optional[str] = None,
+                          entry: Optional["DiscoveredEntry"] = None,
+                          regime: str = "normal",
+-                         seed: int = 0) -> bool:
++                         seed: int = 0,
++                         replay_dir: Optional[Path] = None) -> bool:
+     """Run the variant .so once on the SAME synthesized inputs the oracle
+     used (#9/#10/#11) and dump the snapshot tensor to ``out_path``. Returns
+     True on success. The determinism preamble (#12) is applied so a 3x re-run
+     of this output is a meaningful determinism check.
++
++    When ``replay_dir`` is given (generic record-and-replay capture) the
++    variant is run on the SAME real snapshotted inputs the oracle replayed, so
++    the differential comparison is against the real-workload inputs.
+     """
+     tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
+     dotted = (entry.dotted_path if entry is not None
+               else _format_fused_op_template(tmpl, opt_class))
+     root_expr, attr_chain = _split_fused_op_dotted(dotted)
+-    arg_setup = _render_arg_construction(entry, size, regime, seed)
++    arg_setup = _render_arg_construction(entry, size, regime, seed,
++                                         replay_dir=replay_dir)
+     script = textwrap.dedent(f"""
+         import os, sys, numpy as np
+         {_DETERMINISM_PREAMBLE.strip()}
+@@ -12145,19 +12673,25 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
+                           fused_op_template: Optional[str] = None,
+                           entry: Optional["DiscoveredEntry"] = None,
+                           regime: str = "normal",
+-                          seed: int = 0) -> bool:
++                          seed: int = 0,
++                          replay_dir: Optional[Path] = None) -> bool:
+     """Run the variant 3 times; return True iff all 3 outputs are
+     bit-identical to each other.
+ 
+     Fix-#2 §3: ``entry``/``regime``/``seed`` are forwarded to
+     ``_dump_variant_output`` so the determinism check uses the SAME
+-    oracle-matched inputs as the validation pass."""
++    oracle-matched inputs as the validation pass. ``replay_dir`` (generic
++    record-and-replay capture) is likewise forwarded so the determinism
++    re-runs use the same real snapshotted inputs."""
+     import numpy as np
+     paths: List[Path] = []
+     # Include a per-variant token (.so stem) + regime/seed in the temp filename
+     # so concurrent determinism checks across configs cannot collide on the same
+     # scratch files (serial today, but the build-pool TODO would break it).
+     vtag = _short_key(f"{Path(variant_so).stem}_{regime}_{seed}")
++    # Forward replay_dir only when set, so the default (synthesis) path keeps
++    # the kwarg absent for fixed-signature test doubles of _dump_variant_output.
++    _replay_kw = {"replay_dir": replay_dir} if replay_dir is not None else {}
+     for i in range(3):
+         p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}_{vtag}.npy"
+         if p.exists():
+@@ -12167,7 +12701,8 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
+                 pass
+         if not _dump_variant_output(variant_so, opt_class, size, dtype, p,
+                                     fused_op_template=fused_op_template,
+-                                    entry=entry, regime=regime, seed=seed):
++                                    entry=entry, regime=regime, seed=seed,
++                                    **_replay_kw):
+             return False
+         paths.append(p)
+     if len(paths) < 2:
+@@ -12429,7 +12964,27 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+     ref_state: Dict[str, Any] = {
+         "paths": {}, "entry": None, "entry_resolved": False,
+         "warned": False, "oracle_unavailable": False,
+-        "size": 4096, "dtype": "float32"}
++        "size": 4096, "dtype": "float32", "replay_dir": None}
++
++    # ── Generic record-and-replay capture (OFF unless spec.capture_workload) ──
++    # When a capture_workload is configured AND no hand-written hook supplants
++    # it, run the real workload ONCE under a torch op-interception shim and
++    # snapshot the real kernel inputs. Those snapshots are then replayed as the
++    # oracle / variant-dump inputs (instead of schema-synthesis) so a project
++    # whose kernel IS a torch op needs no hand-written capture hook. Absent ⇒
++    # ref_state["replay_dir"] stays None and the schema-synthesis path (the
++    # default for grokking) is byte-identical to today. Capture is OPTIONAL:
++    # any failure falls back to schema-synthesis (loud, never fatal).
++    if numerics_enabled and getattr(spec, "capture_workload", None):
++        try:
++            _snap = _capture_real_inputs(
++                spec, Path(aot_so), variant_dump_dir / "_capture", report)
++            if _snap is not None:
++                ref_state["replay_dir"] = _snap
++        except Exception as _capexc:
++            report.write(f"  [capture] record-and-replay errored ({_capexc}); "
++                         f"falling back to schema-synthesis.\n")
++            _debug_swallow("_make_variant_timer.capture", _capexc)
+ 
+     def _resolve_ref(regime: str = "normal", seed: int = 0) -> Optional[Path]:
+         """Capture (or return the cached) strict-oracle reference output for a
+@@ -12477,17 +13032,19 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                 f"(base_strict_math={strict_posture}) on synthesized inputs "
+                 f"across regimes {list(_validation_regimes(spec))}.\n")
+ 
++        _replay = ref_state.get("replay_dir")
++
+         def _capture(entry) -> Path:
+             if entry is None:
+                 return _capture_reference_output(
+                     Path(aot_so), OPT_CLASS[spec.optimizer],
+                     ref_state["size"], ref_state["dtype"], spec.out_dir,
+                     fused_op_template=spec.fused_op_template,
+-                    regime=regime, seed=seed)
++                    regime=regime, seed=seed, replay_dir=_replay)
+             return _capture_reference_output(
+                 Path(aot_so), OPT_CLASS[spec.optimizer],
+                 ref_state["size"], ref_state["dtype"], spec.out_dir,
+-                entry=entry, regime=regime, seed=seed)
++                entry=entry, regime=regime, seed=seed, replay_dir=_replay)
+ 
+         # Entry already resolved (a prior regime) — capture this regime directly
+         # with the same entry so all regimes share one oracle source.

@@ -1,0 +1,16 @@
+launched 6 workers (logs: /workspace/SuperGrok1.5/results/tuning/logs)
+all workers done
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 22:39:29,782] Using an existing study with name 'adamw__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:30,443] Using an existing study with name 'neuralgrok__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:31,133] Using an existing study with name 'grokadamw__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:31,901] Using an existing study with name 'supergrok__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:33,061] Using an existing study with name 'supergrok15__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:33,704] Using an existing study with name 'supergrok2__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:34,368] Using an existing study with name 'grokfast__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:35,048] Using an existing study with name 'muon__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:35,698] Using an existing study with name 'lion__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:36,361] Using an existing study with name 'looksam__mamba' instead of creating a new one.
+[I 2026-06-10 22:39:37,034] Using an existing study with name 'prodigy__mamba' instead of creating a new one.
+wrote /workspace/SuperGrok1.5/results/tuning/TUNING_REPORT_mamba.md and /workspace/SuperGrok1.5/results/tuning/trials_mamba.csv

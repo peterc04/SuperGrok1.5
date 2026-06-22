@@ -1,0 +1,350 @@
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..d9a0935 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -1269,6 +1269,38 @@ _LIVE_TUNING_DIMS: frozenset = frozenset({
+ # byte-identical to the depth-4 build yet forced a fresh (wasted) compile.
+ _ASYNC_DEPTH_MAX: int = 4
+ 
++# Dims whose macro reshapes a tensor-core / GEMM mainloop (stage count, warp
++# interleave, software-pipeline depth). They route through the tensor-core
++# timing path — i.e. they are PTX-shaping knobs that change the wgmma/mma
++# schedule rather than a plain elementwise launch geometry. A consumer that
++# wants only the GEMM-tile-relevant device flags (e.g. a tensor-core micro-
++# benchmark harness) can intersect a config against this set. ``maxrregcount``
++# is intentionally NOT here: it is a global register cap, not a tile-shape knob.
++_GEMM_TILE_DIM_NAMES: frozenset = frozenset({
++    "block", "vec", "unroll", "num_stages", "cluster_shape", "async_depth",
++    "wgmma_shape", "mfma_shape", "wmma_shape", "warp_specialization",
++    # GEMM mainloop stage/interleave/pipeline knobs (auto-pinned until the
++    # kernels expose the matching ``#ifndef SG_TUNED_*`` guard).
++    "dec_gemm_stages", "mb_gemm_stages",
++    "dec_gemm_interleave", "mb_gemm_interleave", "vit_gemm_interleave",
++    "pipe_depth",
++})
++
++# Bare-compiler-flag tuning dims (``macro=None``): the value is emitted as a
++# real ptxas/llvm flag (e.g. ``--maxrregcount=N``, ``-Xptxas --opt-level=N``)
++# rather than a ``-DSG_TUNED_*`` macro, so it ALWAYS reshapes codegen and is
++# never auto-pinned as dead. ``resolve_extra_nvcc_flags`` matches on the dim
++# name to know which flag to emit.
++_PTXAS_FLAG_DIMS: frozenset = frozenset({
++    "maxrregcount", "opt_level", "allow_expensive_opts",
++})
++
++# Default value list for an AUTO-DERIVED tuning dim — a 2-point on/off-style
++# sweep used for any ``#ifndef SG_TUNED_X`` knob the kernels expose that has no
++# hand-written dim spec. Two points keeps the Cartesian blow-up minimal (×2 per
++# newly-discovered knob) while still letting the autotuner probe the macro.
++_AUTO_DERIVED_DIM_VALUES: List[int] = [2, 1]
++
+ 
+ _KERNEL_MACRO_CACHE: Optional[frozenset] = None
+ 
+@@ -1306,6 +1338,110 @@ def _kernel_source_macros() -> frozenset:
+     return _KERNEL_MACRO_CACHE
+ 
+ 
++_KERNEL_IFNDEF_CACHE: Optional[frozenset] = None
++
++
++def _kernel_ifndef_macros() -> frozenset:
++    """Auto-detect every ``#ifndef SG_TUNED_X`` guard the committed kernels
++    expose. A kernel that wants to be tunable wraps its default in::
++
++        #ifndef SG_TUNED_FOO
++        #define SG_TUNED_FOO <default>
++        #endif
++
++    so the autotuner can override the default with ``-DSG_TUNED_FOO=VAL``.
++    This returns the set of macro tokens guarded that way, which lets the
++    search-space builder AUTO-ADD a tuning dim for any knob a kernel newly
++    exposes even when no hand-written ``_dim(...)`` declares it — the space
++    self-configures to the kernels rather than waiting on a manual edit here.
++
++    Lines that are pure ``//`` comments are skipped so a commented-out guard
++    in a kernel doesn't spuriously inflate the space. Cached; returns an empty
++    set when no source tree is visible (installed wheel without kernels/).
++    """
++    global _KERNEL_IFNDEF_CACHE
++    if _KERNEL_IFNDEF_CACHE is not None:
++        return _KERNEL_IFNDEF_CACHE
++    import re as _re
++    roots = [REPO_ROOT / "csrc", REPO_ROOT / "grokking_optimizers" / "kernels"]
++    # Anchored at line start (after optional whitespace): ``#ifndef SG_TUNED_X``.
++    pat = _re.compile(r"^\s*#\s*ifndef\s+(SG_TUNED_[A-Z0-9_]+)")
++    exts = {".cu", ".cuh", ".h", ".hpp", ".hip", ".cpp", ".cc", ".cxx"}
++    found: set = set()
++    for root in roots:
++        if not root.exists():
++            continue
++        for p in root.rglob("*"):
++            if p.suffix not in exts:
++                continue
++            try:
++                text = p.read_text(errors="ignore")
++            except OSError:
++                continue
++            for line in text.splitlines():
++                stripped = line.lstrip()
++                if stripped.startswith("//"):
++                    continue  # comment-only line — not a live guard
++                m = pat.match(line)
++                if m:
++                    found.add(m.group(1))
++    _KERNEL_IFNDEF_CACHE = frozenset(found)
++    return _KERNEL_IFNDEF_CACHE
++
++
++def _macro_has_explicit_dim(macro: str, dims: List[Dict[str, Any]]) -> bool:
++    """True if ``macro`` (or a derived ``macro_*`` variant, e.g. the
++    per-component ``SG_TUNED_CLUSTER_SHAPE_0`` a tuple dim expands to) is
++    already declared by some hand-written dim in ``dims``."""
++    for d in dims:
++        dm = d.get("macro")
++        if dm and (dm == macro or macro.startswith(dm + "_")):
++            return True
++    return False
++
++
++def _macro_to_dim_name(macro: str) -> str:
++    """Derive a stable dim ``name`` from an ``SG_TUNED_X`` macro token —
++    ``SG_TUNED_PIPE_DEPTH`` -> ``pipe_depth``. Lower-cased, prefix stripped."""
++    base = macro[len("SG_TUNED_"):] if macro.startswith("SG_TUNED_") else macro
++    return base.lower()
++
++
++def _auto_derived_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Return default dims for every ``#ifndef SG_TUNED_*`` guard the kernels
++    expose that has NO explicit dim in ``dims``.
++
++    This is the self-configuring half of the search space: a kernel that adds a
++    new ``#ifndef SG_TUNED_FOO`` knob gets a 2-value tuning dim auto-swept with
++    zero edits here. Hand-written dims always WIN — they're treated as
++    overrides (richer value lists, custom ``applies_to``/``kind``), so the
++    explicit GEMM/pipe/etc. specs below are unaffected. Auto dims default to a
++    device-only ``-DSG_TUNED_FOO=VAL`` macro over ``_AUTO_DERIVED_DIM_VALUES``.
++    """
++    guarded = _kernel_ifndef_macros()
++    if not guarded:
++        return []
++    extra: List[Dict[str, Any]] = []
++    seen_names = {d.get("name") for d in dims}
++    for macro in sorted(guarded):
++        if _macro_has_explicit_dim(macro, dims):
++            continue
++        name = _macro_to_dim_name(macro)
++        if name in seen_names:
++            continue
++        seen_names.add(name)
++        extra.append(_dim(name, "int", list(_AUTO_DERIVED_DIM_VALUES),
++                          macro, ["device"]))
++    return extra
++
++
++def _with_auto_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Append auto-derived dims (for kernel ``#ifndef`` knobs lacking an
++    explicit spec) to a hand-written dim list, in place, and return it."""
++    dims.extend(_auto_derived_dims(dims))
++    return dims
++
++
+ def _is_dead_dim(spec: Dict[str, Any]) -> bool:
+     """True if ``spec`` is a tuning dim whose value never reaches the binary.
+ 
+@@ -1356,13 +1492,25 @@ _DEAD_KEY_DIMS: frozenset = frozenset({
+ 
+ 
+ def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+-    """Collapse every DEAD tuning dim to a single pinned default value.
+-
+-    The dim object is preserved (so the macro is still emitted and can be
+-    revived) but its ``values`` list is truncated to its first entry, removing
+-    it from the Cartesian product. Mutates and returns ``dims``. Live dims and
+-    Pallas kwargs are untouched.
++    """Append auto-derived dims, then collapse every DEAD tuning dim to a
++    single pinned default value.
++
++    First the search space self-configures: any ``#ifndef SG_TUNED_*`` knob a
++    kernel exposes that lacks an explicit dim gets a default 2-value dim added
++    (:func:`_auto_derived_dims`). Then each DEAD dim — one whose macro no
++    committed kernel reads, so sweeping it just burns compiles on byte-identical
++    binaries — is pinned: its dim object is preserved (so the macro is still
++    emittable and can be revived) but its ``values`` list is truncated to its
++    first entry, removing it from the Cartesian product.
++
++    This is also where confirmed-DEAD dims on the current arch get inerted: a
++    ``-DSG_TUNED_*`` macro dim (block/vec/unroll/async_depth on an arch whose
++    kernels no longer ``#ifndef`` it, plus every never-consumed shape macro) is
++    pinned to one value so it can't waste trial budget — yet the dim stays in
++    the space so a different vendor (e.g. HIP) that DOES consume it still sweeps
++    it. Mutates and returns ``dims``. Live dims and Pallas kwargs are untouched.
+     """
++    _with_auto_dims(dims)
+     for d in dims:
+         if _is_dead_dim(d):
+             vals = d.get("values") or []
+@@ -1519,6 +1667,14 @@ def _build_cuda_space(arch_key: str,
+     dims: List[Dict[str, Any]] = [
+         _dim("block", "int", _cuda_block_values(arch_key),
+              "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
++        # ptxas optimizer knobs (bare flags, macro=None — always LIVE, see
++        # _PTXAS_FLAG_DIMS / resolve_extra_nvcc_flags). Default value first.
++        # Placed in the geometry head (before the high-cardinality
++        # maxrregcount tail) to keep prefilter-discriminating dims early in
++        # the Cartesian iteration.
++        _dim("opt_level", "int", [3, 2], None, ["device"]),
++        _dim("allow_expensive_opts", "bool", [False, True],
++             None, ["device"]),
+         _dim("vec", "int", vec_values,
+              "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+         _dim("unroll", "int", unroll_values,
+@@ -1581,6 +1737,22 @@ def _build_cuda_space(arch_key: str,
+                          ["tma_a", "tma_b", "mma", "tma_mma"],
+                          "SG_TUNED_TCGEN05_VARIANT", ["device"]))
+ 
++    # GEMM-mainloop PTX-shaping knobs — auto-pinned by _pin_dead_dims until the
++    # matching kernel ``#ifndef SG_TUNED_*`` guard exists, then auto-active.
++    # See _GEMM_TILE_DIM_NAMES (these route through the tensor-core timing path).
++    dims.append(_dim("dec_gemm_stages", "int", [2, 1],
++                     "SG_TUNED_DEC_GEMM_STAGES", ["device"]))
++    dims.append(_dim("mb_gemm_stages", "int", [2, 1],
++                     "SG_TUNED_MB_GEMM_STAGES", ["device"]))
++    dims.append(_dim("dec_gemm_interleave", "int", [2, 1, 3, 4],
++                     "SG_TUNED_DEC_GEMM_INTERLEAVE", ["device"]))
++    dims.append(_dim("mb_gemm_interleave", "int", [2, 1, 3, 4],
++                     "SG_TUNED_MB_GEMM_INTERLEAVE", ["device"]))
++    dims.append(_dim("vit_gemm_interleave", "int", [2, 1, 3, 4],
++                     "SG_TUNED_VIT_GEMM_INTERLEAVE", ["device"]))
++    dims.append(_dim("pipe_depth", "int", [2, 3],
++                     "SG_TUNED_PIPE_DEPTH", ["device"]))
++
+     return {
+         "dims": _pin_dead_dims(dims),
+         "prefilter": {
+@@ -1768,6 +1940,19 @@ def _sm90_full_space() -> Dict[str, Any]:
+         "dims": _pin_dead_dims([
+             _dim("block", "int", list(range(32, 1025, 32)),
+                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
++            # --- ptxas optimizer knobs (bare compiler flags, macro=None) -----
++            # opt_level tunes ptxas's own PTX optimization (-Xptxas
++            # --opt-level=N); allow_expensive_opts toggles ptxas's expensive
++            # optimization passes. Both are LIVE — they change codegen directly
++            # — so _is_dead_dim keeps them swept (never pinned). Emitted by
++            # resolve_extra_nvcc_flags, matched on the dim name (like
++            # maxrregcount). Default value first so the canonical build matches
++            # the base flag list. Kept adjacent to the geometry head (before the
++            # high-cardinality maxrregcount/cluster_shape tail) so the Cartesian
++            # iteration still reaches vec>1 inside a small prefix window.
++            _dim("opt_level", "int", [3, 2], None, ["device"]),
++            _dim("allow_expensive_opts", "bool", [False, True],
++                 None, ["device"]),
+             _dim("vec", "int", [1, 2, 4, 8, 16],
+                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
+@@ -1788,6 +1973,26 @@ def _sm90_full_space() -> Dict[str, Any]:
+             # _ASYNC_DEPTH_MAX (was list(range(1, 17))).
+             _dim("async_depth", "int", list(range(1, _ASYNC_DEPTH_MAX + 1)),
+                  "SG_TUNED_ASYNC_DEPTH", ["device"]),
++            # --- GEMM-mainloop PTX-shaping knobs ------------------------------
++            # These reshape the wgmma/mma software pipeline (stage count, warp
++            # interleave factor, pipeline depth). Each is auto-pinned by
++            # _pin_dead_dims until the matching kernel exposes its
++            # ``#ifndef SG_TUNED_*`` guard, then auto-activates — so declaring
++            # them here is forward-compatible, not a hardcode that wastes
++            # budget today. Listed in _GEMM_TILE_DIM_NAMES so a tensor-core
++            # timing harness can route them through the TC path.
++            _dim("dec_gemm_stages", "int", [2, 1],
++                 "SG_TUNED_DEC_GEMM_STAGES", ["device"]),
++            _dim("mb_gemm_stages", "int", [2, 1],
++                 "SG_TUNED_MB_GEMM_STAGES", ["device"]),
++            _dim("dec_gemm_interleave", "int", [2, 1, 3, 4],
++                 "SG_TUNED_DEC_GEMM_INTERLEAVE", ["device"]),
++            _dim("mb_gemm_interleave", "int", [2, 1, 3, 4],
++                 "SG_TUNED_MB_GEMM_INTERLEAVE", ["device"]),
++            _dim("vit_gemm_interleave", "int", [2, 1, 3, 4],
++                 "SG_TUNED_VIT_GEMM_INTERLEAVE", ["device"]),
++            _dim("pipe_depth", "int", [2, 3],
++                 "SG_TUNED_PIPE_DEPTH", ["device"]),
+         ]),
+         "prefilter": {
+             "register_pressure_max": 255,
+@@ -2564,15 +2769,38 @@ def resolve_extra_nvcc_flags(config: Dict[str, Any],
+ 
+     Currently emits:
+       - ``maxrregcount`` -> ``--maxrregcount=N``
++      - ``opt_level`` -> ``-Xptxas --opt-level=N`` (ptxas PTX optimization)
++      - ``allow_expensive_opts`` -> ``-Xptxas
++        --allow-expensive-optimizations=true`` (only when the dim is True)
+       - feature macros for arch capabilities (TMA, fp4/fp8, cluster, ...)
+       - layout macros for tuned dtypes (e.g. ``fp8_layout=e4m3`` -> ``-DCUDA_FP8_E4M3=1``)
++
++    The ptxas knobs (``macro is None`` bare-flag dims, see ``_PTXAS_FLAG_DIMS``)
++    are emitted as space-separated argv pairs (``-Xptxas`` then the long-form
++    option), matching ``NVCC_DEVICE_BASE``. ptxas honors the LAST ``--opt-level``
++    on its line, so a tuned value cleanly overrides the base ``--opt-level=3``.
+     """
+     out: List[str] = []
+     for spec in dim_specs:
+-        if spec.get("macro") is None and spec["name"] == "maxrregcount":
++        if spec.get("macro") is not None:
++            continue
++        name = spec.get("name")
++        if name == "maxrregcount":
+             v = config.get("maxrregcount")
+             if v is not None:
+                 out.append(f"--maxrregcount={int(v)}")
++        elif name == "opt_level":
++            v = config.get("opt_level")
++            if v is not None:
++                out.extend(["-Xptxas", f"--opt-level={int(v)}"])
++        elif name == "allow_expensive_opts":
++            # Only emit on True — the False (default) build stays byte-identical
++            # to today's base flags and never trips older ptxas that lacks the
++            # flag (it's a CUDA 12.5+ option; failed variants are simply dropped
++            # by the autotuner, but skipping the flag on the default avoids that
++            # entirely for the canonical config).
++            if config.get("allow_expensive_opts"):
++                out.extend(["-Xptxas", "--allow-expensive-optimizations=true"])
+ 
+     if arch and arch in ARCH_TABLE:
+         entry = get_arch_entry(arch)
+@@ -20315,7 +20543,11 @@ def _self_test_codegen(run) -> None:
+         except ImportError:
+             return  # skip
+         from grokking_optimizers import codegen as _cg
+-        sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
++        # Select the geometry dims the adamw template renders BY NAME (not by
++        # list position) so the test is robust to dim-ordering changes in the
++        # search space — e.g. ptxas-flag dims interleaved with the geometry head.
++        _all = build_full_search_space()["sm_90"]["dims"]
++        sm90_dims = [d for d in _all if d["name"] in ("block", "vec", "unroll")]
+         cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+         td = Path(tempfile.mkdtemp())
+         try:
+@@ -20346,7 +20578,11 @@ def _self_test_codegen(run) -> None:
+         from grokking_optimizers import codegen as _cg
+         td = Path(tempfile.mkdtemp())
+         try:
+-            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
++            # Geometry dims selected by name (order-independent — see
++            # test_codegen_emit_returns_path).
++            _all = build_full_search_space()["sm_90"]["dims"]
++            sm90_dims = [d for d in _all
++                         if d["name"] in ("block", "vec", "unroll")]
+             cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+             emitted, _ = _cg.emit_variant_source(
+                 cfg, sm90_dims, "adamw", "sm_90a", td)
+@@ -20398,7 +20634,11 @@ def _self_test_codegen(run) -> None:
+             spec = BuildSpec(
+                 optimizer="adamw", model="mamba", arch="sm_90a",
+                 out_dir=td, enable_emitter=True)
+-            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
++            # Geometry dims selected by name (order-independent — see
++            # test_codegen_emit_returns_path).
++            _all = build_full_search_space()["sm_90"]["dims"]
++            sm90_dims = [d for d in _all
++                         if d["name"] in ("block", "vec", "unroll")]
+             cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+             # Device path triggers the emitter and stashes a path.
+             flags = _variant_macros(cfg, sm90_dims, "device", spec=spec)

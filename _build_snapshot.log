@@ -1,0 +1,22 @@
+[07:36:55] clean any prior build dir
+[07:36:55] copy full working tree (including all .git; will strip next)
+[07:40:33] strip every nested .git (main + cutlass submodule + 36 worktrees)
+[07:40:42] remove stale .gitmodules (cutlass is now vendored as plain files)
+[07:40:42] capture python deps -> requirements-lock.txt
+[07:40:43]   froze 22 packages
+[07:40:43] write ENVIRONMENT.md (rebuild recipe)
+[07:40:43] copy /workspace planning docs -> workspace_docs/
+[07:40:43]   copied 9 planning docs
+[07:40:43] git init + single snapshot commit
+[07:43:45]   staged 26664 files; committing...
+
+[07:43:58] === VERIFY ===
+tracked files:      26664
+gitlinks (want 0):  0
+cutlass files:      5888
+worktree files:     19073
+env recipe present: 2/2
+planning docs:      9
+.git object size:   1.1G
+branch:             claude/custom-optimizer-analysis-HFYhg
+[07:43:59] BUILD COMPLETE (nothing pushed yet)

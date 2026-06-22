@@ -1,0 +1,361 @@
+diff --git a/examples/toy_tune_project/compile_config.toml b/examples/toy_tune_project/compile_config.toml
+new file mode 100644
+index 0000000..d48f8b6
+--- /dev/null
++++ b/examples/toy_tune_project/compile_config.toml
+@@ -0,0 +1,69 @@
++# Example "toy" project demonstrating that grokking_optimizers/compile.py is
++# plug-and-play for an arbitrary project via config only — no code changes.
++#
++# This config drives compile.py with a foreign optimizer (`toy_saxpy`), a
++# foreign model (`toy`), a custom macro prefix / Python package, a custom
++# source layout (including a dedicated fused-kernel root), a config-extensible
++# optimizer-class registry, and a project-supplied CUTLASS include dir.
++#
++# Resolve & validate it from Python with, e.g.:
++#
++#     import grokking_optimizers.compile as C
++#     cfg = C._load_toml_file(
++#         __import__("pathlib").Path(
++#             "examples/toy_tune_project/compile_config.toml"))
++#     merged = C._deep_merge(C._DEFAULT_PROJECT_CONFIG, cfg)  # or load_config()
++#     spec = C.BuildSpec(optimizer="toy_saxpy", model="toy",
++#                        arch="sm_90a",
++#                        out_dir=__import__("pathlib").Path("/tmp/toy"))
++#     C.apply_to_buildspec(spec, merged)
++#     C._validate(spec)   # passes — no ValueError
++
++[project]
++name           = "toy_tune"
++version        = "0.1.0"
++# Custom -D macro namespace. compile.py emits e.g. -DTOY_OPTIMIZER_TOY_SAXPY=1
++# and -DTOY_STRICT_MATH=1 (strict-math oracle) instead of leaking SG_*.
++macro_prefix   = "TOY_"
++# Worker / timing / validation subprocesses import the optimizer class from
++# this package; the JIT/AOT module name becomes toy_kernels_compiled_*.
++python_package = "toy_kernels"
++namespace      = "toy::kernels"
++fused_op_template = "torch.ops.toy_kernels.fused_{opt_lower}_step"
++
++# Config-extensible optimizer-class registry: maps the short name used on the
++# CLI / BuildSpec to the importable class string. Without this entry,
++# _opt_class_for("toy_saxpy") would KeyError against the built-in OPT_CLASS.
++[project.optimizer_classes]
++toy_saxpy = "toy_kernels.ToySaxpy"
++
++# The same lists the CLI `choices=` read via _resolve_enabled_* — _validate()
++# accepts these foreign names IN ADDITION to the built-in grokking optimizers.
++[optimizers]
++enabled = ["toy_saxpy"]
++
++[models]
++enabled = ["toy"]
++
++[archs]
++default = "sm_90a"
++
++[sources]
++# Custom per-vendor source tree (compile.py probes <root>/<arch> too).
++cuda_root       = "src/cuda"
++hip_root        = "src/hip"
++pallas_root     = ""
++bindings_dir    = "src/bindings"
++algorithms_dir  = "src/algorithms"
++tuned_header_path = "src/algorithms/tuned_configs.h"
++# Dedicated fused-kernel root. _resolve_sources probes both
++# <fused_root>/<arch-subdir-leaf> (e.g. src/fused/sm_90 for arch sm_90a — the
++# leaf matches the ArchEntry.subdir convention) and <fused_root> itself, using
++# the arch's launcher+model globs, so the kernels are discovered alongside the
++# launcher/model sources.
++fused_root      = "src/fused"
++# Project-supplied CUTLASS checkout; nvcc gets an explicit -I for it.
++cutlass_include = "third_party/cutlass/include"
++
++[sources.include_paths]
++extra = ["include"]
+diff --git a/grokking_optimizers/compile.py b/grokking_optimizers/compile.py
+index efdacf7..ef0f3fa 100644
+--- a/grokking_optimizers/compile.py
++++ b/grokking_optimizers/compile.py
+@@ -7919,12 +7919,56 @@ def bootstrap_toolchain(arch: str, stream=None) -> bool:
+     return False
+ 
+ 
++def _opt_class_for(optimizer: str,
++                   config: Optional[Dict[str, Any]] = None) -> str:
++    """Stream A — config-extensible optimizer-class resolver.
++
++    Resolve a short optimizer name (e.g. ``"adamw"``) to the class string the
++    worker / timing / validation subprocesses import from the project package
++    (e.g. ``"AdamW"`` or, for a foreign project, ``"my_pkg.MyOpt"``). Lookup
++    order:
++
++      1. ``config["project"]["optimizer_classes"]`` — a ``{short: "pkg.Class"}``
++         map declared in the project TOML. Lets a foreign optimizer resolve
++         without a KeyError against the built-in registry.
++      2. The built-in :data:`OPT_CLASS` registry (re-exported from
++         ``dispatch.py``) — grokking's eleven optimizers.
++
++    A missing name raises ``KeyError`` exactly like ``OPT_CLASS[optimizer]``
++    did, so callers that relied on that behaviour are unchanged. With no config
++    (or a config that omits ``optimizer_classes``) this is byte-identical to a
++    direct ``OPT_CLASS[optimizer]`` lookup, so grokking is unaffected.
++    """
++    if isinstance(config, dict):
++        proj = config.get("project")
++        if isinstance(proj, dict):
++            ocmap = proj.get("optimizer_classes")
++            if isinstance(ocmap, dict) and optimizer in ocmap:
++                return str(ocmap[optimizer])
++    return OPT_CLASS[optimizer]
++
++
+ def _validate(spec: BuildSpec) -> None:
+-    if spec.optimizer not in OPTIMIZERS:
++    # Stream A — portability: accept optimizer / model names declared in the
++    # project config (the same ``[optimizers].enabled`` / ``[models].enabled``
++    # lists the CLI ``choices=`` read via ``_resolve_enabled_*``) IN ADDITION
++    # to the built-in ``profile.OPTIMIZERS`` / ``MODELS``. ``spec.config`` is
++    # populated by ``apply_to_buildspec`` (empty dict pre-apply, so the
++    # config-less grokking path collapses to exactly the historical
++    # ``profile``-only check — byte-identical). A foreign TOML name now passes
++    # validation instead of dying with a ValueError before the build starts.
++    cfg = getattr(spec, "config", None)
++    cfg = cfg if isinstance(cfg, dict) else None
++    allowed_opts = set(OPTIMIZERS)
++    allowed_mdls = set(MODELS)
++    if cfg is not None:
++        allowed_opts |= set(_resolve_enabled_optimizers(cfg))
++        allowed_mdls |= set(_resolve_enabled_models(cfg))
++    if spec.optimizer not in allowed_opts:
+         raise ValueError(
+-            f"optimizer={spec.optimizer!r} not in {list(OPTIMIZERS)}")
+-    if spec.model not in MODELS:
+-        raise ValueError(f"model={spec.model!r} not in {list(MODELS)}")
++            f"optimizer={spec.optimizer!r} not in {sorted(allowed_opts)}")
++    if spec.model not in allowed_mdls:
++        raise ValueError(f"model={spec.model!r} not in {sorted(allowed_mdls)}")
+     if spec.arch not in ARCHES:
+         raise ValueError(f"arch={spec.arch!r} not in {list(ARCHES)}")
+     if spec.autotune_mode not in ("exhaustive", "bayesian"):
+@@ -8676,7 +8720,30 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
+     if models_dir.exists():
+         for g in entry.model_glob:
+             models.extend(sorted(models_dir.glob(g)))
+-    structured = bindings + launchers + models
++    # ── fused-kernel dir (Stream A — [sources] fused_root) ───────────────
++    # A foreign project that keeps its fused step kernels in a dedicated tree
++    # (historically ``csrc/fused/<arch>``) declares ``[sources] fused_root``
++    # so those sources are discovered alongside the launcher / model globs.
++    # We probe both ``<fused_root>/<arch>`` (the per-arch layout) and
++    # ``<fused_root>`` itself, using the arch's launcher+model globs so the
++    # extension set matches the vendor. Unset ⇒ ``fused == []`` ⇒ grokking's
++    # historical source list is byte-identical.
++    fused: List[Path] = []
++    fused_root_raw = roots.get("fused")
++    if fused_root_raw:
++        fused_root = _resolve_path(spec, fused_root_raw)
++        arch_leaf = entry.subdir.split("/", 1)[-1]
++        fused_dirs = [fused_root / arch_leaf, fused_root]
++        seen_fused: set = set()
++        for fdir in fused_dirs:
++            if not fdir.exists():
++                continue
++            for g in tuple(entry.launcher_glob) + tuple(entry.model_glob):
++                for p in sorted(fdir.glob(g)):
++                    if p not in seen_fused:
++                        seen_fused.add(p)
++                        fused.append(p)
++    structured = bindings + launchers + models + fused
+     if structured:
+         return structured
+     # Mandate Tier-1 fallback — no structured layout matched. Auto-discover
+@@ -9152,17 +9219,36 @@ def _device_cflags(spec: BuildSpec,
+         cutlass_arch_token = (
+             f"{entry.cutlass_arch}{entry.arch_suffix}"
+             if entry.cutlass_arch is not None else "")
+-        cutlass_hdrs = (REPO_ROOT / "third_party/cutlass/include").exists()
++        # Stream A — portability: the CUTLASS include dir is configurable via
++        # ``[sources] cutlass_include`` (flattened onto
++        # ``spec.source_roots["cutlass_include"]`` by apply_to_buildspec). The
++        # default falls back to the historical vendored
++        # ``third_party/cutlass/include`` so grokking is byte-identical. When a
++        # foreign project points at its own CUTLASS checkout we additionally
++        # emit ``-I<dir>`` so nvcc actually finds the headers (the default dir
++        # was already reachable via the REPO_ROOT ``-I`` from _include_paths,
++        # so no extra ``-I`` is added for it — preserving grokking's flag set).
++        _cutlass_root_raw = (spec.source_roots or {}).get("cutlass_include") \
++            if hasattr(spec, "source_roots") else None
++        if _cutlass_root_raw:
++            cutlass_inc = _resolve_path(spec, _cutlass_root_raw)
++            _cutlass_is_custom = True
++        else:
++            cutlass_inc = REPO_ROOT / "third_party/cutlass/include"
++            _cutlass_is_custom = False
++        cutlass_hdrs = cutlass_inc.exists()
+         if cutlass_hdrs:
+             base += ["-DWITH_CUTLASS",
+                      f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"]
++            if _cutlass_is_custom:
++                base += [f"-I{cutlass_inc}"]
+             _trace_add_many(trace, ["-DWITH_CUTLASS",
+                                     f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"],
+-                            "third_party/cutlass/include is vendored")
++                            f"CUTLASS include {cutlass_inc} is present")
+         else:
+             _trace_add(trace, "-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=…",
+                        "skipped",
+-                       "third_party/cutlass/include not vendored")
++                       f"CUTLASS include {cutlass_inc} not present")
+         if cutlass_arch_token:
+             # Independent of whether CUTLASS headers are vendored — the
+             # supported-arch macro is consumed by host code that probes
+@@ -11090,6 +11176,30 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
+     return lines
+ 
+ 
++def _jit_module_name(spec: "BuildSpec", suffix: str = "") -> str:
++    """Stream A — portability: derive the JIT/AOT extension module name from
++    the project package instead of the hardcoded ``grokking_compiled_`` prefix.
++
++    The prefix is taken from ``spec.python_package`` (dots → underscores so the
++    result is a legal C identifier / module name), e.g. a project whose package
++    is ``"my_pkg.kernels"`` gets ``my_pkg_kernels_compiled_<opt>_<model>_<arch>``.
++
++    Grokking byte-identity: the historical module-name prefix is literally
++    ``grokking_compiled_`` even though the package is ``grokking_optimizers`` —
++    mirroring the ``_build_macros`` 2c special-case, when ``python_package`` is
++    the grokking default (or empty/unset) we emit the historical
++    ``grokking_compiled_`` prefix so the cache key and on-disk build dirs are
++    unchanged for the grokking project. ``suffix`` carries the per-variant tag
++    (e.g. ``"_<short_ckey>"``) appended verbatim, matching the existing sites.
++    """
++    pkg = getattr(spec, "python_package", "") or ""
++    if pkg in ("", "grokking_optimizers"):
++        prefix = "grokking_compiled_"
++    else:
++        prefix = f"{pkg.replace('.', '_')}_compiled_"
++    return f"{prefix}{spec.optimizer}_{spec.model}_{spec.arch}{suffix}"
++
++
+ def _torch_load(spec: BuildSpec, sources: List[Path],
+                 host_cflags: List[str], device_cflags: List[str],
+                 ldflags: List[str], report,
+@@ -11783,12 +11893,27 @@ _FAST_MATH_FLAGS: frozenset = frozenset({
+ })
+ 
+ 
+-def _strict_math_flags(flags: List[str]) -> List[str]:
++def _strict_math_flags(flags: List[str],
++                       macro_prefix: Optional[str] = None) -> List[str]:
+     """Mandate #9 — strip every fast-math token from a flag list and append
+-    the strict/wide-accumulation marker. Pure / CPU-testable."""
++    the strict/wide-accumulation marker. Pure / CPU-testable.
++
++    Stream A — portability: the strict-math marker is project-prefixed so the
++    oracle build respects ``spec.macro_prefix`` instead of leaking the literal
++    ``SG_`` namespace into a foreign project. ``macro_prefix`` mirrors the
++    ``_build_macros`` 2c convention: the historical grokking prefix
++    ``"SG_BUILD_"`` (and the ``None`` default used by callers that don't have a
++    spec) keep the byte-identical ``-DSG_STRICT_MATH=1`` spelling that existing
++    kernels ``#ifdef SG_STRICT_MATH`` on; any other prefix emits
++    ``-D{prefix}STRICT_MATH=1``.
++    """
++    if not macro_prefix or macro_prefix == "SG_BUILD_":
++        marker = "-DSG_STRICT_MATH=1"
++    else:
++        marker = f"-D{macro_prefix}STRICT_MATH=1"
+     out = [f for f in flags if f not in _FAST_MATH_FLAGS]
+-    if "-DSG_STRICT_MATH=1" not in out:
+-        out.append("-DSG_STRICT_MATH=1")
++    if marker not in out:
++        out.append(marker)
+     return out
+ 
+ 
+@@ -13974,9 +14099,10 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
+ 
+     # Group C21 — name what we're actually building so the user can
+     # correlate the cache miss with a specific module / arch / source
+-    # set. ``_torch_load`` derives the same module_name string.
+-    _module_name = (
+-        f"grokking_compiled_{spec.optimizer}_{spec.model}_{spec.arch}")
++    # set. ``_torch_load`` derives the same module_name string. Stream A:
++    # the prefix is project-derived (``_jit_module_name``) so a foreign
++    # package gets its own ``<pkg>_compiled_*`` name; grokking is unchanged.
++    _module_name = _jit_module_name(spec)
+     entry = get_arch_entry(spec.arch)
+     report.write(
+         f"  [aot cache MISS] building {_module_name} for {spec.arch} "
+@@ -27241,6 +27367,12 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
+         # project-specific templates can opt in with
+         # `{{ project_namespace | default("sg::" + arch_short) }}`.
+         "namespace":         "",
++        # Stream A — config-extensible optimizer-class registry. A
++        # ``{short: "pkg.Class"}`` map that overlays the built-in
++        # ``OPT_CLASS`` so a foreign optimizer name resolves through
++        # ``_opt_class_for`` without a KeyError. Empty by default ⇒ grokking
++        # uses exactly the eleven built-in classes from dispatch.OPT_CLASS.
++        "optimizer_classes": {},
+     },
+     "sources": {
+         "cuda_root":      "csrc/backends/cuda",
+@@ -27253,6 +27385,18 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
+         # be absolute, or repo-root-relative when relative. Default
+         # preserves the historical csrc/algorithms/tuned_configs.h.
+         "tuned_header_path": "csrc/algorithms/tuned_configs.h",
++        # Stream A — fused-kernel source root. A foreign project that keeps
++        # its fused step kernels in a dedicated tree (historically
++        # ``csrc/fused/<arch>``) sets this so _resolve_sources discovers
++        # them alongside the launcher / model globs. ``""`` (the default)
++        # adds no fused sources, so grokking's source list is unchanged.
++        "fused_root":     "",
++        # Stream A — CUTLASS include directory. Falls back to the vendored
++        # ``third_party/cutlass/include`` when empty so grokking's device
++        # flags are byte-identical; a foreign project points this at its own
++        # CUTLASS checkout (which also gets an explicit ``-I`` so nvcc finds
++        # the headers).
++        "cutlass_include": "",
+     },
+     # Mandate (NDEBUG migration) — compile.py's base device flags carry NO
+     # project opinion. The grokking project's ``-DNDEBUG`` (assert-stripping;
+@@ -27596,6 +27740,24 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
+         spec.fused_op_template = str(fused_op_template)
+     if proj.get("python_package"):
+         spec.python_package = str(proj["python_package"])
++    # Stream A — config-extensible optimizer-class registry. A foreign
++    # project declares ``[project] optimizer_classes = {short = "pkg.Class"}``
++    # so its optimizer resolves through ``_opt_class_for`` without a KeyError
++    # against the built-in ``OPT_CLASS``. We stash a MERGED map (built-in
++    # registry overlaid by the config entries) on ``spec.optimizer_classes``
++    # so any call site can read a single dict; ``_opt_class_for`` itself reads
++    # ``spec.config`` so it works even when this attribute can't be set
++    # (read-only spec). With no config the merged map equals ``OPT_CLASS`` and
++    # grokking is unaffected.
++    oc_cfg = proj.get("optimizer_classes")
++    if isinstance(oc_cfg, dict) and oc_cfg:
++        merged_oc: Dict[str, str] = dict(OPT_CLASS)
++        for short, cls in oc_cfg.items():
++            merged_oc[str(short)] = str(cls)
++        try:
++            spec.optimizer_classes = merged_oc
++        except Exception as _swexc:
++            _debug_swallow('apply_to_buildspec', _swexc)
+     # ``namespace`` defaults to "" — we still copy that through so a
+     # user that sets it to empty intentionally overrides any earlier
+     # spec value.
+@@ -27620,6 +27782,14 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
+             sr["bindings"] = str(src["bindings_dir"])
+         if src.get("algorithms_dir"):
+             sr["algorithms"] = str(src["algorithms_dir"])
++        # Stream A — fused-kernel root (consumed by _resolve_sources) and
++        # CUTLASS include dir (consumed by _device_cflags). Both default to
++        # "" in _DEFAULT_PROJECT_CONFIG so the grokking path never sets them
++        # and its source list / device flags are byte-identical.
++        if src.get("fused_root"):
++            sr["fused"] = str(src["fused_root"])
++        if src.get("cutlass_include"):
++            sr["cutlass_include"] = str(src["cutlass_include"])
+         extra_inc = (src.get("include_paths", {}) or {}).get("extra", [])
+         # Group A.13 — type-check the TOML schema. ``include_paths.extra``
+         # MUST be a list of strings. Accepting a dict / scalar silently

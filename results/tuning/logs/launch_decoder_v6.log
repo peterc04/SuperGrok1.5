@@ -1,0 +1,11 @@
+launched 7 workers (logs: /workspace/SuperGrok1.5/results/tuning/logs)
+all workers done
+/usr/local/lib/python3.11/dist-packages/optuna/_experimental.py:33: ExperimentalWarning: Argument ``multivariate`` is an experimental feature. The interface can change in the future.
+  optuna_warn(
+[I 2026-06-10 22:39:32,837] Using an existing study with name 'adamw__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:33,475] Using an existing study with name 'neuralgrok__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:34,114] Using an existing study with name 'grokadamw__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:34,754] Using an existing study with name 'supergrok__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:35,395] Using an existing study with name 'supergrok15__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:36,028] Using an existing study with name 'supergrok2__decoder' instead of creating a new one.
+[I 2026-06-10 22:39:36,689] Using an existing study with name 'grokfast__decoder' instead of creating a new one.

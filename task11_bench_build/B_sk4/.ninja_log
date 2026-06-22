@@ -1,0 +1,4 @@
+# ninja log v7
+4	135177	1781617348650621873	mega_decoder_real_adamw_tc.cuda.o	d88ef4e4967dc2bc
+135205	135599	1781617348650621873	mega_decoder_d2048_task11_B_sk4.so	a155b3da2dcba0c1
+56	396	1781617986842231717	mega_decoder_d2048_task11_B_sk4.so	a155b3da2dcba0c1
