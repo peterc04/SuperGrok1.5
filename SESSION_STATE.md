@@ -82,11 +82,11 @@ source .fast_build_env.sh                   # 3. restores the volume-backed scca
 CUDA_VISIBLE_DEVICES="" python -m grokking_optimizers.compile --self-test   # 4. expect 265/0
 ```
 
-## Accessing the volume WITHOUT a GPU instance (this is a RunPod `runpodfs` network volume)
+## Accessing the volume WITHOUT a GPU instance (this is a network volume)
 - **No pod at all (cheapest):** RunPod's **S3-compatible API** for network volumes. In the RunPod console
   Settings, create an "S3 API key" (separate from the normal API key), configure `aws-cli` with it, and use the
-  datacenter S3 endpoint (e.g. `https://REDACTED-s3-endpoint`) to `aws s3 ls/cp` files directly. Available
-  only in select datacenters (US-KS-2 / EU-CZ-1 / US-CA-2 at last check) — confirm THIS volume's DC is supported.
+  datacenter S3 endpoint (e.g. `https://<datacenter-s3-endpoint>`) to `aws s3 ls/cp` files directly. Available
+  only in select datacenters — confirm THIS volume's DC is supported.
   Community GUI: Runpod-Network-Volume-Explorer-GUI.
 - **Cheap pod alt:** attach this same network volume to a **CPU-only** pod (cents/hr, no GPU) → web terminal / SSH / browse.
 

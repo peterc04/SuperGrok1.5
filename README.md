@@ -7,6 +7,390 @@ families — **NVIDIA sm_90 (Hopper)**, **AMD gfx942 (CDNA3 / MI300X)**, and
 (no parallel math trees, no dead duplicates; enforced by a self-test drift
 guard).
 
+## Lines of code
+
+Project source counted per language and per file (excludes the vendored **CUTLASS** dependency under `third_party/`, which is tracked as a git submodule). Generated 2026-06-21.
+
+| Language | Files | Lines |
+|----------|------:|------:|
+| Python | 162 | 87,693 |
+| CUDA | 44 | 23,803 |
+| C/C++ | 63 | 19,640 |
+| HIP (AMD ROCm) | 48 | 2,309 |
+| Shell | 15 | 934 |
+| **Source subtotal** | **332** | **134,379** |
+| Logs/diffs (artifacts) | 124 | 39,907 |
+| JSON (data/results) | 47 | 28,958 |
+| Markdown (docs) | 81 | 14,534 |
+| Config | 15 | 2,354 |
+| **Total tracked text** | **599** | **220,132** |
+
+<details>
+<summary>Per-file breakdown — 332 source files</summary>
+
+
+**Python** (162 files, 87,693 lines)
+
+| File | Lines |
+|------|------:|
+| `grokking_optimizers/compile.py` | 32,900 |
+| `grokking_race_v2.py` | 2,505 |
+| `grokking_optimizers/optimizers/supergrok2.py` | 2,397 |
+| `grokking_optimizers/dispatch.py` | 2,013 |
+| `grokking_optimizers/megakernel_codegen.py` | 1,561 |
+| `tests/hw/test_l3tc_tail_gate.py` | 1,512 |
+| `csrc/backends/pallas/_pallas_kernels.py` | 1,319 |
+| `scripts/fast_triage.py` | 1,197 |
+| `csrc/backends/pallas/_pallas_fused.py` | 1,131 |
+| `csrc/backends/pallas/launch_supergrok2.py` | 1,067 |
+| `tuning/roofline.py` | 1,037 |
+| `setup.py` | 1,029 |
+| `tests/hw/sg2_kernel_mirror.py` | 1,002 |
+| `grokking_optimizers/distributed.py` | 976 |
+| `tests/hw/mamba3_oracle.py` | 958 |
+| `tests/hw/test_reference_parity.py` | 938 |
+| `grokking_optimizers/_tuned_inject.py` | 849 |
+| `tests/hw/test_decoder_tc.py` | 808 |
+| `grokking_optimizers/profile_maximal.py` | 762 |
+| `grokking_optimizers/profile.py` | 740 |
+| `tests/hw/test_multistep_parity.py` | 737 |
+| `bench_backends.py` | 728 |
+| `tests/hw/test_vit_tc.py` | 723 |
+| `grokking_optimizers/utilization.py` | 722 |
+| `tests/tpu/test_pallas_parity_interpret.py` | 707 |
+| `grokking_optimizers/verify_all.py` | 699 |
+| `tuning/tune_optimizers.py` | 693 |
+| `csrc/backends/pallas/_pallas_models.py` | 681 |
+| `tests/hw/test_mamba_tc.py` | 681 |
+| `grokking_optimizers/mamba3_block.py` | 638 |
+| `grokking_optimizers/optimizers/neuralgrok.py` | 622 |
+| `tests/hw/mamba_oracle.py` | 619 |
+| `grokking_optimizers/optimizers/supergrok15.py` | 604 |
+| `tuning/test_build_injection.py` | 576 |
+| `grokking_optimizers/optimizers/supergrok11.py` | 575 |
+| `tests/hw/test_sg2_megakernel.py` | 565 |
+| `scripts/check_math_single_source.py` | 537 |
+| `grokking_optimizers/megakernel_engine.py` | 521 |
+| `tests/hw/test_opt_stages.py` | 502 |
+| `tests/hw/test_dp2_loopback_determinism.py` | 485 |
+| `tests/hw/test_wgmma_substrate.py` | 483 |
+| `tests/hw/vit_kernel_mirror.py` | 482 |
+| `tests/hw/mamba_kernel_mirror.py` | 478 |
+| `scripts/nvcc_baseline.py` | 470 |
+| `tests/hw/vit_oracle.py` | 463 |
+| `tests/hw/test_vit_megakernel.py` | 449 |
+| `tests/hw/decoder_oracle.py` | 444 |
+| `tests/hw/decoder_kernel_mirror.py` | 431 |
+| `grokking_optimizers/optimizers/grokadamw.py` | 379 |
+| `grokking_optimizers/parallel/pipeline.py` | 367 |
+| `wiring_check.py` | 367 |
+| `tuning/_grokadamw_multistep_parity.py` | 362 |
+| `tests/hw/_sg2_l3tc_gate.py` | 356 |
+| `tests/hw/test_3d_parallel.py` | 355 |
+| `grokking_optimizers/parallel/zero3.py` | 331 |
+| `grokking_optimizers/tune_hook.py` | 327 |
+| `tests/hw/test_mamba_megakernel.py` | 325 |
+| `tests/hw/test_pp2_loopback_determinism.py` | 323 |
+| `tuning/decoder_bench.py` | 323 |
+| `grokking_optimizers/megakernel.py` | 310 |
+| `tuning/precision_analysis.py` | 309 |
+| `tests/hw/test_distributed_step.py` | 300 |
+| `tests/hw/test_sharded_optimizer.py` | 290 |
+| `tests/hw/test_step_graph_capture.py` | 285 |
+| `tests/test_shard_map.py` | 275 |
+| `grokking_optimizers/parallel/shard_map.py` | 272 |
+| `tests/hw/test_zero3_roundtrip.py` | 270 |
+| `grokking_optimizers/optimizers/muon.py` | 263 |
+| `tuning/_prodigy_multistep_parity.py` | 256 |
+| `tests/hw/test_tp_loopback.py` | 255 |
+| `grokking_optimizers/parallel/distributed_step.py` | 250 |
+| `tests/hw/test_parallel_instantiation.py` | 235 |
+| `grokking_optimizers/lowprec.py` | 233 |
+| `tuning/vit_bench.py` | 233 |
+| `grokking_optimizers/optimizers/looksam.py` | 228 |
+| `grokking_optimizers/optimizers/prodigy.py` | 228 |
+| `examples/autotune_demo/run_autotune.py` | 204 |
+| `tests/test_pipeline_schedule.py` | 204 |
+| `grokking_optimizers/optimizers/grokfast.py` | 201 |
+| `grokking_optimizers/optimizers/adamw.py` | 192 |
+| `scripts/diag_neuralgrok_seed123.py` | 189 |
+| `tests/test_zero3_plan.py` | 185 |
+| `scripts/roofline_bench.py` | 177 |
+| `tuning/mamba_bench.py` | 165 |
+| `grokking_optimizers/optimizers/lion.py` | 161 |
+| `csrc/backends/pallas/launch_supergrok11.py` | 159 |
+| `csrc/backends/pallas/launch_looksam.py` | 149 |
+| `csrc/backends/pallas/launch_supergrok15.py` | 149 |
+| `grokking_optimizers/__init__.py` | 147 |
+| `examples/toy_tune_project/tune_hook.py` | 146 |
+| `examples/autotune_demo/tune_hook.py` | 145 |
+| `.regpressure/gpu/prodtime.py` | 144 |
+| `csrc/backends/pallas/launch_muon.py` | 143 |
+| `tests/hw/_mamba_race_probe.py` | 134 |
+| `tuning/_prodigy_owner_block_unit.py` | 134 |
+| `csrc/backends/pallas/launch_prodigy.py` | 129 |
+| `tuning/_h3_dw_aaa.py` | 125 |
+| `csrc/backends/pallas/launch_neuralgrok.py` | 121 |
+| `_sg_realsg_probe.py` | 111 |
+| `tests/hw/_mamba_fill_test.py` | 111 |
+| `csrc/backends/pallas/launch_grokadamw.py` | 107 |
+| `tuning/_mbtc_bypass_profile.py` | 101 |
+| `csrc/backends/pallas/v6e/__init__.py` | 98 |
+| `tests/hw/test_mb3_scalar.py` | 98 |
+| `tests/hw/_mamba_prodigy_production_probe.py` | 95 |
+| `csrc/backends/pallas/v5p/__init__.py` | 90 |
+| `scripts/time_cell.py` | 87 |
+| `scripts/_vit_phase_profile.py` | 85 |
+| `.smoke12_driver.py` | 84 |
+| `scripts/diag_sg_sharpness.py` | 76 |
+| `csrc/backends/pallas/launch_grokfast.py` | 75 |
+| `csrc/backends/pallas/launch_lion.py` | 74 |
+| `tuning/_decoder_validate.py` | 73 |
+| `scripts/_vit_baseline.py` | 72 |
+| `tuning/_grokadamw_final_revalidate.py` | 69 |
+| `tuning/_h3_splitk_sweep.py` | 67 |
+| `scripts/diag_looksam_samdir.py` | 64 |
+| `.regpressure/parse2.py` | 63 |
+| `.regpressure/parse_ptxas.py` | 62 |
+| `examples/autotune_demo/build_variant.py` | 53 |
+| `tuning/_embed_aaa.py` | 49 |
+| `grokking_optimizers/parallel/__init__.py` | 43 |
+| `grokking_optimizers/optimizers/__init__.py` | 41 |
+| `csrc/backends/pallas/launch_adamw.py` | 40 |
+| `scripts/_vit_ncu_driver.py` | 39 |
+| `csrc/fused/tpu_v6e/mega_mamba3_adamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_grokadamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_grokfast.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_lion.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_looksam.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_muon.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_neuralgrok.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_prodigy.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_supergrok11.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_supergrok15.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_mamba3_supergrok2.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_adamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_grokadamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_grokfast.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_lion.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_looksam.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_muon.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_neuralgrok.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_prodigy.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_supergrok11.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_supergrok15.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_transformer_decoder_supergrok2.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_adamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_grokadamw.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_grokfast.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_lion.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_looksam.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_muon.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_neuralgrok.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_prodigy.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_supergrok11.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_supergrok15.py` | 24 |
+| `csrc/fused/tpu_v6e/mega_vit_supergrok2.py` | 24 |
+| `csrc/backends/pallas/__init__.py` | 17 |
+| `tests/conftest.py` | 17 |
+| `tests/tpu/__init__.py` | 8 |
+| `csrc/backends/__init__.py` | 6 |
+
+**CUDA** (44 files, 23,803 lines)
+
+| File | Lines |
+|------|------:|
+| `csrc/fused/sm_90/model_stage_decoder_tc.cuh` | 2,595 |
+| `csrc/fused/sm_90/model_stage_vit_tc.cuh` | 1,704 |
+| `csrc/fused/sm_90/fused_decoder_megakernel.cuh` | 1,575 |
+| `csrc/fused/sm_90/opt_stage_supergrok2.cuh` | 1,343 |
+| `csrc/fused/sm_90/model_stage_mamba3.cuh` | 1,305 |
+| `csrc/fused/sm_90/fused_mamba_megakernel.cuh` | 1,282 |
+| `csrc/fused/sm_90/fused_vit_megakernel.cuh` | 1,187 |
+| `csrc/fused/sm_90/dec_weights.cuh` | 1,023 |
+| `csrc/fused/sm_90/model_stage_vit.cuh` | 947 |
+| `csrc/backends/cuda/sm_90/mma.cuh` | 877 |
+| `csrc/backends/cuda/sm_90/primitives.cuh` | 679 |
+| `csrc/fused/sm_90/opt_stages_precompute.cuh` | 673 |
+| `csrc/backends/cuda/sm_90/wgmma.cuh` | 646 |
+| `csrc/fused/sm_90/opt_components.cuh` | 524 |
+| `tests/hw/tp_loopback_binding.cu` | 487 |
+| `csrc/fused/sm_90/mega_vit_real_adamw_tc.cu` | 452 |
+| `csrc/fused/sm_90/pp_stage_decoder_tc.cuh` | 400 |
+| `csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu` | 373 |
+| `csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu` | 370 |
+| `csrc/backends/cuda/sm_90/tile_pipeline.cuh` | 366 |
+| `csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu` | 351 |
+| `tests/hw/_mamba_prodigy_probe.cu` | 297 |
+| `csrc/fused/sm_90/vit_layout.cuh` | 296 |
+| `csrc/backends/cuda/sm_90/wgmma_selftest.cu` | 288 |
+| `csrc/fused/sm_90/tp_layer.cuh` | 288 |
+| `csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu` | 285 |
+| `csrc/fused/sm_90/mamba3_layout.cuh` | 283 |
+| `csrc/fused/megakernel_common.cuh` | 278 |
+| `csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu` | 267 |
+| `csrc/fused/sm_90/tp_transport.cuh` | 233 |
+| `csrc/fused/sm_90/decoder_tc_selftest.cu` | 199 |
+| `csrc/fused/sm_90/decoder_layout.cuh` | 198 |
+| `examples/autotune_demo/gemm_kernel.cu` | 176 |
+| `csrc/backends/cuda/sm_90/warp_specialize.cuh` | 173 |
+| `csrc/fused/sm_90/sharded_optimizer_kernel.cuh` | 167 |
+| `tests/hw/sharded_optimizer_binding.cu` | 167 |
+| `tests/hw/pp_stage_binding.cu` | 166 |
+| `csrc/fused/sm_90/sg2_meta_tail.cu` | 164 |
+| `.perf/M0_mamba_ws_agreement_proof.cu` | 152 |
+| `csrc/fused/sm_90/parallel_config.cuh` | 124 |
+| `csrc/common/utils.cuh` | 120 |
+| `examples/toy_tune_project/toy_kernel.cu` | 119 |
+| `csrc/fused/sm_90/model_stage_mamba_tc.cuh` | 118 |
+| `tests/hw/_mb3_scalar_probe.cu` | 86 |
+
+**C/C++** (63 files, 19,640 lines)
+
+| File | Lines |
+|------|------:|
+| `grokking_optimizers/kernels/gfx942/supergrok2_gfx942.hip.hpp` | 2,692 |
+| `grokking_optimizers/kernels/gfx942/mamba3_gfx942.hip.hpp` | 2,040 |
+| `csrc/bindings/dispatch.cpp` | 1,378 |
+| `csrc/algorithms/supergrok2_bilevel_adjoint.h` | 869 |
+| `csrc/backends/hip/gfx942/supergrok2_bilevel_adjoint_gfx942.hip.hpp` | 861 |
+| `grokking_optimizers/kernels/gfx942/attention_gfx942.hip.hpp` | 798 |
+| `grokking_optimizers/kernels/gfx942/muon_gfx942.hip.hpp` | 648 |
+| `csrc/algorithms/supergrok2.h` | 578 |
+| `grokking_optimizers/kernels/gfx942/prodigy_gfx942.hip.hpp` | 566 |
+| `grokking_optimizers/kernels/gfx942/vit_gfx942.hip.hpp` | 557 |
+| `grokking_optimizers/kernels/gfx942/supergrok11_gfx942.hip.hpp` | 544 |
+| `grokking_optimizers/kernels/gfx942/transformer_decoder_gfx942.hip.hpp` | 493 |
+| `grokking_optimizers/kernels/gfx942/supergrok15_gfx942.hip.hpp` | 472 |
+| `grokking_optimizers/kernels/gfx942/neuralgrok_gfx942.hip.hpp` | 437 |
+| `grokking_optimizers/kernels/gfx942/looksam_gfx942.hip.hpp` | 433 |
+| `grokking_optimizers/kernels/gfx942/grokadamw_gfx942.hip.hpp` | 427 |
+| `csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp` | 348 |
+| `csrc/backends/hip/gfx942/moe_compaction_gfx942.hip.hpp` | 346 |
+| `csrc/bindings/helpers.h` | 345 |
+| `grokking_optimizers/kernels/gfx942/grokfast_gfx942.hip.hpp` | 336 |
+| `grokking_optimizers/kernels/gfx942/lion_gfx942.hip.hpp` | 312 |
+| `csrc/common/platform.h` | 302 |
+| `csrc/fused/megakernel_common_hip.hip.hpp` | 300 |
+| `csrc/bindings/bindings.cpp` | 296 |
+| `grokking_optimizers/kernels/gfx942/adamw_gfx942.hip.hpp` | 295 |
+| `csrc/fused/gfx942/fused_megakernel.hip.hpp` | 288 |
+| `csrc/fused/gfx942/opt_components.hip.hpp` | 233 |
+| `csrc/fused/fused_wired_cells.inc` | 206 |
+| `csrc/algorithms/supergrok11.h` | 178 |
+| `csrc/backends/hip/gfx942/primitives.hpp` | 145 |
+| `csrc/fused/gfx942/model_stages.hip.hpp` | 141 |
+| `csrc/backends/hip/gfx942/models/mamba.hip.cpp` | 139 |
+| `csrc/backends/hip/gfx942/models/decoder.hip.cpp` | 125 |
+| `csrc/algorithms/neuralgrok.h` | 119 |
+| `csrc/fused/sm_90/fused_dispatch_table.inc` | 119 |
+| `csrc/fused/gfx942/fused_dispatch_table.inc` | 116 |
+| `csrc/algorithms/supergrok15.h` | 114 |
+| `csrc/algorithms/adamw.h` | 107 |
+| `csrc/backends/hip/gfx942/models/vit.hip.cpp` | 107 |
+| `csrc/algorithms/grokadamw.h` | 103 |
+| `csrc/algorithms/prodigy.h` | 99 |
+| `csrc/algorithms/looksam.h` | 93 |
+| `csrc/common/types.h` | 80 |
+| `csrc/algorithms/muon.h` | 78 |
+| `grokking_optimizers/kernels/gfx942/common_gfx942.hip.hpp` | 78 |
+| `csrc/algorithms/grokfast.h` | 77 |
+| `csrc/algorithms/lion.h` | 77 |
+| `csrc/scan/affine2x2.h` | 74 |
+| `csrc/backends/hip/gfx942/launch_adamw.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_grokadamw.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_grokfast.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_lion.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_looksam.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_muon.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_neuralgrok.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_prodigy.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_supergrok11.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_supergrok15.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/launch_supergrok2.hip.cpp` | 5 |
+| `csrc/backends/hip/gfx942/models/attention.hip.h` | 4 |
+| `csrc/backends/hip/gfx942/models/decoder.hip.h` | 4 |
+| `csrc/backends/hip/gfx942/models/mamba.hip.h` | 4 |
+| `csrc/backends/hip/gfx942/models/vit.hip.h` | 4 |
+
+**HIP (AMD ROCm)** (48 files, 2,309 lines)
+
+| File | Lines |
+|------|------:|
+| `csrc/fused/gfx942/mega_mamba3_neuralgrok.hip` | 69 |
+| `csrc/fused/gfx942/mega_transformer_decoder_neuralgrok.hip` | 69 |
+| `csrc/fused/gfx942/mega_vit_neuralgrok.hip` | 69 |
+| `csrc/fused/gfx942/mega_mamba3_adamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_grokadamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_grokfast.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_lion.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_looksam.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_muon.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_prodigy.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_supergrok11.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_supergrok15.hip` | 62 |
+| `csrc/fused/gfx942/mega_mamba3_supergrok2.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_adamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_grokadamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_grokfast.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_lion.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_looksam.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_muon.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_prodigy.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_supergrok11.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_supergrok15.hip` | 62 |
+| `csrc/fused/gfx942/mega_transformer_decoder_supergrok2.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_adamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_grokadamw.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_grokfast.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_lion.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_looksam.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_muon.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_prodigy.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_supergrok11.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_supergrok15.hip` | 62 |
+| `csrc/fused/gfx942/mega_vit_supergrok2.hip` | 62 |
+| `csrc/backends/hip/gfx942/device_adamw.hip` | 23 |
+| `csrc/backends/hip/gfx942/device_grokadamw.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_grokfast.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_lion.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_looksam.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_neuralgrok.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_prodigy.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_supergrok11.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_supergrok15.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_supergrok2.hip` | 16 |
+| `csrc/backends/hip/gfx942/device_attention.hip` | 15 |
+| `csrc/backends/hip/gfx942/device_mamba3.hip` | 15 |
+| `csrc/backends/hip/gfx942/device_muon.hip` | 15 |
+| `csrc/backends/hip/gfx942/device_transformer_decoder.hip` | 15 |
+| `csrc/backends/hip/gfx942/device_vit.hip` | 15 |
+
+**Shell** (15 files, 934 lines)
+
+| File | Lines |
+|------|------:|
+| `build.sh` | 306 |
+| `scripts/amdgcn_check.sh` | 113 |
+| `.perf/batch/run_12h_frontload.sh` | 96 |
+| `scripts/install_deps.sh` | 77 |
+| `scripts/bootstrap_env.sh` | 72 |
+| `.regpressure/gpu/patchgate.sh` | 47 |
+| `.fast_build_env.sh` | 45 |
+| `.regpressure/compile_one.sh` | 38 |
+| `.build_tools/nvcc-cached` | 30 |
+| `.regpressure/gpu/baseline_chain.sh` | 27 |
+| `scripts/verify_stage0.sh` | 26 |
+| `LICENSE` | 21 |
+| `scripts/compile_to_object.sh` | 15 |
+| `.regpressure/env.sh` | 14 |
+| `.build_tools/g++-cached` | 7 |
+
+</details>
+
+
+---
+
 > **Status honesty.** The **NVIDIA sm_90 (H100)** path is **verified on real
 > silicon**: the `_ops` extension builds, links, imports, and runs on an H100
 > 80GB, the fused kernels are **numerically parity-exact** (11/0 on
