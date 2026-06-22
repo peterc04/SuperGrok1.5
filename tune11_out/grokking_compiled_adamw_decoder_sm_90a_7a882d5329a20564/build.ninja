@@ -1,0 +1,38 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /workspace/.local/bin/sccache /usr/local/cuda/bin/nvcc
+
+cflags = -DTORCH_EXTENSION_NAME=grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5 -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/TH -isystem /usr/local/lib/python3.11/dist-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++17 -O3 -std=c++17 -fPIC -fno-semantic-interposition -fvisibility=hidden -fdata-sections -ffunction-sections -fno-math-errno -fno-trapping-math -fomit-frame-pointer -funroll-loops -march=native -mtune=native -DWITH_CUDA -ggdb -DSG_BUILD_OPTIMIZER_ADAMW=1 -DSG_BUILD_MODEL_DECODER=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DSG_TUNED_BLOCK_SIZE=896 -DSG_TUNED_VEC_WIDTH=4 -DSG_TUNED_UNROLL=128
+post_cflags = 
+cuda_cflags = -ccbin cc -DTORCH_EXTENSION_NAME=grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5 -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -isystem /usr/local/lib/python3.11/dist-packages/torch/include/TH -isystem /usr/local/lib/python3.11/dist-packages/torch/include/THC -isystem /usr/local/cuda/include -isystem /usr/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=0 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -lineinfo --generate-line-info --source-in-ptx -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DCUTLASS_NVCC_ARCHS_SUPPORTED=90a -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -DCUDA_FORCE_CDP1_IF_SUPPORTED -DSG_BUILD_OPTIMIZER_ADAMW=1 -DSG_BUILD_MODEL_DECODER=1 -DSG_BUILD_ARCH_SM90=1 -DSG_VERBOSE=1 -DNDEBUG -DSG_TUNED_BLOCK_SIZE=896 -DSG_TUNED_VEC_WIDTH=4 -DSG_TUNED_UNROLL=128 -DSG_TUNED_MIN_BLOCKS=1 -DSG_TUNED_PROD_REGS=40 -DSG_TUNED_CONS_REGS=200 -DSG_TUNED_MEGA_BLOCK=512 -DSG_TUNED_GRAD_TILE=2048 -DSG_TUNED_TILE_M=256 -DSG_TUNED_TILE_N=128 -DSG_TUNED_DEC_DW_SPLITK=1 -DSG_TUNED_VIT_DW_SPLITK=2 -DSG_TUNED_MB_DW_SPLITK=1 -DSG_TUNED_CLUSTER_SHAPE_0=2 -DSG_TUNED_CLUSTER_SHAPE_1=1 -DSG_TUNED_CLUSTER_SHAPE_2=1 -DSG_TUNED_CLUSTER_SHAPE_VOLUME=2 -DSG_TUNED_SWIZZLE=none -DSG_TUNED_WARP_SPECIALIZATION=0 -DSG_TUNED_TMA=0 -DSG_TUNED_ASYNC_DEPTH=2 -DSG_TUNED_DEC_GEMM_STAGES=2 -DSG_TUNED_MB_GEMM_STAGES=2 -DSG_TUNED_DEC_GEMM_INTERLEAVE=3 -DSG_TUNED_MB_GEMM_INTERLEAVE=4 -DSG_TUNED_VIT_GEMM_INTERLEAVE=4 -DSG_TUNED_PIPE_DEPTH=2 -DSG_TUNED_BW_CKPT_STRIDE=32 -DSG_TUNED_GEMM_IMPL=SG_GEMM_IMPL_SCALAR -DSG_TUNED_PSCAN_BLOCK=512 -DSG_TUNED_VIT_TILE_M=1088 -DSG_TUNED_WG_COUNT=2 -Xptxas --opt-level=3 --maxrregcount=128 -DCUDA_TMA_ENABLED=1 -DCUDA_WGMMA_ENABLED=1 -DCUDA_CLUSTER_ENABLED=1 -DCUDA_FP8_ENABLED=1 -Xptxas --register-usage-level=10 -Xptxas --def-load-cache=ca -Xptxas --def-store-cache=wb --threads 8 --diag-suppress=20012,20013
+cuda_post_cflags = 
+cuda_dlink_post_cflags = 
+ldflags = -shared -Wl,--as-needed -Wl,--gc-sections -Wl,-O3 -L/usr/local/lib/python3.11/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build bindings.o: compile /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp
+build dispatch.o: compile /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp
+build mega_decoder_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+build mega_mamba_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu
+build mega_vit_real_adamw_tc_launcher.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu
+build sg2_meta_tail.cuda.o: cuda_compile /workspace/SuperGrok1.5/csrc/fused/sm_90/sg2_meta_tail.cu
+
+
+
+build grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564.so: link bindings.o dispatch.o mega_decoder_real_adamw_tc_launcher.cuda.o mega_mamba_real_adamw_tc_launcher.cuda.o mega_vit_real_adamw_tc_launcher.cuda.o sg2_meta_tail.cuda.o
+
+default grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564.so

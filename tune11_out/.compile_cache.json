@@ -1,0 +1,89 @@
+{
+  "created_at": "2026-06-16T05:01:56.689302",
+  "entries": {
+    "adamw/decoder/sm_90a": {
+      "aot_completed_at": "2026-06-16T05:09:08.371615",
+      "aot_host": {
+        "cuda": "12.4",
+        "hip": null,
+        "jax": "0.4.38",
+        "ncpus": 224,
+        "platform": "Linux-6.8.0-79-generic-x86_64-with-glibc2.35",
+        "python": "3.11.10",
+        "recorded_at": "2026-06-16T05:09:08.371708",
+        "torch": "2.4.1+cu124"
+      },
+      "bayesian_trials": [],
+      "device_cflags_hash": "cbc4f1526d629f963772b9725dca3c68fe72065258312f166535cfadb74b8f3e",
+      "host_cflags_hash": "ead449ee127d422341ffd9957782a7673d1650bb6a13992357269a283f07827a",
+      "jit_completed_at": null,
+      "jit_host": null,
+      "mode": null,
+      "pgo_completed_at": null,
+      "pgo_enabled": false,
+      "pgo_host": null,
+      "pgo_profile_dir": null,
+      "pgo_workload_hash": null,
+      "primary_artifact": {
+        "mtime": 1781586548.0631936,
+        "path": "/workspace/tune11_out/grokking_compiled_adamw_decoder_sm_90a/grokking_compiled_adamw_decoder_sm_90a.so",
+        "sha256": "5ef83c4a5d32a38bb951dcf9ef0d76cc3338c558a4e811cb99db67f12592293b",
+        "size": 36615936
+      },
+      "search_space_hash": "2ae12186c620d451e69e4a34ca7126c5bb4f0dac99d835e9d78a28c4de3b2e27",
+      "source_hash": "92f5c0e242b76ac33eaa46ab1fc248a025d770f4a750839fbbf016e7e6b601a6",
+      "sweep_history": [],
+      "trial_log_path": "trials_adamw_decoder_sm_90a.jsonl",
+      "trial_log_summary": {
+        "best_timing_ms": 14.712110900878907,
+        "last_updated_unix": 1781588417.9408543,
+        "n_trials": 9,
+        "stop_reason": null
+      },
+      "tuned_config": null,
+      "variant_artifacts": {
+        "allow_expensive_opts=0_async_depth=2_block=352_bw_ckpt_stride=32_cluster_shape=4,2,1_cons_regs=216_dec_dw_splitk=4_dec_gemm_interleave=4_dec_gemm_stages=1_gemm_impl=SG_GEMM_IMPL_SCALAR_grad_tile=2048_maxrregcount=116_mb_dw_splitk=8_mb_gemm_interleave=3_mb_gemm_stages=1_mega_block=256_opt_level=3_pipe_depth=3_prod_regs=24_pscan_block=512_tile_m=256_tile_n=128_unroll=8_vec=4_vit_dw_splitk=1_vit_gemm_interleave=3_vit_tile_m=1088_wg_count=2": {
+          "build_sig": "8af676cfcd4eac896e19b1ef23b1d9e55a86a176536f7d60e82f132de6257999",
+          "mtime": 1781588342.8648698,
+          "path": "/workspace/tune11_out/grokking_compiled_adamw_decoder_sm_90a_aba71f216d321649/grokking_compiled_adamw_decoder_sm_90a_aba71f216d321649.so",
+          "size": 40118176
+        },
+        "allow_expensive_opts=0_async_depth=2_block=896_bw_ckpt_stride=32_cluster_shape=2,1,1_cons_regs=200_dec_dw_splitk=1_dec_gemm_interleave=3_dec_gemm_stages=2_gemm_impl=SG_GEMM_IMPL_SCALAR_grad_tile=2048_maxrregcount=128_mb_dw_splitk=1_mb_gemm_interleave=4_mb_gemm_stages=2_mega_block=512_opt_level=3_pipe_depth=2_prod_regs=40_pscan_block=512_tile_m=256_tile_n=128_unroll=128_vec=4_vit_dw_splitk=2_vit_gemm_interleave=4_vit_tile_m=1088_wg_count=2": {
+          "build_sig": "0fffd3e8a40fdd3dcd7fb74e2b3c431c8fadf204653aa4e0abb80ab04d4cce24",
+          "mtime": 1781587742.7414489,
+          "path": "/workspace/tune11_out/grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564/grokking_compiled_adamw_decoder_sm_90a_7a882d5329a20564.so",
+          "size": 40978336
+        },
+        "allow_expensive_opts=0_async_depth=4_block=832_bw_ckpt_stride=32_cluster_shape=1,1,4_cons_regs=232_dec_dw_splitk=2_dec_gemm_interleave=2_dec_gemm_stages=1_gemm_impl=SG_GEMM_IMPL_SCALAR_grad_tile=1024_maxrregcount=176_mb_dw_splitk=8_mb_gemm_interleave=4_mb_gemm_stages=1_mega_block=512_opt_level=3_pipe_depth=3_prod_regs=40_pscan_block=512_tile_m=256_tile_n=64_unroll=128_vec=4_vit_dw_splitk=1_vit_gemm_interleave=3_vit_tile_m=1088_wg_count=2": {
+          "build_sig": "5076afb8c83800f0634aab75b9625db6e2bb63a395e15b6b9a7b3880516fb935",
+          "mtime": 1781587153.223525,
+          "path": "/workspace/tune11_out/grokking_compiled_adamw_decoder_sm_90a_2944e03f7cd60f3e/grokking_compiled_adamw_decoder_sm_90a_2944e03f7cd60f3e.so",
+          "size": 38086560
+        }
+      }
+    }
+  },
+  "host_history": [
+    {
+      "cuda": "12.4",
+      "hip": null,
+      "jax": "0.4.38",
+      "ncpus": 224,
+      "platform": "Linux-6.8.0-79-generic-x86_64-with-glibc2.35",
+      "python": "3.11.10",
+      "recorded_at": "2026-06-16T05:01:56.984874",
+      "torch": "2.4.1+cu124"
+    },
+    {
+      "cuda": "12.4",
+      "hip": null,
+      "jax": "0.4.38",
+      "ncpus": 224,
+      "platform": "Linux-6.8.0-79-generic-x86_64-with-glibc2.35",
+      "python": "3.11.10",
+      "recorded_at": "2026-06-16T05:09:11.564700",
+      "torch": "2.4.1+cu124"
+    }
+  ],
+  "version": 4
+}
