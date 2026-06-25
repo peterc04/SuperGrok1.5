@@ -1505,6 +1505,75 @@ __device__ __forceinline__ void dectc_attn_fwd_tile(
     __syncthreads();
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  TP HEAD-LOCALIZED attention FORWARD (tp_kernel.md §6/§12 NOTE). IDENTICAL
+//  per-head math to dectc_attn_fwd_tile, but over the rank's LOCAL head shard:
+//  on the kTPComm column-parallel in_proj path the qkv buffer is the rank's
+//  dense [q_own | k_own | v_own] concatenation (tp_layer.cuh §"QKV 3-BLOCK
+//  SHARD"), so the per-row stride is 3*Dloc and the q|k|v blocks start at
+//  0 / Dloc / 2*Dloc, with Hloc = kHeads/P whole heads of width kDhead each
+//  (Dloc == Hloc*kDhead == kD/P). `ctx` is the rank's own [nrows, Dloc] context
+//  (recombined to full width by the row-parallel out_proj all-reduce, reduce
+//  point ①). At TP=1 (Hloc==kHeads, Dloc==kD) every literal here equals the
+//  SingleGPU dectc_attn_fwd_tile EXACTLY — but this function is ONLY ever
+//  instantiated under `if constexpr (Par::kTPComm)`, so the default path keeps
+//  calling the byte-identical dectc_attn_fwd_tile above. attn_w is indexed with
+//  Hloc heads (self-consistent fwd-write / bwd-read).
+//
+//  Hloc/Dloc are passed in (the caller derives them from dec::kHeads/Par::kTP);
+//  if kHeads%P != 0 the caller passes Hloc==0 ⇒ this loop is a NO-OP (the ColQKV
+//  per-head split is geometrically impossible for that {layout,P} — head-whole
+//  is the documented precondition, tp_layer.cuh:158-161). The {1,8} dispatch is
+//  the head-divisible allow-list.
+__device__ __forceinline__ void dectc_attn_fwd_tile_tp(
+        const __nv_bfloat16* __restrict__ qkv, int nrows,
+        float* __restrict__ ctx, float* __restrict__ attn_w,
+        int Hloc, int Dloc) {
+    const int nsamp = nrows / dec::kSeq;
+    const float scale = dec::attn_scale();
+    const int stride3 = 3 * Dloc;                          // local per-row qkv stride
+    const int rows_per = nsamp * Hloc * dec::kSeq;         // (sample,local-head,qpos)
+    for (int r = threadIdx.x; r < rows_per; r += blockDim.x) {
+        const int si = r / (Hloc * dec::kSeq);
+        const int rem = r % (Hloc * dec::kSeq);
+        const int hh = rem / dec::kSeq, qi = rem % dec::kSeq;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;        // first row of this sample
+        const __nv_bfloat16* qrow = qkv + (int64_t)(rbase + qi) * stride3 + qoff;
+        float maxs = -CUDART_INF_F; float sc[dec::kSeq];
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            if (kj > qi) { sc[kj] = -CUDART_INF_F; continue; }
+            const __nv_bfloat16* krow = qkv + (int64_t)(rbase + kj) * stride3 + Dloc + qoff;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < dec::kDhead; ++t)
+                dot += __bfloat162float(qrow[t]) * __bfloat162float(krow[t]);
+            sc[kj] = dot * scale; maxs = fmaxf(maxs, sc[kj]);
+        }
+        float denom = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            float e = (kj <= qi) ? __expf(sc[kj] - maxs) : 0.0f; sc[kj] = e; denom += e;
+        }
+        float invd = 1.0f / denom;
+        float* aw = attn_w + ((int64_t)(si * Hloc + hh) * dec::kSeq + qi) * dec::kSeq;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) aw[kj] = sc[kj] * invd;
+        #pragma unroll
+        for (int t = 0; t < dec::kDhead; ++t) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int kj = 0; kj <= qi; ++kj) {
+                float vv = __bfloat162float(qkv[(int64_t)(rbase + kj) * stride3 + 2 * Dloc + qoff + t]);
+                acc += aw[kj] * vv;
+            }
+            ctx[(int64_t)(rbase + qi) * Dloc + qoff + t] = acc;
+        }
+    }
+    __syncthreads();
+}
+
 // Global SAMPLE index of the si-th sample in a tile whose first token row is g0.
 __device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq + si; }
 
@@ -1755,6 +1824,96 @@ __device__ __forceinline__ void dectc_attn_bwd_tile(
     __syncthreads();
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  TP HEAD-LOCALIZED attention BACKWARD (mirror of dectc_attn_bwd_tile over the
+//  rank's LOCAL head shard, tp_kernel.md §6/§12 NOTE). IDENTICAL 3-pass math
+//  (A: dv, B: dscores, C: dq/dk), but over Hloc = kHeads/P heads with local
+//  per-row qkv stride 3*Dloc and q|k|v blocks at 0 / Dloc / 2*Dloc. `dctx` is
+//  the rank's own [nrows, Dloc] context grad (the row-parallel out_proj dX is
+//  comm-free local, tp_layer.cuh:51) and `dqkv_out` is the rank's own
+//  [nrows, 3*Dloc] (fed to the column-parallel in_proj dX reduce ①'). attn_w/dsc
+//  index with Hloc heads (matches the fwd-side dectc_attn_fwd_tile_tp). At TP=1
+//  (Hloc==kHeads, Dloc==kD) every literal equals dectc_attn_bwd_tile EXACTLY;
+//  this function is ONLY instantiated under `if constexpr (Par::kTPComm)`. If
+//  kHeads%P != 0 the caller passes Hloc==0 ⇒ all three passes are NO-OPs.
+__device__ __forceinline__ void dectc_attn_bwd_tile_tp(
+        const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ attn_w,
+        const float* __restrict__ dctx, int nrows,
+        float* __restrict__ dqkv_out, float* __restrict__ dsc,
+        int Hloc, int Dloc) {
+    const int nsamp = nrows / dec::kSeq;
+    const float scale = dec::attn_scale();
+    const int stride3 = 3 * Dloc;                          // local per-row qkv stride
+    // A: dv[kj] = Σ_{qi>=kj} attn[qi,kj] * dctx[qi].  Owner: (sample,kj,local-head,t).
+    for (int r = threadIdx.x; r < nsamp * dec::kSeq * Hloc * dec::kDhead; r += blockDim.x) {
+        const int si  = r / (dec::kSeq * Hloc * dec::kDhead);
+        int rem = r % (dec::kSeq * Hloc * dec::kDhead);
+        const int kj  = rem / (Hloc * dec::kDhead);
+        rem = rem % (Hloc * dec::kDhead);
+        const int hh  = rem / dec::kDhead, t = rem % dec::kDhead;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* aw = attn_w + ((int64_t)(si * Hloc + hh) * dec::kSeq) * dec::kSeq;  // [S,S]
+        float acc = 0.0f;
+        #pragma unroll
+        for (int qi = kj; qi < dec::kSeq; ++qi)
+            acc += aw[qi * dec::kSeq + kj] * dctx[(int64_t)(rbase + qi) * Dloc + qoff + t];
+        dqkv_out[(int64_t)(rbase + kj) * stride3 + 2 * Dloc + qoff + t] = acc;   // dv block
+    }
+    __syncthreads();
+    // B: dscores ds[qi,kj] = attn*(datt - Σ_k datt*attn)*scale, masked kj>qi → 0.
+    //    datt[kj] = Σ_t dctx[qi,qoff+t]*v[kj,qoff+t]. Owner: (sample,local-head,qi).
+    for (int r = threadIdx.x; r < nsamp * Hloc * dec::kSeq; r += blockDim.x) {
+        const int si = r / (Hloc * dec::kSeq);
+        int rem = r % (Hloc * dec::kSeq);
+        const int hh = rem / dec::kSeq, qi = rem % dec::kSeq;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* aw = attn_w + ((int64_t)(si * Hloc + hh) * dec::kSeq) * dec::kSeq;
+        float datt[dec::kSeq];
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            if (kj > qi) { datt[kj] = 0.0f; continue; }
+            float acc = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < dec::kDhead; ++t)
+                acc += dctx[(int64_t)(rbase + qi) * Dloc + qoff + t]
+                     * __bfloat162float(qkv[(int64_t)(rbase + kj) * stride3 + 2 * Dloc + qoff + t]);
+            datt[kj] = acc;
+        }
+        float dot = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj <= qi; ++kj) dot += datt[kj] * aw[qi * dec::kSeq + kj];
+        float* ds = dsc + ((int64_t)(si * Hloc + hh) * dec::kSeq + qi) * dec::kSeq;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            float a = aw[qi * dec::kSeq + kj];
+            ds[kj] = (kj <= qi) ? a * (datt[kj] - dot) * scale : 0.0f;
+        }
+    }
+    __syncthreads();
+    // C: dq[qi] = Σ_kj ds[qi,kj]*k[kj]; dk[kj] = Σ_qi ds[qi,kj]*q[qi]. Owner: (sample,pos,local-head,t).
+    for (int r = threadIdx.x; r < nsamp * dec::kSeq * Hloc * dec::kDhead; r += blockDim.x) {
+        const int si = r / (dec::kSeq * Hloc * dec::kDhead);
+        int rem = r % (dec::kSeq * Hloc * dec::kDhead);
+        const int pos = rem / (Hloc * dec::kDhead);
+        rem = rem % (Hloc * dec::kDhead);
+        const int hh = rem / dec::kDhead, t = rem % dec::kDhead;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* ds = dsc + ((int64_t)(si * Hloc + hh) * dec::kSeq) * dec::kSeq;  // [S,S]
+        float dq = 0.0f, dk = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            dq += ds[pos * dec::kSeq + kj] * __bfloat162float(qkv[(int64_t)(rbase + kj) * stride3 + Dloc + qoff + t]);
+            dk += ds[kj * dec::kSeq + pos] * __bfloat162float(qkv[(int64_t)(rbase + kj) * stride3 + qoff + t]);
+        }
+        dqkv_out[(int64_t)(rbase + pos) * stride3 + qoff + t] = dq;          // dq block
+        dqkv_out[(int64_t)(rbase + pos) * stride3 + Dloc + qoff + t] = dk;   // dk block
+    }
+    __syncthreads();
+}
+
 // ════════════════════════════════════════════════════════════════════════
 //  BACKWARD over one TOKEN TILE. Assumes dectc_forward_tile ran for THIS tile
 //  (scratch + DecActs X-inputs populated). Fork B: computes dX via wgmma and
@@ -1988,12 +2147,29 @@ __device__ float dectc_forward_tile_impl(
             sc.qkv[li][idx] = __float2bfloat16(v);
         }
         __syncthreads();
-        // attention → ctx (work fp32) + attn[li] weights.
-        dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
-        // ctx bf16 → X_ctx[li] (out_proj input + its dW operand).
-        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
-            const int r = idx / dec::kD, j = idx % dec::kD;
-            acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+        // attention → ctx (work fp32) + attn[li] weights. HEAD-LOCALIZED on the
+        // kTPComm path: the col-parallel qkv is the rank's [q|k|v]_own shard
+        // (stride 3*Dloc, Hloc=kHeads/P heads); ctx is the rank's own [nrows,Dloc]
+        // (recombined to full width by the row-parallel out_proj all-reduce ① below).
+        // tp_kernel.md §6/§12 head-localization NOTE. SingleGPU path uses the
+        // byte-identical dectc_attn_fwd_tile above (this branch folds away there).
+        const int Dloc  = Par::kTPComm ? (dec::kD / Par::kTP) : dec::kD;          // local q/k/v block width
+        const int Hloc  = Par::kTPComm ? (dec::kHeads / Par::kTP) : dec::kHeads;  // local whole heads (0 if kHeads%P!=0)
+        if constexpr (!Par::kTPComm) {
+            dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+            // ctx bf16 → X_ctx[li] (out_proj input + its dW operand). Full width.
+            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+                const int r = idx / dec::kD, j = idx % dec::kD;
+                acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+            }
+        } else {
+            dectc_attn_fwd_tile_tp(sc.qkv[li], nrows, sc.work, sc.attn[li], Hloc, Dloc);
+            // ctx bf16 → X_ctx[li] at LOCAL width Dloc (== out_proj's Kloc input
+            // width; the row-parallel out_proj GEMM reads acts.X_ctx + g0*Dloc).
+            for (int idx = threadIdx.x; idx < nrows * Dloc; idx += blockDim.x) {
+                const int r = idx / Dloc, j = idx % Dloc;
+                acts.X_ctx[li][(int64_t)(g0 + r) * Dloc + j] = __float2bfloat16(sc.work[(int64_t)r * Dloc + j]);
+            }
         }
         __syncthreads();
         // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
@@ -2269,8 +2445,19 @@ __device__ void dectc_backward_tile_impl(
         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, wb.out_wT[li],
                                            sc.work, dctx_nin, dec::kD, sA, sB, pipeBars);  // dctx [nrows, d/P]
         __syncthreads();
-        // attention bwd (full-width on this path; head-local shard is the §6 8-GPU touch).
-        dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+        // attention bwd HEAD-LOCALIZED on the kTPComm path (tp_kernel.md §6/§12):
+        // dctx (sc.work) is the rank's own [nrows,Dloc] out_proj dX (dctx_nin==Dloc
+        // above), qkv is the [q|k|v]_own shard (stride 3*Dloc, Hloc heads), and the
+        // produced dqkv (work2) is the rank's own [nrows,3*Dloc] (==qkv_nout) fed to
+        // the column-parallel in_proj dX reduce ①' below. SingleGPU uses the
+        // byte-identical dectc_attn_bwd_tile (this branch folds away there).
+        if constexpr (!Par::kTPComm) {
+            dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+        } else {
+            const int Dloc = dec::kD / Par::kTP;          // local q/k/v block width
+            const int Hloc = dec::kHeads / Par::kTP;      // local whole heads (0 if kHeads%P!=0)
+            dectc_attn_bwd_tile_tp(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc, Hloc, Dloc);
+        }
         for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x)
             acts.dY_qkv[li][(int64_t)g0 * qkv_nout + idx] = __float2bfloat16(work2[idx]);
         __syncthreads();
