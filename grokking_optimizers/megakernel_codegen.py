@@ -860,6 +860,23 @@ _VIT_DFF = 4 * _VIT_D
 # mirrors the decoder's SG_DEC_BENCH_LAYOUT dual-branch (commit 79d3840).
 _VIT_BENCH_D = 2048
 
+# ── FLAGSHIP ViT tier (~1.5 B params, the decoder-twin Vision-Transformer) ───
+# SINGLE SOURCE OF TRUTH for these dims: grokking_race_v2.py
+# MODEL_SCALES_BY_MODEL['flagship']['vit'] = {dim_model:1664, num_heads:16,
+# num_layers:48}. Mirrored here as build-time constants (this generator imports
+# NO torch / grokking_race_v2 — it is a pure codegen tool with no runtime call
+# sites), exactly as _VIT_* mirror the tiny-tier eager model and _DEC_FLAGSHIP_*
+# mirror the flagship decoder. vocab/patch/npatch are the ViT's fixed tokenizer/
+# patch geometry (== _VIT_VOCAB / _VIT_PATCH / _VIT_NPATCH). HEADS is mirrored
+# EXPLICITLY (not via _vit_heads(d)=max(d//64,4), which would give 26 at d=1664):
+# the flagship model class uses 16 heads (head_dim=104). The flagship layout is
+# emitted into its OWN standalone header (vit_flagship_layout_header /
+# --vit-layout-flagship); it does NOT touch the committed d=128 production or
+# d=2048 bench layouts. At d=1664,L=48 the table is 584 tensors, total
+# 1,596,200,417 elems (every offset < INT32_MAX, so the int32 kVitOffsets/
+# kVitSizes tables are exact).
+_VIT_FLAGSHIP_D, _VIT_FLAGSHIP_HEADS, _VIT_FLAGSHIP_LAYERS = 1664, 16, 48
+
 
 def _vit_heads(d: int) -> int:
     """ViT attention head count for width `d`. The d/64 head-dim rule used by the
@@ -873,16 +890,21 @@ def _vit_heads(d: int) -> int:
     return max(d // 64, 4)
 
 
-def _vit_param_sizes(d: int = _VIT_D) -> List[int]:
+def _vit_param_sizes(d: int = _VIT_D, *, layers: int = _VIT_LAYERS,
+                     vocab: int = _VIT_VOCAB, patch: int = _VIT_PATCH,
+                     npatch: int = _VIT_NPATCH) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of vit_oracle.py
-    vit_param_layout()). 32 tensors; at d=128 total 418017. cls_token leads (leaf
-    before the patch_proj submodule). `d` is parametric so the d-scaled bench
-    layout (SG_VIT_BENCH_LAYOUT) reuses the SAME shape formula — every per-tensor
-    shape is a function of (d, dff=4d, vocab, patch, npatch), so a single d
-    controls the whole table."""
-    dff, v, patch, npatch = 4 * d, _VIT_VOCAB, _VIT_PATCH, _VIT_NPATCH
+    vit_param_layout()). At d=128,layers=2 there are 32 tensors, total 418017.
+    cls_token leads (leaf before the patch_proj submodule). Parametric in
+    (d, layers, vocab, patch, npatch) — every per-tensor shape is a function of
+    those (dff=4d), so the SAME formula drives the d-scaled bench layout
+    (SG_VIT_BENCH_LAYOUT, d=2048) AND the flagship layout (d=1664, layers=48).
+    Layer-count L emits 4 + 12*L + 4 tensors (cls/patch.w/patch.b/pos lead, 12
+    per layer, norm+out tail). Defaults == the historical (d=128, L=2) constants →
+    callers that pass only `d` are byte-identical."""
+    dff, v = 4 * d, vocab
     sizes = [1 * 1 * d, d * patch, d, (npatch + 1) * d]   # cls, patch.w/b, pos
-    for _ in range(_VIT_LAYERS):
+    for _ in range(layers):
         sizes += [
             3 * d * d, 3 * d,                     # attn.in_proj_weight/bias
             d * d, d,                             # attn.out_proj.weight/bias
@@ -894,30 +916,37 @@ def _vit_param_sizes(d: int = _VIT_D) -> List[int]:
     return sizes
 
 
-def _vit_layout_body(d: int) -> str:
+def _vit_layout_body(d: int, *, layers: int = _VIT_LAYERS,
+                     vocab: int = _VIT_VOCAB, patch: int = _VIT_PATCH,
+                     npatch: int = _VIT_NPATCH, heads: int | None = None) -> str:
     """The constants + __constant__ tables + compile-time cross-check + dynamic-smem
-    budget for ONE ViT width `d`. Emitted into ONE of the SG_VIT_BENCH_LAYOUT
-    branches; the branches are mutually exclusive at preprocess time, so reusing the
-    SAME symbol names (kVitOffsets/kVitSizes/vit_layout_check) across both is safe.
+    budget for ONE ViT config (d, layers, vocab, patch, npatch, heads). Emitted into
+    ONE of the SG_VIT_BENCH_LAYOUT branches (or the standalone flagship header); the
+    branches are mutually exclusive at preprocess time, so reusing the SAME symbol
+    names (kVitOffsets/kVitSizes/vit_layout_check) across them is safe. Defaults ==
+    the historical (vocab=97, layers=2, patch=49, npatch=16) constants, and heads
+    defaults to the _vit_heads(d) rule → callers that pass only `d` are byte-identical.
+    Pass `heads=` to override the rule (the flagship uses 16, not the rule's d//64=26).
 
     The smem-budget block mirrors sizeof(VitSampleSmem) (model_stage_vit.cuh)
     field-by-field; every field is a function of (seq, d, dff=4d, heads, npatch,
     patch, vocab) so a single d (+ its head count) scales it. The `< 227 KB`
     per-block dynamic-smem cap assert guards the SCALAR ViT megakernel (the only
-    consumer of VitSampleSmem). It is emitted ONLY in the production branch: the
-    bench branch compiles with the scalar megakernel gated OFF
-    (SG_VIT_SCALAR_MEGAKERNEL=0, mirroring the decoder's SG_DEC_SCALAR_MEGAKERNEL),
-    so the cap does not apply — the TC engine that the bench drives uses a small,
+    consumer of VitSampleSmem). It is emitted ONLY in the production (d==_VIT_D)
+    branch: the bench AND flagship widths compile with the scalar megakernel gated
+    OFF (SG_VIT_SCALAR_MEGAKERNEL=0, mirroring the decoder's SG_DEC_SCALAR_MEGAKERNEL),
+    so the cap does not apply — the TC engine that they drive uses a small,
     d-independent static VitTcSmem, not VitSampleSmem."""
-    sizes = _vit_param_sizes(d)
+    sizes = _vit_param_sizes(d, layers=layers, vocab=vocab, patch=patch, npatch=npatch)
     offsets, acc = [], 0
     for n in sizes:
         offsets.append(acc)
         acc += n
     total = acc
     n_tensors = len(sizes)
-    heads, dff, seq = _vit_heads(d), 4 * d, _VIT_NPATCH + 1
-    npatch, patch, vocab = _VIT_NPATCH, _VIT_PATCH, _VIT_VOCAB
+    if heads is None:
+        heads = _vit_heads(d)
+    dff, seq = 4 * d, npatch + 1
     # sizeof(VitSampleSmem) in floats, field-by-field (mirrors model_stage_vit.cuh).
     smem_floats = (npatch * patch + 2 * seq * d + seq * d + seq * 3 * d
                    + seq * d + seq * d + seq * dff + seq * dff + heads * seq * seq
@@ -1013,12 +1042,12 @@ constexpr int kVitSampleSmemFloats =
 constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
 static_assert(kVitSampleSmemBytes == {smem_bytes},
               "vit_layout: VitSampleSmem byte budget drifted from {smem_bytes}.");"""
-    return f"""constexpr int SG_VIT_VOCAB  = {_VIT_VOCAB};          // p (head Linear(d, p))
+    return f"""constexpr int SG_VIT_VOCAB  = {vocab};          // p (head Linear(d, p))
 constexpr int SG_VIT_D      = {d};
 constexpr int SG_VIT_HEADS  = {heads};
-constexpr int SG_VIT_LAYERS = {_VIT_LAYERS};
-constexpr int SG_VIT_PATCH  = {_VIT_PATCH};          // patch pixel count (7×7)
-constexpr int SG_VIT_NPATCH = {_VIT_NPATCH};          // image patches
+constexpr int SG_VIT_LAYERS = {layers};
+constexpr int SG_VIT_PATCH  = {patch};          // patch pixel count (7×7)
+constexpr int SG_VIT_NPATCH = {npatch};          // image patches
 constexpr int SG_VIT_SEQ    = SG_VIT_NPATCH + 1;  // {seq} (CLS + {npatch} patches)
 constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // {dff}
 
@@ -1162,6 +1191,65 @@ namespace sg {{ namespace fused {{ namespace sm90 {{
 }}}}}} // namespace sg::fused::sm90
 
 #endif  // SG_FUSED_SM90_VIT_LAYOUT_CUH_
+"""
+
+
+def vit_flagship_layout_header() -> str:
+    """Emit a STANDALONE FLAGSHIP ViT weight-layout header (the decoder-twin
+    Vision-Transformer, d=1664, layers=48, heads=16, vocab=97, patch=49, npatch=16 —
+    ~1.5 B params, 584 tensors, total 1,596,200,417 elems). Separate include guard
+    (SG_FUSED_SM90_VIT_FLAGSHIP_LAYOUT_CUH_) and a SINGLE config (no
+    SG_VIT_BENCH_LAYOUT #if branch): a TU that wants the flagship layout includes
+    THIS header instead of vit_layout.cuh. Symbol names are IDENTICAL
+    (kVitOffsets/kVitSizes/kVitNumTensors/kVitTotalElems/SG_VIT_* /
+    kVitMaxTensorNumel, namespace sg::fused::sm90), so the SAME kernel template binds
+    against it unchanged. The body takes the SCALED smem block (d≠_VIT_D ⇒ the `else`
+    branch: no `< 227 KB` cap assert) — the flagship VitSampleSmem (≈2.25 MB) cannot
+    host the SCALAR megakernel (gated OFF, SG_VIT_SCALAR_MEGAKERNEL=0); the TC engine
+    the flagship drives uses the small d-independent static VitTcSmem.
+
+    SOURCE OF TRUTH for the dims: grokking_race_v2.py
+    MODEL_SCALES_BY_MODEL['flagship']['vit'] (mirrored in _VIT_FLAGSHIP_*).
+    Generated by: python -m grokking_optimizers.megakernel_codegen
+    --vit-layout-flagship > csrc/fused/sm_90/vit_flagship_layout.cuh"""
+    body = _vit_layout_body(
+        _VIT_FLAGSHIP_D, layers=_VIT_FLAGSHIP_LAYERS, vocab=_VIT_VOCAB,
+        patch=_VIT_PATCH, npatch=_VIT_NPATCH, heads=_VIT_FLAGSHIP_HEADS)
+    return f"""#ifndef SG_FUSED_SM90_VIT_FLAGSHIP_LAYOUT_CUH_
+#define SG_FUSED_SM90_VIT_FLAGSHIP_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/vit_flagship_layout.cuh — GENERATED weight-layout mirror for
+// the FLAGSHIP L3-REAL Vision-Transformer megakernel (~1.5 B params).
+//
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --vit-layout-flagship > csrc/fused/sm_90/vit_flagship_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _vit_param_sizes() (parameterized by (d, layers, vocab, patch, npatch)); the
+// flagship dims (d={_VIT_FLAGSHIP_D}, layers={_VIT_FLAGSHIP_LAYERS}, heads={_VIT_FLAGSHIP_HEADS})
+// mirror grokking_race_v2.py MODEL_SCALES_BY_MODEL['flagship']['vit']. The flat
+// blob is torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the
+// kernel addresses tensor i at params + kVitOffsets[i] for kVitSizes[i] elems.
+//
+// A count/total mismatch fails the BUILD loudly (a static_assert below).
+//
+// This is a STANDALONE single-config header (NO SG_VIT_BENCH_LAYOUT #if branch):
+// a TU that wants the flagship layout includes THIS file instead of vit_layout.cuh.
+// Symbol names are byte-identical to vit_layout.cuh
+// (kVitOffsets/kVitSizes/kVitNumTensors/kVitTotalElems/SG_VIT_*), so the SAME
+// kernel template binds against it unchanged. The committed d=128 production /
+// d=2048 bench header vit_layout.cuh is NOT affected.
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+// ── FLAGSHIP (d={_VIT_FLAGSHIP_D}, layers={_VIT_FLAGSHIP_LAYERS}): the decoder-twin ViT, ~1.5 B params. ──
+{body}
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_VIT_FLAGSHIP_LAYOUT_CUH_
 """
 
 
@@ -1587,6 +1675,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--vit-layout", action="store_true",
                     help="emit the PHASE-2 L3-REAL ViT weight-layout header "
                          "(csrc/fused/sm_90/vit_layout.cuh)")
+    ap.add_argument("--vit-layout-flagship", action="store_true",
+                    help="emit the FLAGSHIP (d=1664, layers=48) L3-REAL ViT "
+                         "weight-layout header "
+                         "(csrc/fused/sm_90/vit_flagship_layout.cuh)")
     ap.add_argument("--mamba-layout", action="store_true",
                     help="emit the PHASE-2 L3-REAL Mamba weight-layout header "
                          "(csrc/fused/sm_90/mamba3_layout.cuh)")
@@ -1634,6 +1726,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.vit_layout:
         sys.stdout.write(vit_layout_header())
+        return 0
+
+    if args.vit_layout_flagship:
+        sys.stdout.write(vit_flagship_layout_header())
         return 0
 
     if args.mamba_layout:

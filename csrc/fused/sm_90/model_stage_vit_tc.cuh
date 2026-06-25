@@ -186,26 +186,45 @@ static_assert(kVitMaxIL >= 1 && kVitMaxIL <= 4,
 //    tail. The kernel's Muon P2.7 loops THIS table running the grid-cooperative NS
 //    per matrix; P3 routes tensor t to the NS apply iff it is in the table, else the
 //    AdamW tail. Indices MUST match vit_layout / named_parameters() order. ──
-constexpr int kVitNumMuon2D = 11;
+// kVitNumMuon2D = patch_proj + pos + 4 weights/layer (in_proj,out_proj,ff0,ff2)
+//   + head.out = 2 + 4*L + 1  (= 11 at L=2). The table is now a FORMULA
+// (vit_muon_2d) — a __device__ __constant__ array can't be loop-filled to 195
+// entries at L=48.
+constexpr int kVitNumMuon2D = 2 + 4 * vit::kLayers + 1;
 struct VitMuon2D { int tidx; int rows; int cols; };
-__device__ __constant__ VitMuon2D kVitMuon2D[kVitNumMuon2D] = {
-    { 1, vit::kD,      vit::kPatch },   // patch_proj.weight  [128,49]
-    { 3, vit::kSeq,    vit::kD     },   // pos.weight         [17,128]
-    { 4, 3*vit::kD,    vit::kD     },   // L0 in_proj_weight  [384,128]
-    { 6, vit::kD,      vit::kD     },   // L0 out_proj.weight [128,128]
-    {12, vit::kDff,    vit::kD     },   // L0 ff.0.weight     [512,128]
-    {14, vit::kD,      vit::kDff   },   // L0 ff.2.weight     [128,512]
-    {16, 3*vit::kD,    vit::kD     },   // L1 in_proj_weight  [384,128]
-    {18, vit::kD,      vit::kD     },   // L1 out_proj.weight [128,128]
-    {24, vit::kDff,    vit::kD     },   // L1 ff.0.weight     [512,128]
-    {26, vit::kD,      vit::kDff   },   // L1 ff.2.weight     [128,512]
-    {30, vit::kVocab,  vit::kD     },   // out.weight         [97,128]
-};
-// Is tensor index `t` one of the Muon 2D matrices (orthogonalized in P2.7)? P3 uses
-// this to route ONLY the 1D / non-2D weights to the AdamW tail for Muon.
+// The mi-th Muon 2D matrix (tensor index + rows/cols), L-general. Dense order:
+//   mi=0 patch_proj.weight tidx 1  [d, patch];
+//   mi=1 pos.weight        tidx 3  [seq, d];
+//   mi∈[2,2+4L): li=(mi-2)/4, kind=(mi-2)%4, base=4+12*li →
+//     kind0 in_proj  tidx base+0 [3d,d]
+//     kind1 out_proj tidx base+2 [d, d]
+//     kind2 ff0      tidx base+8 [dff,d]
+//     kind3 ff2      tidx base+10 [d, dff]
+//   mi=2+4L head out.weight tidx 4+12*L+2 [V,d].
+// At L=2 reproduces the old kVitMuon2D[11] EXACTLY (tidx {1,3,4,6,12,14,16,18,24,26,30}).
+__host__ __device__ __forceinline__ VitMuon2D vit_muon_2d(int mi) {
+    if (mi == 0)                     return { 1, vit::kD,    vit::kPatch }; // patch_proj
+    if (mi == 1)                     return { 3, vit::kSeq,  vit::kD     }; // pos
+    if (mi == 2 + 4 * vit::kLayers)  return { 4 + 12 * vit::kLayers + 2, vit::kVocab, vit::kD }; // head.out
+    const int li   = (mi - 2) / 4;
+    const int kind = (mi - 2) % 4;
+    const int base = 4 + 12 * li;
+    if (kind == 0) return { base + 0,  3 * vit::kD, vit::kD   };  // in_proj
+    if (kind == 1) return { base + 2,  vit::kD,     vit::kD   };  // out_proj
+    if (kind == 2) return { base + 8,  vit::kDff,   vit::kD   };  // ff0
+    return            { base + 10, vit::kD,     vit::kDff };      // ff2
+}
+// Is tensor index `t` a Muon 2D matrix (orthogonalized in P2.7)? P3 routes only
+// the 1D / non-2D weights to the AdamW tail. Closed-form (no table scan):
+//   t∈{1,3} (patch_proj/pos), OR t==head.out (4+12L+2), OR a per-layer 2D weight
+//   (t∈[4,4+12L) and (t-4)%12 ∈ {0,2,8,10} = in_w/out_w/ff0_w/ff2_w).
 __device__ __forceinline__ bool vit_is_muon_2d(int t) {
-    #pragma unroll
-    for (int mi = 0; mi < kVitNumMuon2D; ++mi) if (kVitMuon2D[mi].tidx == t) return true;
+    if (t == 1 || t == 3) return true;
+    if (t == 4 + 12 * vit::kLayers + 2) return true;       // head out.weight
+    if (t >= 4 && t < 4 + 12 * vit::kLayers) {
+        const int r = (t - 4) % 12;
+        return (r == 0 || r == 2 || r == 8 || r == 10);
+    }
     return false;
 }
 
@@ -252,19 +271,25 @@ constexpr int kVitP1MaxAtomsM = (kVitP1SubtileRows + wgs::kWgmmaAtomM - 1) / wgs
 constexpr int kVitTcSmemA1 = wgs::kWgmmaAtomM * wgs::kWgmmaAtomK;   // 64*16 bf16
 constexpr int kVitAtomsPerSlot = kVitMaxIL;                        // A-tiles the arena holds
 
-// ── LN vector-grad partials layout (the 10 tile-local γ/β grads). Order MUST
-//    match the vit_layout tensor indices of {n1.w, n1.b, n2.w, n2.b}×L plus
-//    {norm.w, norm.b}. We store them densely [10 × kD] per CTA; the P2 reduce
-//    maps them back by tensor index. (vit_layout order: per-layer block starts
-//    at 4 + li*12, with n1.w/b at +4/+5, n2.w/b at +6/+7; norm.w/b at 28/29.) ─
-constexpr int kNumLnVec = 10;                  // n1_w,n1_b,n2_w,n2_b ×L + norm_w,norm_b
-constexpr int kLnVecElems = kNumLnVec * vit::kD;   // 10 * 128 = 1280
-// The vit_layout tensor index of each LN-vector slot, in our dense order.
-__device__ __constant__ int kLnVecTensorIdx[kNumLnVec] = {
-    8, 9, 10, 11,      // L0 n1.w, n1.b, n2.w, n2.b  (4 + 0*12 + {4,5,6,7})
-    20, 21, 22, 23,    // L1 n1.w, n1.b, n2.w, n2.b  (4 + 1*12 + {4,5,6,7})
-    28, 29             // norm.w, norm.b
-};
+// ── LN vector-grad partials layout (the tile-local γ/β grads). Dense order:
+//    4 slots/layer (n1.w,n1.b,n2.w,n2.b) for li∈[0,L), then norm.w,norm.b. At L=2
+//    this is {8,9,10,11,20,21,22,23,28,29} (the original 10-slot table). We store
+//    them densely [kNumLnVec × kD] per CTA; the P2 reduce maps them back by tensor
+//    index via vit_lnvec_tensor_idx (a formula — a __constant__ array can't be
+//    filled by a loop at L=48). L-GENERAL: kNumLnVec = 4*L+2. (vit_layout order:
+//    per-layer block starts at 4 + li*12, with n1.w/b at +4/+5, n2.w/b at +6/+7;
+//    norm.w/b at 4+12L / 4+12L+1.) ─
+constexpr int kNumLnVec = 4 * vit::kLayers + 2;    // n1_w,n1_b,n2_w,n2_b ×L + norm_w,norm_b
+constexpr int kLnVecElems = kNumLnVec * vit::kD;   // (4*L+2)*kD  (1280 at L=2)
+// vit_layout tensor index of LN-vector dense slot v. v∈[0,4L): li=v/4, kind=v%4 →
+// 8+12*li+kind (n1.w/b,n2.w/b are tensors 4..7 of each 12-tensor layer block, base
+// 4+12*li); v=4L → norm.w (4+12*L); v=4L+1 → norm.b (4+12*L+1). At L=2 reproduces
+// the old kLnVecTensorIdx[10] EXACTLY ({8,9,10,11,20,21,22,23,28,29}).
+__host__ __device__ __forceinline__ int vit_lnvec_tensor_idx(int v) {
+    const int Lx4 = 4 * vit::kLayers;
+    if (v < Lx4) return 8 + 12 * (v / 4) + (v % 4);
+    return 4 + 12 * vit::kLayers + (v - Lx4);     // 4+12L (norm.w), 4+12L+1 (norm.b)
+}
 
 // ════════════════════════════════════════════════════════════════════════
 //  HBM bf16 ACTS buffer (Fork B). Carved from the FRONT of the workspace the
@@ -1124,8 +1149,8 @@ __device__ void vittc_backward_tile(
         gn_n2w[li] = lnvec + (int64_t)(li * 4 + 2) * vit::kD;
         gn_n2b[li] = lnvec + (int64_t)(li * 4 + 3) * vit::kD;
     }
-    float* gn_normw = lnvec + (int64_t)8 * vit::kD;
-    float* gn_normb = lnvec + (int64_t)9 * vit::kD;
+    float* gn_normw = lnvec + (int64_t)(4 * vit::kLayers + 0) * vit::kD;  // 8*kD at L=2
+    float* gn_normb = lnvec + (int64_t)(4 * vit::kLayers + 1) * vit::kD;  // 9*kD at L=2
 
     // ── CE bwd (per sample): dlogits = (softmax - onehot)/B → dY_logits (bf16);
     //    head dX → dhn; final-norm bwd → dh on the CLS row (pos 0), zero others. ──
@@ -1278,21 +1303,29 @@ struct VitDwSpec {
     int kind;                  // 0=transformer (dY/X both token rows), 1=patch_proj
 };
 
-// Build the 10 specs (called by all CTAs; cheap). T = B*kSeq; Tp = B*kNPatch.
+// Number of dW specs: 1 patch_proj + 4 per layer (in_proj,out_proj,ff0,ff2) + 1
+//   head.out = 2 + 4*L  (= 10 at L=2, the original spec[10]; = 194 at flagship L=48).
+// This is the compile-time bound for EVERY VitDwSpec array (the VitTcSmem member,
+// every spec[] signature/local, the dW phase loops). At L=2 it is exactly 10 → the
+// spec arrays + their smem footprint are byte-identical.
+constexpr int kVitNumDwSpecs = 2 + 4 * vit::kLayers;
+
+// Build the dW specs (called by all CTAs; cheap). T = B*kSeq; Tp = B*kNPatch.
+// kVitNumDwSpecs = 2 + 4*L (patch + 4/layer + head); 10 at L=2.
 __device__ __forceinline__ void vittc_build_dw_specs(
-        const VitActs& acts, int B, int T, int Tp, VitDwSpec spec[10]) {
+        const VitActs& acts, int B, int T, int Tp, VitDwSpec spec[kVitNumDwSpecs]) {
     // vit_layout weight tensor indices (and bias idx). Per-layer block base = 4 + li*12:
     //   in_w = base+0 (in_b base+1), out_w base+2 (out_b base+3),
     //   ff0_w base+8 (ff0_b base+9), ff2_w base+10 (ff2_b base+11).
-    //   patch_proj.weight=1 (bias=2); head out.weight=30 (out.bias=31).
-    // spec[0] = patch_proj; spec[1..8] = transformer (li,kind); spec[9] = head.
+    //   patch_proj.weight=1 (bias=2); head out.weight = 4+12*L+2 (out.bias +1; 30/31 at L=2).
+    // spec[0] = patch_proj; spec[1..4L] = transformer (li,kind); spec[1+4L] = head.
     {
         VitDwSpec& sp = spec[0];
         sp.dY = nullptr; sp.X = acts.X_patch; sp.Nout = vit::kD; sp.Kin = vit::kPatch;
         sp.K = Tp; sp.Kpad = vit::kPatch;  // K (contraction over patch rows) IS Tp; Kin padding handled in run_tile
         sp.grad_off = kVitOffsets[1]; sp.bias_off = kVitOffsets[2]; sp.kind = 1;
     }
-    for (int s = 0; s < 8; ++s) {
+    for (int s = 0; s < 4 * vit::kLayers; ++s) {
         const int li = s / 4, kk = s % 4;
         const int base = 4 + li * 12;
         VitDwSpec& sp = spec[1 + s];
@@ -1302,9 +1335,10 @@ __device__ __forceinline__ void vittc_build_dw_specs(
         else if (kk == 2) { sp.dY = acts.dY_ff0[li]; sp.X = acts.X_x1[li];  sp.Nout = vit::kDff;   sp.Kin = vit::kD;   sp.grad_off = kVitOffsets[base + 8]; sp.bias_off = kVitOffsets[base + 9]; }
         else              { sp.dY = acts.dY_ff2[li]; sp.X = acts.X_gact[li];sp.Nout = vit::kD;     sp.Kin = vit::kDff; sp.grad_off = kVitOffsets[base + 10]; sp.bias_off = kVitOffsets[base + 11]; }
     }
-    VitDwSpec& hd = spec[9];
+    VitDwSpec& hd = spec[1 + 4 * vit::kLayers];   // head spec (was spec[9] at L=2)
     hd.dY = acts.dY_logits; hd.X = acts.X_hn; hd.Nout = vit::kVocab; hd.Kin = vit::kD; hd.K = B; hd.kind = 0; hd.Kpad = 0;
-    hd.grad_off = kVitOffsets[30]; hd.bias_off = kVitOffsets[31];
+    hd.grad_off = kVitOffsets[4 + 12 * vit::kLayers + 2];   // out.weight (30 at L=2)
+    hd.bias_off = kVitOffsets[4 + 12 * vit::kLayers + 3];   // out.bias   (31 at L=2)
 }
 
 // Total number of 64×N dW output tiles across the 10 weights (for the tile loop).
@@ -1329,9 +1363,9 @@ __device__ __host__ __forceinline__ int vit_dw_groups(int Nout) {
 // Total number of dW output WORK ITEMS (M-atom groups × N-tiles) across the 10
 // weights. The N-tiling is over Kin (the in-dim), padded so the GEMM N covers it.
 template <int N>
-__device__ __forceinline__ int vittc_dw_total_tiles(const VitDwSpec spec[10]) {
+__device__ __forceinline__ int vittc_dw_total_tiles(const VitDwSpec spec[kVitNumDwSpecs]) {
     int n = 0;
-    for (int s = 0; s < 10; ++s)
+    for (int s = 0; s < kVitNumDwSpecs; ++s)
         n += vit_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
     return n;
 }
@@ -1349,10 +1383,10 @@ __device__ __forceinline__ int vittc_dw_total_tiles(const VitDwSpec spec[10]) {
 // ragged final group), so multi-atom groups need no per-atom shimming here.
 template <int N>
 __device__ __forceinline__ void vittc_dw_run_tile(
-        const VitDwSpec spec[10], int gt, const __nv_bfloat16* __restrict__ dh0,
+        const VitDwSpec spec[kVitNumDwSpecs], int gt, const __nv_bfloat16* __restrict__ dh0,
         float* __restrict__ grad, __nv_bfloat16* sA, __nv_bfloat16* sB) {
     int acc = 0, s = 0, m_group = 0, n_tile = 0;
-    for (s = 0; s < 10; ++s) {
+    for (s = 0; s < kVitNumDwSpecs; ++s) {
         const int ng = vit_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
         if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
@@ -1457,15 +1491,15 @@ __host__ __device__ __forceinline__ int64_t vit_dw_part_floats(int G) {
 // indexes M-atom GROUPS of kVitDwIL (group's first atom = m_group·kVitDwIL).
 template <int N>
 __device__ __forceinline__ void vittc_dw_decode(
-        const VitDwSpec spec[10], int gt, int& s, int& m_group, int& n_tile) {
+        const VitDwSpec spec[kVitNumDwSpecs], int gt, int& s, int& m_group, int& n_tile) {
     int acc = 0;
-    for (s = 0; s < 10; ++s) {
+    for (s = 0; s < kVitNumDwSpecs; ++s) {
         const int ng = vit_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
         if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; return; }
         acc += ng * nt;
     }
-    s = 9; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+    s = 1 + 4 * vit::kLayers; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined (head idx)
 }
 
 // PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. FLOOR-BALANCED
@@ -1478,7 +1512,7 @@ __device__ __forceinline__ void vittc_dw_decode(
 // chunk → true partial; writes the full 64×N tile (LOCAL rows) to the slot.
 template <int N>
 __device__ __forceinline__ void vittc_dw_run_tile_splitk(
-        const VitDwSpec spec[10], int gt, int kc, int G,
+        const VitDwSpec spec[kVitNumDwSpecs], int gt, int kc, int G,
         const __nv_bfloat16* __restrict__ dh0,
         float* __restrict__ dw_part, __nv_bfloat16* sA, __nv_bfloat16* sB) {
     int s, m_group, n_tile;
@@ -1552,7 +1586,7 @@ __device__ __forceinline__ void vittc_dw_run_tile_splitk(
 // group's kVitDwIL·64 group-local rows (row); mbase is the group's first global row.
 template <int N>
 __device__ __forceinline__ void vittc_dw_reduce_splitk(
-        const VitDwSpec spec[10], int n_dw, int G, const float* __restrict__ dw_part,
+        const VitDwSpec spec[kVitNumDwSpecs], int n_dw, int G, const float* __restrict__ dw_part,
         float* __restrict__ grad, int cta, int nCTA) {
     for (int gt = cta; gt < n_dw; gt += nCTA) {
         int s, m_group, n_tile;
@@ -1590,13 +1624,13 @@ __device__ __forceinline__ void vittc_dw_reduce_splitk(
 //       the 32 lane-partials. 32× parallelism per column. The lane reads dY[k*Nout+o]
 //       at fixed o with k = lane, lane+32, … (stride 32·Nout); writes by lane 0 only.
 __device__ __forceinline__ void vittc_dw_biases(
-        const VitDwSpec spec[10], const __nv_bfloat16* __restrict__ dh0,
+        const VitDwSpec spec[kVitNumDwSpecs], const __nv_bfloat16* __restrict__ dh0,
         float* __restrict__ grad, int cta, int nCTA) {
     const int warp = threadIdx.x >> 5;            // 0..(blockDim/32 - 1)
     const int lane = threadIdx.x & 31;
     const int nwarps = blockDim.x >> 5;
     int gcol_base = 0;
-    for (int s = 0; s < 10; ++s) {
+    for (int s = 0; s < kVitNumDwSpecs; ++s) {
         const VitDwSpec& sp = spec[s];
         const int Nout = sp.Nout;
         const bool patch = (sp.kind == 1);
@@ -1686,7 +1720,7 @@ __device__ __forceinline__ void vittc_lnvec_reduce(
         const float* __restrict__ lnvec_base, float* __restrict__ grad,
         int nCTA, int cta) {
     for (int v = cta; v < kNumLnVec; v += nCTA) {
-        const int goff = kLnVecTensorIdx[v];
+        const int goff = vit_lnvec_tensor_idx(v);   // was kLnVecTensorIdx[v]
         const int64_t gbase = kVitOffsets[goff];
         for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
             float accv = 0.0f;

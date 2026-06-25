@@ -377,7 +377,7 @@ struct VitTcSmem {
     __nv_bfloat16 sA[vittc::kVitAtomsPerSlot * 64 * 16];
     __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
     float red[256];
-    vittc::VitDwSpec spec[10];
+    vittc::VitDwSpec spec[vittc::kVitNumDwSpecs];
 };
 
 // ── TC workspace layout (carved from in.workspace; the host sizes it). Regions
@@ -920,7 +920,7 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     }
 
     // ── P2.7 (Muon ONLY): grid-cooperative Newton-Schulz orthogonalization of the
-    //    2D weights (INTEGRATION-OPTSTAGES §3). For EACH 2D matrix (kVitMuon2D) all
+    //    2D weights (INTEGRATION-OPTSTAGES §3). For EACH 2D matrix (vit_muon_2d) all
     //    CTAs cooperate: buf=μ·buf+g (buf is the PERSISTENT m-slice — momentum state,
     //    NOT transient), ‖buf‖_F via per-CTA partials → inv_norm, X=buf·inv_norm,
     //    then ns_steps × { A=XXᵀ → AX=A·X → AAX=A·AX → orth=a·X+b·AX+c·AAX, swap },
@@ -943,7 +943,7 @@ fused_vit_megakernel_tc(PersistentContext ctx,
         const float momentum = st.beta1;          // Muon momentum (eager Muon: betas[0])
         const int   ns_steps = 5;                 // bindings.cpp default
         for (int mi = 0; mi < vittc::kVitNumMuon2D; ++mi) {
-            const vittc::VitMuon2D M = vittc::kVitMuon2D[mi];
+            const vittc::VitMuon2D M = vittc::vit_muon_2d(mi);   // was kVitMuon2D[mi]
             const int rows = M.rows, cols = M.cols;
             const int64_t numel = (int64_t)rows * cols;
             const int64_t off   = (int64_t)kVitOffsets[M.tidx];
