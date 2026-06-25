@@ -729,6 +729,208 @@ def _even_partition(numel: int, world: int, rank: int) -> Tuple[int, int]:
     return start, end
 
 
+# ───────────────────────── Tensor-parallel weight shard (§8.1 TP) ─────────────
+# dist_step.md §6.C.5 / run_harness.md §0: the Megatron column/row split of the
+# decoder's large per-layer weights so per-rank Nmax = kDecMaxTensorNumel/TP — the
+# load-bearing memory win that makes the staged-opt (SG2) scratch fit at TP=8 (it is
+# LINEAR in Nmax, so it shrinks by TP). This is NOT the ZeRO flat even-partition (which
+# splits the FLAT blob arbitrarily and would break the per-layer all-reduce reassembly):
+# TP needs the Megatron STRUCTURE — column-parallel tensors split on their OUTPUT dim,
+# row-parallel on their INPUT dim — so the in-kernel ``tp_allreduce_sum_fixed_order``
+# (tp_transport.cuh) after the row-parallel GEMMs reassembles the right thing.
+#
+# PURE FUNCTION on a name+shape list (no torch tensor data, no collectives, no GPU) so it
+# is CPU/CI-testable exactly like shard_map.partition_tensor_granular. The caller (the
+# host bringup / harness) feeds it [(name, numel)] or [(name, shape)] from
+# named_parameters(); it returns per-rank numel + the per-tensor split kind so the budget
+# math (flagship_budget.Nmax/tp) and the kernel ParConfig<…,TP,…> agree on the geometry.
+
+# Megatron parallel-tensor name classification for the decoder cell (the
+# named_parameters() spelling decoder_flagship_layout.cuh addresses). COLUMN-parallel
+# tensors are split on their first (output-feature) dim; ROW-parallel on their second
+# (input-feature) dim; everything else (embeddings, norms, final unembed, biases) is
+# REPLICATED on every TP rank (Megatron leaves them whole — the all-reduce handles the
+# cross-rank combine, not a weight split).
+_TP_COLUMN_PARALLEL = ("in_proj", "ff.0", "qkv", "fc1", "w1", "gate_proj", "up_proj")
+_TP_ROW_PARALLEL    = ("out_proj", "ff.2", "proj", "fc2", "w2", "down_proj")
+
+# TP split kinds.
+TP_REPLICATED = "replicated"
+TP_COLUMN     = "column"      # split dim 0 (output features) by TP
+TP_ROW        = "row"        # split dim 1 (input features) by TP
+
+
+@dataclasses.dataclass(frozen=True)
+class TPTensorShard:
+    """One tensor's per-TP-rank shard under Megatron column/row parallelism.
+
+    ``name``/``full_numel`` identify the tensor; ``kind`` is one of
+    :data:`TP_REPLICATED` / :data:`TP_COLUMN` / :data:`TP_ROW`. ``shard_numel`` is
+    this TP rank's owned element count (== full_numel for replicated tensors,
+    full_numel/TP for a split tensor whose split dim is divisible by TP). For a
+    split tensor ``rows``/``cols`` carry the per-rank shard's 2D shape (the kernel
+    reads the matrix shape for the wgmma tiling); for a replicated/1D tensor they
+    are 0. ``split_dim`` is 0 (column), 1 (row), or -1 (replicated).
+    """
+
+    name: str
+    full_numel: int
+    kind: str
+    shard_numel: int
+    rows: int
+    cols: int
+    split_dim: int
+
+
+@dataclasses.dataclass(frozen=True)
+class TPShardPlan:
+    """The full TP weight-shard for one (tp, tp_rank) point (dist_step.md §6.C.5).
+
+    ``shards`` is one :class:`TPTensorShard` per input tensor, in input order
+    (named_parameters() order — the kernel addresses tensors in that order). The
+    aggregate metrics drive the budget gate + the static-allocation sizing.
+    """
+
+    tp: int
+    tp_rank: int
+    shards: List["TPTensorShard"]
+
+    @property
+    def total_shard_numel(self) -> int:
+        """This TP rank's resident param count (the per-rank model footprint)."""
+        return sum(s.shard_numel for s in self.shards)
+
+    @property
+    def total_full_numel(self) -> int:
+        return sum(s.full_numel for s in self.shards)
+
+    @property
+    def max_shard_numel(self) -> int:
+        """Per-rank Nmax — the LARGEST per-tensor shard. This is the term the SG2
+        staged-opt scratch is linear in (run_harness.md §0): at TP>1 the split
+        tensors shrink to numel/TP, so the binding tensor's per-rank numel is
+        what the budget uses (== kDecMaxTensorNumel/TP when the max tensor splits)."""
+        return max((s.shard_numel for s in self.shards), default=0)
+
+    @property
+    def n_split(self) -> int:
+        return sum(1 for s in self.shards if s.kind != TP_REPLICATED)
+
+
+def _tp_classify(name: str) -> str:
+    """Classify a tensor name into a Megatron TP split kind (case-insensitive
+    substring match on the column/row roster). Unknown ⇒ replicated (the safe
+    Megatron default: embeddings/norms/biases/unembed are never weight-split)."""
+    low = name.lower()
+    for key in _TP_COLUMN_PARALLEL:
+        if key in low:
+            return TP_COLUMN
+    for key in _TP_ROW_PARALLEL:
+        if key in low:
+            return TP_ROW
+    return TP_REPLICATED
+
+
+def _as_numel_shape(size) -> Tuple[int, Tuple[int, ...]]:
+    """Normalize a size entry to (numel, shape). Accepts an int numel or a shape
+    tuple/list (e.g. ``p.shape``); a torch.Size is just a tuple subclass."""
+    if isinstance(size, int):
+        return size, (size,)
+    shape = tuple(int(x) for x in size)
+    numel = 1
+    for x in shape:
+        numel *= x
+    return numel, shape
+
+
+def partition_tensor_parallel(
+    named_sizes, tp: int, tp_rank: int, *, model: str = "decoder",
+) -> TPShardPlan:
+    """Megatron column/row TP weight-shard of the decoder's per-layer weights
+    (dist_step.md §6.C.5 / run_harness.md §0). Pure function on a name+shape list.
+
+    ``named_sizes`` is ``[(name, numel), ...]`` OR ``[(name, shape), ...]`` (e.g. from
+    ``[(n, p.numel()) for n, p in model.named_parameters()]`` or with ``p.shape``). For
+    a split tensor the 2D matrix shape is needed to know WHICH dim to split (output vs
+    input feature), so a shape is preferred; given a bare numel for a 2D weight we infer
+    the split factor from ``tp`` directly (numel/tp) and report ``rows/cols = 0`` (the
+    budget only needs the per-rank numel, which is numel/tp either way).
+
+    SPLIT GEOMETRY (Megatron):
+      * COLUMN-parallel (``in_proj`` 3d×d, ``ff.0`` 4d×d): split the OUTPUT-feature
+        dim (dim 0) by ``tp`` → each rank holds ``(out/tp)×in`` → numel/tp. No
+        all-reduce after (the split is along the output; the next op consumes the
+        local columns). ``in_proj`` 3d×d at tp=8 → (3d/8)×d.
+      * ROW-parallel (``out_proj`` d×d, ``ff.2`` d×4d): split the INPUT-feature dim
+        (dim 1) by ``tp`` → each rank holds ``out×(in/tp)`` → numel/tp. The partial
+        outputs are all-reduced after (the in-kernel ``tp_allreduce_sum_fixed_order``).
+      * REPLICATED (embeddings ``tok``/``pos``, ``norm``s, final unembed, biases):
+        whole tensor on every rank (Megatron never weight-splits these).
+
+    Returns a :class:`TPShardPlan`; ``plan.max_shard_numel`` is the per-rank Nmax the
+    staged-opt budget is linear in (== kDecMaxTensorNumel/tp when the max tensor splits).
+
+    LOUD on a split dim that ``tp`` does not divide (the Megatron geometry requires
+    ``out_features % tp == 0`` for column and ``in_features % tp == 0`` for row — at the
+    flagship d=1600 every split dim is a multiple of 8/4/2/1, but a bad (tp, model) pair
+    must fail here, never silently mis-shard). At tp==1 every tensor is replicated whole
+    (the byte-identical single-GPU fold — TPShardPlan.total_shard_numel == total).
+    """
+    tp = int(tp)
+    if tp < 1:
+        raise ValueError(f"tp must be >= 1, got {tp}")
+    if not (0 <= tp_rank < tp):
+        raise ValueError(f"tp_rank {tp_rank} out of range for tp {tp}")
+    if model != "decoder":
+        # The column/row roster is the decoder's; other cells reuse the same
+        # mechanism with their own roster. Loud rather than silently mis-classify.
+        raise ValueError(
+            f"partition_tensor_parallel: model={model!r} unsupported "
+            f"(only 'decoder' has a Megatron col/row roster wired here)")
+
+    shards: List[TPTensorShard] = []
+    for name, size in named_sizes:
+        full_numel, shape = _as_numel_shape(size)
+        if full_numel < 0:
+            raise ValueError(f"tensor {name!r} has negative numel {full_numel}")
+        if tp == 1:
+            shards.append(TPTensorShard(name, full_numel, TP_REPLICATED,
+                                        full_numel, 0, 0, -1))
+            continue
+        kind = _tp_classify(name)
+        if kind == TP_REPLICATED:
+            shards.append(TPTensorShard(name, full_numel, TP_REPLICATED,
+                                        full_numel, 0, 0, -1))
+            continue
+        # A split tensor: divide numel by tp (the Megatron col/row split of a 2D
+        # weight is exactly an even division of the split-dim, hence numel/tp).
+        if full_numel % tp != 0:
+            raise ValueError(
+                f"tensor {name!r} (numel {full_numel}, kind {kind}) is not "
+                f"divisible by tp={tp} — Megatron col/row split requires the "
+                f"split feature dim to be a multiple of tp")
+        shard_numel = full_numel // tp
+        rows = cols = 0
+        split_dim = 0 if kind == TP_COLUMN else 1
+        if len(shape) == 2:
+            out_f, in_f = shape
+            if kind == TP_COLUMN:
+                if out_f % tp != 0:
+                    raise ValueError(
+                        f"tensor {name!r} out_features {out_f} not divisible by "
+                        f"tp={tp} (column-parallel split)")
+                rows, cols = out_f // tp, in_f
+            else:  # TP_ROW
+                if in_f % tp != 0:
+                    raise ValueError(
+                        f"tensor {name!r} in_features {in_f} not divisible by "
+                        f"tp={tp} (row-parallel split)")
+                rows, cols = out_f, in_f // tp
+        shards.append(TPTensorShard(name, full_numel, kind, shard_numel,
+                                    rows, cols, split_dim))
+    return TPShardPlan(tp=tp, tp_rank=tp_rank, shards=shards)
+
+
 class ZeRO3Sharder:
     """§8.3 ZeRO-3 full optimizer-state sharding across the DP group.
 
@@ -966,6 +1168,15 @@ class ZeRO3Sharder:
                         flat[start:end].copy_(gathered[r][:n])
 
 
+# Host NVSHMEM TP-team bootstrap (the launcher EDIT-E companion). Re-exported so a
+# caller can `from grokking_optimizers.distributed import TPBootstrap` next to the TP
+# weight-shard it pairs with. Import-safe: host_bringup is pure-Python (no torch,
+# no NVSHMEM dlopen at import — discovery only).
+from grokking_optimizers.host_bringup import (  # noqa: E402
+    TPBootstrap,
+    bootstrap_tp_team,
+)
+
 __all__ = [
     "ParallelConfig",
     "DistributedContext",
@@ -973,4 +1184,14 @@ __all__ = [
     "is_dist_available_and_initialized",
     "deepspeed_available",
     "ZeRO3Sharder",
+    # Tensor-parallel weight shard (§8.1 TP / dist_step.md §6.C.5).
+    "partition_tensor_parallel",
+    "TPShardPlan",
+    "TPTensorShard",
+    "TP_REPLICATED",
+    "TP_COLUMN",
+    "TP_ROW",
+    # Host NVSHMEM TP-team bootstrap (run_harness.md / dist_step.md §6.D).
+    "TPBootstrap",
+    "bootstrap_tp_team",
 ]
