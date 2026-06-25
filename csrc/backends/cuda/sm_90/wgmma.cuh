@@ -123,6 +123,30 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// ─────────────────────────────────────────────────────────────────────────
+//  SG_TUNED_GEMM_ENGINE (new knob): 0 = ship the hand-rolled inline-PTX engine
+//  below (DEFAULT, byte-identical to the pre-knob kernel — the CuTe code is
+//  entirely #if-erased); 1 = drive the SAME sg::sm90::wgs:: ABI through CuTe
+//  device atoms (cute::GmmaDescriptor + SM90::GMMA::MMA_64xNx16_F32BF16BF16_SS::fma
+//  + cute::warpgroup_*). The ABI (WgmmaAccum<N>.c[i], make_desc_{A,B}_kmajor,
+//  wgmma_m64nNk16_bf16<N,ScaleD,0,0>, fence/commit/wait, wgmma_frag_decode) is
+//  IDENTICAL under both values, so NO call site changes. TMA + smem swizzle are
+//  out of scope for this knob (only kSwizzleNone / INTERLEAVE is used, the
+//  correctness-gated layout). See the parity proof in /workspace/cute_plan.
+#ifndef SG_TUNED_GEMM_ENGINE
+#define SG_TUNED_GEMM_ENGINE 0
+#endif
+
+#if (SG_TUNED_GEMM_ENGINE == 1)
+// CuTe device-atom GEMM engine. Header-only; on the compile path already
+// (-Ithird_party/cutlass/include). We pull ONLY the GMMA atoms / warpgroup
+// helpers and the descriptor union — NOT cute/tensor.hpp — to avoid CuTe
+// Tensor/Layout address-algebra register bloat (the descriptor bytes are built
+// by hand and are proven bit-identical to make_gmma_desc<Major::K>).
+#include <cute/arch/mma_sm90_desc.hpp>   // cute::GmmaDescriptor (union), SM90::GMMA::LayoutType
+#include <cute/arch/mma_sm90_gmma.hpp>   // cute::SM90::GMMA::MMA_64xNx16_F32BF16BF16_SS, warpgroup_*
+#endif
+
 namespace sg { namespace sm90 { namespace wgs {
 
 // =========================================================================
@@ -223,6 +247,22 @@ __device__ __forceinline__ SmemDesc make_smem_desc(
 ) {
     SmemDesc d;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if (SG_TUNED_GEMM_ENGINE == 1)
+    // CuTe step 1: descriptor -> cute::GmmaDescriptor. Same field layout as the
+    // hand path (mma_sm90_desc.hpp): start_address_ = addr>>4,
+    // leading_byte_offset_ = lbo>>4, stride_byte_offset_ = sbo>>4, base_offset_,
+    // layout_type_ = Swizzle. For Swizzle=kSwizzleNone(0)=INTERLEAVE this is
+    // bit-identical to cute::make_gmma_desc<Major::K> over the INTERLEAVE bf16
+    // tile (proof in /workspace/cute_plan). No cute::Tensor constructed.
+    cute::GmmaDescriptor gd;
+    gd.bitfield.start_address_       = static_cast<uint16_t>(smem_desc_encode_addr(smem_base));
+    gd.bitfield.leading_byte_offset_ = static_cast<uint16_t>((lbo_bytes >> 4) & 0x3FFFu);
+    gd.bitfield.stride_byte_offset_  = static_cast<uint16_t>((sbo_bytes >> 4) & 0x3FFFu);
+    gd.bitfield.base_offset_         = static_cast<uint8_t>(base_offset & 0x7u);
+    gd.bitfield.layout_type_         = static_cast<uint8_t>(
+        static_cast<uint32_t>(Swizzle) & 0x3u);   // INTERLEAVE/B128/B64/B32 == SwizzleMode
+    d.desc = gd.desc_;
+#else
     uint64_t addr = static_cast<uint64_t>(smem_desc_encode_addr(smem_base));
     uint64_t lbo  = static_cast<uint64_t>((lbo_bytes >> 4) & 0x3FFFu);
     uint64_t sbo  = static_cast<uint64_t>((sbo_bytes >> 4) & 0x3FFFu);
@@ -233,6 +273,7 @@ __device__ __forceinline__ SmemDesc make_smem_desc(
            | (sbo << 32)            // bits 45:32
            | (bo  << 49)            // bits 51:49
            | (sw  << 62);           // bits 63:62
+#endif
 #else
     (void)smem_base; (void)lbo_bytes; (void)sbo_bytes; (void)base_offset;
     d.desc = 0;
@@ -373,7 +414,11 @@ __device__ __forceinline__ void wgmma_frag_decode(
 // =========================================================================
 __device__ __forceinline__ void wgmma_fence() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if (SG_TUNED_GEMM_ENGINE == 1)
+    cute::warpgroup_arrive();   // emits wgmma.fence.sync.aligned
+#else
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
+#endif
 #endif
 }
 
@@ -384,7 +429,11 @@ __device__ __forceinline__ void wgmma_fence() {
 // =========================================================================
 __device__ __forceinline__ void wgmma_commit_group() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if (SG_TUNED_GEMM_ENGINE == 1)
+    cute::warpgroup_commit_batch();  // wgmma.commit_group.sync.aligned
+#else
     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
+#endif
 #endif
 }
 
@@ -398,7 +447,11 @@ __device__ __forceinline__ void wgmma_commit_group() {
 template <int N>
 __device__ __forceinline__ void wgmma_wait_group() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if (SG_TUNED_GEMM_ENGINE == 1)
+    cute::warpgroup_wait<N>();   // wgmma.wait_group.sync.aligned N
+#else
     asm volatile("wgmma.wait_group.sync.aligned %0;" :: "n"(N) : "memory");
+#endif
 #endif
 }
 
@@ -570,6 +623,73 @@ __device__ __forceinline__ void wgmma_issue_n128(
 //  non-Hopper arches; this dispatcher is a no-op there so the substrate still
 //  compiles in the codegen matrix). DESIGN §4.1 item 1.
 // =========================================================================
+#if (SG_TUNED_GEMM_ENGINE == 1)
+// ─────────────────────────────────────────────────────────────────────────
+//  CuTe step 2: issue -> cute::SM90::GMMA::MMA_64xNx16_F32BF16BF16_SS<K,K>::fma
+//  One helper per N (the atom's fma takes N/2 float& by reference, in index
+//  order, so the acc.c[] pack is written out — same boilerplate the hand
+//  wgmma_issue_n* uses). Major::K,Major::K == production TransA=TransB=0.
+//  ScaleD(0=overwrite/1=accumulate) -> GMMA::ScaleOut::{Zero,One}.
+// ─────────────────────────────────────────────────────────────────────────
+template <int N, int ScaleD>
+__device__ __forceinline__ void cute_wgmma_issue(
+    WgmmaAccum<N>& acc, uint64_t descA, uint64_t descB
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    namespace G = cute::SM90::GMMA;
+    constexpr G::ScaleOut sd = (ScaleD == 0) ? G::ScaleOut::Zero : G::ScaleOut::One;
+    if constexpr (N == 8) {
+        G::MMA_64x8x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0], acc.c[1], acc.c[2], acc.c[3], sd);
+    } else if constexpr (N == 16) {
+        G::MMA_64x16x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0], acc.c[1], acc.c[2], acc.c[3], acc.c[4], acc.c[5], acc.c[6], acc.c[7],
+            sd);
+    } else if constexpr (N == 32) {
+        G::MMA_64x32x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0],  acc.c[1],  acc.c[2],  acc.c[3],  acc.c[4],  acc.c[5],  acc.c[6],  acc.c[7],
+            acc.c[8],  acc.c[9],  acc.c[10], acc.c[11], acc.c[12], acc.c[13], acc.c[14], acc.c[15],
+            sd);
+    } else if constexpr (N == 64) {
+        G::MMA_64x64x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0],  acc.c[1],  acc.c[2],  acc.c[3],  acc.c[4],  acc.c[5],  acc.c[6],  acc.c[7],
+            acc.c[8],  acc.c[9],  acc.c[10], acc.c[11], acc.c[12], acc.c[13], acc.c[14], acc.c[15],
+            acc.c[16], acc.c[17], acc.c[18], acc.c[19], acc.c[20], acc.c[21], acc.c[22], acc.c[23],
+            acc.c[24], acc.c[25], acc.c[26], acc.c[27], acc.c[28], acc.c[29], acc.c[30], acc.c[31],
+            sd);
+    } else if constexpr (N == 96) {
+        G::MMA_64x96x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0],  acc.c[1],  acc.c[2],  acc.c[3],  acc.c[4],  acc.c[5],  acc.c[6],  acc.c[7],
+            acc.c[8],  acc.c[9],  acc.c[10], acc.c[11], acc.c[12], acc.c[13], acc.c[14], acc.c[15],
+            acc.c[16], acc.c[17], acc.c[18], acc.c[19], acc.c[20], acc.c[21], acc.c[22], acc.c[23],
+            acc.c[24], acc.c[25], acc.c[26], acc.c[27], acc.c[28], acc.c[29], acc.c[30], acc.c[31],
+            acc.c[32], acc.c[33], acc.c[34], acc.c[35], acc.c[36], acc.c[37], acc.c[38], acc.c[39],
+            acc.c[40], acc.c[41], acc.c[42], acc.c[43], acc.c[44], acc.c[45], acc.c[46], acc.c[47],
+            sd);
+    } else if constexpr (N == 128) {
+        G::MMA_64x128x16_F32BF16BF16_SS<G::Major::K, G::Major::K>::fma(
+            descA, descB,
+            acc.c[0],  acc.c[1],  acc.c[2],  acc.c[3],  acc.c[4],  acc.c[5],  acc.c[6],  acc.c[7],
+            acc.c[8],  acc.c[9],  acc.c[10], acc.c[11], acc.c[12], acc.c[13], acc.c[14], acc.c[15],
+            acc.c[16], acc.c[17], acc.c[18], acc.c[19], acc.c[20], acc.c[21], acc.c[22], acc.c[23],
+            acc.c[24], acc.c[25], acc.c[26], acc.c[27], acc.c[28], acc.c[29], acc.c[30], acc.c[31],
+            acc.c[32], acc.c[33], acc.c[34], acc.c[35], acc.c[36], acc.c[37], acc.c[38], acc.c[39],
+            acc.c[40], acc.c[41], acc.c[42], acc.c[43], acc.c[44], acc.c[45], acc.c[46], acc.c[47],
+            acc.c[48], acc.c[49], acc.c[50], acc.c[51], acc.c[52], acc.c[53], acc.c[54], acc.c[55],
+            acc.c[56], acc.c[57], acc.c[58], acc.c[59], acc.c[60], acc.c[61], acc.c[62], acc.c[63],
+            sd);
+    }
+#else
+    (void)acc; (void)descA; (void)descB;
+#endif
+}
+#endif  // SG_TUNED_GEMM_ENGINE == 1
+
 template <int N, int ScaleD, int TransA, int TransB>
 __device__ __forceinline__ void wgmma_m64nNk16_bf16(
     WgmmaAccum<N>& acc, SmemDesc descA, SmemDesc descB
@@ -579,12 +699,21 @@ __device__ __forceinline__ void wgmma_m64nNk16_bf16(
                   N == 128,
                   "wgmma N must be one of {8,16,32,64,96,128} (bf16 atoms "
                   "selected by DESIGN §3); add the overload for other legal N");
+#if (SG_TUNED_GEMM_ENGINE == 1)
+    // Production is always TransA=TransB=0 (Major::K,Major::K); the CuTe atom
+    // template binds that. Assert so a non-(0,0) caller is caught.
+    static_assert(TransA == 0 && TransB == 0,
+                  "SG_TUNED_GEMM_ENGINE=1 supports only Major-K/Major-K "
+                  "(TransA=TransB=0), the production orientation.");
+    cute_wgmma_issue<N, ScaleD>(acc, descA.desc, descB.desc);
+#else
     if constexpr (N == 8)   wgmma_issue_n8  <ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
     else if constexpr (N == 16)  wgmma_issue_n16 <ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
     else if constexpr (N == 32)  wgmma_issue_n32 <ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
     else if constexpr (N == 64)  wgmma_issue_n64 <ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
     else if constexpr (N == 96)  wgmma_issue_n96 <ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
     else if constexpr (N == 128) wgmma_issue_n128<ScaleD, TransA, TransB>(acc, descA.desc, descB.desc);
+#endif
 #else
     (void)acc; (void)descA; (void)descB;
 #endif

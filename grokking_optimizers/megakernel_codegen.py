@@ -578,16 +578,34 @@ _DEC_DFF = 4 * _DEC_D
 # proven end-to-end d (task #13 context: parity 2.4e-07, A/A/A) is 1024.
 _DEC_BENCH_D = 2048
 
+# ── FLAGSHIP decoder tier (canonical-published GPT-2 XL, ~1.5 B params) ──────
+# SINGLE SOURCE OF TRUTH for these dims: grokking_race_v2.py
+# MODEL_SCALES_BY_MODEL['flagship']['decoder'] = {dim_model:1600, num_heads:25,
+# num_layers:48} (PHASE1_CAMPAIGN.md §1). Mirrored here as build-time constants
+# (this generator imports NO torch / grokking_race_v2 — it is a pure codegen tool
+# with no runtime call sites), exactly as _DEC_* mirror the tiny-tier eager model.
+# vocab/seq are the decoder's fixed tokenizer/seq (== _DEC_VOCAB / _DEC_SEQ). The
+# flagship layout is emitted into its OWN standalone header (decoder_flagship_-
+# layout_header / --decoder-layout-flagship); it does NOT touch the committed
+# d=128 production or d=2048 bench layouts. At d=1600,L=48 the table is 582
+# tensors, total 1,475,884,899 elems (every offset < INT32_MAX, so the int32
+# kDecOffsets/kDecSizes tables are exact).
+_DEC_FLAGSHIP_D, _DEC_FLAGSHIP_HEADS, _DEC_FLAGSHIP_LAYERS = 1600, 25, 48
 
-def _decoder_param_sizes(d: int = _DEC_D) -> List[int]:
+
+def _decoder_param_sizes(d: int = _DEC_D, *, layers: int = _DEC_LAYERS,
+                         vocab: int = _DEC_VOCAB, seq: int = _DEC_SEQ) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of decoder_oracle.py
-    decoder_param_spec()). 30 tensors; at d=128 total 422755. `d` is parametric
-    so the d-scaled bench layout (SG_DEC_BENCH_LAYOUT) reuses the SAME shape
-    formula — the per-tensor shapes are all functions of (d, dff=4d, vocab, seq),
-    so a single d controls the whole table."""
-    dff, v, seq = 4 * d, _DEC_VOCAB, _DEC_SEQ
-    sizes = [v * d, seq * d]                      # tok, pos
-    for _ in range(_DEC_LAYERS):
+    decoder_param_spec()). At d=128,layers=2 there are 30 tensors, total 422755.
+    Parametric in (d, layers, vocab, seq) — every per-tensor shape is a function
+    of those (dff=4d), so the SAME formula drives the d-scaled bench layout
+    (SG_DEC_BENCH_LAYOUT, d=2048) AND the flagship layout (d=1600, layers=48).
+    Layer-count L emits 2 + 12*L + 4 tensors (tok/pos head, 12 per layer, norm+out
+    tail). Defaults == the historical (d=128, L=2) constants → callers that pass
+    only `d` are byte-identical."""
+    dff = 4 * d
+    sizes = [vocab * d, seq * d]                  # tok, pos
+    for _ in range(layers):
         sizes += [
             3 * d * d, 3 * d,                     # attn.in_proj_weight/bias
             d * d, d,                             # attn.out_proj.weight/bias
@@ -595,16 +613,21 @@ def _decoder_param_sizes(d: int = _DEC_D) -> List[int]:
             dff * d, dff,                         # ff.0.weight/bias
             d * dff, d,                           # ff.2.weight/bias
         ]
-    sizes += [d, d, v * d, v]                     # norm.w/b, out.weight/bias
+    sizes += [d, d, vocab * d, vocab]             # norm.w/b, out.weight/bias
     return sizes
 
 
-def _decoder_layout_body(d: int) -> str:
+def _decoder_layout_body(d: int, *, layers: int = _DEC_LAYERS,
+                         vocab: int = _DEC_VOCAB, seq: int = _DEC_SEQ,
+                         heads: int = _DEC_HEADS) -> str:
     """The constants + __constant__ tables + compile-time cross-check for ONE
-    decoder width `d`. Emitted into ONE of the SG_DEC_BENCH_LAYOUT branches; the
-    branches are mutually exclusive at preprocess time, so reusing the SAME symbol
-    names (kDecOffsets/kDecSizes/dec_layout_check) across both is safe."""
-    sizes = _decoder_param_sizes(d)
+    decoder config (d, layers, vocab, seq, heads). Emitted into ONE of the
+    SG_DEC_BENCH_LAYOUT branches (or the standalone flagship header); the branches
+    are mutually exclusive at preprocess time, so reusing the SAME symbol names
+    (kDecOffsets/kDecSizes/dec_layout_check) across them is safe. Defaults == the
+    historical (vocab=99, layers=2, seq=4, heads=4) constants → callers that pass
+    only `d` are byte-identical."""
+    sizes = _decoder_param_sizes(d, layers=layers, vocab=vocab, seq=seq)
     offsets, acc = [], 0
     for n in sizes:
         offsets.append(acc)
@@ -621,11 +644,11 @@ def _decoder_layout_body(d: int) -> str:
 
     sizes_block = _fmt(sizes)
     offsets_block = _fmt(offsets)
-    return f"""constexpr int SG_DEC_VOCAB  = {_DEC_VOCAB};
+    return f"""constexpr int SG_DEC_VOCAB  = {vocab};
 constexpr int SG_DEC_D      = {d};
-constexpr int SG_DEC_HEADS  = {_DEC_HEADS};
-constexpr int SG_DEC_LAYERS = {_DEC_LAYERS};
-constexpr int SG_DEC_SEQ    = {_DEC_SEQ};
+constexpr int SG_DEC_HEADS  = {heads};
+constexpr int SG_DEC_LAYERS = {layers};
+constexpr int SG_DEC_SEQ    = {seq};
 constexpr int SG_DEC_DFF    = 4 * SG_DEC_D;   // {4 * d}
 
 constexpr int     kDecNumTensors = {n_tensors};
@@ -754,6 +777,62 @@ namespace sg {{ namespace fused {{ namespace sm90 {{
 }}}}}} // namespace sg::fused::sm90
 
 #endif  // SG_FUSED_SM90_DECODER_LAYOUT_CUH_
+"""
+
+
+def decoder_flagship_layout_header() -> str:
+    """Emit a STANDALONE FLAGSHIP decoder weight-layout header (GPT-2 XL tier,
+    d=1600, layers=48, heads=25, vocab=99, seq=4 — ~1.5 B params, 582 tensors,
+    total 1,475,884,899 elems). Separate include guard
+    (SG_FUSED_SM90_DECODER_FLAGSHIP_LAYOUT_CUH_) and a SINGLE config (no
+    SG_DEC_BENCH_LAYOUT #if branch): a TU that wants the flagship layout includes
+    THIS header instead of decoder_layout.cuh. Symbol names are IDENTICAL
+    (kDecOffsets/kDecSizes/kDecNumTensors/kDecTotalElems/SG_DEC_* /
+    kDecMaxTensorNumel, namespace sg::fused::sm90), so the SAME kernel template
+    binds against it unchanged.
+
+    SOURCE OF TRUTH for the dims: grokking_race_v2.py
+    MODEL_SCALES_BY_MODEL['flagship']['decoder'] (mirrored in _DEC_FLAGSHIP_*).
+    Generated by: python -m grokking_optimizers.megakernel_codegen
+    --decoder-layout-flagship > csrc/fused/sm_90/decoder_flagship_layout.cuh"""
+    body = _decoder_layout_body(
+        _DEC_FLAGSHIP_D, layers=_DEC_FLAGSHIP_LAYERS,
+        vocab=_DEC_VOCAB, seq=_DEC_SEQ, heads=_DEC_FLAGSHIP_HEADS)
+    return f"""#ifndef SG_FUSED_SM90_DECODER_FLAGSHIP_LAYOUT_CUH_
+#define SG_FUSED_SM90_DECODER_FLAGSHIP_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/decoder_flagship_layout.cuh — GENERATED weight-layout mirror
+// for the FLAGSHIP L3-REAL transformer-decoder megakernel (GPT-2 XL tier).
+//
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --decoder-layout-flagship > csrc/fused/sm_90/decoder_flagship_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _decoder_param_sizes() (parameterized by (d, layers, vocab, seq)); the flagship
+// dims (d={_DEC_FLAGSHIP_D}, layers={_DEC_FLAGSHIP_LAYERS}, heads={_DEC_FLAGSHIP_HEADS})
+// mirror grokking_race_v2.py MODEL_SCALES_BY_MODEL['flagship']['decoder']. The
+// flat blob is torch.cat([p.reshape(-1) for _, p in model.named_parameters()]);
+// the kernel addresses tensor i at params + kDecOffsets[i] for kDecSizes[i] elems.
+//
+// A count/total mismatch fails the BUILD loudly (a static_assert below).
+//
+// This is a STANDALONE single-config header (NO SG_DEC_BENCH_LAYOUT #if branch):
+// a TU that wants the flagship layout includes THIS file instead of
+// decoder_layout.cuh. Symbol names are byte-identical to decoder_layout.cuh
+// (kDecOffsets/kDecSizes/kDecNumTensors/kDecTotalElems/SG_DEC_*), so the SAME
+// kernel template binds against it unchanged. The committed d=128 production /
+// d=2048 bench header decoder_layout.cuh is NOT affected.
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+// ── FLAGSHIP (d={_DEC_FLAGSHIP_D}, layers={_DEC_FLAGSHIP_LAYERS}): GPT-2 XL tier, ~1.5 B params. ──
+{body}
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_DECODER_FLAGSHIP_LAYOUT_CUH_
 """
 
 
@@ -1501,6 +1580,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--decoder-layout", action="store_true",
                     help="emit the PHASE-1 L3-REAL decoder weight-layout header "
                          "(csrc/fused/sm_90/decoder_layout.cuh)")
+    ap.add_argument("--decoder-layout-flagship", action="store_true",
+                    help="emit the FLAGSHIP (d=1600, layers=48) L3-REAL decoder "
+                         "weight-layout header "
+                         "(csrc/fused/sm_90/decoder_flagship_layout.cuh)")
     ap.add_argument("--vit-layout", action="store_true",
                     help="emit the PHASE-2 L3-REAL ViT weight-layout header "
                          "(csrc/fused/sm_90/vit_layout.cuh)")
@@ -1543,6 +1626,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.decoder_layout:
         sys.stdout.write(decoder_layout_header())
+        return 0
+
+    if args.decoder_layout_flagship:
+        sys.stdout.write(decoder_flagship_layout_header())
         return 0
 
     if args.vit_layout:

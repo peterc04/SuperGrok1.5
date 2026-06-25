@@ -137,26 +137,39 @@ struct LoopbackTransport {
 #if defined(SG_HAS_NVSHMEM)
 // ─────────────────────────────────────────────────────────────────────────
 //  NvshmemTransport — the REAL device-initiated transport (design §5.2).
-//  COMPILED ONLY under -DSG_HAS_NVSHMEM=1 (toolkit on the path). The math code
-//  path is IDENTICAL to the loopback's; only the address translation + the
-//  rendezvous scope differ:
+//  COMPILED ONLY under -DSG_HAS_NVSHMEM=1 (NVSHMEM 3.7.0 IS installed:
+//  NVSHMEM_HOME=/usr/local/lib/python3.11/dist-packages/nvidia/nvshmem; the TU
+//  that instantiates a kTPComm point must be built -rdc=true and device-linked
+//  against libnvshmem_device_sm_90.bc — see /workspace/impl_diffs/tp_kernel.md
+//  §6). The math code path is IDENTICAL to the loopback's; only the address
+//  translation + the rendezvous scope differ:
 //    * `heap_base` is an nvshmem_malloc'd SYMMETRIC allocation (same offset
-//      valid on every PE);
+//      valid on every PE) — a plain cudaMalloc pointer is NOT addressable via
+//      nvshmem_ptr, so the TP slots MUST live on the symmetric heap the
+//      launcher carves (tp_kernel.md §2/EDIT E). `tp_team_` is the TP-group
+//      team (NVSHMEM_TEAM_WORLD when TP == world); `peer()` is called with the
+//      TEAM-LOCAL pe and translated to the global pe for nvshmem_ptr.
 //    * `peer()` translates via nvshmem_ptr (NVLink direct load/store — the
 //      single-node 8×H100 case; a multi-node fabric would use nvshmem_get,
-//      which is the documented extension point, NOT silently emulated);
-//    * `rendezvous()` = in-GPU GridBarrier + ONE CTA running the cross-GPU
-//      nvshmemx_barrier_all_block + GridBarrier again (so every CTA of every
-//      GPU is fenced both sides — the §5.2 "two barrier systems must not
-//      deadlock" discipline: the NVSHMEM barrier is entered by exactly one CTA
-//      per GPU, never concurrently with the GridBarrier spin).
-//  GO/NO-GO (§5.4): parity vs host-NCCL TP, A/A/A, MFU, ZeRO-3/DP composition —
-//  all 8×H100-window activities (design §7.5).
+//      the documented extension point, NOT silently emulated);
+//    * `rendezvous()` = in-GPU GridBarrier + nvshmem_quiet (drain THIS PE's
+//      published partials so peers' NVLink loads see them) + ONE CTA running
+//      the cross-GPU TEAM-scoped block barrier + GridBarrier again. The NVSHMEM
+//      barrier is entered by exactly one CTA per GPU, NEVER concurrently with
+//      the GridBarrier spin (the design's "two barrier systems must not
+//      deadlock" rule, tp_nvshmem.md §1(3)).
+//    * TEAM SCOPE: nvshmemx_barrier_block(tp_team_) joins ONLY the TP group, so
+//      under a 4D mesh DP/PP replicas are not dragged into the TP barrier.
+//      NVSHMEM 3.7.0 exposes nvshmemx_barrier_block (host/nvshmemx_coll_api.h:112),
+//      so the tp_nvshmem.md §3.1 "version-dependent follow-up" is RESOLVED — no
+//      whole-world fallback needed.
+//  GO/NO-GO (§5.4): parity vs host-NCCL TP, A/A/A, MFU, ZeRO-3/DP composition.
 // ─────────────────────────────────────────────────────────────────────────
 struct NvshmemTransport {
-    float*  heap_base;       // nvshmem_malloc'd symmetric base (LOCAL pointer)
-    int     n_pes_;          // TP group size  (nvshmem_n_pes() on the TP team)
-    int     my_pe_;          // this GPU's pe  (nvshmem_my_pe())
+    float*         heap_base;  // nvshmem_malloc'd symmetric base (LOCAL pointer)
+    nvshmem_team_t tp_team_;   // the TP-group team (NVSHMEM_TEAM_WORLD if TP==world)
+    int            n_pes_;     // TP group size  (nvshmem_team_n_pes(tp_team_))
+    int            my_pe_;     // this GPU's pe-in-team (nvshmem_team_my_pe(tp_team_))
 
     __device__ __forceinline__ int my_pe() const { return my_pe_; }
     __device__ __forceinline__ int n_pes() const { return n_pes_; }
@@ -164,18 +177,22 @@ struct NvshmemTransport {
     __device__ __forceinline__ float* local(int64_t off) const {
         return heap_base + off;
     }
-    __device__ __forceinline__ const float* peer(int64_t off, int pe) const {
-        // NVLink path: direct load/store through the peer mapping. nvshmem_ptr
-        // returns nullptr for non-P2P-reachable peers — single-node 8×H100 is
-        // always reachable; the multi-node fall-back (nvshmem_get staging) is
-        // future work and must NOT be silently approximated here.
-        return static_cast<const float*>(nvshmem_ptr(heap_base, pe)) + off;
+    __device__ __forceinline__ const float* peer(int64_t off, int pe_in_team) const {
+        // peer() is called with the TEAM-LOCAL pe index (ascending 0..n_pes()-1,
+        // the fixed reduce order); map it to the GLOBAL pe nvshmem_ptr needs.
+        const int global_pe = nvshmem_team_translate_pe(tp_team_, pe_in_team,
+                                                         NVSHMEM_TEAM_WORLD);
+        return static_cast<const float*>(nvshmem_ptr(heap_base, global_pe)) + off;
     }
 
     __device__ __forceinline__ void rendezvous(const ::sg::fused::GridBarrier& bar) const {
         bar.sync();                       // all CTAs of THIS GPU arrived
         if (blockIdx.x == 0) {            // one CTA crosses the GPU boundary
-            nvshmemx_barrier_all_block();
+            // Drain THIS PE's outstanding symmetric stores so the ascending-pe
+            // NVLink loads on every peer observe our published partial, THEN
+            // join the TP-group barrier (team-scoped — not the whole world).
+            nvshmem_quiet();
+            nvshmemx_barrier_block(tp_team_);
         }
         bar.sync();                       // release every CTA after the cross-GPU join
     }
@@ -226,6 +243,37 @@ __device__ __forceinline__ void tp_allreduce_sum_fixed_order_to_slot(
         int64_t n, int tid, int nthreads) {
     float* dst = tr.local(dst_slot_off);
     tp_allreduce_sum_fixed_order(tr, src_slot_off, dst, n, tid, nthreads);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  make_transport_from_comm<Par> — the ONE place that selects the transport
+//  from a populated par::CommCtx, so the megakernel constructs `tr` with a
+//  single call (no #if clutter at the call site). Returns:
+//    * NvshmemTransport       when -DSG_HAS_NVSHMEM (the real 8×H100 path),
+//    * LoopbackTransport      otherwise (the single-GPU honest simulation).
+//  Both read the SAME CommCtx fields (sym-heap base, stride, team pe/size), so
+//  the launcher populates ONE struct and either transport binds it. Only ever
+//  called under `if constexpr (Par::kTPComm)` (folded away on SingleGPU), so it
+//  is never instantiated on the byte-identical default path.
+//
+//  The CommCtx type is forward-declared opaquely here to avoid pulling
+//  parallel_config.cuh's include into every tp_transport.cuh consumer; the real
+//  definition (par::CommCtx) is included by the megakernel before this is used.
+//  The fields read are POD (float*/int64_t/int) — no NVSHMEM type crosses the
+//  CommCtx boundary (the team handle is a void* cast to nvshmem_team_t here).
+// ─────────────────────────────────────────────────────────────────────────
+template <class Par, class CommT>
+__device__ __forceinline__ auto make_transport_from_comm(const CommT& comm) {
+#if defined(SG_HAS_NVSHMEM)
+    return NvshmemTransport{
+        reinterpret_cast<float*>(comm.tp_sym_heap),
+        static_cast<nvshmem_team_t>(reinterpret_cast<intptr_t>(comm.tp_comm_handle)),
+        comm.tp_team_n_pes, comm.tp_team_local_pe };
+#else
+    return LoopbackTransport{
+        reinterpret_cast<float*>(comm.tp_sym_heap), comm.tp_heap_stride_floats,
+        comm.tp_team_n_pes, comm.tp_team_local_pe };
+#endif
 }
 
 }}}}  // namespace sg::fused::sm90::tp

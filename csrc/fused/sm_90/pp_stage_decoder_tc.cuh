@@ -284,16 +284,16 @@ pp_decoder_stage_bwd_tc(PersistentContext ctx,
     // Owned biases (single-owner grid-stride column-sum over the GLOBAL bias
     // index space — same owner map as fused; non-owned outputs skipped).
     {
-        int pre[10];
+        int pre[dectc::kDecNumDwSpecs + 1];
         pre[0] = 0;
         #pragma unroll
-        for (int s = 0; s < 9; ++s) pre[s + 1] = pre[s] + spec[s].Nout;
-        const int total_b = pre[9];
+        for (int s = 0; s < dectc::kDecNumDwSpecs; ++s) pre[s + 1] = pre[s] + spec[s].Nout;
+        const int total_b = pre[dectc::kDecNumDwSpecs];
         const int stride = nCTA * blockDim.x;
         for (int go = cta * blockDim.x + threadIdx.x; go < total_b; go += stride) {
             int s = 0;
             #pragma unroll
-            for (int t = 0; t < 9; ++t) if (go >= pre[t + 1]) s = t + 1;
+            for (int t = 0; t < dectc::kDecNumDwSpecs; ++t) if (go >= pre[t + 1]) s = t + 1;
             if (!S::owns_spec(s)) continue;
             const dectc::DecDwSpec& sp = spec[s];
             const int o = go - pre[s];
@@ -311,7 +311,7 @@ pp_decoder_stage_bwd_tc(PersistentContext ctx,
     // Owned LN-vec slots (ascending-CTA reduce, fused pattern, filtered).
     for (int v = cta; v < dectc::kNumLnVec; v += nCTA) {
         if (!S::owns_lnvec(v)) continue;
-        const int goff = dectc::kLnVecTensorIdx[v];
+        const int goff = dectc::dec_lnvec_tensor_idx(v);   // was dectc::kLnVecTensorIdx[v]
         const int64_t gbase = kDecOffsets[goff];
         for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
             float accv = 0.0f;

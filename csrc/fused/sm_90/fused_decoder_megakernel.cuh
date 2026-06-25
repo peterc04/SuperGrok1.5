@@ -386,7 +386,7 @@ struct DecTcSmem {
     alignas(16) __nv_bfloat16 sA[kDecRingStages * kDecAtomsPerSlot * 64 * 16];
     alignas(16) __nv_bfloat16 sB[kDecRingStages * SG_TUNED_TILE_N * 16];
     float red[256];
-    dectc::DecDwSpec spec[9];
+    dectc::DecDwSpec spec[dectc::kDecNumDwSpecs];
 #if SG_TUNED_DEC_FWD_PIPE == 2
     // ── DESIGN-TOURNAMENT entry (b): producer/consumer mbarrier words for the
     //    PIPE=2 fwd/dX engine (tile_pipeline.cuh's full[]+empty[] ring). Two 8-byte
@@ -1254,7 +1254,7 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //    2D weights (INTEGRATION-OPTSTAGES §3). IDENTICAL to the vit twin
     //    (fused_vit_megakernel.cuh P2.7) — same shared opt_stages_precompute.cuh
     //    helpers, same barrier sequence — only the per-model 2D table (dectc::
-    //    kDecMuon2D, 11 matrices including tok[99,128]/pos[4,128]) and offset array
+    //    dec_muon_2d, 2+4L+1 matrices including tok/pos) and offset array
     //    (kDecOffsets) differ. For EACH 2D matrix all CTAs cooperate: buf=μ·buf+g
     //    (buf is the PERSISTENT m-slice — momentum state, NOT transient), ‖buf‖_F via
     //    per-CTA partials → inv_norm, X=buf·inv_norm, then ns_steps × { A=XXᵀ → AX=A·X
@@ -1278,7 +1278,7 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
         const float momentum = st.beta1;          // Muon momentum (eager Muon: betas[0])
         const int   ns_steps = 5;                 // bindings.cpp default
         for (int mi = 0; mi < dectc::kDecNumMuon2D; ++mi) {
-            const dectc::DecMuon2D M = dectc::kDecMuon2D[mi];
+            const dectc::DecMuon2D M = dectc::dec_muon_2d(mi);   // was kDecMuon2D[mi]
             const int rows = M.rows, cols = M.cols;
             const int64_t numel = (int64_t)rows * cols;
             const int64_t off   = (int64_t)kDecOffsets[M.tidx];

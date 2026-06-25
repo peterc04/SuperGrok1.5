@@ -170,6 +170,14 @@ class Zero3FlatParamStore:
             self.shard = (torch.cat(parts).clone() if parts else
                           full_flat.new_empty(0))
         else:
+            # Cold-start (no full_flat): default the shard's device to the current
+            # CUDA device when one is available and the caller did not pin `device`
+            # — the full_flat path inherits full_flat's (GPU) device, so a zero
+            # cold-start store must match it or a later device-mixed op / torch.equal
+            # against a GPU shard throws (test_zero3_roundtrip resume path). On a
+            # CPU-only box (cuda unavailable) this falls through to CPU unchanged.
+            if device is None and torch.cuda.is_available():
+                device = torch.cuda.current_device()
             self.shard = torch.zeros(
                 n, device=device, dtype=dtype if dtype is not None else torch.float32)
 

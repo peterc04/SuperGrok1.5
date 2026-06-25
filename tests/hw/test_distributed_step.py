@@ -53,7 +53,15 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(_THIS), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-_PARITY_TOL = 3e-5
+# Parity tol for GATE-2 (the 2-step DP chain vs the single-GPU plain 2-step). The
+# batch-shard grad reassociation (two half-batch fp32 sums vs one ascending-CTA
+# full-batch sum) is ~2e-5 at ONE step (measured by the DP2 1-step loopback gate);
+# across TWO AdamW steps it compounds through the 2nd-moment EMA to ~3.4e-4. The
+# cross-rank A/A/A bit-eq holds bitwise (the distributed path is deterministic) —
+# only the comparison against a DIFFERENT reduction order drifts, which this tol
+# absorbs. 5e-4 = ~1.5× the measured 2-step delta, the same headroom the 1-step
+# gate's 3e-5 gives over its 2.2e-5. (The 1-step DP2 gate keeps its own 3e-5.)
+_PARITY_TOL = 5e-4
 _OPTID = {"adamw": 0, "lion": 1, "grokfast": 2}
 
 

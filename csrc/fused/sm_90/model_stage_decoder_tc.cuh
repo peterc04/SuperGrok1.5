@@ -335,17 +335,23 @@ static_assert(kTileM % dec::kSeq == 0,
 constexpr int kAtomsM = kTileM / wgs::kWgmmaAtomM;   // stacked m64 atoms per tile
 constexpr int kSamplesPerTile = kTileM / dec::kSeq;  // 32 for TILE_M=128
 
-// ── LN vector-grad partials layout (the 10 tile-local γ/β grads). Order MUST
-//    match dec_layout tensor indices {6,7,8,9,18,19,20,21,26,27}. We store them
-//    densely [10 x kD] per CTA; the P2 reduce maps them back by tensor index. ──
-constexpr int kNumLnVec = 10;                 // n1_w,n1_b,n2_w,n2_b ×L + norm_w,norm_b
-constexpr int kLnVecElems = kNumLnVec * dec::kD;   // 10 * 128 = 1280
-// The dec_layout tensor index of each LN-vector slot, in our dense order.
-__device__ __constant__ int kLnVecTensorIdx[kNumLnVec] = {
-    6, 7, 8, 9,        // L0 n1.w, n1.b, n2.w, n2.b
-    18, 19, 20, 21,    // L1 n1.w, n1.b, n2.w, n2.b
-    26, 27             // norm.w, norm.b
-};
+// ── LN vector-grad partials layout (the tile-local γ/β grads). Dense order:
+//    4 slots/layer (n1.w,n1.b,n2.w,n2.b) for li∈[0,L), then norm.w,norm.b. At L=2
+//    this is {6,7,8,9,18,19,20,21,26,27} (the original 10-slot table). We store
+//    them densely [kNumLnVec x kD] per CTA; the P2 reduce maps them back by tensor
+//    index via dec_lnvec_tensor_idx (a formula — a __constant__ array can't be
+//    filled by a loop at L=48). L-GENERAL: kNumLnVec = 4*L+2. ──
+constexpr int kNumLnVec = 4 * dec::kLayers + 2;   // n1_w,n1_b,n2_w,n2_b ×L + norm_w,norm_b
+constexpr int kLnVecElems = kNumLnVec * dec::kD;  // (4*L+2)*kD  (1280 at L=2)
+// dec_layout tensor index of LN-vector dense slot v. v∈[0,4L): li=v/4, kind=v%4 →
+// 6+12*li+kind (n1.w/b,n2.w/b are tensor 6..9 of each 12-tensor layer block);
+// v=4L → norm.w (2+12*L); v=4L+1 → norm.b (2+12*L+1). At L=2 reproduces the old
+// kLnVecTensorIdx[10] EXACTLY ({6,7,8,9,18,19,20,21,26,27}).
+__host__ __device__ __forceinline__ int dec_lnvec_tensor_idx(int v) {
+    const int Lx4 = 4 * dec::kLayers;
+    if (v < Lx4) return 6 + 12 * (v / 4) + (v % 4);
+    return 2 + 12 * dec::kLayers + (v - Lx4);     // 2+12L (norm.w), 2+12L+1 (norm.b)
+}
 
 // ── Muon 2D-weight table (the matrices Newton-Schulz orthogonalizes). The eager
 //    Muon auto-splits params by p.ndim: ndim==2 → NS, everything else → AdamW
@@ -359,26 +365,42 @@ __device__ __constant__ int kLnVecTensorIdx[kNumLnVec] = {
 //    running the grid-cooperative NS per matrix; P3 routes tensor t to the NS
 //    apply iff it is in the table, else the AdamW aux tail. Indices MUST match
 //    decoder_layout / named_parameters() order. ──
-constexpr int kDecNumMuon2D = 11;
+// kDecNumMuon2D = tok + pos + 4 weights/layer (in_proj,out_proj,ff0,ff2) + head.out
+//   = 2 + 4*L + 1  (= 11 at L=2). The table is now a FORMULA (dec_muon_2d) — a
+// __device__ __constant__ array can't be loop-filled to 195 entries at L=48.
+constexpr int kDecNumMuon2D = 2 + 4 * dec::kLayers + 1;
 struct DecMuon2D { int tidx; int rows; int cols; };
-__device__ __constant__ DecMuon2D kDecMuon2D[kDecNumMuon2D] = {
-    { 0, dec::kVocab,  dec::kD     },   // tok.weight          [99,128]
-    { 1, dec::kSeq,    dec::kD     },   // pos.weight          [4,128]
-    { 2, 3*dec::kD,    dec::kD     },   // L0 in_proj_weight   [384,128]
-    { 4, dec::kD,      dec::kD     },   // L0 out_proj.weight  [128,128]
-    {10, dec::kDff,    dec::kD     },   // L0 ff.0.weight      [512,128]
-    {12, dec::kD,      dec::kDff   },   // L0 ff.2.weight      [128,512]
-    {14, 3*dec::kD,    dec::kD     },   // L1 in_proj_weight   [384,128]
-    {16, dec::kD,      dec::kD     },   // L1 out_proj.weight  [128,128]
-    {22, dec::kDff,    dec::kD     },   // L1 ff.0.weight      [512,128]
-    {24, dec::kD,      dec::kDff   },   // L1 ff.2.weight      [128,512]
-    {28, dec::kVocab,  dec::kD     },   // out.weight          [99,128]
-};
-// Is tensor index `t` one of the Muon 2D matrices (orthogonalized in P2.7)? P3
-// uses this to route ONLY the 1D / non-2D weights to the AdamW aux tail for Muon.
-__device__ __forceinline__ bool dec_is_muon_2d(int t) {
-    #pragma unroll
-    for (int mi = 0; mi < kDecNumMuon2D; ++mi) if (kDecMuon2D[mi].tidx == t) return true;
+// The mi-th Muon 2D matrix (tensor index + rows/cols), L-general. Dense order:
+//   mi=0 tok[V,d]; mi=1 pos[seq,d];
+//   mi∈[2,2+4L): li=(mi-2)/4, kind=(mi-2)%4 →
+//     kind0 in_proj  tidx 2 +12li  [3d,d]
+//     kind1 out_proj tidx 4 +12li  [d, d]
+//     kind2 ff0      tidx 10+12li  [dff,d]
+//     kind3 ff2      tidx 12+12li  [d, dff]
+//   mi=2+4L head out.weight tidx 2+12L+2 [V,d].
+// At L=2 reproduces the old kDecMuon2D[11] EXACTLY (tidx {0,1,2,4,10,12,14,16,22,24,28}).
+__host__ __device__ __forceinline__ DecMuon2D dec_muon_2d(int mi) {
+    if (mi == 0)                         return { 0, dec::kVocab, dec::kD };   // tok
+    if (mi == 1)                         return { 1, dec::kSeq,   dec::kD };   // pos
+    if (mi == 2 + 4 * dec::kLayers)      return { 2 + 12 * dec::kLayers + 2, dec::kVocab, dec::kD }; // head.out
+    const int li   = (mi - 2) / 4;
+    const int kind = (mi - 2) % 4;
+    if (kind == 0) return { 2  + 12 * li, 3 * dec::kD, dec::kD   };  // in_proj
+    if (kind == 1) return { 4  + 12 * li, dec::kD,     dec::kD   };  // out_proj
+    if (kind == 2) return { 10 + 12 * li, dec::kDff,   dec::kD   };  // ff0
+    return            { 12 + 12 * li, dec::kD,     dec::kDff };      // ff2
+}
+// Is tensor index `t` a Muon 2D matrix (orthogonalized in P2.7)? P3 routes only
+// the 1D / non-2D weights to the AdamW aux tail. Closed-form (no table scan):
+//   t∈{0,1} (tok/pos), OR t==head.out (2+12L+2), OR a per-layer 2D weight
+//   (t∈[2,2+12L) and (t-2)%12 ∈ {0,2,8,10} = in_w/out_w/ff0_w/ff2_w).
+__device__ __host__ __forceinline__ bool dec_is_muon_2d(int t) {
+    if (t == 0 || t == 1) return true;
+    if (t == 2 + 12 * dec::kLayers + 2) return true;       // head out.weight
+    if (t >= 2 && t < 2 + 12 * dec::kLayers) {
+        const int r = (t - 2) % 12;
+        return (r == 0 || r == 2 || r == 8 || r == 10);
+    }
     return false;
 }
 // Largest 2D weight (numel) + largest #rows over the table — sizes the per-matrix
@@ -1760,8 +1782,8 @@ __device__ void dectc_backward_tile(
         gn_n2w[li] = lnvec + (int64_t)(li * 4 + 2) * dec::kD;
         gn_n2b[li] = lnvec + (int64_t)(li * 4 + 3) * dec::kD;
     }
-    float* gn_normw = lnvec + (int64_t)8 * dec::kD;
-    float* gn_normb = lnvec + (int64_t)9 * dec::kD;
+    float* gn_normw = lnvec + (int64_t)(4 * dec::kLayers + 0) * dec::kD;  // 8*kD at L=2
+    float* gn_normb = lnvec + (int64_t)(4 * dec::kLayers + 1) * dec::kD;  // 9*kD at L=2
 
     // ── CE bwd (per sample): dlogits = (softmax - onehot)/B, overwrite logits.
     //    head bwd: dY_logits[si] = dlogits (the head dW operand); dhn = dlogits@out_w.
@@ -1966,6 +1988,13 @@ struct DecDwSpec {
 #endif
 };
 
+// Number of dW specs: 4 per layer (in_proj, out_proj, ff0, ff2) + 1 head.out.
+//   = 4*L + 1  (= 9 at L=2, the original spec[9]; = 193 at the flagship L=48).
+// This is the compile-time bound for EVERY DecDwSpec array (the DecTcSmem member,
+// every spec[] signature/local, the dW phase loops, the bias prefix). At L=2 it
+// is exactly 9 → the spec arrays + their stack/smem footprint are byte-identical.
+constexpr int kDecNumDwSpecs = 4 * dec::kLayers + 1;
+
 // ── CONTIGUOUS-TRANSPOSE dW scratch geometry (SG_TUNED_DEC_DW_STAGE=1). The 9
 //    weights' transposed operands (dYt[Nout,K] + Xt[Kin,K]) are packed into ONE
 //    contiguous bf16 region. Per weight s the block is (Nout_s + Kin_s)·K_s bf16:
@@ -2015,39 +2044,43 @@ __host__ __device__ __forceinline__ int64_t dec_dw_transpose_elems(int B, int T)
 // to its packed sub-block (same running-offset walk as dec_dw_transpose_elems +
 // the host carve). On the scalar path pass dwt_base=nullptr → dYt/Xt stay null.
 __device__ __forceinline__ void dectc_build_dw_specs(
-        const DecActs& acts, int B, int T, DecDwSpec spec[9],
+        const DecActs& acts, int B, int T, DecDwSpec spec[kDecNumDwSpecs],
         __nv_bfloat16* dwt_base);
 
 // Back-compat overload (scalar path / pre-existing call sites): no transpose
 // scratch. Forwards with dwt_base=nullptr so dYt/Xt are null and stage==0 runs
 // the proven lambda gather unchanged.
 __device__ __forceinline__ void dectc_build_dw_specs(
-        const DecActs& acts, int B, int T, DecDwSpec spec[9]) {
+        const DecActs& acts, int B, int T, DecDwSpec spec[kDecNumDwSpecs]) {
     dectc_build_dw_specs(acts, B, T, spec, /*dwt_base=*/nullptr);
 }
 
 __device__ __forceinline__ void dectc_build_dw_specs(
-        const DecActs& acts, int B, int T, DecDwSpec spec[9],
+        const DecActs& acts, int B, int T, DecDwSpec spec[kDecNumDwSpecs],
         __nv_bfloat16* dwt_base) {
-    // dec_layout offsets: see kDecOffsets. Weight tensor indices (and bias idx):
-    //   L0: in_w=2 (in_b=3), out_w=4 (out_b=5), ff0_w=10 (ff0_b=11), ff2_w=12 (ff2_b=13)
-    //   L1: in_w=14(15), out_w=16(17), ff0_w=22(23), ff2_w=24(25)
-    //   head: out_w=28 (out_b=29)
-    const int wi[9]  = {2,4,10,12, 14,16,22,24, 28};
-    const int bi[9]  = {3,5,11,13, 15,17,23,25, 29};
-    for (int s = 0; s < 8; ++s) {
+    // dec_layout offsets: see kDecOffsets. Per-layer 12-tensor block (li):
+    //   weight tidx = 2 + 12*li + {0,2,8,10}[kind] (in_w,out_w,ff0_w,ff2_w), bias +1.
+    //   head out.weight tidx = 2 + 12*L + 2, bias +1.
+    // At L=2 these reproduce the old wi {2,4,10,12,14,16,22,24} / bi {3,5,11,13,
+    // 15,17,23,25} and head {28,29} EXACTLY. 4*L layer specs + 1 head = kDecNumDwSpecs.
+    for (int s = 0; s < 4 * dec::kLayers; ++s) {
         const int li = s / 4, kind = s % 4;
+        const int woff = (kind == 0) ? 0 : (kind == 1) ? 2 : (kind == 2) ? 8 : 10;
+        const int wi = 2 + 12 * li + woff;   // weight tensor index
+        const int bi = wi + 1;               // bias tensor index
         DecDwSpec& sp = spec[s];
-        sp.K = T; sp.grad_off = kDecOffsets[wi[s]]; sp.bias_off = kDecOffsets[bi[s]];
+        sp.K = T; sp.grad_off = kDecOffsets[wi]; sp.bias_off = kDecOffsets[bi];
         if (kind == 0)      { sp.dY = acts.dY_qkv[li]; sp.X = acts.X_in[li];  sp.Nout = 3 * dec::kD; sp.Kin = dec::kD;   }
         else if (kind == 1) { sp.dY = acts.dY_a[li];   sp.X = acts.X_ctx[li]; sp.Nout = dec::kD;     sp.Kin = dec::kD;   }
         else if (kind == 2) { sp.dY = acts.dY_ff0[li]; sp.X = acts.X_x1[li];  sp.Nout = dec::kDff;   sp.Kin = dec::kD;   }
         else                { sp.dY = acts.dY_ff2[li]; sp.X = acts.X_gact[li];sp.Nout = dec::kD;     sp.Kin = dec::kDff; }
         sp.dY_bias = sp.dY;
     }
-    DecDwSpec& hd = spec[8];
+    DecDwSpec& hd = spec[4 * dec::kLayers];   // head spec (was spec[8] at L=2)
     hd.dY = acts.dY_logits; hd.X = acts.X_hn; hd.Nout = dec::kVocab; hd.Kin = dec::kD; hd.K = B;
-    hd.grad_off = kDecOffsets[28]; hd.bias_off = kDecOffsets[29]; hd.dY_bias = hd.dY;
+    hd.grad_off = kDecOffsets[2 + 12 * dec::kLayers + 2];           // out.weight (28 at L=2)
+    hd.bias_off = kDecOffsets[2 + 12 * dec::kLayers + 3];           // out.bias   (29 at L=2)
+    hd.dY_bias = hd.dY;
 
     // CONTIGUOUS-TRANSPOSE bind (stage==1): pack each weight's dYt[Mpad,K] then
     // Xt[Kin,K] into dwt_base via the SAME running-offset walk dec_dw_transpose_elems
@@ -2058,7 +2091,7 @@ __device__ __forceinline__ void dectc_build_dw_specs(
 #if SG_TUNED_DEC_DW_STAGE
     if (kDecDwTransposeActive && dwt_base != nullptr) {
         int64_t e = 0;
-        for (int s = 0; s < 9; ++s) {
+        for (int s = 0; s < kDecNumDwSpecs; ++s) {
             DecDwSpec& sp = spec[s];
             sp.t_off = e;
             sp.dYt   = dwt_base + e;                                  // [Mpad, K]
@@ -2066,7 +2099,7 @@ __device__ __forceinline__ void dectc_build_dw_specs(
             e += dec_dw_weight_t_elems(sp.Nout, sp.Kin, sp.K);
         }
     } else {
-        for (int s = 0; s < 9; ++s) { spec[s].dYt = nullptr; spec[s].Xt = nullptr; spec[s].t_off = 0; }
+        for (int s = 0; s < kDecNumDwSpecs; ++s) { spec[s].dYt = nullptr; spec[s].Xt = nullptr; spec[s].t_off = 0; }
     }
 #else
     (void)dwt_base;
@@ -2086,13 +2119,13 @@ __device__ __forceinline__ void dectc_build_dw_specs(
 //    bf16 stores, touched ONCE per step and reused across every dW work item +
 //    split-K chunk of that weight. ──
 __device__ __forceinline__ void dectc_dw_transpose_operands(
-        const DecDwSpec spec[9], int cta, int nCTA) {
+        const DecDwSpec spec[kDecNumDwSpecs], int cta, int nCTA) {
 #if SG_TUNED_DEC_DW_STAGE
     if constexpr (!kDecDwTransposeActive) { (void)spec; (void)cta; (void)nCTA; return; }
     const int tpb = blockDim.x;
     const int64_t stride = (int64_t)nCTA * tpb;
     const int64_t lane0  = (int64_t)cta * tpb + threadIdx.x;
-    for (int s = 0; s < 9; ++s) {
+    for (int s = 0; s < kDecNumDwSpecs; ++s) {
         const DecDwSpec& sp = spec[s];
         if (sp.dYt == nullptr) continue;
         const int64_t K = sp.K, Nout = sp.Nout, Kin = sp.Kin;
@@ -2138,9 +2171,9 @@ __device__ __host__ __forceinline__ int dec_dw_groups(int Nout) {
 // Total number of dW output WORK ITEMS (M-atom groups × N-tiles) across the 9
 // weights (the tile loop count). Each item is a group of <= kDecDwIL m64 atoms.
 template <int N>
-__device__ __forceinline__ int dectc_dw_total_tiles(const DecDwSpec spec[9]) {
+__device__ __forceinline__ int dectc_dw_total_tiles(const DecDwSpec spec[kDecNumDwSpecs]) {
     int n = 0;
-    for (int s = 0; s < 9; ++s)
+    for (int s = 0; s < kDecNumDwSpecs; ++s)
         n += dec_dw_groups(spec[s].Nout) * ((spec[s].Kin + N - 1) / N);
     return n;
 }
@@ -2152,11 +2185,11 @@ __device__ __forceinline__ int dectc_dw_total_tiles(const DecDwSpec spec[9]) {
 // X B-tile (H1's win, now on the dW K=T contraction).
 template <int N>
 __device__ __forceinline__ void dectc_dw_run_tile(
-        const DecDwSpec spec[9], int gt, float* __restrict__ grad,
+        const DecDwSpec spec[kDecNumDwSpecs], int gt, float* __restrict__ grad,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     // Decode gt → (s, m_group, n_tile).
     int acc = 0, s = 0, m_group = 0, n_tile = 0;
-    for (s = 0; s < 9; ++s) {
+    for (s = 0; s < kDecNumDwSpecs; ++s) {
         const int ng = dec_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
         if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; break; }
@@ -2273,15 +2306,15 @@ __host__ __device__ __forceinline__ int64_t dec_dw_part_floats(int G) {
 // kDecDwIL, base row = m_group·kDecDwIL·64).
 template <int N>
 __device__ __forceinline__ void dectc_dw_decode(
-        const DecDwSpec spec[9], int gt, int& s, int& m_group, int& n_tile) {
+        const DecDwSpec spec[kDecNumDwSpecs], int gt, int& s, int& m_group, int& n_tile) {
     int acc = 0;
-    for (s = 0; s < 9; ++s) {
+    for (s = 0; s < kDecNumDwSpecs; ++s) {
         const int ng = dec_dw_groups(spec[s].Nout);
         const int nt = (spec[s].Kin + N - 1) / N;
         if (gt < acc + ng * nt) { int loc = gt - acc; m_group = loc / nt; n_tile = loc % nt; return; }
         acc += ng * nt;
     }
-    s = 8; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined
+    s = 4 * dec::kLayers; m_group = 0; n_tile = 0;   // unreachable (gt < n_dw); keep defined (head idx)
 }
 
 // PARTIAL dW for global tile gt over K-chunk kc of G → dw_part. K-chunk uses sp.K
@@ -2294,7 +2327,7 @@ __device__ __forceinline__ void dectc_dw_decode(
 // per chunk → true partial. Writes the full 64×N tile (LOCAL rows) to the slot.
 template <int N>
 __device__ __forceinline__ void dectc_dw_run_tile_splitk(
-        const DecDwSpec spec[9], int gt, int kc, int G, float* __restrict__ dw_part,
+        const DecDwSpec spec[kDecNumDwSpecs], int gt, int kc, int G, float* __restrict__ dw_part,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     int s, m_group, n_tile;
     dectc_dw_decode<N>(spec, gt, s, m_group, n_tile);
@@ -2342,7 +2375,7 @@ __device__ __forceinline__ void dectc_dw_run_tile_splitk(
 // → grad. Same (gt → geometry) decode as the partial.
 template <int N>
 __device__ __forceinline__ void dectc_dw_reduce_splitk(
-        const DecDwSpec spec[9], int n_dw, int G, const float* __restrict__ dw_part,
+        const DecDwSpec spec[kDecNumDwSpecs], int n_dw, int G, const float* __restrict__ dw_part,
         float* __restrict__ grad, int cta, int nCTA) {
     for (int gt = cta; gt < n_dw; gt += nCTA) {
         int s, m_group, n_tile;
@@ -2387,19 +2420,19 @@ __device__ __forceinline__ void dectc_dw_reduce_splitk(
 // bias/reduction-to-a-vector that a megakernel was recomputing per-CTA; vit/mamba
 // bias grads (same db = Σ_K dY shape) reuse this verbatim.
 __device__ __forceinline__ void dectc_dw_biases(
-        const DecDwSpec spec[9], float* __restrict__ grad, int cta, int nCTA) {
-    // exclusive prefix of Nout across the 9 specs → total bias-output count.
-    int pre[10];
+        const DecDwSpec spec[kDecNumDwSpecs], float* __restrict__ grad, int cta, int nCTA) {
+    // exclusive prefix of Nout across the specs → total bias-output count.
+    int pre[kDecNumDwSpecs + 1];
     pre[0] = 0;
     #pragma unroll
-    for (int s = 0; s < 9; ++s) pre[s + 1] = pre[s] + spec[s].Nout;
-    const int total = pre[9];
+    for (int s = 0; s < kDecNumDwSpecs; ++s) pre[s + 1] = pre[s] + spec[s].Nout;
+    const int total = pre[kDecNumDwSpecs];
     const int stride = nCTA * blockDim.x;
     for (int go = cta * blockDim.x + threadIdx.x; go < total; go += stride) {
-        // decode global output index → (spec s, local row o). 9 specs → linear scan.
+        // decode global output index → (spec s, local row o). #specs → linear scan.
         int s = 0;
         #pragma unroll
-        for (int t = 0; t < 9; ++t) if (go >= pre[t + 1]) s = t + 1;
+        for (int t = 0; t < kDecNumDwSpecs; ++t) if (go >= pre[t + 1]) s = t + 1;
         const DecDwSpec& sp = spec[s];
         const int o = go - pre[s];
         float accv = 0.0f;
@@ -2575,9 +2608,9 @@ __device__ __forceinline__ void dectc_embed_owner_scan(
 __device__ __forceinline__ void dectc_lnvec_reduce(
         const float* __restrict__ lnvec_base, float* __restrict__ grad,
         int nCTA, int cta) {
-    // Each CTA reduces a subset of the 10 LN tensors (round-robin by tensor).
+    // Each CTA reduces a subset of the LN tensors (round-robin by tensor).
     for (int v = cta; v < kNumLnVec; v += nCTA) {
-        const int goff = kLnVecTensorIdx[v];
+        const int goff = dec_lnvec_tensor_idx(v);   // was kLnVecTensorIdx[v]
         const int64_t gbase = kDecOffsets[goff];
         for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
             float accv = 0.0f;

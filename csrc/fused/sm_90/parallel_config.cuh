@@ -115,8 +115,26 @@ struct CommCtx {
     // Opaque handle slots (NVSHMEM team / NCCL comm) — left as nullptr-able
     // pointers a builder casts to the concrete handle type behind kEmitComm, so
     // this header need NOT include <nccl.h>/<nvshmem.h> (kept CPU-compilable).
-    void* tp_comm_handle = nullptr;   // NCCL comm / NVSHMEM team for the TP group (§5)
+    // tp_comm_handle carries the NVSHMEM TP team id stored as
+    // reinterpret_cast<void*>((intptr_t)nvshmem_team_t) (tp_team_t is int32_t);
+    // tp::make_transport_from_comm reverses the cast (tp_kernel.md §3 A.2).
+    void* tp_comm_handle = nullptr;   // NCCL comm / NVSHMEM TP team id (§5)
     void* dp_comm_handle = nullptr;   // NCCL comm for the DP group (reduce-scatter / all-gather)
+    // ── In-kernel TP all-reduce wiring (filled ONLY on kEmitComm; nullptr/0 on
+    //    the SingleGPU path, so a default-constructed CommCtx forwards "no TP
+    //    heap" and the kEmitComm=false megakernel never reads these — the ABI of
+    //    the default <Opt,SingleGPU> instantiation is preserved, the §6 PTX gate).
+    //  * tp_sym_heap: the nvshmem_malloc'd SYMMETRIC base for the TP reduce slots
+    //    (NOT the cudaMalloc workspace — /workspace/impl_diffs/tp_kernel.md §2/EDIT E).
+    //    Opaque float* here; NvshmemTransport reinterprets it as heap_base. On the
+    //    loopback build it is the strided cudaMalloc heap (LoopbackTransport).
+    //  * tp_heap_stride_floats: per-PE symmetric stride (== tp::tp_heap_stride_floats).
+    //  * tp_team_local_pe / tp_team_n_pes: the team-local pe index + team size
+    //    (== nvshmem_team_my_pe / _n_pes on the TP team; == tp_rank / tp_size).
+    void*   tp_sym_heap           = nullptr;  // nvshmem_malloc'd symmetric TP-slot base
+    int64_t tp_heap_stride_floats = 0;        // per-PE symmetric stride (floats)
+    int     tp_team_local_pe      = 0;        // pe-in-TP-team (== tp_rank)
+    int     tp_team_n_pes         = 1;        // TP team size  (== tp_size)
 };
 
 }}}  // namespace sg::fused::par

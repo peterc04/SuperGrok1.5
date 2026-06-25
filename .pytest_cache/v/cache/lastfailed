@@ -1,1 +1,3 @@
-{}
+{
+  "tests/hw/test_dp2_loopback_determinism.py::test_dp2_loopback_cross_rank_aaa[grokfast-decoder]": true
+}
