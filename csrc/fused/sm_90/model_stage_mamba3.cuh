@@ -775,10 +775,15 @@ __device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
 //  bare mixer output (residual=False) into `mix_out` [kSeq,d]. Uses sm scratch.
 //  Mirrors mamba3_oracle.layer_forward (residual OFF).
 // ════════════════════════════════════════════════════════════════════════
-__device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+// Mixer forward up to (but NOT including) the out_proj recombination: computes
+// y_gated into sm->adj_a (the out_proj INPUT). Split out so the tensor-parallel
+// path (model_stage_mamba_tc.cuh mb_forward_sample_tp) can run the replicated SSM
+// body here and apply the ROW-parallel out_proj all-reduce itself; the SingleGPU
+// mb_mixer_fwd below CALLS this then does the unsharded out_proj (ONE body → the
+// SSM math is byte-identical on both paths; the pytest gate proves it).
+__device__ inline void mb_mixer_fwd_pre_outproj(const MambaWeights::Layer& L,
                             const float* __restrict__ xn,   // [kSeq,d] (mixer input)
                             MambaSampleSmem::LayerAct* a,
-                            float* __restrict__ mix_out,     // [kSeq,d] OUT
                             MambaSampleSmem* sm) {
     // xz = in_proj(xn); split rows [0,d_inner)->x_in, [d_inner,2di)->z.
     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
@@ -843,13 +848,24 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
     __syncthreads();
     // selective scan -> a->y_scan.
     mb_scan_fwd(L.A_log, a, &a->y_scan[0][0]);
-    // y_gated = (y_scan + x_in*D) * silu(z) -> sm->adj_a ; out = out_proj(y_gated).
+    // y_gated = (y_scan + x_in*D) * silu(z) -> sm->adj_a (the out_proj INPUT).
     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kDInner; idx += blockDim.x) {
         const int s = idx / mb::kDInner, c = idx % mb::kDInner;
         float yv = a->y_scan[s][c] + a->x_in[s][c] * L.D[c];
         sm->adj_a[s][c] = yv * mb_silu(a->z[s][c]);
     }
     __syncthreads();
+}
+
+// Mixer forward (SingleGPU): the SSM body + the unsharded out_proj. ONE body via
+// the _pre helper so the SSM math is shared byte-identically with the TP path.
+__device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
+                            const float* __restrict__ xn,   // [kSeq,d] (mixer input)
+                            MambaSampleSmem::LayerAct* a,
+                            float* __restrict__ mix_out,     // [kSeq,d] OUT
+                            MambaSampleSmem* sm) {
+    mb_mixer_fwd_pre_outproj(L, xn, a, sm);   // → y_gated in sm->adj_a
+    // out = out_proj(y_gated).
     mb_linear(&sm->adj_a[0][0], mb::kDInner, mb::kDInner, L.out_w, nullptr,
               mb::kD, mix_out, mb::kD);
 }
@@ -858,10 +874,13 @@ __device__ inline void mb_mixer_fwd(const MambaWeights::Layer& L,
 //  SwiGLU forward for one sample. Input h1n = RMSNorm_mlp(h1). Caches g_pre,u_mlp.
 //  out = down(silu(gate(x)) * up(x)). Mirrors mamba3_oracle.swiglu_forward.
 // ════════════════════════════════════════════════════════════════════════
-__device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
+// SwiGLU forward up to (but NOT including) the down recombination: computes prod
+// = silu(gate(x))*up(x) into sm->wff_a (the down_proj INPUT). Split out so the TP
+// path runs gate/up (column-parallel, replicated weights here) + applies the
+// ROW-parallel down all-reduce itself; mb_swiglu_fwd CALLS this (ONE body).
+__device__ inline void mb_swiglu_fwd_pre_down(const MambaWeights::Layer& L,
                              const float* __restrict__ h1n,   // [kSeq,d]
                              MambaSampleSmem::LayerAct* a,
-                             float* __restrict__ mlp_out,      // [kSeq,d] OUT
                              MambaSampleSmem* sm) {
     mb_linear(h1n, mb::kD, mb::kD, L.gate_w, nullptr, mb::kDff, &a->g_pre[0][0], mb::kDff);
     mb_linear(h1n, mb::kD, mb::kD, L.up_w,   nullptr, mb::kDff, &a->u_mlp[0][0], mb::kDff);
@@ -871,6 +890,14 @@ __device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
         sm->wff_a[s][o] = mb_silu(a->g_pre[s][o]) * a->u_mlp[s][o];
     }
     __syncthreads();
+}
+
+__device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
+                             const float* __restrict__ h1n,   // [kSeq,d]
+                             MambaSampleSmem::LayerAct* a,
+                             float* __restrict__ mlp_out,      // [kSeq,d] OUT
+                             MambaSampleSmem* sm) {
+    mb_swiglu_fwd_pre_down(L, h1n, a, sm);   // → prod in sm->wff_a
     mb_linear(&sm->wff_a[0][0], mb::kDff, mb::kDff, L.down_w, nullptr, mb::kD, mlp_out, mb::kD);
 }
 

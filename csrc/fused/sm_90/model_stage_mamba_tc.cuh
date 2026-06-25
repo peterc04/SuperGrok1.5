@@ -28,6 +28,8 @@
 #include "csrc/fused/sm_90/mamba3_layout.cuh"
 #include "csrc/fused/sm_90/model_stage_mamba3.cuh"   // mb:: dims, MambaWeights/Grad, scan/RMSNorm/SwiGLU
 #include "csrc/backends/cuda/sm_90/wgmma.cuh"
+#include "csrc/fused/sm_90/parallel_config.cuh"       // par::ParConfig / par::SingleGPU (TP shard table default arg — EDIT M)
+#include "csrc/fused/sm_90/tp_transport.cuh"          // tp:: transport seam + tp_allreduce_sum_fixed_order (EDIT M)
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -153,7 +155,447 @@ __device__ __forceinline__ bool mb_is_muon_2d(int t) {
 constexpr int kMbMuonMaxNumel = kMambaMaxTensorNumel;      // == mamba_layout_check::max_size()
 constexpr int kMbMuonMaxRows  = 2 * mb::kDInner;           // 512 at d=128 (in_proj rows)
 
+// ════════════════════════════════════════════════════════════════════════════
+//  MAMBA-3 TENSOR-PARALLEL (Megatron) SHARD — the analogue of the decoder's
+//  kDecTpShard / tp_layer.cuh geometry, scoped to the SCALAR Mamba path.
+//
+//  WHY A NEW TABLE (NOT a reuse of tp_layer.cuh): tp_layer.cuh's partial-GEMM
+//  helpers are built on the decoder wgmma tile engine (dectc::dectc_gemm_*,
+//  dec:: dims) — they do NOT apply to the scan-dominated scalar Mamba path,
+//  which projects with the per-(s,o)-owner-computes mb_linear, not wgmma tiles.
+//  So the Mamba TP reuses ONLY the transport-agnostic primitives from
+//  tp_transport.cuh (LoopbackTransport/NvshmemTransport, the fixed-order
+//  ascending-pe reduce, make_transport_from_comm) + parallel_config.cuh
+//  (ParConfig/CommCtx). The sharded partial here is a SCALAR row-parallel
+//  mb_linear writing fp32 directly into the symmetric slot.
+//
+//  THE MEGATRON SPLIT ON MAMBA'S 45-TENSOR LAYOUT (row-major [Nout,Kin],
+//  named_parameters() order; per-layer 20-block at flat 2+20*li; block-offsets
+//  r∈{7=in_proj,8=x_proj,9=dt_proj_w,15=out_proj,17=gate,18=up,19=down}):
+//
+//   weight (block r)     split          rank owns                    comm
+//   ------------------------------------------------------------------------
+//   in_proj  (7)         COLUMN         rows [r·2di/P,(r+1)·2di/P)    none (fwd)
+//   out_proj (15)        ROW            cols [r·di/P,(r+1)·di/P)      fwd all-reduce ①
+//   gate     (17)        COLUMN         rows [r·dff/P,(r+1)·dff/P)    none (fwd)
+//   up       (18)        COLUMN         same rows                     none
+//   down     (19)        ROW            cols [r·dff/P,(r+1)·dff/P)    fwd all-reduce ②
+//   x_proj/dt_proj/scan internals + B/C norms + biases + D + A_log + the
+//   RMSNorms + tok/pos/head + norm           REPLICATED               none
+//
+//  SCOPING NOTE (the Mamba-specific honest boundary — analogue of the decoder's
+//  "attention head-shard is the one model-specific touch"): the decoder TP
+//  localizes attention to H/P heads on the column-parallel in_proj path. Mamba
+//  has NO standard attention, so that touch is precisely SCOPED OUT. The Mamba
+//  SSM (x_proj→dt/A/lam/theta/B/C→selective scan) consumes the FULL d_inner
+//  x_main with HEAD-SHARED (theta/B/C over Nc) and per-head (dt/A/lam) terms
+//  that do NOT decompose into independent per-rank channel shards the way the
+//  decoder's per-head attention does (theta/B/C are shared across heads). So
+//  the Mamba TP shards the PROJECTION recombination boundaries (the row-parallel
+//  out_proj/down all-reduces + their column-parallel dX conjugates) — exactly
+//  the decoder's 4 reduce points minus the head localization — and keeps the
+//  SSM math replicated. A full head-sharded selective scan (n_heads/P per rank,
+//  head-local theta/B/C) is the documented deep follow-up, NOT this mechanical
+//  mirror. The 4 reduce points below are the faithful, loopback-checkable core.
+// ════════════════════════════════════════════════════════════════════════════
+enum class MbTpSplit : int8_t {
+    Replicated = 0,   // full tensor on every rank (grads bit-identical, no comm)
+    Col        = 1,   // split along Nout (output rows) — column-parallel
+    Row        = 2,   // split along Kin  (input cols)  — row-parallel (+ all-reduce)
+};
+struct MbTpTensorShard { int tidx; MbTpSplit split; };
+
+// The 45-tensor Mamba shard table (mb_bind named order). Per-layer 20-block at
+// flat 2+20*li; only {in_proj(+7)=Col, out_proj(+15)=Row, gate(+17)=Col,
+// up(+18)=Col, down(+19)=Row} are sharded; everything else replicated.
+__device__ __forceinline__ MbTpSplit mb_tp_split_of(int t) {
+    if (t < 2) return MbTpSplit::Replicated;                       // tok, pos
+    if (t >= 2 + 20 * mb::kLayers) return MbTpSplit::Replicated;   // norm, head w/b
+    const int r = (t - 2) % 20;
+    if (r == 7)  return MbTpSplit::Col;   // in_proj  [2*d_inner, d]
+    if (r == 15) return MbTpSplit::Row;   // out_proj [d, d_inner]
+    if (r == 17) return MbTpSplit::Col;   // gate     [d_ff, d]
+    if (r == 18) return MbTpSplit::Col;   // up       [d_ff, d]
+    if (r == 19) return MbTpSplit::Row;   // down     [d, d_ff]
+    return MbTpSplit::Replicated;
+}
+
+// Contiguous own-range along a split extent (caller asserts extent % P == 0).
+__host__ __device__ __forceinline__ void mb_tp_own_range(int extent, int P, int r,
+                                                         int* lo, int* hi) {
+    const int per = extent / P;
+    *lo = r * per; *hi = *lo + per;
+}
+
+// ── SCALAR row-parallel forward partial (the Mamba analogue of
+//    tp_rowparallel_fwd_partial_tile, but owner-computes not wgmma). Each PE
+//    computes Ypart[s, o] = Σ_{k in own col-shard} Xown[s,k]·Wshard[o,k] over
+//    its [Nout, Kin/P] dense col-shard and writes the fp32 partial DIRECTLY into
+//    this PE's symmetric slot (the publish). Caller then rendezvous + fixed-order
+//    ascending-pe reduce → the full Σ_pe Ypart (all-reduce point ①/②). No bias
+//    here — the replicated bias is added by the caller AFTER the reduce (matching
+//    the decoder: out_b/ff2_b are post-reduce adds). ──
+__device__ __forceinline__ void mb_tp_rowparallel_fwd_partial(
+        float* __restrict__ slot,                 // tr.local(slot_off): [kSeq*Nout] fp32
+        const float* __restrict__ Xown, int ldX,  // [kSeq, Kin_local] (rank's own input shard)
+        const float* __restrict__ Wshard,         // [Nout, Kin_local] dense row-major col-shard
+        int Kin_local, int Nout) {
+    const int total = mb::kSeq * Nout;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int s = idx / Nout, o = idx % Nout;
+        const float* xr = Xown + (int64_t)s * ldX;
+        const float* Wr = Wshard + (int64_t)o * Kin_local;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int k = 0; k < Kin_local; ++k) acc += xr[k] * Wr[k];
+        slot[(int64_t)s * Nout + o] = acc;
+    }
+    __syncthreads();
+}
+
+// ── SCALAR column-parallel backward dX partial (the conjugate comm point ①'/②').
+//    dXpart[s,i] = Σ_{o in own row-shard} dYown[s,o]·Wshard[o,i], the rank's
+//    contribution to the FULL [kSeq, Kin] dX; published to the symmetric slot,
+//    caller rendezvous + reduce ⇒ dX = Σ_pe dXpart. Wshard is the rank's
+//    [Nout_local, Kin] dense row-shard. ──
+__device__ __forceinline__ void mb_tp_colparallel_dx_partial(
+        float* __restrict__ slot,                 // tr.local(slot_off): [kSeq*Kin] fp32
+        const float* __restrict__ dYown, int ldY, // [kSeq, Nout_local]
+        const float* __restrict__ Wshard,         // [Nout_local, Kin] dense row-major row-shard
+        int Kin, int Nout_local) {
+    const int total = mb::kSeq * Kin;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int s = idx / Kin, i = idx % Kin;
+        const float* dyr = dYown + (int64_t)s * ldY;
+        float acc = 0.0f;
+        for (int o = 0; o < Nout_local; ++o) acc += dyr[o] * Wshard[(int64_t)o * Kin + i];
+        slot[(int64_t)s * Kin + i] = acc;
+    }
+    __syncthreads();
+}
+
+// ── Symmetric-slot budget for one Mamba TP reduce, in floats. The largest
+//    reduced payload per sample is max(kSeq·d [out_proj/down fwd reduce, and the
+//    in_proj/gate-up dX reduce → kSeq·d]). All four reduces are [kSeq, d]. The
+//    canonical heap plan (one publish + one reduced slot per CTA-in-PE):
+//      slot 0: partial  [kSeq · d]   (publish target)
+//      slot 1: reduced  [kSeq · d]   (reduce output)
+//    The persistent kernel runs ONE sample per CTA at a time ⇒ heap stride =
+//    ctas_per_pe · 2 · kSeq · d floats. (Mirrors tp_layer.cuh::tp_tile_slot_floats
+//    / tp_heap_stride_floats, with the Mamba sample shape kSeq·d in place of the
+//    decoder tile shape kTileM·d.) ──
+__host__ __device__ __forceinline__ int64_t mb_tp_slot_floats() {
+    return (int64_t)mb::kSeq * mb::kD;
+}
+__host__ __device__ __forceinline__ int64_t mb_tp_heap_stride_floats(int ctas_per_pe) {
+    return (int64_t)ctas_per_pe * 2 * mb_tp_slot_floats();
+}
+
 }  // namespace mbtc
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TENSOR-PARALLEL Mamba sample fwd/bwd (EDIT M-D) — the analogue of the
+//  decoder's dectc_forward_tile_impl / dectc_backward_tile_impl with the four
+//  if-constexpr(Par::kTPComm) reduce points, scoped to the scalar Mamba path.
+//
+//  SHAPE: mb_forward_sample_tp<Par,Transport> / mb_backward_sample_tp<Par,
+//  Transport> share the EXACT body of mb_forward_sample / mb_backward_sample
+//  (model_stage_mamba3.cuh) on the SingleGPU (!kTPComm) path — they CALL those
+//  functions verbatim, so SingleGPU is byte-identical by construction (the
+//  wrappers add no code on the folded path). On the kTPComm path they run a
+//  TP-aware mixer/swiglu where the row-parallel out_proj/down forward produce a
+//  partial → publish → fixed-order ascending-pe reduce (①/②), and the
+//  column-parallel in_proj/gate-up backward dX is a partial → reduce (①'/②').
+//
+//  GRID-LOCKSTEP CONTRACT (mirrors tp_kernel.md §1 / the decoder C.3): these are
+//  called ONLY from the kTPComm grid-lockstep-over-samples P1 (EDIT M-C), where
+//  every CTA on a GPU cooperates on the SAME sample each round so tr.rendezvous
+//  (bar) at the 4 reduce points is reached a GRID-UNIFORM number of times. The
+//  `active` flag lets an empty round still reach every rendezvous (publishing a
+//  zero partial / skipping the math) so the arrival count stays uniform — the
+//  §1 deadlock fix. `slot_pub`/`slot_red` are this CTA's lanes in the symmetric
+//  heap (publish + reduced).
+//
+//  ⚠ SSM REPLICATION (the honest scope boundary, see mbtc:: shard-table NOTE):
+//  the selective scan + x_proj/dt internals are REPLICATED on every rank (the
+//  full d_inner x_main is reconstructed post-in_proj-reduce-free since in_proj is
+//  column-parallel and the SSM is head-shared). So the kTPComm mixer below runs
+//  the unsharded mb_mixer_fwd for the SSM body and applies the TP reduce ONLY at
+//  the out_proj/down recombination — exactly the decoder's reduce-point set
+//  minus the head localization that Mamba's head-shared SSM cannot take. The
+//  loopback transport makes this honestly checkable: with P virtual PEs each
+//  holding the full (replicated) weights, the reduce of P identical partials is
+//  P× the single value — which is why a TRUE multi-rank shard needs the sharded
+//  out_w/down_w col-shards the launcher's per-rank `params` provides (EDIT M-E,
+//  E.3 upstream host plan). The SCAFFOLD (template/transport/reduce/sym-heap/
+//  dispatch) is the faithful decoder mirror; the per-rank weight shard is the
+//  upstream host plan, out of this kernel track (decoder E.3 parallel).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Forward: SingleGPU forwards verbatim (byte-identical). kTPComm runs the mixer
+// with out_proj row-parallel reduce + swiglu with down row-parallel reduce.
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ inline float mb_forward_sample_tp(
+        const MambaWeights& w, const int* tokens_s, int target, bool active,
+        MambaSampleSmem* sm, const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red) {
+    if constexpr (!Par::kTPComm) {
+        (void)active; (void)tr; (void)bar; (void)slot_pub; (void)slot_red;
+        return mb_forward_sample(w, tokens_s, target, sm);
+    } else {
+        // ── kTPComm forward. The SSM body is replicated (unsharded mb_* device
+        //    fns); the two ROW-parallel projections (mixer out_proj, swiglu down)
+        //    publish a partial → rendezvous → fixed-order reduce. The replicated
+        //    bias is folded post-reduce. The recombination is the decoder ①/② set.
+        const int P = tr.n_pes();
+        float nll_acc = 0.0f;
+        // Embedding + positional -> layer_in[0] (replicated, only when active).
+        if (active) {
+            for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                const int s = idx / mb::kD, j = idx % mb::kD;
+                sm->layer_in[0][s][j] = w.tok[(int64_t)tokens_s[s] * mb::kD + j]
+                                      + w.pos[(int64_t)s * mb::kD + j];
+            }
+            __syncthreads();
+        }
+        for (int li = 0; li < mb::kLayers; ++li) {
+            const MambaWeights::Layer& L = w.layer[li];
+            MambaSampleSmem::LayerAct* a = &sm->act[li];
+            float* hin = &sm->layer_in[li][0][0];
+            // --- mixer sub-block (SSM replicated; out_proj ROW-parallel reduce ①) ---
+            if (active) {
+                mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mixn_r[0],
+                               sm->red, mb::kD, mb::kD);   // xn -> sm->dr
+                // mixer through y_gated (everything before out_proj); y_gated -> sm->adj_a.
+                mb_mixer_fwd_pre_outproj(L, &sm->dr[0][0], a, sm);
+            }
+            // out_proj ROW-parallel: out_w is the rank's [d, d_inner/P] col-shard;
+            // y_gated (sm->adj_a) is the rank's own [kSeq, d_inner/P]. Publish [kSeq,d]
+            // partial -> reduce -> mix_out (sm->adj_b, kD-strided). (① of the shard table.)
+            const int Kloc = mb::kDInner / P;
+            if (active) {
+                mbtc::mb_tp_rowparallel_fwd_partial(
+                    tr.local(slot_pub), &sm->adj_a[0][0], mb::kDInner, L.out_w, Kloc, mb::kD);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, &sm->adj_b[0][0], (int64_t)mb::kSeq * mb::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+            if (active) {
+                float* mo = &sm->adj_b[0][0];
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    a->h1[s][j] = hin[s * mb::kD + j] + mo[s * mb::kD + j];   // h1 = x + mixer_out
+                }
+                __syncthreads();
+                // --- SwiGLU sub-block (gate/up COLUMN replicated; down ROW reduce ②) ---
+                mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mlpn_r[0],
+                               sm->red, mb::kD, mb::kD);   // h1n -> sm->dr
+                // swiglu through prod (silu(gate)*up) -> sm->wff_a (down_proj input).
+                mb_swiglu_fwd_pre_down(L, &sm->dr[0][0], a, sm);
+            }
+            // down ROW-parallel: down_w is the rank's [d, d_ff/P] col-shard; prod
+            // (sm->wff_a) is the rank's own [kSeq, d_ff/P]. Publish -> reduce -> mlp_out. (②)
+            const int Kloc2 = mb::kDff / P;
+            if (active) {
+                mbtc::mb_tp_rowparallel_fwd_partial(
+                    tr.local(slot_pub), &sm->wff_a[0][0], mb::kDff, L.down_w, Kloc2, mb::kD);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, &sm->adj_b[0][0], (int64_t)mb::kSeq * mb::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+            if (active) {
+                float* mo = &sm->adj_b[0][0];
+                float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0] : &sm->final_in[0][0];
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    dst[s * mb::kD + j] = a->h1[s][j] + mo[s * mb::kD + j];   // h2 = h1 + mlp_out
+                }
+                __syncthreads();
+            }
+        }
+        // Final RMSNorm + head + NLL (replicated, only when active).
+        if (active) {
+            const float* hlast = &sm->final_in[mb::kSeq - 1][0];
+            float ss = 0.0f;
+            for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) { float v = hlast[j]; ss += v * v; }
+            float ms = mb_block_sum(ss, sm->red) / (float)mb::kD;
+            float r = rsqrtf(ms + mb::kRmsEps);
+            if (threadIdx.x == 0) sm->fn_r[mb::kSeq - 1] = r;
+            for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+                float xh = hlast[j] * r;
+                sm->fn_xhat[mb::kSeq - 1][j] = xh;
+                sm->adj_a[0][j] = xh * w.norm_w[j];
+            }
+            __syncthreads();
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
+                const float* Wr = w.out_w + (int64_t)o * mb::kD;
+                float acc = w.out_b[o];
+                #pragma unroll 4
+                for (int k = 0; k < mb::kD; ++k) acc += sm->adj_a[0][k] * Wr[k];
+                sm->logits[o] = acc;
+            }
+            __syncthreads();
+            float lmax = -CUDART_INF_F;
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) lmax = fmaxf(lmax, sm->logits[o]);
+            lmax = mb_block_max(lmax, sm->red);
+            float es = 0.0f;
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) es += __expf(sm->logits[o] - lmax);
+            es = mb_block_sum(es, sm->red);
+            float logz = lmax + __logf(es);
+            nll_acc = logz - sm->logits[target];
+        }
+        return nll_acc;
+    }
+}
+
+// Backward: SingleGPU forwards verbatim (byte-identical). kTPComm runs the mixer
+// with in_proj column-parallel dX reduce + swiglu with gate/up column dX reduce.
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ inline void mb_backward_sample_tp(
+        const MambaWeights& w, const MambaGrad& g, const int* tokens_s, int target,
+        int B, bool active, MambaSampleSmem* sm, const Transport& tr,
+        const ::sg::fused::GridBarrier& bar, int64_t slot_pub, int64_t slot_red) {
+    if constexpr (!Par::kTPComm) {
+        (void)active; (void)tr; (void)bar; (void)slot_pub; (void)slot_red;
+        mb_backward_sample(w, g, tokens_s, target, B, sm);
+    } else {
+        // ── kTPComm backward. The replicated head/final-norm + the SSM body bwd run
+        //    the unsharded mb_* device fns; the two COLUMN-parallel projections
+        //    (in_proj, gate+up) have a PARTIAL dX → publish → reduce (①'/②').
+        const int P = tr.n_pes();
+        if (active) {
+            // CE bwd + head + final RMSNorm bwd (replicated) → sm->dh (last pos nonzero).
+            float lmax = -CUDART_INF_F;
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) lmax = fmaxf(lmax, sm->logits[o]);
+            lmax = mb_block_max(lmax, sm->red);
+            float es = 0.0f;
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) es += __expf(sm->logits[o] - lmax);
+            es = mb_block_sum(es, sm->red);
+            float inv_es = 1.0f / es;
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
+                float smo = __expf(sm->logits[o] - lmax) * inv_es;
+                sm->logits[o] = (smo - ((o == target) ? 1.0f : 0.0f)) / (float)B;
+            }
+            __syncthreads();
+            const float* xh = &sm->fn_xhat[mb::kSeq - 1][0];
+            for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
+                float dl = sm->logits[o];
+                g.out_b[o] += dl;
+                float* gwrow = g.out_w + (int64_t)o * mb::kD;
+                #pragma unroll 4
+                for (int j = 0; j < mb::kD; ++j) gwrow[j] += dl * (xh[j] * w.norm_w[j]);
+            }
+            __syncthreads();
+            for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+                float acc = 0.0f;
+                for (int o = 0; o < mb::kPHead; ++o) acc += sm->logits[o] * w.out_w[(int64_t)o * mb::kD + j];
+                sm->dr[0][j] = acc;
+            }
+            __syncthreads();
+            for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) g.norm_w[j] += sm->dr[0][j] * xh[j];
+            __syncthreads();
+            {
+                float sdax = 0.0f;
+                for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+                    float dxhat = sm->dr[0][j] * w.norm_w[j]; sdax += dxhat * xh[j];
+                }
+                sdax = mb_block_sum(sdax, sm->red);
+                float corr = sdax / (float)mb::kD;
+                float rs = sm->fn_r[mb::kSeq - 1];
+                for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+                    float dxhat = sm->dr[0][j] * w.norm_w[j];
+                    for (int s = 0; s < mb::kSeq; ++s) sm->dh[s][j] = 0.0f;
+                    sm->dh[mb::kSeq - 1][j] = rs * (dxhat - xh[j] * corr);
+                }
+                __syncthreads();
+            }
+        }
+        for (int li = mb::kLayers - 1; li >= 0; --li) {
+            const MambaWeights::Layer& L = w.layer[li];
+            const MambaGrad::Layer& G = g.layer[li];
+            MambaSampleSmem::LayerAct* a = &sm->act[li];
+            float* hin = &sm->layer_in[li][0][0];
+            // h2 = h1 + mlp(mlp_norm(h1)). dh2 = sm->dh.
+            if (active) {
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    sm->dr[s][j] = (a->h1[s][j] * a->mlpn_r[s]) * L.mlpn_w[j];   // h1n
+                }
+                __syncthreads();
+                // swiglu bwd: dW(down/gate/up) accumulate + dX = dx_gate + dx_up into
+                // sm->fn_xhat. On the COLUMN-parallel shard each rank owns dff/P rows of
+                // gate/up, so its dX is a PARTIAL Σ over its own rows; publish it to the
+                // symmetric slot for the fixed-order reduce (②' of the shard table). In the
+                // loopback (replicated weights) this publishes the full dX (the documented
+                // P× loopback artifact — see the SSM-REPLICATION NOTE).
+                mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x)
+                    tr.local(slot_pub)[idx] = sm->fn_xhat[idx / mb::kD][idx % mb::kD];
+                __syncthreads();
+            }
+            // gate+up COLUMN-parallel dX reduce (②'): the partial dh1n is in tr.local(slot_pub).
+            // Reduce → sm->fn_xhat.
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, &sm->fn_xhat[0][0], (int64_t)mb::kSeq * mb::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+            if (active) {
+                mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], &a->h1[0][0], &a->mlpn_r[0], L.mlpn_w,
+                                    &sm->dr[0][0], G.mlpn_w, sm->red, mb::kD, mb::kD);
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    sm->dh[s][j] += sm->dr[s][j];   // dh1 = dh2 + mlp_norm path
+                }
+                __syncthreads();
+                // mixer bwd through the SSM body to the in_proj dxz; dxn (mixer_norm out
+                // grad) is the COLUMN-parallel in_proj dX partial; reduced below (①').
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    sm->dr[s][j] = (hin[s * mb::kD + j] * a->mixn_r[s]) * L.mixn_w[j];   // xn
+                }
+                __syncthreads();
+                // mixer bwd: dW(out/x_proj/dt/in/scan/...) accumulate + dX = in_proj dX
+                // into sm->fn_xhat. in_proj is COLUMN-parallel, so its dX is a PARTIAL Σ
+                // over the rank's own 2*d_inner/P rows; publish for the reduce (①').
+                mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x)
+                    tr.local(slot_pub)[idx] = sm->fn_xhat[idx / mb::kD][idx % mb::kD];
+                __syncthreads();
+            }
+            // in_proj COLUMN-parallel dX reduce (①'): partial dxn in tr.local(slot_pub).
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, &sm->fn_xhat[0][0], (int64_t)mb::kSeq * mb::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+            if (active) {
+                mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], hin, &a->mixn_r[0], L.mixn_w,
+                                    &sm->dr[0][0], G.mixn_w, sm->red, mb::kD, mb::kD);
+                for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
+                    const int s = idx / mb::kD, j = idx % mb::kD;
+                    sm->dh[s][j] += sm->dr[s][j];   // dx = dh1 + mixer_norm path
+                }
+                __syncthreads();
+            }
+        }
+        // embedding backward (replicated).
+        if (active) {
+            for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
+                #pragma unroll
+                for (int s = 0; s < mb::kSeq; ++s) {
+                    float d = sm->dh[s][j];
+                    g.tok[(int64_t)tokens_s[s] * mb::kD + j] += d;
+                    g.pos[(int64_t)s * mb::kD + j] += d;
+                }
+            }
+            __syncthreads();
+        }
+        (void)P; (void)slot_red;
+    }
+}
 
 }}} // namespace sg::fused::sm90
 

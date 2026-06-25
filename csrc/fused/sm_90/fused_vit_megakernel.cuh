@@ -99,6 +99,8 @@
 #endif
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
 #include "csrc/fused/sm_90/model_stage_vit_tc.cuh"
+#include "csrc/fused/sm_90/parallel_config.cuh"   // par::ParConfig / par::SingleGPU / par::CommCtx (EDIT C — TP track)
+#include "csrc/fused/sm_90/tp_transport.cuh"      // tp:: make_transport_from_comm + fixed-order reduce (EDIT C)
 // SuperGrok2 FULL CSA/HCA/PEER/GRU meta-net stages (composed as the optimizer
 // phase) — the ViT twin of the decoder's SG2 composition. Pulls in sg2_meta_stages
 // + the in-kernel segmented sort (STAGE -1). The SG2 weight bundle is read from HBM
@@ -497,15 +499,20 @@ __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B
 __device__ unsigned long long g_vit_prof_max[6];
 #endif
 
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 __global__ void __launch_bounds__(SG_VIT_TC_MEGA_BLOCK)
 fused_vit_megakernel_tc(PersistentContext ctx,
                         float* __restrict__ params,
                         ViTInputCtx in,
                         float* __restrict__ grad,
-                        float lr, int step, FusedOptState st) {
+                        float lr, int step, FusedOptState st,
+                        ::sg::fused::par::CommCtx comm = {}) {
     __shared__ VitTcSmem sm;
     GridBarrier bar = ctx.barrier();
+    // TP transport: constructed ONLY inside the kTPComm P1 branch (EDIT C.3 below)
+    // via make_transport_from_comm<Par>(comm), so NOTHING TP-related is named on
+    // the SingleGPU path — the cleanest PTX identity (tp_kernel.md §5 RECOMMENDED).
+    (void)comm;  // default-constructed POD, unread on SingleGPU
     const int cta = blockIdx.x;
     const int nCTA = (int)ctx.n_ctas;
     const int B = in.B;
@@ -591,25 +598,70 @@ fused_vit_megakernel_tc(PersistentContext ctx,
 #ifdef SG_VIT_PROFILE
     unsigned long long prof_fwd = 0, prof_bwd = 0;
 #endif
-    for (int ti = cta; ti < n_tiles; ti += nCTA) {
-        const int g0 = ti * nrows_tile;
-        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+    if constexpr (!Par::kTPComm) {
+        // ░░ DEFAULT / SingleGPU path — BYTE-IDENTICAL to the pre-Par kernel. ░░
+        for (int ti = cta; ti < n_tiles; ti += nCTA) {
+            const int g0 = ti * nrows_tile;
+            const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
 #ifdef SG_VIT_PROFILE
-        __syncthreads(); unsigned long long _c0 = clock64();
+            __syncthreads(); unsigned long long _c0 = clock64();
 #endif
-        float nll = vittc::vittc_forward_tile(w, g0, nrows, acts, sc, in.patches, in.targets,
-                                              sm.sA, sm.sB, sm.red);
+            float nll = vittc::vittc_forward_tile(w, g0, nrows, acts, sc, in.patches, in.targets,
+                                                  sm.sA, sm.sB, sm.red);
 #ifdef SG_VIT_PROFILE
-        __syncthreads(); unsigned long long _c1 = clock64();
+            __syncthreads(); unsigned long long _c1 = clock64();
 #endif
-        vittc::vittc_backward_tile(w, g0, nrows, B, acts, sc, in.targets,
-                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+            vittc::vittc_backward_tile(w, g0, nrows, B, acts, sc, in.targets,
+                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
 #ifdef SG_VIT_PROFILE
-        __syncthreads(); unsigned long long _c2 = clock64();
-        if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+            __syncthreads(); unsigned long long _c2 = clock64();
+            if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
 #endif
-        if (threadIdx.x == 0) nll_acc += nll;
-        __syncthreads();
+            if (threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
+    } else {
+        // ░░ kTPComm path — GRID-LOCKSTEP so tr.rendezvous(bar) at the 4 reduce
+        //    points (model_stage_vit_tc.cuh ①/②/①'/②') is reached the SAME number
+        //    of times by every CTA on this GPU (tp_kernel.md §1 deadlock fix). All
+        //    CTAs of THIS GPU cooperate on the SAME tile each round; the tile fns
+        //    thread <Par,Transport> + (tr, bar, slot) so the reduce fires inside
+        //    fwd/bwd.
+        //
+        //    ROUND COUNT is GRID-UNIFORM: the activations are REPLICATED across TP
+        //    ranks (TP shards WEIGHTS, not the batch), so every PE/GPU sees the
+        //    SAME T ⇒ SAME n_tiles ⇒ SAME n_rounds. The loopback (P virtual PEs in
+        //    ONE grid) and the real multi-GPU (P grids) BOTH satisfy this.
+        //
+        //    The two slot offsets (publish / reduced) are this CTA's lane in the
+        //    symmetric heap: slot_base = (cta_within_pe) * 2 * vit_tp_tile_slot_floats.
+        auto tr = ::sg::fused::sm90::tp::make_transport_from_comm<Par>(comm);
+        const int P            = tr.n_pes();
+        const int ctas_per_pe  = nCTA / P;                 // launcher asserts nCTA % P == 0
+        const int cta_in_pe    = ::sg::fused::sm90::tp::LoopbackTransport::cta_within_pe(cta, nCTA, P);
+        const int64_t slot_pub = (int64_t)cta_in_pe * 2 * vittc::vit_tp_tile_slot_floats();
+        const int64_t slot_red = slot_pub + vittc::vit_tp_tile_slot_floats();
+        // Tiles THIS CTA's PE owns: contiguous per-PE tile blocks, grid-strided by
+        // ctas_per_pe within the PE group. n_rounds is the grid-uniform max.
+        const int tiles_per_round = ctas_per_pe;           // CTAs of one PE per round
+        const int n_rounds = (n_tiles + tiles_per_round - 1) / tiles_per_round;
+        for (int rd = 0; rd < n_rounds; ++rd) {
+            const int ti = rd * tiles_per_round + cta_in_pe;
+            const bool active = (ti < n_tiles);
+            const int g0    = active ? ti * nrows_tile : 0;
+            const int nrows = active ? ((T - g0) < nrows_tile ? (T - g0) : nrows_tile) : 0;
+            // fwd+bwd with the TP reduce inside (the tile fns call tr.rendezvous(bar)
+            // at ①/②/①'/②' UNCONDITIONALLY each round, so every CTA rendezvouses the
+            // same number of times even when !active — the §1 lockstep invariant).
+            float nll = vittc::vittc_forward_tile_tp<Par>(
+                w, g0, nrows, active, acts, sc, in.patches, in.targets,
+                sm.sA, sm.sB, sm.red, tr, bar, slot_pub, slot_red);
+            vittc::vittc_backward_tile_tp<Par>(
+                w, g0, nrows, active, B, acts, sc, in.targets,
+                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red, tr, bar, slot_pub, slot_red);
+            if (active && threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
     }
     if (threadIdx.x == 0) loss_part[cta] = nll_acc;
 #ifdef SG_VIT_PROFILE
@@ -1142,11 +1194,11 @@ fused_vit_megakernel_tc(PersistentContext ctx,
 // the SAME nCTA (they read ctx.n_ctas). The shipped path passes 0 (full
 // saturation); a memory-constrained TEST passes a small cap so the per-CTA
 // scratch (nCTA × slab) fits. Determinism is preserved per fixed nCTA.
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 cudaError_t launch_fused_vit_megakernel_tc(
         PersistentContext ctx, float* params, ViTInputCtx in,
         float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
-        int ncta_cap = 0) {
+        int ncta_cap = 0, const ::sg::fused::par::CommCtx& comm = {}) {
     int dev = 0;
     cudaError_t err = cudaGetDevice(&dev);
     if (err != cudaSuccess) return err;
@@ -1159,7 +1211,7 @@ cudaError_t launch_fused_vit_megakernel_tc(
     // place one block/SM, REFUSE (the grid barrier would hang).
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_vit_megakernel_tc<Opt>, SG_VIT_TC_MEGA_BLOCK,
+        &occ, (const void*)&fused_vit_megakernel_tc<Opt, Par>, SG_VIT_TC_MEGA_BLOCK,
         /*dynamicSMemBytes=*/0);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
@@ -1169,14 +1221,19 @@ cudaError_t launch_fused_vit_megakernel_tc(
     ctx.n_ctas = launch_ctas;
     // B%16 required (the dW K-loop contracts K=T=B*kSeq and K=B in 16-step atoms).
     if ((in.B % 16) != 0) return cudaErrorInvalidValue;
+    // TP lockstep precondition (kTPComm only): the grid-lockstep P1 (kernel C.3)
+    // partitions nCTA into Par::kTP contiguous PE groups, so nCTA must divide by TP.
+    if constexpr (Par::kTPComm) {
+        if ((launch_ctas % (unsigned)Par::kTP) != 0) return cudaErrorInvalidValue;
+    }
 
     if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     dim3 grid(launch_ctas), block(SG_VIT_TC_MEGA_BLOCK);
-    fused_vit_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
-        ctx, params, in, grad, lr, step, st);
+    fused_vit_megakernel_tc<Opt, Par><<<grid, block, 0, stream>>>(
+        ctx, params, in, grad, lr, step, st, comm);
     return cudaGetLastError();
 }
 

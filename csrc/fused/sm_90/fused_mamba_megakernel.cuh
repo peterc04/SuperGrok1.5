@@ -95,6 +95,8 @@
 #endif
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
 #include "csrc/fused/sm_90/model_stage_mamba_tc.cuh"
+#include "csrc/fused/sm_90/parallel_config.cuh"   // par::ParConfig / par::SingleGPU / par::CommCtx (EDIT M-C)
+#include "csrc/fused/sm_90/tp_transport.cuh"       // tp:: make_transport_from_comm + fixed-order reduce (EDIT M-C)
 // SuperGrok2 FULL CSA/HCA/PEER/GRU meta-net stages (composed as the optimizer phase)
 // — the mamba twin of the decoder/vit SG2 include. Pulls in sg2_meta_stages + the
 // in-kernel segmented sort (STAGE -1) + SG2Dims/SG2State/SG2Scalars/SG2Weights. Only
@@ -524,13 +526,14 @@ __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nC
          ;
 }
 
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 __global__ void SG_MBTC_LAUNCH_BOUNDS
 fused_mamba_megakernel_tc(PersistentContext ctx,
                           float* __restrict__ params,
                           MambaTokenCtx tok,
                           float* __restrict__ grad,
-                          float lr, int step, FusedOptState st) {
+                          float lr, int step, FusedOptState st,
+                          ::sg::fused::par::CommCtx comm = {}) {
     // MAMBA-3 design: the "TC" megakernel runs the VALIDATED scalar per-sample
     // fwd+bwd (model_stage_mamba3.cuh, mb_forward_sample/mb_backward_sample —
     // matched to the fp64 oracle to ~2e-6) batch-parallel into a per-CTA FULL-grad
@@ -543,6 +546,10 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     extern __shared__ char mamba_tc_smem_raw[];
     MambaSampleSmem& sm = *reinterpret_cast<MambaSampleSmem*>(mamba_tc_smem_raw);
     GridBarrier bar = ctx.barrier();
+    // TP transport: constructed ONLY inside the kTPComm P1 branch (EDIT M-C below)
+    // via make_transport_from_comm<Par>(comm), so NOTHING TP-related is named on the
+    // SingleGPU path — the cleanest PTX identity (decoder tp_kernel.md §5 RECOMMENDED).
+    (void)comm;  // default-constructed POD, unread on SingleGPU (kTPComm==false)
     constexpr bool kSamCoupled = (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
                                   Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2);
     (void)kSamCoupled;
@@ -610,9 +617,11 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     if (threadIdx.x == 0) loss_part[cta] = 0.0f;
     bar.sync();   // B0
 
-    // ── P1: batch-parallel fwd+bwd (scalar per-sample). Fixed contiguous slice
-    //    [b0,b1) for this CTA; the whole CTA cooperates on ONE sample at a time. ──
-    {
+    // ── P1: fwd+bwd (scalar per-sample). Fixed contiguous slice [b0,b1) for this
+    //    CTA; the whole CTA cooperates on ONE sample at a time. ──
+    if constexpr (!Par::kTPComm) {
+        // ░░ DEFAULT / SingleGPU path — BYTE-IDENTICAL to the pre-Par kernel
+        //    (batch-parallel: each CTA owns a contiguous batch slice). ░░
         const int base = B / nCTA, rem = B % nCTA;
         const int b0 = cta * base + (cta < rem ? cta : rem);
         const int cnt = base + (cta < rem ? 1 : 0);
@@ -632,6 +641,57 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         }
         if (threadIdx.x == 0) loss_part[cta] = nll_acc;
         SG_MBTC_PROF_ACC(0, _pt);
+    } else {
+        // ░░ kTPComm path — GRID-LOCKSTEP OVER SAMPLES so tr.rendezvous(bar) at the 4
+        //    reduce points (mb_*_sample_tp out_proj/down fwd + in_proj/gate-up dX bwd)
+        //    is reached the SAME number of times by every CTA on this GPU (the decoder
+        //    tp_kernel.md §1 deadlock fix, applied to the scalar batch-parallel P1).
+        //
+        //    The decoder shards a TILE across the P CTA-groups; Mamba's unit of work is
+        //    a SAMPLE (one CTA cooperatively per sample), so the analogue is: all P
+        //    CTA-groups cooperate on the SAME sample each round, each owning the rank's
+        //    weight-shard of the row-parallel out_proj/down. ROUND COUNT is GRID-UNIFORM
+        //    because the activations (the batch) are REPLICATED across TP ranks (TP
+        //    shards WEIGHTS, not the batch — decoder §1): every PE/GPU sees the SAME B
+        //    ⇒ SAME n_rounds. A virtual PE with no sample in a round STILL calls
+        //    tr.rendezvous(bar) (active=false, math skipped) so the arrival count is
+        //    grid-uniform — the §1 lockstep invariant.
+        const int P            = Par::kTP;                   // TP degree (constexpr; == tr.n_pes())
+        const int ctas_per_pe  = nCTA / P;                   // launcher asserts nCTA % P == 0
+        const int cta_in_pe    = ::sg::fused::sm90::tp::LoopbackTransport::cta_within_pe(cta, nCTA, P);
+        const int64_t slot_pub = (int64_t)cta_in_pe * 2 * mbtc::mb_tp_slot_floats();
+        const int64_t slot_red = slot_pub + mbtc::mb_tp_slot_floats();
+        auto tr = ::sg::fused::sm90::tp::make_transport_from_comm<Par>(comm);
+        // Samples THIS CTA's PE owns: contiguous per-PE blocks, grid-strided by
+        // ctas_per_pe within the PE group (mirrors the batch-parallel slice but scoped
+        // to the PE's CTA sub-grid). n_rounds is the grid-uniform max over all PEs.
+        const int samples_per_round = ctas_per_pe;
+        const int n_rounds = (B + samples_per_round - 1) / samples_per_round;
+        __shared__ int tok_s[mb::kSeq];
+        __shared__ int tgt_s;
+        float nll_acc = 0.0f;
+        SG_MBTC_PROF_TIC(_pt);
+        for (int rd = 0; rd < n_rounds; ++rd) {
+            const int b = rd * samples_per_round + cta_in_pe;
+            const bool active = (b < B);
+            if (active) {
+                if (threadIdx.x < mb::kSeq) tok_s[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
+                if (threadIdx.x == 0) tgt_s = tok.targets[b];
+                __syncthreads();
+            }
+            // fwd+bwd with the TP reduce inside (the _tp fns call tr.rendezvous(bar)
+            // at ①/②/①'/②' UNCONDITIONALLY each round, so every CTA rendezvouses the
+            // same number of times even when !active — the §1 lockstep invariant).
+            float nll = mb_forward_sample_tp<Par>(
+                w, tok_s, active ? tgt_s : 0, active, &sm, tr, bar, slot_pub, slot_red);
+            mb_backward_sample_tp<Par>(
+                w, g, tok_s, active ? tgt_s : 0, B, active, &sm, tr, bar, slot_pub, slot_red);
+            if (active && threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+        SG_MBTC_PROF_ACC(0, _pt);
+        (void)slot_red;
     }
     bar.sync();   // B1: all CTA full-grad partials + loss slots complete
     SG_MBTC_PROF_TIC(_pt);
@@ -1233,11 +1293,11 @@ int mb_tc_launched_nctas(int dev, int ncta_cap) {
     return (int)launch_ctas;
 }
 
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 cudaError_t launch_fused_mamba_megakernel_tc(
         PersistentContext ctx, float* params, MambaTokenCtx tok,
         float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
-        int ncta_cap = 0) {
+        int ncta_cap = 0, const ::sg::fused::par::CommCtx& comm = {}) {
     int dev = 0;
     cudaError_t err = cudaGetDevice(&dev);
     if (err != cudaSuccess) return err;
@@ -1249,12 +1309,12 @@ cudaError_t launch_fused_mamba_megakernel_tc(
     // mandatory steps (cudaFuncSetAttribute + dyn_smem in the occ query + dyn_smem
     // at <<<>>>); one block/SM by design (occ=1, smem-bound).
     const int dyn_smem = (int)kMambaSmemBytes;
-    err = cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt>,
+    err = cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt, Par>,
                                cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
     if (err != cudaSuccess) return err;
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_mamba_megakernel_tc<Opt>, SG_MB_TC_MEGA_BLOCK,
+        &occ, (const void*)&fused_mamba_megakernel_tc<Opt, Par>, SG_MB_TC_MEGA_BLOCK,
         /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
@@ -1265,14 +1325,20 @@ cudaError_t launch_fused_mamba_megakernel_tc(
     // B%16 kept (the gate truncates B to a multiple of 16; the scalar per-sample
     // path needs no tile alignment but the contract upstream assumes B%16).
     if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
+    // TP lockstep precondition (kTPComm only): the grid-lockstep-over-samples P1
+    // (kernel M-C) partitions nCTA into Par::kTP contiguous PE groups, so nCTA must
+    // divide by TP. Byte-identical when OFF (Par::kTPComm folds to false).
+    if constexpr (Par::kTPComm) {
+        if ((launch_ctas % (unsigned)Par::kTP) != 0) return cudaErrorInvalidValue;
+    }
 
     if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     dim3 grid(launch_ctas), block(SG_MB_TC_MEGA_BLOCK);
-    fused_mamba_megakernel_tc<Opt><<<grid, block, dyn_smem, stream>>>(
-        ctx, params, tok, grad, lr, step, st);
+    fused_mamba_megakernel_tc<Opt, Par><<<grid, block, dyn_smem, stream>>>(
+        ctx, params, tok, grad, lr, step, st, comm);
     return cudaGetLastError();
 }
 

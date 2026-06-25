@@ -48,6 +48,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "csrc/fused/sm_90/fused_mamba_megakernel.cuh"
+#if defined(SG_HAS_NVSHMEM)
+// Real NVSHMEM host API — present ONLY when the toolkit is on the path and the
+// build opts in (-DSG_HAS_NVSHMEM=1 -rdc=true). Used to carve the symmetric
+// TP-slot heap (nvshmem_malloc) + read the TP team pe (decoder EDIT E mirror).
+#include <nvshmem.h>
+#include <nvshmemx.h>
+#endif
 
 namespace sg { namespace fused { namespace sm90 {
 
@@ -61,8 +68,16 @@ struct MbTcLauncherScratch {
     int*      g_next = nullptr;        // int [1]
     unsigned* g_arrived = nullptr;     // unsigned [1]
     unsigned* g_generation = nullptr;  // unsigned [1]
-    float*    workspace = nullptr;     // float [mb_tc_workspace_floats(T, nCTA)]
+    float*    workspace = nullptr;     // float [mb_tc_workspace_floats(T, nCTA)] (cudaMalloc — grad/state)
     int64_t   ws_floats = 0;
+#if defined(SG_HAS_NVSHMEM)
+    // SYMMETRIC TP-slot heap (nvshmem_malloc — the ONLY operands that need cross-PE
+    // addressing; decoder tp_kernel.md §2 / EDIT E mirror). Sized to the WORLD-UNIFORM
+    // per-PE stride so every PE's collective nvshmem_malloc agrees. nullptr on the
+    // TP==1 / no-NVSHMEM path.
+    float*   tp_sym_heap = nullptr;   // nvshmem_malloc'd [tp_sym_floats]
+    int64_t  tp_sym_floats = 0;
+#endif
     int       dev = -1;
 };
 
@@ -81,6 +96,21 @@ MbTcLauncherScratch& mb_tc_launcher_scratch(int dev, int64_t need_floats) {
     }
     return s;
 }
+
+#if defined(SG_HAS_NVSHMEM)
+// Ensure the symmetric TP-slot heap is sized >= need_sym_floats. COLLECTIVE: every
+// PE must call nvshmem_malloc with the SAME size in the SAME order, so the caller
+// passes the WORLD-UNIFORM stride (computed from the global shapes, not a per-rank
+// size). nvshmem_malloc is a collective barrier internally; call it from the host
+// TP-group bootstrap BEFORE the kernel launch. (Decoder dec_tc_ensure_tp_sym_heap mirror.)
+void mb_tc_ensure_tp_sym_heap(MbTcLauncherScratch& s, int64_t need_sym_floats) {
+    if (s.tp_sym_floats >= need_sym_floats) return;
+    if (s.tp_sym_heap) nvshmem_free(s.tp_sym_heap);
+    s.tp_sym_heap   = static_cast<float*>(
+        nvshmem_malloc((size_t)need_sym_floats * sizeof(float)));
+    s.tp_sym_floats = need_sym_floats;
+}
+#endif
 }  // anonymous namespace
 
 // mega_mamba_real_adamw_tc — the WIRED Mamba TC launcher. Boundary mirrors the scalar
@@ -96,7 +126,7 @@ cudaError_t mega_mamba_real_adamw_tc(
         const int* tokens, const int* targets, int B,
         float* state, float* grad, float* /*workspace_unused*/, float* loss_out,
         float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-        int ncta_cap, int opt_id) {
+        int ncta_cap, int opt_id, int tp_size = 1) {
     const int64_t total = kMambaTotalElems;
     const int T = B * mb::kSeq;
 
@@ -183,6 +213,38 @@ cudaError_t mega_mamba_real_adamw_tc(
     // Unsupported opt_ids return cudaErrorInvalidValue → dispatch.cpp throws LOUD.
     switch (static_cast<OptId>(opt_id)) {
         case OptId::AdamW:
+#if defined(SG_HAS_NVSHMEM)
+            // TP allow-list (the decoder §1.3/§7.2 explicit-instantiation gate): {1, 8}.
+            // DP rides in CommCtx at runtime (no Par::kDP read in the kernel), so a fixed
+            // DP sentinel avoids a DP×TP instantiation matrix (dist_step.md §6.C.4).
+            if (tp_size == 8) {
+                using ParTP8 = ::sg::fused::par::ParConfig<
+                    /*DP=*/8, /*TP=*/8, /*PP=*/1, /*SP=*/1,
+                    ::sg::fused::par::ZeROStage::Z3>;
+                // Symmetric TP-slot heap: one publish+reduced slot per CTA-in-PE. The
+                // WORLD-UNIFORM stride (every PE agrees) = ctas_per_pe·2·kSeq·d.
+                const int P = tp_size;
+                const int ctas_per_pe = nCTA / P;   // launcher asserts nCTA % P == 0
+                const int64_t sym_floats =
+                    ::sg::fused::sm90::mbtc::mb_tp_heap_stride_floats(ctas_per_pe);
+                mb_tc_ensure_tp_sym_heap(sc, sym_floats);
+                ::sg::fused::par::CommCtx comm{};
+                comm.world_size = 8; comm.tp_size = 8; comm.dp_size = 8;
+                comm.tp_rank = nvshmem_team_my_pe(/*TP team*/NVSHMEM_TEAM_WORLD);
+                comm.tp_sym_heap = sc.tp_sym_heap;
+                comm.tp_heap_stride_floats = sym_floats;
+                comm.tp_team_n_pes  = 8;
+                comm.tp_team_local_pe = comm.tp_rank;
+                // Store the TP team id as void* (int32 team → intptr → void*); the host
+                // bootstrap that nvshmem_team_split_strided's the TP group sets the real
+                // team — NVSHMEM_TEAM_WORLD for the single-node pure-TP run.
+                comm.tp_comm_handle = reinterpret_cast<void*>(
+                    static_cast<intptr_t>(NVSHMEM_TEAM_WORLD));
+                return launch_fused_mamba_megakernel_tc<OptId::AdamW, ParTP8>(
+                    ctx, params, tok, grad, lr, step, st, stream, nCTA, comm);
+            }
+#endif
+            (void)tp_size;
             return launch_fused_mamba_megakernel_tc<OptId::AdamW>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
         case OptId::Lion:
