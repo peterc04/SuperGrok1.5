@@ -289,6 +289,23 @@ DEFAULT_CONFIG: Dict = {
     "patch_dim": 49, "num_patches": 16,
     "chain_length": 3, "seq_len": 8,
     "use_fused": True,
+    # ── Layer-A scaled-dataset axis (P3, DEFAULT-OFF). "modular" = the legacy
+    # in-memory mod-p grokking task (full-batch GD, whole-tensor eval), byte-
+    # identical to pre-knob. Any other value dispatches make_data_for_task to
+    # grokking_optimizers.dataset_sources (streaming train VIEW + FIXED eval
+    # probe). Layer-B (real vocab/patch/class resize + kernel regen) is OUT OF
+    # SCOPE; the stub sources are shaped to the current size-pinned kernels.
+    "data_source": "modular",          # modular | fineweb_edu | imagenet1k | gifteval | synthetic
+    "train_batch_size": 512,           # per-step minibatch for the streaming regime
+    "train_view_rows": None,           # fixed train-view size (None → derived from budget)
+    "eval_probe_rows": 4096,           # FIXED eval-probe size (built once, reused)
+    "eval_micro_batch": 0,             # >0 → capped micro-batched evaluate() (0=single-shot)
+    # ── Early-stop mode (DEFAULT-OFF). "acc" = legacy 0.95-grok trigger (ViT +
+    # every mod-p cell), byte-identical. "loss" = val/test-LOSS PLATEAU stop for
+    # LM (decoder) / forecasting (mamba) where 0.95-acc is meaningless at scale.
+    "early_stop_mode": "acc",          # acc | loss
+    "early_stop_plateau_patience": 30, # # evals w/o loss improvement before plateau stop
+    "early_stop_plateau_min_delta": 1e-4,  # min loss decrease counted as improvement
 }
 
 # ── Data 1: Modular Division (a ÷ b) mod p  [Decoder] ────────────────
@@ -372,6 +389,18 @@ def make_sequential_division_data(p=97, chain_length=3, frac_train=0.5, val_rati
 def make_data_for_task(c, seed):
     mt = c.get("model_type", "decoder"); ft, p = c.get("frac_train", 0.5), c.get("p", 97)
     vr = c.get("val_ratio", 0.10)
+    # Layer-A scaled-dataset dispatch (DEFAULT-OFF). data_source=="modular" is the
+    # legacy in-memory mod-p task, returned VERBATIM (byte-identical). Any other
+    # value routes to the streaming train-VIEW + FIXED eval-probe stub interface;
+    # the returned 6-tuple has the identical shape/role contract, so .to(device),
+    # the full-batch train loops, and evaluate() are unchanged. Layer-B resize is
+    # OUT OF SCOPE (stubs are shaped to the current size-pinned kernels).
+    if c.get("data_source", "modular") != "modular":
+        from grokking_optimizers.dataset_sources import make_source_for_task
+        cc = dict(c)
+        if not cc.get("train_view_rows"):   # normalize None → module's budget default
+            cc.pop("train_view_rows", None)
+        return make_source_for_task(cc, seed)
     if mt == "decoder":  return make_data(p, ft, vr, seed)
     elif mt == "vit":    return make_mnist_addition_data(p, ft, vr, seed)
     elif mt == "mamba":  return make_sequential_division_data(p, c.get("chain_length", 3), ft, vr, seed)
@@ -533,27 +562,68 @@ def get_init_state(c, device):
     return copy.deepcopy(_raw_model(c, device).state_dict())
 
 @torch.no_grad()
-def evaluate(model, x, y, p=97):
-    logits = model(x)
-    loss = F.cross_entropy(logits, y).item()
-    acc = (logits[:, :p].argmax(-1) == y).float().mean().item()
-    return loss, acc
+def evaluate(model, x, y, p=97, micro_batch=0):
+    # micro_batch<=0 (mod-p default) → the original single-shot forward, byte-
+    # identical. micro_batch>0 → capped micro-batched forward over a FIXED eval
+    # probe so a large probe forwards in seconds, not one giant activation. The
+    # sum/÷n form reproduces the single-shot mean (per-forward fp32 order
+    # preserved within each chunk; cross-chunk is an fp32 add of per-chunk sums).
+    n = x.shape[0]
+    if micro_batch is None or micro_batch <= 0 or micro_batch >= n:
+        logits = model(x)
+        loss = F.cross_entropy(logits, y).item()
+        acc = (logits[:, :p].argmax(-1) == y).float().mean().item()
+        return loss, acc
+    tot_loss = 0.0; tot_correct = 0
+    for i in range(0, n, micro_batch):
+        xb = x[i:i+micro_batch]; yb = y[i:i+micro_batch]
+        logits = model(xb)
+        tot_loss += F.cross_entropy(logits, yb, reduction="sum").item()
+        tot_correct += (logits[:, :p].argmax(-1) == yb).sum().item()
+    return tot_loss / n, tot_correct / n
 
 class EarlyStopper:
-    def __init__(self, threshold=0.95, max_steps=20_000, patience=500, metric_name="test_acc"):
+    def __init__(self, threshold=0.95, max_steps=20_000, patience=500, metric_name="test_acc",
+                 mode="acc", plateau_patience=None, plateau_min_delta=1e-4):
         self.threshold=threshold; self.max_steps=max_steps; self.patience=patience
         self.metric_name=metric_name  # which accuracy feeds step(): "test_acc" or "val_acc"
         # [A4-M1/M2] best_metric_acc / metric_acc are metric-agnostic names: under
         # val-stopping this tracks val, under test-stopping it tracks test — the
         # old test_acc-specific names mislabelled the val-criterion runs.
+        # mode (P3, DEFAULT "acc"): "acc" → the legacy >=threshold grok trigger (ViT
+        # ImageNet + every mod-p cell), BYTE-IDENTICAL. "loss" → PLATEAU stop for the
+        # LM (decoder) / forecasting (mamba) scaled cells: stop after plateau_patience
+        # evals with no loss improvement beyond plateau_min_delta.
+        self.mode=mode
+        self.plateau_patience = plateau_patience if plateau_patience is not None else patience
+        self.plateau_min_delta = plateau_min_delta
+        self._best_loss=float("inf"); self._plateau_counter=0
         self._triggered=False; self._counter=0; self.best_metric_acc=0.
         self.grokking_step=None; self.grokking_wall=None; self._t0=time.time()
         self.stopping_reason=None; self.stopping_step=None
     def step(self, metric_acc, current_step):
+        # `metric_acc` is ACCURACY in acc-mode; in loss-mode the caller passes LOSS.
         if current_step >= self.max_steps:
             if self.stopping_reason is None:
                 self.stopping_reason="max_steps"; self.stopping_step=current_step
             return True
+        if self.mode == "loss":
+            # PLATEAU: track best (lowest) loss; stop after plateau_patience evals with
+            # no improvement beyond plateau_min_delta. grokking_step anchors at the first
+            # improvement so downstream "grokked" reporting still has a step.
+            signal = metric_acc
+            if signal < self._best_loss - self.plateau_min_delta:
+                self._best_loss = signal; self._plateau_counter = 0
+                if self.grokking_step is None:
+                    self.grokking_step = current_step
+                    self.grokking_wall = time.time() - self._t0
+            else:
+                self._plateau_counter += 1
+                if self._plateau_counter >= self.plateau_patience:
+                    if self.stopping_reason is None:
+                        self.stopping_reason=f"{self.metric_name}_plateau"; self.stopping_step=current_step
+                    return True
+            return False
         self.best_metric_acc = max(self.best_metric_acc, metric_acc)
         if metric_acc >= self.threshold:
             if not self._triggered:
@@ -688,8 +758,13 @@ def _stopper(c):
     # early_stop_on: "test" (default, historical) or "val" — which accuracy
     # triggers the threshold/patience stop. Tuner + the val-criterion race use "val".
     metric = "val_acc" if c.get("early_stop_on", "test") == "val" else "test_acc"
+    mode = c.get("early_stop_mode", "acc")   # "acc" (ViT/mod-p) | "loss" (LM/forecast plateau)
+    if mode == "loss":
+        metric = "val_loss" if c.get("early_stop_on", "test") == "val" else "test_loss"
     return EarlyStopper(c["early_stop_threshold"], c.get("early_stop_max_steps", c["max_steps"]),
-                        c["early_stop_patience"], metric_name=metric)
+                        c["early_stop_patience"], metric_name=metric, mode=mode,
+                        plateau_patience=c.get("early_stop_plateau_patience"),
+                        plateau_min_delta=c.get("early_stop_plateau_min_delta", 1e-4))
 def _pbar(name, mx, pos):
     return tqdm(range(1, mx+1), desc=f"{name:<14s}", position=pos, leave=True, ncols=120,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]")
@@ -736,6 +811,9 @@ def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
         stop_acc = va_f if c.get("early_stop_on", "test") == "val" else None
         if stop_acc is None:
             return False, None, None  # fast path only valid with val stopping
+        # loss-mode plateau stopper consumes the val LOSS, not the accuracy.
+        if c.get("early_stop_mode", "acc") == "loss":
+            stop_acc = vl_f
         return st.step(stop_acc, step), None, None
     with torch.no_grad():
         outs = []
@@ -755,6 +833,9 @@ def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
     if cb is not None:
         cb(step, ta, va, tea)
     stop_acc = va if c.get("early_stop_on", "test") == "val" else tea
+    # loss-mode plateau stopper consumes the LOSS matching early_stop_on.
+    if c.get("early_stop_mode", "acc") == "loss":
+        stop_acc = vl if c.get("early_stop_on", "test") == "val" else tel
     return st.step(stop_acc, step), tl, tel
 
 # Map a TrainResult.name (the display name passed to _tr, e.g. "AdamW") to the
@@ -812,7 +893,8 @@ def _fin(r, st, step, t0, m, tex, tey, p=97):
     r.final_val_loss = r.val_losses[-1] if r.val_losses else 0.
     m.eval()
     with torch.no_grad():
-        r.final_test_loss, r.final_test_acc = evaluate(m, tex, tey, p)
+        r.final_test_loss, r.final_test_acc = evaluate(
+            m, tex, tey, p, micro_batch=getattr(_fin, "_eval_micro_batch", 0))
     m.train()
     r.val_test_gap = r.final_val_acc - r.final_test_acc
     # [A4-M3] TEST-confirm the first threshold crossing. Under val-stopping the
@@ -823,7 +905,11 @@ def _fin(r, st, step, t0, m, tex, tey, p=97):
     # whenever grokked (the criterion already IS test). recorded test_accs live
     # on the 10-step grid (r.steps/r.test_accs); fast_val_eval steps aren't
     # recorded, so we snap to the nearest recorded eval.
-    if r.grokking_step is not None and r.steps and r.test_accs:
+    if getattr(st, "mode", "acc") == "loss":
+        # loss-mode: "confirmed" just means a best-loss anchor was recorded; the
+        # 0.95-acc test confirmation is meaningless for LM/forecasting plateau cells.
+        r.grokking_step_test_confirmed = (r.grokking_step is not None)
+    elif r.grokking_step is not None and r.steps and r.test_accs:
         gi = min(range(len(r.steps)), key=lambda i: abs(r.steps[i] - r.grokking_step))
         r.grokking_step_test_confirmed = bool(r.test_accs[gi] >= st.threshold - 0.05)
     else:
@@ -856,6 +942,9 @@ def _tr(name, c):
                     c.get("val_ratio",0.10), matmul_precision=_resolve_matmul_precision(c),
                     use_amp=bool(c.get("use_amp", False)))
     r.use_fused_requested = bool(c.get("use_fused", True))  # task 2: guard input
+    # P3: thread the (DEFAULT-OFF) capped-eval micro-batch to _fin's final test eval
+    # without widening _fin's signature. 0 (mod-p default) → single-shot, byte-identical.
+    _fin._eval_micro_batch = int(c.get("eval_micro_batch", 0) or 0)
     return r
 
 # ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
@@ -891,11 +980,6 @@ def _l3_path_label(engine, precision):
     if engine == "scalar":
         return f"L3-scalar {precision}"  # legacy/inert: scalar path removed
     return "L1+eager"                      # legacy/inert: eager/L1 path removed
-
-def _maybe_wrap_cuda_graph(opt, c):
-    """No-op shim. CUDA Graph wrapping was removed in the post-refactor
-    cleanup; the race is single-node and does not need graph capture."""
-    return opt
 
 def _try_fused_train_step(model_name, opt_name, model, optimizer, x_batch,
                           y_batch, c):
@@ -980,7 +1064,6 @@ def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"], fused=True)
     # AdamW baseline does not support use_grad_hooks (no _single_param_step API).
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     mtype=c.get("model_type","decoder")
@@ -1087,7 +1170,6 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         gamma=c.get("grokadamw_gamma",0.1), kappa=c.get("grokadamw_kappa",0.1),
         lamb=c.get("grokadamw_lamb",2.0), grad_clip=c.get("grokadamw_grad_clip",1.0),
         use_grad_hooks=c.get("use_grad_hooks",False))
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     alpha_freq=c.get("grokadamw_alpha_update_freq",50)
@@ -1384,7 +1466,6 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
         grokfast_lamb=c.get("grokfast_lamb",2.0),
         use_grad_hooks=c.get("use_grad_hooks",False))
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     mtype=c.get("model_type","decoder")
@@ -1421,7 +1502,6 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
         adamw_betas=(c["beta1"],c["beta2"]),
         use_grad_hooks=c.get("use_grad_hooks",False))
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     mtype=c.get("model_type","decoder")
@@ -1449,7 +1529,6 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
         betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0),
         use_grad_hooks=c.get("use_grad_hooks",False))
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     mtype=c.get("model_type","decoder")
@@ -1509,7 +1588,6 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
     opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"],
         use_grad_hooks=c.get("use_grad_hooks",False))
-    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     mtype=c.get("model_type","decoder")
