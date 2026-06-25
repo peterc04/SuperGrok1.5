@@ -25,6 +25,9 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "csrc/fused/sm_90/fused_vit_megakernel.cuh"
+#if defined(SG_HAS_NVSHMEM)
+#include <nvshmem.h>   // nvshmem_malloc/_free + nvshmem_team_my_pe + NVSHMEM_TEAM_WORLD (EDIT E)
+#endif
 
 namespace sg { namespace fused { namespace sm90 {
 
@@ -33,8 +36,16 @@ struct VitTcLauncherScratch {
     int*      g_next = nullptr;
     unsigned* g_arrived = nullptr;
     unsigned* g_generation = nullptr;
-    float*    workspace = nullptr;
+    float*    workspace = nullptr;     // cudaMalloc — acts/grad/state
     int64_t   ws_floats = 0;
+#if defined(SG_HAS_NVSHMEM)
+    // SYMMETRIC TP-slot heap (nvshmem_malloc — the ONLY operands that need cross-PE
+    // addressing; tp_nvshmem.md §2 Option A). Sized to the WORLD-UNIFORM per-PE
+    // stride so every PE's collective nvshmem_malloc agrees. nullptr on the TP==1 /
+    // no-NVSHMEM path. The ViT twin of the decoder launcher's tp_sym_heap (EDIT E).
+    float*    tp_sym_heap = nullptr;   // nvshmem_malloc'd [tp_sym_floats]
+    int64_t   tp_sym_floats = 0;
+#endif
     int       dev = -1;
 };
 
@@ -53,6 +64,22 @@ VitTcLauncherScratch& vit_tc_launcher_scratch(int dev, int64_t need_floats) {
     }
     return s;
 }
+
+#if defined(SG_HAS_NVSHMEM)
+// Ensure the symmetric TP-slot heap is sized >= need_sym_floats. COLLECTIVE:
+// every PE must call nvshmem_malloc with the SAME size in the SAME order, so the
+// caller passes the WORLD-UNIFORM stride (computed from the global shapes, not a
+// per-rank size). nvshmem_malloc is a collective barrier internally; call it from
+// the host TP-group bootstrap BEFORE the kernel launch. ViT twin of the decoder
+// launcher's dec_tc_ensure_tp_sym_heap (EDIT E).
+void vit_tc_ensure_tp_sym_heap(VitTcLauncherScratch& s, int64_t need_sym_floats) {
+    if (s.tp_sym_floats >= need_sym_floats) return;
+    if (s.tp_sym_heap) nvshmem_free(s.tp_sym_heap);
+    s.tp_sym_heap   = static_cast<float*>(
+        nvshmem_malloc((size_t)need_sym_floats * sizeof(float)));
+    s.tp_sym_floats = need_sym_floats;
+}
+#endif
 }  // anonymous namespace
 
 // mega_vit_real_adamw_tc — the WIRED ViT TC launcher. Boundary mirrors the scalar
@@ -72,7 +99,13 @@ cudaError_t mega_vit_real_adamw_tc(
         const float* patches, const int* targets, int B,
         float* state, float* grad, float* /*workspace_unused*/, float* loss_out,
         float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-        int ncta_cap, int opt_id) {
+        int ncta_cap, int opt_id, int tp_size) {
+    (void)tp_size;               // unread unless SG_HAS_NVSHMEM (TP dispatch arm below).
+    // NOTE: this is the TP-AWARE definition (trailing int tp_size). The original
+    // 15-arg boundary dispatch.cpp links is provided as a thin BYTE-IDENTICAL
+    // forwarder OVERLOAD just below this function (tp_size=1), so the shipped _ops
+    // symbol is unchanged and dispatch.cpp needs no edit — the new tp_size>1 path
+    // is reached only by a (future) dispatch.cpp caller of this 16-arg overload.
     const int64_t total = kVitTotalElems;
     const int T = B * vit::kSeq;
 
@@ -144,6 +177,37 @@ cudaError_t mega_vit_real_adamw_tc(
 
     switch (static_cast<OptId>(opt_id)) {
         case OptId::AdamW:
+#if defined(SG_HAS_NVSHMEM)
+            // TP allow-list (the §1.3/§7.2 explicit-instantiation gate): {1, 8}.
+            // DP rides in CommCtx at runtime (no Par::kDP read in the kernel), so a
+            // fixed DP sentinel avoids a DP×TP instantiation matrix (dist_step.md §6.C.4).
+            if (tp_size == 8) {
+                using ParTP8 = ::sg::fused::par::ParConfig<
+                    /*DP=*/8, /*TP=*/8, /*PP=*/1, /*SP=*/1,
+                    ::sg::fused::par::ZeROStage::Z3>;
+                // Symmetric TP-slot heap: one publish+reduced slot per CTA-in-PE.
+                // WORLD-UNIFORM stride (every PE agrees) = ctas_per_pe·2·kTileM·d.
+                const int P = tp_size;
+                const int ctas_per_pe = nCTA / P;   // launcher asserts nCTA % P == 0
+                const int64_t sym_floats =
+                    ::sg::fused::sm90::vittc::vit_tp_heap_stride_floats(ctas_per_pe);
+                vit_tc_ensure_tp_sym_heap(sc, sym_floats);
+                ::sg::fused::par::CommCtx comm{};
+                comm.world_size = 8; comm.tp_size = 8; comm.dp_size = 8;
+                comm.tp_rank = nvshmem_team_my_pe(/*TP team*/NVSHMEM_TEAM_WORLD);
+                comm.tp_sym_heap = sc.tp_sym_heap;
+                comm.tp_heap_stride_floats = sym_floats;
+                comm.tp_team_n_pes  = 8;
+                comm.tp_team_local_pe = comm.tp_rank;
+                // Store the TP team id as void* (int32 team → intptr → void*); the
+                // host bootstrap that nvshmem_team_split_strided's the TP group sets
+                // the real team — NVSHMEM_TEAM_WORLD for the single-node pure-TP run.
+                comm.tp_comm_handle = reinterpret_cast<void*>(
+                    static_cast<intptr_t>(NVSHMEM_TEAM_WORLD));
+                return launch_fused_vit_megakernel_tc<OptId::AdamW, ParTP8>(
+                    ctx, params, in, grad, lr, step, st, stream, nCTA, comm);
+            }
+#endif
             return launch_fused_vit_megakernel_tc<OptId::AdamW>(
                 ctx, params, in, grad, lr, step, st, stream, nCTA);
         case OptId::Lion:
@@ -202,6 +266,22 @@ cudaError_t mega_vit_real_adamw_tc(
         default:
             return cudaErrorInvalidValue;
     }
+}
+
+// BACK-COMPAT 15-arg forwarder — the EXACT boundary dispatch.cpp extern-decls and
+// links today (no tp_size). Forwards to the 16-arg TP-aware definition with
+// tp_size=1 ⇒ the single-GPU path, byte-identical to the pre-TP launcher. The
+// shipped _ops symbol is therefore unchanged; the TP path (tp_size>1) is reached
+// only by a future dispatch.cpp caller of the 16-arg overload (EDIT E.2).
+cudaError_t mega_vit_real_adamw_tc(
+        PersistentContext ctx, float* params,
+        const float* patches, const int* targets, int B,
+        float* state, float* grad, float* workspace_unused, float* loss_out,
+        float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
+        int ncta_cap, int opt_id) {
+    return mega_vit_real_adamw_tc(
+        ctx, params, patches, targets, B, state, grad, workspace_unused, loss_out,
+        lr, step, scalars, stream, ncta_cap, opt_id, /*tp_size=*/1);
 }
 
 // mega_vit_sg2_tc — the DEDICATED SuperGrok2 ViT TC launcher (twin of

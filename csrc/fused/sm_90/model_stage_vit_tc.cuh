@@ -72,6 +72,8 @@
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/vit_layout.cuh"
 #include "csrc/fused/sm_90/model_stage_vit.cuh"   // reuse VitWeights/VitGrad/bind + fp32 helpers
+#include "csrc/fused/sm_90/parallel_config.cuh"   // par::SingleGPU default tmpl arg (EDIT D — TP track)
+#include "csrc/fused/sm_90/tp_transport.cuh"      // LoopbackTransport default tmpl arg + fixed-order reduce (EDIT D)
 #include "csrc/backends/cuda/sm_90/wgmma.cuh"
 
 #include <cuda_runtime.h>
@@ -1278,6 +1280,481 @@ __device__ void vittc_backward_tile(
     for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
         acts.dh0[(int64_t)g0 * vit::kD + idx] = __float2bfloat16(sc.dh[idx]);
     __syncthreads();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TENSOR-PARALLEL symmetric-slot budget (the ViT twin of tp_layer.cuh's
+//  tp_tile_slot_floats / tp_heap_stride_floats — keyed on VIT dims, since
+//  tp_layer.cuh's are decoder-dim'd (dectc::kTileM·dec::kD) and tp_layer.cuh is
+//  the decoder-coupled header this ViT track does NOT include). The largest
+//  reduced payload for one ViT tile is [kTileM, d] (all four fwd/bwd reduces are
+//  [rows, d]). The persistent kernel runs ONE tile per CTA at a time ⇒ heap
+//  stride = ctas_per_pe · 2 · kTileM · d floats (publish slot + reduced slot per
+//  CTA-in-PE). The launcher (mega_vit_real_adamw_tc_launcher.cu, EDIT E) sizes
+//  the nvshmem_malloc'd symmetric heap with this. ──
+__host__ __device__ __forceinline__ int64_t vit_tp_tile_slot_floats() {
+    return (int64_t)kTileM * vit::kD;
+}
+__host__ __device__ __forceinline__ int64_t vit_tp_heap_stride_floats(int ctas_per_pe) {
+    return (int64_t)ctas_per_pe * 2 * vit_tp_tile_slot_floats();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TP-AWARE forward/backward tile bodies (EDIT D, /workspace/impl_diffs/
+//  tp_kernel.md §6 — mirrored onto ViT). TWO-BODY shape (the spec's SAFE
+//  default): the SingleGPU entries `vittc_forward_tile` / `vittc_backward_tile`
+//  above are LEFT BYTE-IDENTICAL (so the test_vit_tc.py PTX gate is guaranteed).
+//  These `_impl<Par,Transport>` bodies are NEW functions only ever instantiated
+//  under `if constexpr (Par::kTPComm)` at the megakernel call site (folded away
+//  on SingleGPU), so they NEVER codegen on the default path. They are a copy of
+//  the SingleGPU body with the FOUR all-reduce points wrapped in `if constexpr
+//  (Par::kTPComm)` (① out_proj fwd, ② ff2 fwd, ②' ff0 dX, ①' in_proj dX) + the
+//  two COLUMN-parallel forward GEMM width ternaries (§6 NOTE).
+//
+//  THE MEGATRON SPLIT on the ViT weight layout (row-major, matching VitWeights):
+//    in_w  (COLUMN/QKV) : rank owns 3d/P out rows                 none (fwd)
+//    out_w (ROW)        : rank owns d/P in cols                   fwd all-reduce ①
+//    ff0_w (COLUMN)     : rank owns dff/P out rows                none (fwd)
+//    ff2_w (ROW)        : rank owns dff/P in cols                 fwd all-reduce ②
+//    cls/patch/pos/LN/head/norm : REPLICATED (no comm; grads bit-identical).
+//  Backward conjugates: the all-reduce moves to the dX of every COLUMN-parallel
+//  linear — ff0 dX (②') and in_proj dX (①'); ROW-parallel dX (out_proj, ff2) is
+//  comm-free (the rank's own K-shard). dW NEVER needs comm (exact row/col slice).
+//
+//  ViT vs the decoder twin: the ViT TC GEMMs read RAW fp32 params (VitWeights::*
+//  fp32 W pointers), NOT a preconverted bf16 cache, so the partial-GEMM publishes
+//  use the ViT GEMM helpers (vittc_gemm_fwd_f32 / vittc_gemm_dx_f32) writing the
+//  fp32 partial DIRECTLY into the symmetric slot tr.local(slot_pub); the reduce
+//  (tp_allreduce_sum_fixed_order) + the rendezvous come from the model-agnostic
+//  tp_transport.cuh (shared with the decoder). The decoder's tp_layer.cuh
+//  partial-GEMM wrappers are decoder-GEMM-coupled, so they are NOT reused here.
+//
+//  HONEST SCOPE (recorded as a deviation): the attention head-localization
+//  (H_loc = vit::kHeads/P, the local-shard qkv stride) is the one extra
+//  correctness touch the spec (§6 NOTE) flags BEYOND the four reduce points; it
+//  is a deeper rewrite of vittc_attn_fwd/bwd_tile (which hardcode 3*vit::kD
+//  stride and vit::kHeads). On the kTPComm path here the attention still runs
+//  full-width; the per-rank QKV shard + local-head attention is the 8×H100-window
+//  task (tp_kernel.md §12). The FOUR linear-projection reduces — the core of EDIT
+//  D — are exact and reuse the loopback-validated tp_allreduce_sum_fixed_order.
+//  NOTE: the SUBTILE knob (SG_TUNED_VIT_P1_SUBTILE_S<64) is orthogonal to TP and
+//  is NOT used on the TP path (the saturation config is the default S=64 tile);
+//  the TP GEMMs use the full-tile call form (kAtomsM literal) — matching the
+//  S=64 default the launcher dispatches.
+// ════════════════════════════════════════════════════════════════════════
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ float vittc_forward_tile_impl(
+        const VitWeights& w, int g0, int nrows, bool active, const VitActs& acts,
+        const VitTileScratch& sc, const float* __restrict__ patches,
+        const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red) {
+    // On the kTPComm path an inactive round still must reach every rendezvous;
+    // the GEMM/elementwise work is skipped (nrows==0) but the rendezvous calls
+    // at ①/② below run unconditionally (the §1 lockstep invariant).
+    (void)active; (void)slot_red;
+    const int nsamp = nrows / vit::kSeq;
+#if SG_TUNED_VIT_P1_SUBTILE_S < 64
+    // B1 sub-tile: nrows = kSeq·S is generally not a multiple of 64 → the linear
+    // GEMMs issue ceil(nrows/64) m64 atoms and guard pad rows with m_real=nrows.
+    const int m_atoms_rt = (nrows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
+#endif
+    const int npatch_rows = nsamp * vit::kNPatch;
+    const int gp0 = (g0 / vit::kSeq) * vit::kNPatch;   // first PATCH row of this tile
+    // ── Stage this tile's patches into X_patch (bf16) as patch token rows. ──
+    for (int idx = threadIdx.x; idx < npatch_rows * vit::kPatch; idx += blockDim.x) {
+        const int pr = idx / vit::kPatch, c = idx % vit::kPatch;
+        const int si = pr / vit::kNPatch, p = pr % vit::kNPatch;
+        const int gs = si_global(g0, si);
+        float v = patches[((int64_t)gs * vit::kNPatch + p) * vit::kPatch + c];
+        acts.X_patch[(int64_t)(gp0 + pr) * vit::kPatch + c] = __float2bfloat16(v);
+    }
+    __syncthreads();
+    // ── patch_proj (REPLICATED, comm-free). ──
+    {
+        const int pm_atoms = (npatch_rows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
+        const __nv_bfloat16* Xp = acts.X_patch + (int64_t)gp0 * vit::kPatch;
+        const int Kpad = ((vit::kPatch + wgs::kWgmmaAtomK - 1) / wgs::kWgmmaAtomK) * wgs::kWgmmaAtomK; // 64
+        const int N = SG_TUNED_TILE_N;
+        const int k_steps = Kpad / wgs::kWgmmaAtomK;
+        for (int n0 = 0; n0 < vit::kD; n0 += N) {
+            const int n_real = (vit::kD - n0) < N ? (vit::kD - n0) : N;
+            auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
+                return k < vit::kPatch ? Xp[(int64_t)m * vit::kPatch + k] : __float2bfloat16(0.f); };
+            auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+                int nn = n0 + n; return (nn < vit::kD && k < vit::kPatch) ? __float2bfloat16(w.patch_w[(int64_t)nn * vit::kPatch + k]) : __float2bfloat16(0.f); };
+            auto out  = [&] (int m, int n, float v) { sc.work[(int64_t)m * vit::kD + n0 + n] = v; };
+            tc_gemm_block_unpipelined<SG_TUNED_TILE_N, /*MaxAtomsM=*/kAtomsM>(
+                0, pm_atoms, n_real, k_steps SG_VIT_PATCH_MREAL_ARG, srcA, srcB, out, sA, sB);
+        }
+    }
+    __syncthreads();
+    // ── Build X_in[0]: CLS rows = cls + pos[0]; patch rows = proj + pos + patch_b. ──
+    for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+        const int r = idx / vit::kD, j = idx % vit::kD;
+        const int g = g0 + r;
+        const int sp = g % vit::kSeq;
+        float v;
+        if (sp == 0) {
+            v = w.cls[j] + w.pos[j];
+        } else {
+            const int si = r / vit::kSeq;
+            const int p = sp - 1;
+            const int pr = si * vit::kNPatch + p;
+            v = sc.work[(int64_t)pr * vit::kD + j] + w.pos[(int64_t)sp * vit::kD + j] + w.patch_b[j];
+        }
+        acts.X_in[0][(int64_t)g * vit::kD + j] = __float2bfloat16(v);
+    }
+    __syncthreads();
+
+    for (int li = 0; li < vit::kLayers; ++li) {
+        const VitWeights::Layer& L = w.layer[li];
+        const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * vit::kD;        // [nrows,d]
+        // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+        // COLUMN(QKV)-parallel on kTPComm: rank owns 3d/P out columns (§6 NOTE).
+        const int qkv_nout = Par::kTPComm ? (3 * vit::kD) / Par::kTP : 3 * vit::kD;
+        vittc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], vit::kD, vit::kD, qkv_nout, SG_VIT_P1_BF16_MA_MR, sA, sB);
+        __syncthreads();
+        // add in_b (the fwd GEMM did W only; biases folded in scalar here for qkv).
+        for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x) {
+            const int j = idx % qkv_nout;
+            float v = __bfloat162float(sc.qkv[li][idx]) + L.in_b[j];
+            sc.qkv[li][idx] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        // attention (FULL) → ctx (work fp32) + attn[li] weights.
+        vittc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+        // ctx bf16 → X_ctx[li] (out_proj input + its dW operand).
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            const int r = idx / vit::kD, j = idx % vit::kD;
+            acts.X_ctx[li][(int64_t)(g0 + r) * vit::kD + j] = __float2bfloat16(sc.work[(int64_t)r * vit::kD + j]);
+        }
+        __syncthreads();
+        // a = X_ctx @ out_w^T (+ out_b). fp32 → work.
+        if constexpr (!Par::kTPComm) {
+            vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * vit::kD, L.out_w,
+                                                sc.work, vit::kD, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+        } else {
+            // ROW-parallel out_proj: out_w is the [d, d/P] col-shard; X_ctx is the
+            // rank's own ctx [nrows, d/P]. Publish the [nrows,d] partial to the
+            // symmetric slot, rendezvous, fixed-order ascending-pe reduce → sc.work
+            // (① of design §5.1). Activations are full-width [nrows,d] post-reduce, so
+            // the r1 residual+bias fold below runs UNCHANGED.
+            const int Kloc = vit::kD / tr.n_pes();   // local input width (col-shard)
+            if (active) {
+                vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * Kloc, L.out_w,
+                                                    tr.local(slot_pub), Kloc, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+            }
+            tr.rendezvous(bar);                                  // publish visible
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * vit::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);                                  // slot reusable
+        }
+        __syncthreads();
+        // r1 = Xin + a + out_b → work (fp32).
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            const int r = idx / vit::kD, j = idx % vit::kD;
+            sc.work[(int64_t)r * vit::kD + j] += __bfloat162float(Xin[(int64_t)r * vit::kD + j]) + L.out_b[j];
+        }
+        __syncthreads();
+        // n1(r1) → x1 (fp32) + caches[li]; then bf16 → X_x1[li].
+        vittc_ln_fwd_tile(sc.work, L.n1_w, L.n1_b, nrows, sc.x1, sc.n1x[li], sc.n1i[li], red);
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            const int r = idx / vit::kD, j = idx % vit::kD;
+            acts.X_x1[li][(int64_t)(g0 + r) * vit::kD + j] = __float2bfloat16(sc.x1[(int64_t)r * vit::kD + j]);
+        }
+        __syncthreads();
+        // ff0 = X_x1 @ ff0_w^T (+ ff0_b). fp32 → work; pre-gelu bf16 → ff0pre;
+        // gelu(pre+b) → X_gact[li] (bf16). COLUMN-parallel on kTPComm: dff/P out cols.
+        const int ff0_nout = Par::kTPComm ? vit::kDff / Par::kTP : vit::kDff;
+        vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * vit::kD, L.ff0_w,
+                                            sc.work, vit::kD, ff0_nout SG_VIT_P1_F32_MA_MR, sA, sB);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * ff0_nout; idx += blockDim.x) {
+            const int r = idx / ff0_nout, j = idx % ff0_nout;
+            float pre = sc.work[(int64_t)r * ff0_nout + j] + L.ff0_b[j];
+            sc.ff0pre[li][(int64_t)r * ff0_nout + j] = __float2bfloat16(pre);
+            acts.X_gact[li][(int64_t)(g0 + r) * ff0_nout + j] = __float2bfloat16(vit_gelu(pre));
+        }
+        __syncthreads();
+        // ff2 = X_gact @ ff2_w^T (+ ff2_b). fp32 → work.
+        if constexpr (!Par::kTPComm) {
+            vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * vit::kDff, L.ff2_w,
+                                                sc.work, vit::kDff, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+        } else {
+            // ROW-parallel ff2: ff2_w is the [d, dff/P] col-shard; X_gact is the
+            // rank's own gact [nrows, dff/P]. Publish [nrows,d] partial → reduce →
+            // sc.work (② of design §5.1). r2 fold below runs unchanged.
+            const int Kloc = vit::kDff / tr.n_pes();
+            if (active) {
+                vittc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * Kloc, L.ff2_w,
+                                                    tr.local(slot_pub), Kloc, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * vit::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        // r2 = x1 + ff2 + ff2_b → work (fp32).
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            const int r = idx / vit::kD, j = idx % vit::kD;
+            sc.work[(int64_t)r * vit::kD + j] += sc.x1[(int64_t)r * vit::kD + j] + L.ff2_b[j];
+        }
+        __syncthreads();
+        if (li + 1 < vit::kLayers) {
+            vittc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+            for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+                const int r = idx / vit::kD, j = idx % vit::kD;
+                acts.X_in[li + 1][(int64_t)(g0 + r) * vit::kD + j] = __float2bfloat16(sc.finalin[(int64_t)r * vit::kD + j]);
+            }
+            __syncthreads();
+        } else {
+            vittc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+        }
+    }
+
+    // ── Final norm + head + CE, scalar PER-SAMPLE on the CLS position (0) only.
+    //    Head/norm are REPLICATED (no comm; the head input is full-width post-reduce). ──
+    float nll_acc = 0.0f;
+    for (int si = 0; si < nsamp; ++si) {
+        const int rcls = si * vit::kSeq;
+        const float* hcls = sc.finalin + (int64_t)rcls * vit::kD;
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) sum += hcls[j];
+        float mean = vit_block_sum(sum, red) / (float)vit::kD;
+        float vs = 0.0f;
+        for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) { float c = hcls[j] - mean; vs += c * c; }
+        float var = vit_block_sum(vs, red) / (float)vit::kD;
+        float iv = rsqrtf(var + vit::kLnEps);
+        if (threadIdx.x == 0) sc.fni[rcls] = iv;
+        for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
+            float xh = (hcls[j] - mean) * iv;
+            sc.fnx[(int64_t)rcls * vit::kD + j] = xh;
+            float hn = xh * w.norm_w[j] + w.norm_b[j];
+            acts.X_hn[(int64_t)si_global(g0, si) * vit::kD + j] = __float2bfloat16(hn);
+        }
+        __syncthreads();
+        float* lg = sc.logits + (int64_t)si * vit::kVocab;
+        const __nv_bfloat16* hnb = acts.X_hn + (int64_t)si_global(g0, si) * vit::kD;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) {
+            const float* Wr = w.out_w + (int64_t)o * vit::kD;
+            float acc = w.out_b[o];
+            #pragma unroll 4
+            for (int k = 0; k < vit::kD; ++k) acc += __bfloat162float(hnb[k]) * Wr[k];
+            lg[o] = acc;
+        }
+        __syncthreads();
+        int tgt = tgt_ids[si_global(g0, si)];
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = vit_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = vit_block_sum(es, red);
+        float logz = lmax + __logf(es);
+        if (threadIdx.x == 0) nll_acc += (logz - lg[tgt]);
+        __syncthreads();
+    }
+    return nll_acc;
+}
+
+// TP-aware backward tile (mirror of vittc_backward_tile with the two backward
+// reduce points ②' (ff0 dX) and ①' (in_proj dX) wrapped in if constexpr).
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ void vittc_backward_tile_impl(
+        const VitWeights& w, int g0, int nrows, bool active, int B, const VitActs& acts,
+        const VitTileScratch& sc, const int* __restrict__ tgt_ids,
+        float* __restrict__ lnvec, float* __restrict__ work2,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red) {
+    (void)active; (void)slot_red;
+    const int nsamp = nrows / vit::kSeq;
+#if SG_TUNED_VIT_P1_SUBTILE_S < 64
+    // B1 sub-tile: dX GEMMs issue ceil(nrows/64) m64 atoms with m_real=nrows.
+    const int m_atoms_rt = (nrows + wgs::kWgmmaAtomM - 1) / wgs::kWgmmaAtomM;
+#endif
+    float* gn_n1w[vit::kLayers]; float* gn_n1b[vit::kLayers];
+    float* gn_n2w[vit::kLayers]; float* gn_n2b[vit::kLayers];
+    for (int li = 0; li < vit::kLayers; ++li) {
+        gn_n1w[li] = lnvec + (int64_t)(li * 4 + 0) * vit::kD;
+        gn_n1b[li] = lnvec + (int64_t)(li * 4 + 1) * vit::kD;
+        gn_n2w[li] = lnvec + (int64_t)(li * 4 + 2) * vit::kD;
+        gn_n2b[li] = lnvec + (int64_t)(li * 4 + 3) * vit::kD;
+    }
+    float* gn_normw = lnvec + (int64_t)(4 * vit::kLayers + 0) * vit::kD;
+    float* gn_normb = lnvec + (int64_t)(4 * vit::kLayers + 1) * vit::kD;
+
+    for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+    __syncthreads();
+    for (int si = 0; si < nsamp; ++si) {
+        const int rcls = si * vit::kSeq;
+        const int gs = si_global(g0, si);
+        float* lg = sc.logits + (int64_t)si * vit::kVocab;
+        int tgt = tgt_ids[gs];
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = vit_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = vit_block_sum(es, red);
+        float inv_es = 1.0f / es;
+        for (int o = threadIdx.x; o < vit::kVocab; o += blockDim.x) {
+            float smo = __expf(lg[o] - lmax) * inv_es;
+            float dl = (smo - ((o == tgt) ? 1.0f : 0.0f)) / (float)B;
+            lg[o] = dl;
+            acts.dY_logits[(int64_t)gs * vit::kVocab + o] = __float2bfloat16(dl);
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
+            float dhn = 0.0f;
+            for (int o = 0; o < vit::kVocab; ++o)
+                dhn += lg[o] * w.out_w[(int64_t)o * vit::kD + j];
+            sc.work[(int64_t)rcls * vit::kD + j] = dhn;
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
+            float dhn = sc.work[(int64_t)rcls * vit::kD + j];
+            float xh = sc.fnx[(int64_t)rcls * vit::kD + j];
+            gn_normw[j] += dhn * xh; gn_normb[j] += dhn;
+        }
+        __syncthreads();
+        {
+            const float* dyr = sc.work + (int64_t)rcls * vit::kD;
+            const float* xhr = sc.fnx + (int64_t)rcls * vit::kD;
+            float sda = 0.0f, sdax = 0.0f;
+            for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j]; sda += dxhat; sdax += dxhat * xhr[j];
+            }
+            sda = vit_block_sum(sda, red); sdax = vit_block_sum(sdax, red);
+            float iv = sc.fni[rcls];
+            for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j];
+                sc.dh[(int64_t)rcls * vit::kD + j] = iv * (dxhat - (sda + xhr[j] * sdax) / (float)vit::kD);
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int li = vit::kLayers - 1; li >= 0; --li) {
+        const VitWeights::Layer& L = w.layer[li];
+        const int ff0_nout = Par::kTPComm ? vit::kDff / Par::kTP : vit::kDff;
+        const int qkv_nout = Par::kTPComm ? (3 * vit::kD) / Par::kTP : 3 * vit::kD;
+        vittc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            work2[idx] = sc.work[idx];
+            acts.dY_ff2[li][(int64_t)g0 * vit::kD + idx] = __float2bfloat16(sc.work[idx]);
+        }
+        __syncthreads();
+        // ff2 dX (ROW-parallel ff2 ⇒ dgact is the rank's local [nrows, dff/P], comm-free).
+        vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * vit::kD, L.ff2_w,
+                                           sc.work, ff0_nout, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dgact [nrows,dff/P]
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * ff0_nout; idx += blockDim.x) {
+            float dff0 = sc.work[idx] * vit_gelu_grad(__bfloat162float(sc.ff0pre[li][idx]));
+            sc.work[idx] = dff0;
+            acts.dY_ff0[li][(int64_t)g0 * ff0_nout + idx] = __float2bfloat16(dff0);
+        }
+        __syncthreads();
+        // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32 → sc.x1.
+        if constexpr (!Par::kTPComm) {
+            vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * vit::kDff, L.ff0_w,
+                                               sc.x1, /*Kin=*/vit::kD, /*Nout=*/vit::kDff SG_VIT_P1_F32_MA_MR, sA, sB);  // dx1_ffn [nrows,d]
+        } else {
+            // COLUMN-parallel ff0: ff0_w is the rank's [dff/P, d] col-shard; dY_ff0 is
+            // the rank's own [nrows, dff/P]. The dX is a PARTIAL (Σ_pe) → publish
+            // [nrows,d] → reduce → sc.x1 (②' of design §5.1). Then the
+            // `work2[idx] += sc.x1[idx]` accumulate below runs unchanged.
+            const int Noutloc = vit::kDff / tr.n_pes();
+            if (active) {
+                vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * Noutloc, L.ff0_w,
+                                                   tr.local(slot_pub), /*Kin=*/vit::kD, /*Nout=*/Noutloc SG_VIT_P1_F32_MA_MR, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.x1, (int64_t)nrows * vit::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
+            work2[idx] += sc.x1[idx];
+        __syncthreads();
+        vittc_ln_bwd_tile(work2, sc.n1x[li], sc.n1i[li], L.n1_w, nrows, sc.work, gn_n1w[li], gn_n1b[li], red);
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) {
+            sc.dh[idx] = sc.work[idx];
+            acts.dY_a[li][(int64_t)g0 * vit::kD + idx] = __float2bfloat16(sc.work[idx]);
+        }
+        __syncthreads();
+        // out_proj dX (ROW-parallel out_proj ⇒ dctx is the rank's local [nrows, d/P], comm-free).
+        const int dctx_nin = Par::kTPComm ? vit::kD / Par::kTP : vit::kD;
+        vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * vit::kD, L.out_w,
+                                           sc.work, dctx_nin, vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dctx [nrows, d/P]
+        __syncthreads();
+        // attention bwd (full-width on this path; head-local shard is the §6 8-GPU touch).
+        vittc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+        for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x)
+            acts.dY_qkv[li][(int64_t)g0 * qkv_nout + idx] = __float2bfloat16(work2[idx]);
+        __syncthreads();
+        // in_proj dX: dx_in_attn = dqkv @ in_w (output width Kin=d, contract Nout=3d).
+        //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+        if constexpr (!Par::kTPComm) {
+            vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * vit::kD, L.in_w,
+                                               sc.work, /*Kin=*/vit::kD, /*Nout=*/3 * vit::kD SG_VIT_P1_F32_MA_MR, sA, sB);  // dx_in_attn
+        } else {
+            // COLUMN(QKV)-parallel in_proj: in_w is the rank's [3d/P, d] qkv col-shard;
+            // dY_qkv is the rank's own [nrows, 3d/P] (the 3-block q|k|v own-rows
+            // concatenated). The dX is a PARTIAL → publish [nrows,d] → reduce → sc.work
+            // (①' of design §5.1). Then the residual add `sc.dh[idx] += sc.work[idx]`
+            // below runs unchanged.
+            const int Noutloc = (3 * vit::kD) / tr.n_pes();
+            if (active) {
+                vittc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * Noutloc, L.in_w,
+                                                   tr.local(slot_pub), /*Kin=*/vit::kD, /*Nout=*/Noutloc SG_VIT_P1_F32_MA_MR, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * vit::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
+            sc.dh[idx] += sc.work[idx];
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x)
+        acts.dh0[(int64_t)g0 * vit::kD + idx] = __float2bfloat16(sc.dh[idx]);
+    __syncthreads();
+}
+
+// Thin wrappers EDIT C.3 calls (forward `Par`/`Transport` to the _impl bodies).
+template <class Par, class Transport>
+__device__ __forceinline__ float vittc_forward_tile_tp(
+        const VitWeights& w, int g0, int nrows, bool active, const VitActs& acts,
+        const VitTileScratch& sc, const float* __restrict__ patches,
+        const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red) {
+    return vittc_forward_tile_impl<Par, Transport>(
+        w, g0, nrows, active, acts, sc, patches, tgt_ids, sA, sB, red,
+        tr, bar, slot_pub, slot_red);
+}
+template <class Par, class Transport>
+__device__ __forceinline__ void vittc_backward_tile_tp(
+        const VitWeights& w, int g0, int nrows, bool active, int B, const VitActs& acts,
+        const VitTileScratch& sc, const int* __restrict__ tgt_ids,
+        float* __restrict__ lnvec, float* __restrict__ work2,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red) {
+    vittc_backward_tile_impl<Par, Transport>(
+        w, g0, nrows, active, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red,
+        tr, bar, slot_pub, slot_red);
 }
 
 // ════════════════════════════════════════════════════════════════════════
