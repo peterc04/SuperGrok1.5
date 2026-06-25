@@ -57,6 +57,8 @@
 #include "csrc/fused/megakernel_common.cuh"
 #include "csrc/fused/sm_90/decoder_layout.cuh"
 #include "csrc/fused/sm_90/dec_weights.cuh"   // reuse DecWeights/DecGrad/bind + fp32 helpers
+#include "csrc/fused/sm_90/parallel_config.cuh"   // par::SingleGPU default tmpl arg (EDIT D)
+#include "csrc/fused/sm_90/tp_transport.cuh"      // LoopbackTransport default tmpl arg + reduce (EDIT D)
 #include "csrc/backends/cuda/sm_90/wgmma.cuh"
 #include "csrc/backends/cuda/sm_90/tile_pipeline.cuh"
 
@@ -1919,6 +1921,419 @@ __device__ void dectc_backward_tile(
     for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
         acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
     __syncthreads();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TP-AWARE forward/backward tile bodies (EDIT D, /workspace/impl_diffs/
+//  tp_kernel.md §6). TWO-BODY shape (the spec's SAFE default): the SingleGPU
+//  entries `dectc_forward_tile` / `dectc_backward_tile` above are LEFT
+//  BYTE-IDENTICAL (so the test_decoder_tc.py PTX gate is guaranteed). These
+//  `_impl<Par,Transport>` bodies are NEW functions only ever instantiated under
+//  `if constexpr (Par::kTPComm)` at the megakernel call site (folded away on
+//  SingleGPU), so they NEVER codegen on the default path. They are a copy of the
+//  SingleGPU body with the FOUR all-reduce points wrapped in `if constexpr
+//  (Par::kTPComm)` (① out_proj fwd, ② ff2 fwd, ②' ff0 dX, ①' in_proj dX) + the
+//  two COLUMN-parallel forward GEMM width ternaries (§6 NOTE).
+//
+//  HONEST SCOPE (recorded as a deviation): the attention head-localization
+//  (H_loc = kHeads/P, the local-shard qkv stride) is the one extra correctness
+//  touch the spec (§6 NOTE) flags BEYOND the four reduce points; it is a deeper
+//  rewrite of dectc_attn_fwd/bwd_tile (which hardcode 3*dec::kD stride and
+//  dec::kHeads). On the kTPComm path here the attention still runs full-width;
+//  the per-rank QKV shard + local-head attention is the 8×H100-window task
+//  (tp_kernel.md §12: this track "is the part most likely to need an on-silicon
+//  iteration"). The FOUR linear-projection reduces — the core of EDIT D — are
+//  exact and reuse the loopback-validated tp_* primitives.
+// ════════════════════════════════════════════════════════════════════════
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ float dectc_forward_tile_impl(
+        const DecWeights& w, const DecWBf& wb, int g0, int nrows, bool active,
+        const DecActs& acts,
+        const DecTileScratch& sc, const int* __restrict__ tok_ids,
+        const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red,
+        unsigned long long* pipeBars = nullptr) {
+    // On the kTPComm path an inactive round still must reach every rendezvous;
+    // the GEMM/elementwise work is skipped (nrows==0) but the rendezvous calls
+    // at ①/② below run unconditionally (the §1 lockstep invariant).
+    (void)active; (void)slot_red;
+    const int nsamp = nrows / dec::kSeq;
+    // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+        const int r = idx / dec::kD, j = idx % dec::kD;
+        const int g = g0 + r;
+        const int tid = tok_ids[g];
+        const int sp = g % dec::kSeq;            // position within the sample
+        float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
+        acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
+    }
+    __syncthreads();
+
+    for (int li = 0; li < dec::kLayers; ++li) {
+        const DecWeights::Layer& L = w.layer[li];
+        const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+        // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+        // COLUMN(QKV)-parallel on kTPComm: rank owns 3d/P out columns (§6 NOTE).
+        const int qkv_nout = Par::kTPComm ? (3 * dec::kD) / Par::kTP : 3 * dec::kD;
+        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, qkv_nout, sA, sB, pipeBars);
+        __syncthreads();
+        // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+        // matches the bf16-faithful oracle qkv = bf(x_in @ bf(in_w)^T + in_b)).
+        for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x) {
+            const int j = idx % qkv_nout;
+            float v = __bfloat162float(sc.qkv[li][idx]) + L.in_b[j];
+            sc.qkv[li][idx] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        // attention → ctx (work fp32) + attn[li] weights.
+        dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+        // ctx bf16 → X_ctx[li] (out_proj input + its dW operand).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+        }
+        __syncthreads();
+        // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
+        if constexpr (!Par::kTPComm) {
+            dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+                                                sc.work, dec::kD, dec::kD, sA, sB, pipeBars);
+        } else {
+            // ROW-parallel out_proj: out_w[li] is the [d, d/P] col-shard; X_ctx is
+            // the rank's own ctx [nrows, d/P]. Publish the [nrows,d] partial to the
+            // symmetric slot, rendezvous, fixed-order ascending-pe reduce → sc.work.
+            // (① of design §5.1 / tp_layer.cuh. Activations are full-width [nrows,d]
+            // post-reduce, so the r1 residual+bias fold below runs UNCHANGED.)
+            const int Kloc = dec::kD / tr.n_pes();   // local input width (col-shard)
+            if (active) {
+                ::sg::fused::sm90::tp::tp_rowparallel_fwd_partial_tile<SG_TUNED_TILE_N>(
+                    tr, slot_pub,
+                    /*Xown=*/ acts.X_ctx[li] + (int64_t)g0 * Kloc, wb.out_w[li],
+                    /*Kin_local=*/ Kloc, /*Nout=*/ dec::kD, sA, sB);
+            }
+            tr.rendezvous(bar);                                  // publish visible
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);                                  // slot reusable
+        }
+        __syncthreads();
+        // r1 = Xin + a + out_b → work (fp32). out_b folded here (the GEMM did W only)
+        // — matches the oracle a = ctx_b @ out_w^T + out_b kept fp32 through r1.
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            sc.work[(int64_t)r * dec::kD + j] += __bfloat162float(Xin[(int64_t)r * dec::kD + j]) + L.out_b[j];
+        }
+        __syncthreads();
+        // n1(r1) → x1 (fp32) + caches[li]; then bf16 → X_x1[li] (ff0 input + dW operand).
+        dectc_ln_fwd_tile(sc.work, L.n1_w, L.n1_b, nrows, sc.x1, sc.n1x[li], sc.n1i[li], red);
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            acts.X_x1[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.x1[(int64_t)r * dec::kD + j]);
+        }
+        __syncthreads();
+        // ff0 = X_x1 @ ff0_w^T (+ ff0_b)  (N=dff, K=d). fp32 → work; (pre+b) bf16 →
+        // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+        // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
+        // COLUMN-parallel on kTPComm: rank owns dff/P out columns (§6 NOTE).
+        const int ff0_nout = Par::kTPComm ? dec::kDff / Par::kTP : dec::kDff;
+        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
+                                            sc.work, dec::kD, ff0_nout, sA, sB, pipeBars);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * ff0_nout; idx += blockDim.x) {
+            const int r = idx / ff0_nout, j = idx % ff0_nout;
+            float pre = sc.work[(int64_t)r * ff0_nout + j] + L.ff0_b[j];
+            sc.ff0pre[li][(int64_t)r * ff0_nout + j] = __float2bfloat16(pre);
+            acts.X_gact[li][(int64_t)(g0 + r) * ff0_nout + j] = __float2bfloat16(dec_gelu(pre));
+        }
+        __syncthreads();
+        // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
+        if constexpr (!Par::kTPComm) {
+            dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
+                                                sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);
+        } else {
+            // ROW-parallel ff2: ff2_w[li] is the [d, dff/P] col-shard; X_gact is the
+            // rank's own gact [nrows, dff/P]. Publish [nrows,d] partial → reduce → sc.work
+            // (② of design §5.1). r2 fold below runs unchanged on the reduced value.
+            const int Kloc = dec::kDff / tr.n_pes();
+            if (active) {
+                ::sg::fused::sm90::tp::tp_rowparallel_fwd_partial_tile<SG_TUNED_TILE_N>(
+                    tr, slot_pub,
+                    /*Xown=*/ acts.X_gact[li] + (int64_t)g0 * Kloc, wb.ff2_w[li],
+                    /*Kin_local=*/ Kloc, /*Nout=*/ dec::kD, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        // r2 = x1 + ff2 + ff2_b → work (fp32). x1 lives in the dedicated fp32 buffer
+        // (no bf16 round). ff2_b folded here — matches the oracle r2 = x1 + (ff2 + ff2_b).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            sc.work[(int64_t)r * dec::kD + j] += sc.x1[(int64_t)r * dec::kD + j] + L.ff2_b[j];
+        }
+        __syncthreads();
+        if (li + 1 < dec::kLayers) {
+            // n2(r2) → finalin (fp32 reused) + n2 caches[li]; bf16 → X_in[li+1].
+            dectc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+                const int r = idx / dec::kD, j = idx % dec::kD;
+                acts.X_in[li + 1][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.finalin[(int64_t)r * dec::kD + j]);
+            }
+            __syncthreads();
+        } else {
+            // last layer: n2(r2) → finalin (fp32, all positions; head reads last pos) + n2 caches[li].
+            dectc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+        }
+    }
+
+    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
+    //    finalin holds the last-layer n2 output [nrows,d] fp32. ──
+    float nll_acc = 0.0f;
+    for (int si = 0; si < nsamp; ++si) {
+        const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+        const float* hlast = sc.finalin + (int64_t)rlast * dec::kD;
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) sum += hlast[j];
+        float mean = dec_block_sum(sum, red) / (float)dec::kD;
+        float vs = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) { float c = hlast[j] - mean; vs += c * c; }
+        float var = dec_block_sum(vs, red) / (float)dec::kD;
+        float iv = rsqrtf(var + dec::kLnEps);
+        if (threadIdx.x == 0) sc.fni[rlast] = iv;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float xh = (hlast[j] - mean) * iv;
+            sc.fnx[(int64_t)rlast * dec::kD + j] = xh;
+            float hn = xh * w.norm_w[j] + w.norm_b[j];
+            acts.X_hn[(int64_t)si_global(g0, si) * dec::kD + j] = __float2bfloat16(hn);
+        }
+        __syncthreads();
+        float* lg = sc.logits + (int64_t)si * dec::kVocab;
+        const __nv_bfloat16* hnb = acts.X_hn + (int64_t)si_global(g0, si) * dec::kD;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) {
+            const float* Wr = w.out_w + (int64_t)o * dec::kD;
+            float acc = w.out_b[o];
+            #pragma unroll 4
+            for (int k = 0; k < dec::kD; ++k) acc += __bfloat162float(hnb[k]) * Wr[k];
+            lg[o] = acc;
+        }
+        __syncthreads();
+        int tgt = tgt_ids[si_global(g0, si)];
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = dec_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = dec_block_sum(es, red);
+        float logz = lmax + __logf(es);
+        if (threadIdx.x == 0) nll_acc += (logz - lg[tgt]);
+        __syncthreads();
+    }
+    return nll_acc;
+}
+
+// TP-aware backward tile (mirror of dectc_backward_tile with the two backward
+// reduce points ②' (ff0 dX) and ①' (in_proj dX) wrapped in if constexpr).
+template <class Par = ::sg::fused::par::SingleGPU,
+          class Transport = ::sg::fused::sm90::tp::LoopbackTransport>
+__device__ void dectc_backward_tile_impl(
+        const DecWeights& w, const DecWBf& wb, int g0, int nrows, bool active, int B,
+        const DecActs& acts,
+        const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+        float* __restrict__ lnvec, float* __restrict__ work2,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red,
+        unsigned long long* pipeBars = nullptr) {
+    (void)active; (void)slot_red;
+    const int nsamp = nrows / dec::kSeq;
+    float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+    float* gn_n2w[dec::kLayers]; float* gn_n2b[dec::kLayers];
+    for (int li = 0; li < dec::kLayers; ++li) {
+        gn_n1w[li] = lnvec + (int64_t)(li * 4 + 0) * dec::kD;
+        gn_n1b[li] = lnvec + (int64_t)(li * 4 + 1) * dec::kD;
+        gn_n2w[li] = lnvec + (int64_t)(li * 4 + 2) * dec::kD;
+        gn_n2b[li] = lnvec + (int64_t)(li * 4 + 3) * dec::kD;
+    }
+    float* gn_normw = lnvec + (int64_t)(4 * dec::kLayers + 0) * dec::kD;
+    float* gn_normb = lnvec + (int64_t)(4 * dec::kLayers + 1) * dec::kD;
+
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+    __syncthreads();
+    for (int si = 0; si < nsamp; ++si) {
+        const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+        const int gs = si_global(g0, si);
+        float* lg = sc.logits + (int64_t)si * dec::kVocab;
+        int tgt = tgt_ids[gs];
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = dec_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = dec_block_sum(es, red);
+        float inv_es = 1.0f / es;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) {
+            float smo = __expf(lg[o] - lmax) * inv_es;
+            float dl = (smo - ((o == tgt) ? 1.0f : 0.0f)) / (float)B;
+            lg[o] = dl;
+            acts.dY_logits[(int64_t)gs * dec::kVocab + o] = __float2bfloat16(dl);
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dhn = 0.0f;
+            for (int o = 0; o < dec::kVocab; ++o)
+                dhn += lg[o] * w.out_w[(int64_t)o * dec::kD + j];
+            sc.work[(int64_t)rlast * dec::kD + j] = dhn;
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dhn = sc.work[(int64_t)rlast * dec::kD + j];
+            float xh = sc.fnx[(int64_t)rlast * dec::kD + j];
+            gn_normw[j] += dhn * xh; gn_normb[j] += dhn;
+        }
+        __syncthreads();
+        {
+            const float* dyr = sc.work + (int64_t)rlast * dec::kD;
+            const float* xhr = sc.fnx + (int64_t)rlast * dec::kD;
+            float sda = 0.0f, sdax = 0.0f;
+            for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j]; sda += dxhat; sdax += dxhat * xhr[j];
+            }
+            sda = dec_block_sum(sda, red); sdax = dec_block_sum(sdax, red);
+            float iv = sc.fni[rlast];
+            for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j];
+                sc.dh[(int64_t)rlast * dec::kD + j] = iv * (dxhat - (sda + xhr[j] * sdax) / (float)dec::kD);
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int li = dec::kLayers - 1; li >= 0; --li) {
+        const DecWeights::Layer& L = w.layer[li];
+        const int ff0_nout = Par::kTPComm ? dec::kDff / Par::kTP : dec::kDff;
+        const int qkv_nout = Par::kTPComm ? (3 * dec::kD) / Par::kTP : 3 * dec::kD;
+        dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            work2[idx] = sc.work[idx];
+            acts.dY_ff2[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);
+        }
+        __syncthreads();
+        // ff2 dX (ROW-parallel ff2 ⇒ dgact is the rank's local [nrows, dff/P], comm-free).
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, wb.ff2_wT[li],
+                                           sc.work, dec::kDff, ff0_nout, sA, sB, pipeBars);  // dgact [nrows,dff/P]
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * ff0_nout; idx += blockDim.x) {
+            float dff0 = sc.work[idx] * dec_gelu_grad(__bfloat162float(sc.ff0pre[li][idx]));
+            sc.work[idx] = dff0;
+            acts.dY_ff0[li][(int64_t)g0 * ff0_nout + idx] = __float2bfloat16(dff0);
+        }
+        __syncthreads();
+        // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
+        //   → sc.x1 (free now — fwd x1 consumed); then add to work2.
+        if constexpr (!Par::kTPComm) {
+            dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, wb.ff0_wT[li],
+                                               sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB, pipeBars);  // dx1_ffn [nrows,d]
+        } else {
+            // COLUMN-parallel ff0: ff0_wT[li] is the rank's [dff/P, d] col-shard's
+            // transpose; dY_ff0 is the rank's own [nrows, dff/P]. The dX is a PARTIAL
+            // (Σ_pe) → publish [nrows,d] → reduce → sc.x1 (②' of design §5.1). Then
+            // the `work2[idx] += sc.x1[idx]` accumulate below runs unchanged.
+            const int Noutloc = dec::kDff / tr.n_pes();
+            if (active) {
+                ::sg::fused::sm90::tp::tp_colparallel_dx_partial_tile<SG_TUNED_TILE_N>(
+                    tr, slot_pub,
+                    /*dYown=*/ acts.dY_ff0[li] + (int64_t)g0 * Noutloc, wb.ff0_wT[li],
+                    /*Kin=*/ dec::kD, /*Nout_local=*/ Noutloc, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.x1, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+            work2[idx] += sc.x1[idx];
+        __syncthreads();
+        dectc_ln_bwd_tile(work2, sc.n1x[li], sc.n1i[li], L.n1_w, nrows, sc.work, gn_n1w[li], gn_n1b[li], red);
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            sc.dh[idx] = sc.work[idx];
+            acts.dY_a[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);
+        }
+        __syncthreads();
+        // out_proj dX (ROW-parallel out_proj ⇒ dctx is the rank's local [nrows, d/P], comm-free).
+        const int dctx_nin = Par::kTPComm ? dec::kD / Par::kTP : dec::kD;
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, wb.out_wT[li],
+                                           sc.work, dctx_nin, dec::kD, sA, sB, pipeBars);  // dctx [nrows, d/P]
+        __syncthreads();
+        // attention bwd (full-width on this path; head-local shard is the §6 8-GPU touch).
+        dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+        for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x)
+            acts.dY_qkv[li][(int64_t)g0 * qkv_nout + idx] = __float2bfloat16(work2[idx]);
+        __syncthreads();
+        // in_proj dX: dx_in_attn = dqkv @ in_w  (output width Kin=d, contract Nout=3d).
+        //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+        if constexpr (!Par::kTPComm) {
+            dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, wb.in_wT[li],
+                                               sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB, pipeBars);  // dx_in_attn
+        } else {
+            // COLUMN(QKV)-parallel in_proj: in_wT[li] is the rank's [3d/P, d] qkv
+            // col-shard's transpose; dY_qkv is the rank's own [nrows, 3d/P] (the
+            // 3-block q|k|v own-rows concatenated). The dX is a PARTIAL → publish
+            // [nrows,d] → reduce → sc.work (①' of design §5.1). Then the residual
+            // add `sc.dh[idx] += sc.work[idx]` below runs unchanged.
+            const int Noutloc = (3 * dec::kD) / tr.n_pes();
+            if (active) {
+                ::sg::fused::sm90::tp::tp_colparallel_dx_partial_tile<SG_TUNED_TILE_N>(
+                    tr, slot_pub,
+                    /*dYown=*/ acts.dY_qkv[li] + (int64_t)g0 * Noutloc, wb.in_wT[li],
+                    /*Kin=*/ dec::kD, /*Nout_local=*/ Noutloc, sA, sB);
+            }
+            tr.rendezvous(bar);
+            ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+            tr.rendezvous(bar);
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+            sc.dh[idx] += sc.work[idx];
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+        acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
+    __syncthreads();
+}
+
+// Thin wrappers EDIT C.3 calls (forward `Par`/`Transport` to the _impl bodies).
+template <class Par, class Transport>
+__device__ __forceinline__ float dectc_forward_tile_tp(
+        const DecWeights& w, const DecWBf& wb, int g0, int nrows, bool active,
+        const DecActs& acts, const DecTileScratch& sc,
+        const int* __restrict__ tok_ids, const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red,
+        unsigned long long* pipeBars = nullptr) {
+    return dectc_forward_tile_impl<Par, Transport>(
+        w, wb, g0, nrows, active, acts, sc, tok_ids, tgt_ids, sA, sB, red,
+        tr, bar, slot_pub, slot_red, pipeBars);
+}
+template <class Par, class Transport>
+__device__ __forceinline__ void dectc_backward_tile_tp(
+        const DecWeights& w, const DecWBf& wb, int g0, int nrows, bool active, int B,
+        const DecActs& acts, const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+        float* __restrict__ lnvec, float* __restrict__ work2,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red,
+        const Transport& tr, const ::sg::fused::GridBarrier& bar,
+        int64_t slot_pub, int64_t slot_red,
+        unsigned long long* pipeBars = nullptr) {
+    dectc_backward_tile_impl<Par, Transport>(
+        w, wb, g0, nrows, active, B, acts, sc, tgt_ids, lnvec, work2, sA, sB, red,
+        tr, bar, slot_pub, slot_red, pipeBars);
 }
 
 // ════════════════════════════════════════════════════════════════════════
