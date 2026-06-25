@@ -98,6 +98,8 @@
 // is UNCHANGED and its gates stay bit-identical; this is a PARALLEL kernel.
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
 #include "csrc/fused/sm_90/model_stage_decoder_tc.cuh"
+#include "csrc/fused/sm_90/parallel_config.cuh"   // par::ParConfig / par::SingleGPU / par::CommCtx (EDIT C)
+#include "csrc/fused/sm_90/tp_layer.cuh"          // tp:: sharded partial GEMMs + tp_transport seam (EDIT C)
 // STAGED-optimizer in-kernel precompute stages (Prodigy d-reduction, …). Pulls in
 // the canonical prodigy.h reduction math + the deterministic block reductions; the
 // TC megakernel's Prodigy branch runs an INLINE FIXED-PARTITION (r,s) reduce + an EMA
@@ -669,13 +671,14 @@ __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B
 __device__ unsigned long long g_dec_prof_max[8];
 #endif
 
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 __global__ void __launch_bounds__(SG_TC_MEGA_BLOCK)
 fused_decoder_megakernel_tc(PersistentContext ctx,
                             float* __restrict__ params,
                             DecoderTokenCtx tok,
                             float* __restrict__ grad,
-                            float lr, int step, FusedOptState st) {
+                            float lr, int step, FusedOptState st,
+                            ::sg::fused::par::CommCtx comm = {}) {
 #if SG_DEC_TC_DYNAMIC_SMEM
     // DEEP-RING path: DecTcSmem is allocated from DYNAMIC smem (sized at launch to
     // exactly sizeof(DecTcSmem), opt-in via cudaFuncAttributeMaxDynamicSharedMem-
@@ -691,6 +694,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     __shared__ DecTcSmem sm;
 #endif
     GridBarrier bar = ctx.barrier();
+    // TP transport (folds to nothing on SingleGPU — kTPComm==false). Built once;
+    // the four reduce points (model_stage_decoder_tc.cuh ①/②/①'/②') read `tr`.
+    // make_transport_from_comm picks Loopback (no NVSHMEM) or Nvshmem (-DSG_HAS_NVSHMEM).
+    auto tr = ::sg::fused::sm90::tp::make_transport_from_comm<Par>(comm);
+    (void)tr;  // unused on SingleGPU (if-constexpr'd out below) — silence the warn
     // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
     // passes through the out-of-line shims (one shared frame, campaign C2). The
     // single-pass cells keep the inline bodies -- byte-identical allocation.
