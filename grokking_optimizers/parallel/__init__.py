@@ -32,6 +32,13 @@ from grokking_optimizers.parallel.shard_map import (
     partition_tensor_granular,
     shard_mode_for_optimizer,
 )
+from grokking_optimizers.parallel.auto_config import (
+    AdaptivePlan,
+    infer_parallel_config,
+    is_sequence_model,
+    has_model_experts,
+    model_num_experts,
+)
 
 __all__ = [
     "ShardPlan",
@@ -40,4 +47,9 @@ __all__ = [
     "partition_elementwise_even",
     "partition_tensor_granular",
     "shard_mode_for_optimizer",
+    "AdaptivePlan",
+    "infer_parallel_config",
+    "is_sequence_model",
+    "has_model_experts",
+    "model_num_experts",
 ]
