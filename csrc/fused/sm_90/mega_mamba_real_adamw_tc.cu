@@ -264,4 +264,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.attr("STATE") = (int)mb::kState;
     mm.attr("VOCAB") = (int)mb::kVocab;
     mm.attr("PHEAD") = (int)mb::kPHead;
+    // Layer-streaming introspection: the per-CTA dynamic smem the launcher requests
+    // (streamed sizeof on flagship, all-layers on SMALL) + whether streaming is active.
+    mm.attr("DYN_SMEM_BYTES") = (int)::sg::fused::sm90::mb_tc_dyn_smem_bytes();
+    mm.attr("STREAM_SMEM") = (int)::sg::fused::sm90::kMbStreamSmem;
 }

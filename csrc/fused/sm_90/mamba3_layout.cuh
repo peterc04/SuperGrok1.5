@@ -278,6 +278,69 @@ static_assert(kMambaSmemBytes <= 228 * 1024,
               "the live set (e.g. drop a cached LayerAct buffer).");
 #endif  // SG_MB_BENCH_LAYOUT
 
+// ── LAYER-STREAMING smem gate (mirror mamba_flagship_layout.cuh; SAME formula). ──
+// Per-CTA all-layers MambaSampleSmem float count, computed from the layout dims.
+// This is the SAME field formula model_stage_mamba3.cuh's struct realizes; it is
+// used ONLY to pick the streamed vs all-layers struct at compile time. If it ever
+// drifts from sizeof(MambaSampleSmem) the existing static_assert (==kMambaSmemBytes)
+// still guards correctness — this constant only drives the gate.
+constexpr int64_t kMbOneLayerActFloats =
+    (int64_t)SG_MB_SEQ * (1 + 2*SG_MB_DINNER + SG_MB_DTRANK + 3*SG_MB_NHEADS
+        + SG_MB_STATEC + 4*SG_MB_STATEC + 4 + 4*SG_MB_STATEC
+        + SG_MB_DINNER + SG_MB_D + 1 + 2*SG_MB_DFF);
+constexpr int  kMbActsRing = 2;   // layer_in ring depth (streamed path only)
+constexpr int64_t kMbAllLayersSmemFloats =
+    (int64_t)SG_MB_LAYERS*SG_MB_SEQ*SG_MB_D + SG_MB_SEQ*SG_MB_D
+    + (int64_t)SG_MB_LAYERS*kMbOneLayerActFloats
+    + (SG_MB_SEQ*SG_MB_D + SG_MB_SEQ + SG_MB_PHEAD)
+    + 2*SG_MB_SEQ*SG_MB_D
+    + 3*SG_MB_SEQ*SG_MB_DINNER + 2*SG_MB_SEQ*SG_MB_DFF
+    + SG_MB_SEQ*SG_MB_XPROJ
+    + SG_MB_SEQ*SG_MB_STATEC*2*2 + SG_MB_SEQ*SG_MB_STATEC + 64;
+// TRUE only when the all-layers struct does NOT fit the H100 227KB opt-in cap.
+// prod (210.79KB) / bench (1.26MB at d=1024 → also TRUE? see note): the production
+// d=128 branch is 210.79KB → FALSE → OLD struct, byte-identical. The d=1024 bench
+// branch's all-layers struct is 1.26MB → TRUE, but the bench drives the TC engine
+// via the small static MbTcSmem and gates the scalar megakernel OFF, so the streamed
+// MambaSampleSmem is dead there; the gate is correct (it would stream if ever live).
+constexpr bool kMbStreamSmem =
+    (kMbAllLayersSmemFloats * (int64_t)sizeof(float)) > (227 * 1024);
+
+// ── Level B (scratch-to-HBM): on the streamed path the big per-sample
+//    SEQ×{DINNER,DFF,D} working buffers move OUT of smem into a per-CTA HBM scratch
+//    region (mb_scratch_*), accessed via a PROXY type (MbHbmBuf2D) whose operator[]
+//    yields a row pointer so a->x_in[s][c] / sm->adj_a[s][c] read unchanged. On SMALL
+//    (kMbStreamSmem==false) every such field is a REAL fixed-size smem array (the
+//    proxy is never instantiated) → byte-identical. The width aliases below collapse
+//    the smem footprint of the moved fields to a single placeholder float on the
+//    streamed path (the proxy stores only a float* base; the array view is HBM). ──
+// (The exact streamed smem float count is computed in model_stage_mamba3.cuh's
+//  static_assert against sizeof(MambaSampleSmem); kMbStreamSmemFloats below is the
+//  pin. Streamed-resident fields: layer_in ring + one LayerAct's SMALL caches +
+//  fn_xhat + fn_r + logits + xproj + dBbar/dCbar/dtheta + red. Everything SEQ×{DINNER,
+//  DFF,D}-wide that is per-sample-transient is HBM.)
+//   one LayerAct SMALL caches (streamed): mixn_r SEQ + dt_lr SEQ·DTRANK
+//     + dt_pre/A_mod/u_lam 3·SEQ·NHEADS + theta SEQ·STATEC + Br/Bi/Cr/Ci 4·SEQ·STATEC
+//     + 4 rms recips 4·SEQ + Bbar/Cbar 2·SEQ·STATEC·2 + mlpn_r SEQ
+//     (x_in,z,y_scan,h1,g_pre,u_mlp are HBM)
+constexpr int64_t kMbStreamOneLayerActFloats =
+    (int64_t)SG_MB_SEQ * (1 + SG_MB_DTRANK + 3*SG_MB_NHEADS
+        + SG_MB_STATEC + 4*SG_MB_STATEC + 4 + 4*SG_MB_STATEC + 1);
+// fn_xhat rows: SEQ on SMALL (byte-identical), 1 on the streamed path (only the LAST
+// position is read by the head/final-norm fwd+bwd; its SEQ×D backward scratch reuse
+// moves to the HBM scratch slab `dr2`). Saves (SEQ-1)·D floats at flagship.
+constexpr int kMbFnXhatRows = kMbStreamSmem ? 1 : SG_MB_SEQ;
+//   struct remainder (streamed): layer_in ring + fn_xhat(kMbFnXhatRows·D) + fn_r(SEQ)
+//     + logits(PHEAD) + xproj(SEQ·XPROJ) + dBbar/dCbar(2·SEQ·STATEC·2)
+//     + dtheta(SEQ·STATEC) + red(64). (final_in,dh,dr,adj_a/b/c,wff_a/b are HBM.)
+constexpr int64_t kMbStreamSmemFloats =
+    (int64_t)kMbActsRing*SG_MB_SEQ*SG_MB_D                          // layer_in(ring)
+    + kMbStreamOneLayerActFloats                                     // one (small-cache) LayerAct
+    + ((int64_t)kMbFnXhatRows*SG_MB_D + SG_MB_SEQ + SG_MB_PHEAD)    // fn_xhat,fn_r,logits
+    + SG_MB_SEQ*SG_MB_XPROJ                                          // xproj
+    + SG_MB_SEQ*SG_MB_STATEC*2*2 + SG_MB_SEQ*SG_MB_STATEC + 64;     // dBbar,dCbar,dtheta,red
+constexpr int64_t kMbStreamSmemBytes = kMbStreamSmemFloats * (int64_t)sizeof(float);
+
 }}} // namespace sg::fused::sm90
 
 #endif  // SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_

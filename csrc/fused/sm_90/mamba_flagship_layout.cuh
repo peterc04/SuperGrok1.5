@@ -315,6 +315,47 @@ static_assert(kMambaSmemBytes > 48 * 1024,
               "mamba3_layout: if the smem ever drops below 48KB, switch the "
               "launcher back to STATIC smem (no opt-in needed).");
 
+// ── LAYER-STREAMING smem gate (BYTE-IDENTICAL formula to mamba3_layout.cuh; this
+//    standalone flagship header carries its own copy since it is included INSTEAD
+//    of mamba3_layout.cuh). At flagship the all-layers struct is 19.56MB → the gate
+//    is TRUE → the streamed (one-layer + layer_in ring + scratch-to-HBM) struct is
+//    selected so the launch dyn_smem request fits the H100 227KB opt-in cap. ──
+constexpr int64_t kMbOneLayerActFloats =
+    (int64_t)SG_MB_SEQ * (1 + 2*SG_MB_DINNER + SG_MB_DTRANK + 3*SG_MB_NHEADS
+        + SG_MB_STATEC + 4*SG_MB_STATEC + 4 + 4*SG_MB_STATEC
+        + SG_MB_DINNER + SG_MB_D + 1 + 2*SG_MB_DFF);
+constexpr int  kMbActsRing = 2;   // layer_in ring depth (streamed path only)
+constexpr int64_t kMbAllLayersSmemFloats =
+    (int64_t)SG_MB_LAYERS*SG_MB_SEQ*SG_MB_D + SG_MB_SEQ*SG_MB_D
+    + (int64_t)SG_MB_LAYERS*kMbOneLayerActFloats
+    + (SG_MB_SEQ*SG_MB_D + SG_MB_SEQ + SG_MB_PHEAD)
+    + 2*SG_MB_SEQ*SG_MB_D
+    + 3*SG_MB_SEQ*SG_MB_DINNER + 2*SG_MB_SEQ*SG_MB_DFF
+    + SG_MB_SEQ*SG_MB_XPROJ
+    + SG_MB_SEQ*SG_MB_STATEC*2*2 + SG_MB_SEQ*SG_MB_STATEC + 64;
+constexpr bool kMbStreamSmem =
+    (kMbAllLayersSmemFloats * (int64_t)sizeof(float)) > (227 * 1024);
+
+// ── Level B (scratch-to-HBM): the big per-sample SEQ×{DINNER,DFF,D} working buffers
+//    move to a per-CTA HBM scratch region (MbHbmBuf2D proxy); only the small scan/head
+//    caches + the layer_in ring + fn_xhat[1][D] + xproj + dBbar/dCbar/dtheta + red stay
+//    resident. Field map mirrors model_stage_mamba3.cuh's streamed struct branch. ──
+constexpr int64_t kMbStreamOneLayerActFloats =
+    (int64_t)SG_MB_SEQ * (1 + SG_MB_DTRANK + 3*SG_MB_NHEADS
+        + SG_MB_STATEC + 4*SG_MB_STATEC + 4 + 4*SG_MB_STATEC + 1);
+constexpr int kMbFnXhatRows = kMbStreamSmem ? 1 : SG_MB_SEQ;
+constexpr int64_t kMbStreamSmemFloats =
+    (int64_t)kMbActsRing*SG_MB_SEQ*SG_MB_D                          // layer_in(ring)
+    + kMbStreamOneLayerActFloats                                     // one (small-cache) LayerAct
+    + ((int64_t)kMbFnXhatRows*SG_MB_D + SG_MB_SEQ + SG_MB_PHEAD)    // fn_xhat,fn_r,logits
+    + SG_MB_SEQ*SG_MB_XPROJ                                          // xproj
+    + SG_MB_SEQ*SG_MB_STATEC*2*2 + SG_MB_SEQ*SG_MB_STATEC + 64;     // dBbar,dCbar,dtheta,red
+constexpr int64_t kMbStreamSmemBytes = kMbStreamSmemFloats * (int64_t)sizeof(float);
+// Level B clears the 227KB opt-in cap → the flagship TC kernel LAUNCHES.
+static_assert(kMbStreamSmemBytes <= 227 * 1024,
+              "mamba_flagship_layout: streamed MambaSampleSmem exceeds the H100 227KB "
+              "opt-in cap — more per-sample scratch must move to HBM (Level B).");
+
 }}} // namespace sg::fused::sm90
 
 #endif  // SG_FUSED_SM90_MAMBA_FLAGSHIP_LAYOUT_CUH_
