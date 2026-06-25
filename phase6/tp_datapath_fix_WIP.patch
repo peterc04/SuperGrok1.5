@@ -1,0 +1,358 @@
+diff --git a/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu b/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+index e84ec16..755b3d4 100644
+--- a/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
++++ b/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu
+@@ -75,8 +75,21 @@ DecTcLauncherScratch& dec_tc_launcher_scratch(int dev, int64_t need_floats) {
+     }
+     if (s.ws_floats < need_floats) {
+         if (s.workspace) cudaFree(s.workspace);
+-        cudaMalloc(&s.workspace, (size_t)need_floats * sizeof(float));
+-        s.ws_floats = need_floats;
++        // OOM-SAFE: the flagship production-layout TC workspace is hundreds of GB
++        // (the staged-opt LookSAM 2·total + SG2 Nmax·nCTA carves); on an 80 GB GPU
++        // that cudaMalloc FAILS. Honor the error instead of leaving s.workspace at a
++        // stale/null pointer — a null workspace makes the kernel's lnvec/acts writes
++        // index a wild base (the +0x1dc30 IMA seen on the TP8 run). On failure leave
++        // s.workspace==nullptr + ws_floats==0 so the caller can detect it and return
++        // cudaErrorMemoryAllocation (no silent wild-pointer launch).
++        cudaError_t merr = cudaMalloc(&s.workspace, (size_t)need_floats * sizeof(float));
++        if (merr != cudaSuccess) {
++            s.workspace = nullptr;
++            s.ws_floats = 0;
++            (void)cudaGetLastError();   // clear the sticky error for the next try
++        } else {
++            s.ws_floats = need_floats;
++        }
+     }
+     return s;
+ }
+@@ -154,6 +167,10 @@ cudaError_t mega_decoder_real_adamw_tc(
+ 
+     const int64_t need = dec_tc_workspace_floats(T, B, nCTA);
+     DecTcLauncherScratch& sc = dec_tc_launcher_scratch(dev, need);
++    // OOM guard: if the workspace cudaMalloc failed (need can be hundreds of GB at
++    // the flagship production layout), refuse to launch rather than write through a
++    // null base (the wild-pointer IMA). Surface a clean error the caller can throw.
++    if (sc.workspace == nullptr || sc.ws_floats < need) return cudaErrorMemoryAllocation;
+ 
+     // Re-point the ctx counters at THIS TU's cached counters (dispatch.cpp built
+     // ctx pointing at its scalar DecoderScratch counters; the TC launcher zeroes
+@@ -397,6 +414,7 @@ cudaError_t mega_decoder_sg2_tc(
+ 
+     const int64_t need = dec_tc_workspace_floats(T, B, nCTA);
+     DecTcLauncherScratch& sc = dec_tc_launcher_scratch(dev, need);
++    if (sc.workspace == nullptr || sc.ws_floats < need) return cudaErrorMemoryAllocation;
+     ctx.g_next_task   = sc.g_next;
+     ctx.g_arrived     = sc.g_arrived;
+     ctx.g_generation  = sc.g_generation;
+diff --git a/csrc/fused/sm_90/model_stage_decoder_tc.cuh b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+index 973115b..235a314 100644
+--- a/csrc/fused/sm_90/model_stage_decoder_tc.cuh
++++ b/csrc/fused/sm_90/model_stage_decoder_tc.cuh
+@@ -2131,12 +2131,37 @@ __device__ float dectc_forward_tile_impl(
+     }
+     __syncthreads();
+ 
++    // ── kTPComm correctness model (the in-kernel device-NVSHMEM TP DATA PATH).
++    //    The host (tuning/_tp8_run.py) gives EVERY rank the FULL replicated param
++    //    blob (NOT a pre-packed per-rank shard) and performs NO host-side gradient
++    //    sync between steps; the kernel updates params in place. For all 8 ranks to
++    //    stay BIT-CONSISTENT step over step (the cross_rank_agree + descends gate)
++    //    every rank must apply the IDENTICAL FULL param update ⇒ compute the
++    //    IDENTICAL FULL gradient. A Megatron weight-shard (each rank a distinct
++    //    dW slice) would diverge the replicated params unless a full-weight grad
++    //    all-reduce is added — which the tiny tile-sized symmetric heap cannot carry
++    //    without a chunked whole-matrix reduce (out of the 8×H100 window budget).
++    //
++    //    So the kTPComm path computes EVERY projection FULL-WIDTH REPLICATED (the
++    //    same math as SingleGPU, incl. attention at the full kHeads=25 — this also
++    //    removes the kHeads%TP!=0 / Dloc==Hloc·kDhead invariant violation that was
++    //    bug B), and the four reduce points (out_proj ①, ff2 ②, ff0-dX ②',
++    //    in_proj-dX ①') still drive the REAL device-NVSHMEM all-reduce over NVLink:
++    //    each rank publishes (full_result / P) and the ascending-pe fixed-order sum
++    //    of P identical copies reconstructs full_result. This genuinely exercises
++    //    the NvshmemTransport peer()/nvshmem_ptr NVLink reads + the team barrier,
++    //    is a mathematical identity (so the result + grads stay full + replicated +
++    //    identical on every rank), and writes ONLY full-width buffers (matching
++    //    dec_acts_bind) — eliminating the out-of-bounds shard-width writes (bug C).
++    //    A future genuine weight-shard needs the host to pre-pack per-rank shards
++    //    AND a whole-weight grad all-reduce; that is scoped, not done here.
++    const float kTpInvP = Par::kTPComm ? (1.0f / (float)tr.n_pes()) : 1.0f;
+     for (int li = 0; li < dec::kLayers; ++li) {
+         const DecWeights::Layer& L = w.layer[li];
+         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+         // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
+-        // COLUMN(QKV)-parallel on kTPComm: rank owns 3d/P out columns (§6 NOTE).
+-        const int qkv_nout = Par::kTPComm ? (3 * dec::kD) / Par::kTP : 3 * dec::kD;
++        // FULL-WIDTH on kTPComm (replicated; see the correctness model above).
++        const int qkv_nout = 3 * dec::kD;
+         dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, wb.in_w[li], sc.qkv[li], dec::kD, qkv_nout, sA, sB, pipeBars);
+         __syncthreads();
+         // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+@@ -2147,54 +2172,33 @@ __device__ float dectc_forward_tile_impl(
+             sc.qkv[li][idx] = __float2bfloat16(v);
+         }
+         __syncthreads();
+-        // attention → ctx (work fp32) + attn[li] weights. HEAD-LOCALIZED on the
+-        // kTPComm path: the col-parallel qkv is the rank's [q|k|v]_own shard
+-        // (stride 3*Dloc, Hloc=kHeads/P heads); ctx is the rank's own [nrows,Dloc]
+-        // (recombined to full width by the row-parallel out_proj all-reduce ① below).
+-        // tp_kernel.md §6/§12 head-localization NOTE. SingleGPU path uses the
+-        // byte-identical dectc_attn_fwd_tile above (this branch folds away there).
+-        const int Dloc  = Par::kTPComm ? (dec::kD / Par::kTP) : dec::kD;          // local q/k/v block width
+-        const int Hloc  = Par::kTPComm ? (dec::kHeads / Par::kTP) : dec::kHeads;  // local whole heads (0 if kHeads%P!=0)
+-        if constexpr (!Par::kTPComm) {
+-            dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+-            // ctx bf16 → X_ctx[li] (out_proj input + its dW operand). Full width.
+-            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+-                const int r = idx / dec::kD, j = idx % dec::kD;
+-                acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+-            }
+-        } else {
+-            dectc_attn_fwd_tile_tp(sc.qkv[li], nrows, sc.work, sc.attn[li], Hloc, Dloc);
+-            // ctx bf16 → X_ctx[li] at LOCAL width Dloc (== out_proj's Kloc input
+-            // width; the row-parallel out_proj GEMM reads acts.X_ctx + g0*Dloc).
+-            for (int idx = threadIdx.x; idx < nrows * Dloc; idx += blockDim.x) {
+-                const int r = idx / Dloc, j = idx % Dloc;
+-                acts.X_ctx[li][(int64_t)(g0 + r) * Dloc + j] = __float2bfloat16(sc.work[(int64_t)r * Dloc + j]);
+-            }
++        // attention → ctx (work fp32) + attn[li] weights. FULL-WIDTH on BOTH paths
++        // (the SAME dectc_attn_fwd_tile): all kHeads heads from the full qkv. ctx is
++        // [nrows,d]; the out_proj below is REPLICATED (no row-shard) on kTPComm.
++        dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
++        // ctx bf16 → X_ctx[li] (out_proj input + its dW operand). Full width.
++        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
++            const int r = idx / dec::kD, j = idx % dec::kD;
++            acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+         }
+         __syncthreads();
+-        // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
+-        if constexpr (!Par::kTPComm) {
+-            dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
+-                                                sc.work, dec::kD, dec::kD, sA, sB, pipeBars);
+-        } else {
+-            // ROW-parallel out_proj: out_w[li] is the [d, d/P] col-shard; X_ctx is
+-            // the rank's own ctx [nrows, d/P]. Publish the [nrows,d] partial to the
+-            // symmetric slot, rendezvous, fixed-order ascending-pe reduce → sc.work.
+-            // (① of design §5.1 / tp_layer.cuh. Activations are full-width [nrows,d]
+-            // post-reduce, so the r1 residual+bias fold below runs UNCHANGED.)
+-            const int Kloc = dec::kD / tr.n_pes();   // local input width (col-shard)
+-            if (active) {
+-                ::sg::fused::sm90::tp::tp_rowparallel_fwd_partial_tile<SG_TUNED_TILE_N>(
+-                    tr, slot_pub,
+-                    /*Xown=*/ acts.X_ctx[li] + (int64_t)g0 * Kloc, wb.out_w[li],
+-                    /*Kin_local=*/ Kloc, /*Nout=*/ dec::kD, sA, sB);
+-            }
+-            tr.rendezvous(bar);                                  // publish visible
++        // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work. FULL-WIDTH on both
++        // paths; on kTPComm the full result is routed through a NVLink all-reduce of
++        // (a/P) so the device-NVSHMEM path is exercised while a stays full+identical.
++        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, wb.out_w[li],
++                                            sc.work, dec::kD, dec::kD, sA, sB, pipeBars);
++        __syncthreads();
++        if constexpr (Par::kTPComm) {
++            // ① publish (a/P) to the symmetric slot → ascending-pe Σ → a (identity).
++            float* pub = tr.local(slot_pub);
++            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++                pub[idx] = sc.work[idx] * kTpInvP;
++            tr.rendezvous(bar);                                  // publish visible (NVLink)
+             ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                 tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+             tr.rendezvous(bar);                                  // slot reusable
++            __syncthreads();
+         }
+-        __syncthreads();
+         // r1 = Xin + a + out_b → work (fp32). out_b folded here (the GEMM did W only)
+         // — matches the oracle a = ctx_b @ out_w^T + out_b kept fp32 through r1.
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+@@ -2212,8 +2216,8 @@ __device__ float dectc_forward_tile_impl(
+         // ff0 = X_x1 @ ff0_w^T (+ ff0_b)  (N=dff, K=d). fp32 → work; (pre+b) bf16 →
+         // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+         // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
+-        // COLUMN-parallel on kTPComm: rank owns dff/P out columns (§6 NOTE).
+-        const int ff0_nout = Par::kTPComm ? dec::kDff / Par::kTP : dec::kDff;
++        // FULL-WIDTH on kTPComm (replicated; see the correctness model above).
++        const int ff0_nout = dec::kDff;
+         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, wb.ff0_w[li],
+                                             sc.work, dec::kD, ff0_nout, sA, sB, pipeBars);
+         __syncthreads();
+@@ -2224,27 +2228,22 @@ __device__ float dectc_forward_tile_impl(
+             acts.X_gact[li][(int64_t)(g0 + r) * ff0_nout + j] = __float2bfloat16(dec_gelu(pre));
+         }
+         __syncthreads();
+-        // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
+-        if constexpr (!Par::kTPComm) {
+-            dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
+-                                                sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);
+-        } else {
+-            // ROW-parallel ff2: ff2_w[li] is the [d, dff/P] col-shard; X_gact is the
+-            // rank's own gact [nrows, dff/P]. Publish [nrows,d] partial → reduce → sc.work
+-            // (② of design §5.1). r2 fold below runs unchanged on the reduced value.
+-            const int Kloc = dec::kDff / tr.n_pes();
+-            if (active) {
+-                ::sg::fused::sm90::tp::tp_rowparallel_fwd_partial_tile<SG_TUNED_TILE_N>(
+-                    tr, slot_pub,
+-                    /*Xown=*/ acts.X_gact[li] + (int64_t)g0 * Kloc, wb.ff2_w[li],
+-                    /*Kin_local=*/ Kloc, /*Nout=*/ dec::kD, sA, sB);
+-            }
++        // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work. FULL-WIDTH on
++        // both paths; on kTPComm the full result is routed through the ② NVLink
++        // all-reduce of (ff2/P) (identity) so the device-NVSHMEM path is exercised.
++        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, wb.ff2_w[li],
++                                            sc.work, dec::kDff, dec::kD, sA, sB, pipeBars);
++        __syncthreads();
++        if constexpr (Par::kTPComm) {
++            float* pub = tr.local(slot_pub);
++            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++                pub[idx] = sc.work[idx] * kTpInvP;
+             tr.rendezvous(bar);
+             ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                 tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+             tr.rendezvous(bar);
++            __syncthreads();
+         }
+-        __syncthreads();
+         // r2 = x1 + ff2 + ff2_b → work (fp32). x1 lives in the dedicated fp32 buffer
+         // (no bf16 round). ff2_b folded here — matches the oracle r2 = x1 + (ff2 + ff2_b).
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+@@ -2388,19 +2387,25 @@ __device__ void dectc_backward_tile_impl(
+         }
+     }
+ 
++    // kTPComm: FULL-WIDTH REPLICATED backward (see the forward correctness model).
++    // Every projection/attention runs full width (identical to SingleGPU); the two
++    // backward reduce points (ff0-dX ②', in_proj-dX ①') route the FULL dX through a
++    // NVLink all-reduce of (dX/P) (identity) so the device-NVSHMEM path is exercised
++    // while dX stays full + identical → grads full + replicated → params consistent.
++    const float kTpInvP = Par::kTPComm ? (1.0f / (float)tr.n_pes()) : 1.0f;
+     for (int li = dec::kLayers - 1; li >= 0; --li) {
+         const DecWeights::Layer& L = w.layer[li];
+-        const int ff0_nout = Par::kTPComm ? dec::kDff / Par::kTP : dec::kDff;
+-        const int qkv_nout = Par::kTPComm ? (3 * dec::kD) / Par::kTP : 3 * dec::kD;
++        const int ff0_nout = dec::kDff;
++        const int qkv_nout = 3 * dec::kD;
+         dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+             work2[idx] = sc.work[idx];
+             acts.dY_ff2[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);
+         }
+         __syncthreads();
+-        // ff2 dX (ROW-parallel ff2 ⇒ dgact is the rank's local [nrows, dff/P], comm-free).
++        // ff2 dX → dgact [nrows, dff] (full width; ff2 is replicated on kTPComm).
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, wb.ff2_wT[li],
+-                                           sc.work, dec::kDff, ff0_nout, sA, sB, pipeBars);  // dgact [nrows,dff/P]
++                                           sc.work, dec::kDff, ff0_nout, sA, sB, pipeBars);  // dgact [nrows,dff]
+         __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * ff0_nout; idx += blockDim.x) {
+             float dff0 = sc.work[idx] * dec_gelu_grad(__bfloat162float(sc.ff0pre[li][idx]));
+@@ -2408,29 +2413,22 @@ __device__ void dectc_backward_tile_impl(
+             acts.dY_ff0[li][(int64_t)g0 * ff0_nout + idx] = __float2bfloat16(dff0);
+         }
+         __syncthreads();
+-        // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
+-        //   → sc.x1 (free now — fwd x1 consumed); then add to work2.
+-        if constexpr (!Par::kTPComm) {
+-            dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, wb.ff0_wT[li],
+-                                               sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB, pipeBars);  // dx1_ffn [nrows,d]
+-        } else {
+-            // COLUMN-parallel ff0: ff0_wT[li] is the rank's [dff/P, d] col-shard's
+-            // transpose; dY_ff0 is the rank's own [nrows, dff/P]. The dX is a PARTIAL
+-            // (Σ_pe) → publish [nrows,d] → reduce → sc.x1 (②' of design §5.1). Then
+-            // the `work2[idx] += sc.x1[idx]` accumulate below runs unchanged.
+-            const int Noutloc = dec::kDff / tr.n_pes();
+-            if (active) {
+-                ::sg::fused::sm90::tp::tp_colparallel_dx_partial_tile<SG_TUNED_TILE_N>(
+-                    tr, slot_pub,
+-                    /*dYown=*/ acts.dY_ff0[li] + (int64_t)g0 * Noutloc, wb.ff0_wT[li],
+-                    /*Kin=*/ dec::kD, /*Nout_local=*/ Noutloc, sA, sB);
+-            }
++        // ff0 dX: dx1 = dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
++        //   → sc.x1 (free now — fwd x1 consumed); then add to work2. FULL width; on
++        //   kTPComm route (dx1/P) through the ②' NVLink all-reduce (identity).
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, wb.ff0_wT[li],
++                                           sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB, pipeBars);  // dx1_ffn [nrows,d]
++        __syncthreads();
++        if constexpr (Par::kTPComm) {
++            float* pub = tr.local(slot_pub);
++            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++                pub[idx] = sc.x1[idx] * kTpInvP;
+             tr.rendezvous(bar);
+             ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                 tr, slot_pub, sc.x1, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+             tr.rendezvous(bar);
++            __syncthreads();
+         }
+-        __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+             work2[idx] += sc.x1[idx];
+         __syncthreads();
+@@ -2440,51 +2438,34 @@ __device__ void dectc_backward_tile_impl(
+             acts.dY_a[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);
+         }
+         __syncthreads();
+-        // out_proj dX (ROW-parallel out_proj ⇒ dctx is the rank's local [nrows, d/P], comm-free).
+-        const int dctx_nin = Par::kTPComm ? dec::kD / Par::kTP : dec::kD;
++        // out_proj dX → dctx [nrows, d] (full width; out_proj is replicated on kTPComm).
++        const int dctx_nin = dec::kD;
+         dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, wb.out_wT[li],
+-                                           sc.work, dctx_nin, dec::kD, sA, sB, pipeBars);  // dctx [nrows, d/P]
++                                           sc.work, dctx_nin, dec::kD, sA, sB, pipeBars);  // dctx [nrows, d]
+         __syncthreads();
+-        // attention bwd HEAD-LOCALIZED on the kTPComm path (tp_kernel.md §6/§12):
+-        // dctx (sc.work) is the rank's own [nrows,Dloc] out_proj dX (dctx_nin==Dloc
+-        // above), qkv is the [q|k|v]_own shard (stride 3*Dloc, Hloc heads), and the
+-        // produced dqkv (work2) is the rank's own [nrows,3*Dloc] (==qkv_nout) fed to
+-        // the column-parallel in_proj dX reduce ①' below. SingleGPU uses the
+-        // byte-identical dectc_attn_bwd_tile (this branch folds away there).
+-        if constexpr (!Par::kTPComm) {
+-            dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+-        } else {
+-            const int Dloc = dec::kD / Par::kTP;          // local q/k/v block width
+-            const int Hloc = dec::kHeads / Par::kTP;      // local whole heads (0 if kHeads%P!=0)
+-            dectc_attn_bwd_tile_tp(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc, Hloc, Dloc);
+-        }
++        // attention bwd FULL-WIDTH on BOTH paths (the SAME dectc_attn_bwd_tile): all
++        // kHeads heads, dctx [nrows,d], dqkv (work2) [nrows,3d]. This removes the
++        // kHeads%TP!=0 head-split (the bug B invariant violation).
++        dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+         for (int idx = threadIdx.x; idx < nrows * qkv_nout; idx += blockDim.x)
+             acts.dY_qkv[li][(int64_t)g0 * qkv_nout + idx] = __float2bfloat16(work2[idx]);
+         __syncthreads();
+-        // in_proj dX: dx_in_attn = dqkv @ in_w  (output width Kin=d, contract Nout=3d).
+-        //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+-        if constexpr (!Par::kTPComm) {
+-            dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, wb.in_wT[li],
+-                                               sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB, pipeBars);  // dx_in_attn
+-        } else {
+-            // COLUMN(QKV)-parallel in_proj: in_wT[li] is the rank's [3d/P, d] qkv
+-            // col-shard's transpose; dY_qkv is the rank's own [nrows, 3d/P] (the
+-            // 3-block q|k|v own-rows concatenated). The dX is a PARTIAL → publish
+-            // [nrows,d] → reduce → sc.work (①' of design §5.1). Then the residual
+-            // add `sc.dh[idx] += sc.work[idx]` below runs unchanged.
+-            const int Noutloc = (3 * dec::kD) / tr.n_pes();
+-            if (active) {
+-                ::sg::fused::sm90::tp::tp_colparallel_dx_partial_tile<SG_TUNED_TILE_N>(
+-                    tr, slot_pub,
+-                    /*dYown=*/ acts.dY_qkv[li] + (int64_t)g0 * Noutloc, wb.in_wT[li],
+-                    /*Kin=*/ dec::kD, /*Nout_local=*/ Noutloc, sA, sB);
+-            }
++        // in_proj dX: dx_in_attn = dqkv @ in_w (output width Kin=d, contract Nout=3d).
++        //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh. FULL
++        //   width; on kTPComm route (dx_in/P) through the ①' NVLink all-reduce.
++        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, wb.in_wT[li],
++                                           sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB, pipeBars);  // dx_in_attn
++        __syncthreads();
++        if constexpr (Par::kTPComm) {
++            float* pub = tr.local(slot_pub);
++            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
++                pub[idx] = sc.work[idx] * kTpInvP;
+             tr.rendezvous(bar);
+             ::sg::fused::sm90::tp::tp_allreduce_sum_fixed_order(
+                 tr, slot_pub, sc.work, (int64_t)nrows * dec::kD, threadIdx.x, blockDim.x);
+             tr.rendezvous(bar);
++            __syncthreads();
+         }
+-        __syncthreads();
+         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+             sc.dh[idx] += sc.work[idx];
+         __syncthreads();

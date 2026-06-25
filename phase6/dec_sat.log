@@ -1,0 +1,35 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+B=  128 cap=   8  step=  3112.48ms     1.46 TF/s ( 0.15%)  mem~45.7GB
+SAT,decoder,adamw,B128,cap8,3112.4822,1.4557,0.1472
+B=  512 cap=   8  step=  5393.95ms     3.36 TF/s ( 0.34%)  mem~57.6GB
+SAT,decoder,adamw,B512,cap8,5393.9546,3.3600,0.3397
+B= 2048 cap=   8  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 44.74 GiB. GPU 0 has a total capac
+B= 8192 cap=   8  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 157.36 GiB. GPU 0 has a total capa
+B=  128 cap=  16  step=  2282.36ms     1.99 TF/s ( 0.20%)  mem~53.2GB
+SAT,decoder,adamw,B128,cap16,2282.3621,1.9852,0.2007
+B=  512 cap=  16  step=  2832.73ms     6.40 TF/s ( 0.65%)  mem~67.0GB
+SAT,decoder,adamw,B512,cap16,2832.7322,6.3979,0.6469
+B= 2048 cap=  16  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 46.46 GiB. GPU 0 has a total capac
+B= 8192 cap=  16  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 159.07 GiB. GPU 0 has a total capa
+B=  128 cap=  32  step=  1790.81ms     2.53 TF/s ( 0.26%)  mem~55.1GB
+SAT,decoder,adamw,B128,cap32,1790.8131,2.5301,0.2558
+B=  512 cap=  32  step=  2143.41ms     8.46 TF/s ( 0.85%)  mem~72.5GB
+SAT,decoder,adamw,B512,cap32,2143.4114,8.4555,0.8550
+B= 2048 cap=  32  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 49.88 GiB. GPU 0 has a total capac
+B= 8192 cap=  32  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 162.50 GiB. GPU 0 has a total capa
+B=  128 cap=  64  step=  1548.40ms     2.93 TF/s ( 0.30%)  mem~58.8GB
+SAT,decoder,adamw,B128,cap64,1548.3995,2.9262,0.2959
+B=  512 cap=  64  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 28.58 GiB. GPU 0 has a total capac
+B= 2048 cap=  64  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 56.74 GiB. GPU 0 has a total capac
+B= 8192 cap=  64  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 169.35 GiB. GPU 0 has a total capa
+B=  128 cap= 132  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 36.10 GiB. GPU 0 has a total capac
+B=  512 cap= 132  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 43.14 GiB. GPU 0 has a total capac
+B= 2048 cap= 132  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 71.29 GiB. GPU 0 has a total capac
+B= 8192 cap= 132  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 183.91 GiB. GPU 0 has a total capa
+B=  128 cap=   0  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 36.10 GiB. GPU 0 has a total capac
+B=  512 cap=   0  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 43.14 GiB. GPU 0 has a total capac
+B= 2048 cap=   0  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 71.29 GiB. GPU 0 has a total capac
+B= 8192 cap=   0  FAILED: OutOfMemoryError('CUDA out of memory. Tried to allocate 183.91 GiB. GPU 0 has a total capa
+
+BEST: 8.46 TF/s (0.85% peak) at B=512 cap=32 step=2143.41ms

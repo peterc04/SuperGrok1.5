@@ -1,0 +1,20 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Detected CUDA files, patching ldflags
+Emitting ninja build file /workspace/flagship_build/mega_vit_multiopt/build.ninja...
+Building extension module mega_vit_multiopt...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+ninja: no work to do.
+Loading extension module mega_vit_multiopt...
+[vit-multiopt] build done in 0.1s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+  [adamw      ] step=17999.525ms  0.14 TF/s  (0.01% peak)  intensity=44.62 FLOP/B  loss0=4.439
+CSV,vit,adamw,1664,1596200417,17999.5254,0.1446,0.0146,44.6214,2.6029e+12,5.8332e+10
+  [lion       ] step=17500.584ms  0.15 TF/s  (0.02% peak)  intensity=44.62 FLOP/B  loss0=2.905
+CSV,vit,lion,1664,1596200417,17500.5840,0.1487,0.0150,44.6214,2.6029e+12,5.8332e+10
+  [grokfast   ] step=18814.375ms  0.14 TF/s  (0.01% peak)  intensity=44.62 FLOP/B  loss0=2.780
+CSV,vit,grokfast,1664,1596200417,18814.3750,0.1383,0.0140,44.6214,2.6029e+12,5.8332e+10
+  [grokadamw  ] step=19948.254ms  0.13 TF/s  (0.01% peak)  intensity=44.62 FLOP/B  loss0=2.783
+CSV,vit,grokadamw,1664,1596200417,19948.2539,0.1305,0.0132,44.6214,2.6029e+12,5.8332e+10
+  [neuralgrok ] step=19544.977ms  0.13 TF/s  (0.01% peak)  intensity=44.62 FLOP/B  loss0=2.774
+CSV,vit,neuralgrok,1664,1596200417,19544.9766,0.1332,0.0135,44.6214,2.6029e+12,5.8332e+10

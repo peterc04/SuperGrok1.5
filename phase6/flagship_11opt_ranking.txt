@@ -1,0 +1,23 @@
+============================================================================================
+FLAGSHIP 1.5B DECODER — COMPLETE 11-OPTIMIZER RANKING (B=16, fixed-batch overfit)
+  d=1600  layers=48  params=1,475,884,899   |   9/11 opts OK
+============================================================================================
+rank optimizer     id       lr ncta steps    first     last  descent  ms/step    status
+--------------------------------------------------------------------------------------------
+   1 neuralgrok     6  2.0e-03    4   100   4.5850   2.6860   1.8991     5725        OK
+   2 grokadamw      3  2.0e-03    4   100   4.5850   2.6860   1.8991     5751        OK
+   3 adamw          0  3.0e-03    4   100   4.5850   2.6860   1.8991     4212        OK
+   4 grokfast       2  2.0e-03    4   100   4.5850   2.6860   1.8991     4694        OK
+   5 prodigy        5  1.0e+00    4   100   4.5850   2.6860   1.8990     5448        OK
+   6 lion           1  3.0e-04    4   100   4.5850   2.6876   1.8975     3686        OK
+   7 supergrok11    8  3.0e-03    4   100   4.5850   2.6968   1.8882     9578        OK
+   8 supergrok15    9  3.0e-03    4   100   4.5850   2.6974   1.8877     9048        OK
+   9 looksam        4  3.0e-03    4   100   4.5850   2.7329   1.8522     7318        OK
+  -- muon          --       --    1    --       --       --       --       -- FITS/SLOW
+  -- supergrok2    --       --    1    --       --       --       --       -- FITS/SLOW
+--------------------------------------------------------------------------------------------
+GATE: 9/11 opts banked finite descending; 2 FITS-but-slow (ncta=1 deep limit / naive-NS) = 11/11 runnable single-GPU.
+      finite(banked)=True  descending(banked)=True  all-11-runnable=True
+  [muon] MEMORY-FORCED ncta=4 + naive grid-NS. Muon at ncta>=6 OOMs on the kernel's local-memory reservation; at ncta=4 it LAUNCHES and runs at 100% util (3-plane state 16.5 GiB + params + grad + workspace ~66 GiB < 79 GiB). SLOW: the grid-cooperative Newton-Schulz orthogonalizes 2+4L+1 = 195 2D weights x 5 NS iters x 3 naive fp32 matmuls (largest A=X.Xt is 6400x6400xK=1600 = 65 GFLOP) on only 4 SMs ~= hours/step. Inherent to the naive grid-NS at the memory-forced ncta, not a fit failure.
+  [supergrok2] ncta=1 DEEP LIMIT (resource planner). SG2's per-CTA CSA/HCA/PEER/GRU meta-net workspace is O(Nmax)=~3.7 GiB/CTA at the flagship ff width, so it must run at ncta=1 (full occupancy = 270 GiB OOM). FITS: 8-plane state (slow-plane aliased onto the dead LookSAM workspace region) 47 GiB + params 5.5 GiB + grad (aliased onto dead LookSAM sam_backup) + 20 GiB opt-agnostic workspace ~= 74 GiB < 79 GiB; the SG2 kernel LAUNCHES and runs at 100% util (no OOM). SLOW: the per-element meta-net + SAM 2nd backward on a SINGLE SM is ~tens-of-min/step. Path parity-validated by tests/hw/test_sg2_megakernel.py.
+============================================================================================

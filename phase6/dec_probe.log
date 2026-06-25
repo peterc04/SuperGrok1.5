@@ -1,0 +1,14 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[decoder-multiopt] loaded /workspace/flagship_build/mega_decoder_multiopt_adamw/mega_decoder_multiopt_adamw.so
+  d=1600 layers=48 seq=4 vocab=99 params=1,475,884,899
+  [adamw      ] step=3112.919ms  1.46 TF/s  (0.15% peak)  intensity=82.82 FLOP/B  loss0=4.495
+CSV,decoder,adamw,1600,1475884899,3112.9192,1.4555,0.1472,82.8249,4.5309e+12,5.4705e+10
+  [lion       ] step=2870.625ms  1.58 TF/s  (0.16% peak)  intensity=82.82 FLOP/B  loss0=4.132
+CSV,decoder,lion,1600,1475884899,2870.6248,1.5784,0.1596,82.8249,4.5309e+12,5.4705e+10
+  [grokfast   ] step=3486.090ms  1.30 TF/s  (0.13% peak)  intensity=82.82 FLOP/B  loss0=4.143
+CSV,decoder,grokfast,1600,1475884899,3486.0903,1.2997,0.1314,82.8249,4.5309e+12,5.4705e+10
+  [grokadamw  ] step=4019.833ms  1.13 TF/s  (0.11% peak)  intensity=82.82 FLOP/B  loss0=4.123
+CSV,decoder,grokadamw,1600,1475884899,4019.8325,1.1271,0.1140,82.8249,4.5309e+12,5.4705e+10
+  [neuralgrok ] step=4002.946ms  1.13 TF/s  (0.11% peak)  intensity=82.82 FLOP/B  loss0=4.133
+CSV,decoder,neuralgrok,1600,1475884899,4002.9460,1.1319,0.1144,82.8249,4.5309e+12,5.4705e+10
