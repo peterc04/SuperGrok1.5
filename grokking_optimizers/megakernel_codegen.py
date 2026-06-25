@@ -1197,6 +1197,26 @@ _MAMBA_MLP_RATIO = 2     # SwiGLU inner d_ff = mlp_ratio * d (SwiGLU_MLP:251)
 # and head_dim=64 are width-invariant, so Nc=64 is width-invariant too).
 _MAMBA_BENCH_D = 1024
 
+# ── FLAGSHIP Mamba-3 tier (canonical-published 1.5 B SSM) ────────────────────
+# SINGLE SOURCE OF TRUTH for these dims: grokking_race_v2.py
+# MODEL_SCALES_BY_MODEL['flagship']['mamba'] = {dim_model:2048, num_heads:32,
+# num_layers:24, mamba_state_dim:128, mamba_head_dim:64, mamba_expand:2,
+# mamba_mlp_ratio:2}. Mirrored here as a build-time constant (this generator imports
+# NO torch / grokking_race_v2 — it is a pure codegen tool with no runtime call
+# sites), exactly as _MAMBA_* mirror the tiny-tier eager model. ONLY (d, layers) are
+# needed: the eager Mamba3Layer DERIVES n_heads = d_inner // head_dim and IGNORES
+# the config's num_heads (mamba3_block.py:310-313; _raw_model passes head_dim=64,
+# expand=2, NOT num_heads). At d=2048 that gives d_inner=4096, n_heads=4096//64=64
+# (the config's num_heads:32 is a DISPLAY value the Mamba path never consumes). All
+# other dims (state=128, head_dim=64, expand=2, mlp_ratio=2) are the module defaults
+# == the flagship config, so _mamba_dims(2048) reproduces the eager flagship shapes
+# exactly. The flagship layout is emitted into its OWN standalone header
+# (mamba_flagship_layout_header / --mamba-layout-flagship); it does NOT touch the
+# committed d=128 production or d=1024 bench layouts. At d=2048,L=24 the table is 485
+# tensors, total 1,265,411,169 elems (every offset < INT32_MAX, so the int32
+# kMambaOffsets/kMambaSizes tables are exact).
+_MAMBA_FLAGSHIP_D, _MAMBA_FLAGSHIP_LAYERS = 2048, 24
+
 
 def _mamba_dims(d: int) -> tuple:
     """The Mamba-3 per-width derived dims (mamba3_block.py Mamba3Layer/SwiGLU_MLP):
@@ -1214,21 +1234,24 @@ def _mamba_dims(d: int) -> tuple:
     return (d_inner, Nc, head_dim, n_heads, dt_rank, d_ff, x_proj_out)
 
 
-def _mamba_param_sizes(d: int = _MAMBA_D) -> List[int]:
+def _mamba_param_sizes(d: int = _MAMBA_D, *, layers: int = _MAMBA_LAYERS) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of the eager
     Mamba3Model, grokking_optimizers/mamba3_block.py). 45 tensors at nl=2; at
     d=128 total 593713. Per Mamba3Block (20 tensors) the order is: mixer_norm.w,
     then the mixer's OWN params A_log/D/B_bias/Bhat_bias/C_bias/Chat_bias, then the
     mixer submodules in_proj/x_proj/dt_proj.w/dt_proj.b/B_norm/Bhat_norm/C_norm/
-    Chat_norm/out_proj, then mlp_norm.w, then SwiGLU gate/up/down. `d` is parametric
-    so the d-scaled bench layout (SG_MB_BENCH_LAYOUT) reuses the SAME shape formula
-    — every per-tensor shape is a function of the derived dims (d_inner=expand*d,
-    Nc=state//2, n_heads, dt_rank=max(d//16,1), d_ff=mlp_ratio*d, x_proj_out) plus
-    (vocab, phead, seq), so a single d controls the whole table."""
+    Chat_norm/out_proj, then mlp_norm.w, then SwiGLU gate/up/down. Parametric in
+    (d, layers): every per-tensor shape is a function of the derived dims
+    (d_inner=expand*d, Nc=state//2, n_heads, dt_rank=max(d//16,1), d_ff=mlp_ratio*d,
+    x_proj_out) plus (vocab, phead, seq), so the SAME formula drives the d-scaled
+    bench layout (SG_MB_BENCH_LAYOUT, d=1024) AND the flagship layout (d=2048,
+    layers=24). Layer-count L emits 2 + 20*L + 3 tensors (tok/pos head, 20 per
+    Mamba3Block, norm+out.weight+out.bias tail). Default layers=_MAMBA_LAYERS →
+    callers that pass only `d` are byte-identical."""
     v, ph, seq = _MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_SEQ
     di, Nc, hd, nh, dtr, dff, xpo = _mamba_dims(d)
     sizes = [v * d, seq * d]                          # tok.weight, pos.weight
-    for _ in range(_MAMBA_LAYERS):
+    for _ in range(layers):
         sizes += [
             d,                                        # mixer_norm.weight [d]
             nh,                                       # mixer.A_log [n_heads]
@@ -1255,12 +1278,13 @@ def _mamba_param_sizes(d: int = _MAMBA_D) -> List[int]:
     return sizes
 
 
-def _mamba_layout_body(d: int) -> str:
+def _mamba_layout_body(d: int, *, layers: int = _MAMBA_LAYERS) -> str:
     """The constants + __constant__ tables + compile-time cross-check + dynamic-smem
-    budget for ONE Mamba width `d`. Emitted into ONE of the SG_MB_BENCH_LAYOUT
-    branches; the branches are mutually exclusive at preprocess time, so reusing the
-    SAME symbol names (kMambaOffsets/kMambaSizes/mamba_layout_check) across both is
-    safe.
+    budget for ONE Mamba config (d, layers). Emitted into ONE of the SG_MB_BENCH_LAYOUT
+    branches (or the standalone flagship header); the branches are mutually exclusive
+    at preprocess time, so reusing the SAME symbol names (kMambaOffsets/kMambaSizes/
+    mamba_layout_check) across them is safe. Default layers=_MAMBA_LAYERS → callers
+    that pass only `d` are byte-identical.
 
     kMambaSmemFloats is the FIELD-BY-FIELD element count of MambaSampleSmem
     (model_stage_mamba3.cuh). The kernel author is concurrently REWRITING that
@@ -1274,7 +1298,7 @@ def _mamba_layout_body(d: int) -> str:
     gated OFF (SG_MB_SCALAR_MEGAKERNEL=0, mirroring the decoder), so the cap does not
     apply — the TC engine the bench drives uses a small d-independent static
     MbTcSmem, not MambaSampleSmem."""
-    sizes = _mamba_param_sizes(d)
+    sizes = _mamba_param_sizes(d, layers=layers)
     offsets, acc = [], 0
     for n in sizes:
         offsets.append(acc)
@@ -1299,8 +1323,8 @@ def _mamba_layout_body(d: int) -> str:
           + seq * di                                     # y_scan
           + seq * d + seq                                # h1, mlpn_r (mlpn_xhat dropped: recomputed from h1)
           + seq * dff + seq * dff)                       # g_pre, u_mlp
-    smem_floats = (_MAMBA_LAYERS * seq * d + seq * d      # layer_in, final_in
-                   + _MAMBA_LAYERS * la                   # act[layers]
+    smem_floats = (layers * seq * d + seq * d      # layer_in, final_in
+                   + layers * la                   # act[layers]
                    + seq * d + seq + ph                   # fn_xhat, fn_r, logits
                    + seq * d + seq * d                    # dh, dr
                    + 3 * seq * di                         # adj_a/b/c
@@ -1368,7 +1392,7 @@ static_assert(kMambaSmemBytes > 48 * 1024,
     return f"""constexpr int SG_MB_VOCAB   = {_MAMBA_VOCAB};    // ntok (tok embedding rows)
 constexpr int SG_MB_PHEAD   = {_MAMBA_PHEAD};    // p (head width = out Linear cols)
 constexpr int SG_MB_D       = {d};   // d_model
-constexpr int SG_MB_LAYERS  = {_MAMBA_LAYERS};     // nl (Mamba3Block count)
+constexpr int SG_MB_LAYERS  = {layers};     // nl (Mamba3Block count)
 constexpr int SG_MB_SEQ     = {_MAMBA_SEQ};     // seq_len
 constexpr int SG_MB_DINNER  = {di};   // d_inner (= d * expand_factor=2)
 constexpr int SG_MB_STATE   = {st};   // REAL SSM state size N
@@ -1524,6 +1548,66 @@ namespace sg {{ namespace fused {{ namespace sm90 {{
 """
 
 
+def mamba_flagship_layout_header() -> str:
+    """Emit a STANDALONE FLAGSHIP Mamba-3 weight-layout header (1.5 B SSM tier,
+    d=2048, layers=24, n_heads=64, state=128, head_dim=64, expand=2, mlp_ratio=2 —
+    485 tensors, total 1,265,411,169 elems). Separate include guard
+    (SG_FUSED_SM90_MAMBA_FLAGSHIP_LAYOUT_CUH_) and a SINGLE config (no
+    SG_MB_BENCH_LAYOUT #if branch): a TU that wants the flagship layout includes
+    THIS header instead of mamba3_layout.cuh. Symbol names are IDENTICAL
+    (kMambaOffsets/kMambaSizes/kMambaNumTensors/kMambaTotalElems/SG_MB_* /
+    kMambaMaxTensorNumel/kMambaSmemFloats/kMambaSmemBytes, namespace sg::fused::sm90),
+    so the SAME kernel template binds against it unchanged.
+
+    SOURCE OF TRUTH for the dims: grokking_race_v2.py
+    MODEL_SCALES_BY_MODEL['flagship']['mamba'] (mirrored in _MAMBA_FLAGSHIP_*). Only
+    (d, layers) are passed — the eager Mamba3Layer DERIVES n_heads = d_inner//head_dim
+    (= 4096//64 = 64 at d=2048) and ignores the config's num_heads; all other dims are
+    the module defaults == the flagship config.
+    Generated by: python -m grokking_optimizers.megakernel_codegen
+    --mamba-layout-flagship > csrc/fused/sm_90/mamba_flagship_layout.cuh"""
+    di, _Nc, _hd, nh, _dtr, _dff, _xpo = _mamba_dims(_MAMBA_FLAGSHIP_D)
+    body = _mamba_layout_body(_MAMBA_FLAGSHIP_D, layers=_MAMBA_FLAGSHIP_LAYERS)
+    return f"""#ifndef SG_FUSED_SM90_MAMBA_FLAGSHIP_LAYOUT_CUH_
+#define SG_FUSED_SM90_MAMBA_FLAGSHIP_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/mamba_flagship_layout.cuh — GENERATED weight-layout mirror
+// for the FLAGSHIP L3-REAL Mamba-3 megakernel (1.5 B SSM tier).
+//
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --mamba-layout-flagship > csrc/fused/sm_90/mamba_flagship_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _mamba_param_sizes() (parameterized by (d, layers)); the flagship dims
+// (d={_MAMBA_FLAGSHIP_D}, layers={_MAMBA_FLAGSHIP_LAYERS}, n_heads={nh}, d_inner={di})
+// mirror grokking_race_v2.py MODEL_SCALES_BY_MODEL['flagship']['mamba']. The eager
+// Mamba3Layer derives n_heads = d_inner//head_dim (head_dim=64) and ignores the
+// config's nominal num_heads:32, so n_heads={nh}. The flat blob is
+// torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
+// addresses tensor i at params + kMambaOffsets[i] for kMambaSizes[i] elems.
+//
+// A count/total mismatch fails the BUILD loudly (the static_asserts below).
+//
+// This is a STANDALONE single-config header (NO SG_MB_BENCH_LAYOUT #if branch):
+// a TU that wants the flagship layout includes THIS file instead of
+// mamba3_layout.cuh. Symbol names are byte-identical to mamba3_layout.cuh
+// (kMambaOffsets/kMambaSizes/kMambaNumTensors/kMambaTotalElems/SG_MB_*), so the
+// SAME kernel template binds against it unchanged. The committed d=128 production /
+// d=1024 bench header mamba3_layout.cuh is NOT affected.
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+// ── FLAGSHIP (d={_MAMBA_FLAGSHIP_D}, layers={_MAMBA_FLAGSHIP_LAYERS}): 1.5 B SSM tier (n_heads={nh}). ──
+{body}
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_MAMBA_FLAGSHIP_LAYOUT_CUH_
+"""
+
+
 def dispatch_table() -> str:
     """Emit the C++ wired_fused_cell() body covering all 99 cells."""
     lines: List[str] = []
@@ -1590,6 +1674,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--mamba-layout", action="store_true",
                     help="emit the PHASE-2 L3-REAL Mamba weight-layout header "
                          "(csrc/fused/sm_90/mamba3_layout.cuh)")
+    ap.add_argument("--mamba-layout-flagship", action="store_true",
+                    help="emit the FLAGSHIP (d=2048, layers=24) L3-REAL Mamba "
+                         "weight-layout header "
+                         "(csrc/fused/sm_90/mamba_flagship_layout.cuh)")
     args = ap.parse_args(argv)
 
     if args.emit:
@@ -1638,6 +1726,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.mamba_layout:
         sys.stdout.write(mamba_layout_header())
+        return 0
+
+    if args.mamba_layout_flagship:
+        sys.stdout.write(mamba_flagship_layout_header())
         return 0
 
     ap.print_help()

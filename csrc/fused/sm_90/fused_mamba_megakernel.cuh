@@ -420,7 +420,7 @@ struct MbTcSmem {
     float red[256];
     float dBmat[mb::kSeq * mb::kState];
     float dCmat[mb::kSeq * mb::kState];
-    mbtc::MbDwSpec spec[8];
+    mbtc::MbDwSpec spec[mbtc::kMbNumDwSpecs];
 };
 
 // TC workspace layout (carved from tok.workspace; host sizes it):
@@ -468,9 +468,10 @@ __host__ __device__ __forceinline__ int64_t mb_tc_looksam_floats() {
 //    2D weight at a time over all CTAs; the scratch holds X/A/AX/AAX/orth for the LARGEST 2D
 //    weight + the per-CTA Frobenius-norm partials + inv_norm. The momentum buffer (muon_buf)
 //    is NOT here — it PERSISTS across steps as optimizer state, bound to the m slice
-//    (st.exp_avg). Largest mamba 2D weight: in_proj = 512×128 = 65536 numel; largest rows =
-//    512 ⇒ A = 512×512 (mbtc::kMbMuonMaxNumel/kMbMuonMaxRows). Carved UNCONDITIONALLY (≈
-//    4·65536 + 512² + nCTA + 1 floats ≈ 2 MB) so the opt-agnostic cached launcher workspace
+//    (st.exp_avg). Largest mamba 2D weight (numel) is layout-derived (kMambaMaxTensorNumel:
+//    x_proj 86016 at d=128, in_proj at the flagship); largest rows = 2*d_inner (512 at
+//    d=128) ⇒ A = rows×rows (mbtc::kMbMuonMaxNumel/kMbMuonMaxRows). Carved UNCONDITIONALLY
+//    (≈ 4·maxNumel + rows² + nCTA + 1 floats) so the opt-agnostic cached launcher workspace
 //    fits every OptId; unused by every non-Muon cell (its P2.7/P3-2D branches are if-
 //    constexpr'd out → byte-identical). ──
 __host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA) {
@@ -954,8 +955,8 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     //    2D weights (INTEGRATION-OPTSTAGES §3). PORT of the decoder/vit twins' P2.7
     //    (fused_decoder_megakernel.cuh / fused_vit_megakernel.cuh) onto the mamba
     //    constant tables — same shared opt_stages_precompute.cuh helpers, same barrier
-    //    sequence; only the per-model 2D table (mbtc::kMbMuon2D, 13 matrices incl.
-    //    tok[99,128]/pos[8,128]/A_log[256,16]/dt_proj[256,8]/x_proj[40,256]) and offset
+    //    sequence; only the per-model 2D set (mbtc::mb_muon_2d, 2+7*L+1 matrices incl.
+    //    tok[V,d]/pos[seq,d]/in_proj/x_proj/dt_proj per layer + head.out) and offset
     //    array (kMambaOffsets) differ. For EACH 2D matrix all CTAs cooperate: buf=μ·buf+g
     //    (buf is the PERSISTENT m-slice — momentum state, NOT transient), ‖buf‖_F via
     //    per-CTA partials → inv_norm, X=buf·inv_norm, then ns_steps × { A=XXᵀ → AX=A·X →
@@ -987,7 +988,7 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         const float momentum = st.beta1;          // Muon momentum (eager Muon: betas[0])
         const int   ns_steps = 5;                 // bindings.cpp default
         for (int mi = 0; mi < mbtc::kMbNumMuon2D; ++mi) {
-            const mbtc::MbMuon2D M = mbtc::kMbMuon2D[mi];
+            const mbtc::MbMuon2D M = mbtc::mb_muon_2d(mi);   // was kMbMuon2D[mi]
             const int rows = M.rows, cols = M.cols;
             const int64_t numel = (int64_t)rows * cols;
             const int64_t off   = (int64_t)kMambaOffsets[M.tidx];
