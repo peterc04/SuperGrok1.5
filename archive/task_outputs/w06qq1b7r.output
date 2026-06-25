@@ -1,0 +1,54 @@
+{
+  "summary": "Apply the Mamba flagship smem redesign (Level A layer-streaming + Level B stream the per-sample scratch to HBM) so the flagship Mamba TC megakernel launches under the 227KB cap; gated byte-identical at small size",
+  "agentCount": 1,
+  "logs": [
+    "Mamba redesign: A=true B=true launches=true smem=192.97KB"
+  ],
+  "result": {
+    "area": "csrc/fused/sm_90 — Mamba-3 flagship TC megakernel smem redesign (model_stage_mamba3.cuh, model_stage_mamba_tc.cuh, fused_mamba_megakernel.cuh, mamba3_layout.cuh, mamba_flagship_layout.cuh, mega_mamba_real_adamw_tc.cu)",
+    "level_a_done": true,
+    "level_b_done": true,
+    "launches_at_flagship": true,
+    "dyn_smem_kb": 192.97,
+    "small_byte_identical": true,
+    "commit_sha": "d75d178bbc3c7c180276f94a41cab12ade4d3b1a",
+    "remaining": [
+      "ncta_cap: verification ran with ncta_cap=2 (not 8) because the per-CTA full-grad partials are nCTA x 5.06 GB at flagship and the unconditional LookSAM (2*total=10.1GB) + AdamW state (3*total=15.2GB) carves push ncta_cap=8 to ~79.5GB, at the 80GB H100 edge. The dyn_smem opt-in is nCTA-INDEPENDENT, so ncta_cap=2 is a faithful witness for the launchability question; ncta_cap=8 would need either fewer always-on optimizer carves or a 2nd GPU shard (orthogonal to this smem track).",
+      "Optional further smem headroom (NOT needed to launch; 192.97KB already fits 227KB): the layer_in ring(2) is 128KB of the 192.97KB resident set. It could also move to HBM (it is already spilled per-layer to MbActsHbm), dropping resident smem to ~64.85KB if a future change wants more occupancy headroom.",
+      "Mamba TENSOR-PARALLEL at flagship-streamed scale is out of scope: the kTPComm _tp wrapper body indexes sm->layer_in[li]/sm->act[li] for ALL layers (unstreamed). A static_assert(!Par::kTPComm || !kMbStreamSmem) fails the build loudly if TP+streaming is ever requested together; streaming that TP body is a separate task.",
+      "bf16 cross-layer acts (decoder Fork-B parallel): the HBM acts/scratch are stored fp32 (the scan bwd reads fp32). bf16 would halve the ~2.4GB/CTA-batch HBM traffic but is a later memory-bound optimization, not required to launch."
+    ],
+    "summary": "Made the flagship Mamba-3 TC megakernel (d=2048, L=24) actually LAUNCH on H100. ROOT CAUSE: fused_mamba_megakernel_tc reinterpreted MambaSampleSmem (19.56 MB/block at flagship = 88x over the 227 KB opt-in cap), so cudaFuncSetAttribute(maxDynamicSharedMemorySize) returned cudaErrorInvalidValue and the launcher bailed.\n\nLEVEL A (decoder DecTcSmem mirror, applied verbatim): added the kMbStreamSmem gate (TRUE only when the all-layers struct > 227KB) + kMbActsRing=2 to both layout headers; MambaSampleSmem is now layer-INDEPENDENT on the streamed path (act[1] + a 2-deep layer_in ring); cross-layer acts persist in a per-CTA HBM region (MbActsHbm) carved from the workspace FRONT, spilled per layer in mb_forward_sample and refilled in mb_backward_sample; workspace + 3 dyn_smem sites are now config-gated.\n\nLEVEL B (scratch-to-HBM, implemented from the spec structure/formulas — this is what actually clears 227KB): the big per-sample SEQ x {d_inner,d_ff,d} buffers (x_in,z,y_scan,h1,g_pre,u_mlp,final_in,dh,dr,adj_a/b/c,wff_a/b) move OUT of smem into the same per-CTA HBM region via an MbHbmBuf2D proxy (operator[] yields the row pointer so a->x_in[s][c], sm->adj_a[s][c], &buf[0][0] read byte-for-byte unchanged). fn_xhat shrinks to [1][D] (only the last position is used) and its d-wide backward-scratch reuse moves to a dedicated HBM dr2 slab. LayerAct was reordered (small caches first, big proxies last) so the small-cache prefix flat-copies cleanly to per-layer HBM; an offsetof(LayerAct,x_in) static_assert pins the prefix (7216 floats, verified).\n\nRESULT: streamed dyn_smem = sizeof(MambaSampleSmem) = 192.97 KB < 227 KB. The flagship build (-DSG_FUSED_SM90_MAMBA3_LAYOUT_CUH_=1 -include mamba_flagship_layout.cuh -DSG_MB_SCALAR_MEGAKERNEL=0 -DSG_TUNED_GEMM_IMPL=1) ran ONE fwd-bwd-AdamW step at d=2048/L24 (1.265B params, ncta_cap=2, B=16): LAUNCHED OK, finite loss=4.577 (~ln 97), finite grads, grad_absmax=6.22.\n\nHARD GATE met: all new code is if-constexpr(kMbStreamSmem)/zero-width gated. kMbStreamSmem is FALSE at d=128, so the production/test TU folds to the shipped code: sizeof(MambaSampleSmem)==kMambaSmemBytes==215844 byte-for-byte (the dr2 field is char[0] = 0 bytes at SMALL; proxies fold back to real arrays; LayerAct reorder is behavior-identical). test_mamba_tc.py post-change = 2 failed/3 passed, IDENTICAL to the pre-change baseline (the 2 fails are the pre-existing grad_parity B_bias-tol 1.93x + obsolete proj_dw; the kernel grads are byte-identical, k-vs-bf16 == bf16-vs-fp64 to ~3 decimals). gfx942/tpu untouched. Commit d75d178."
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Redesign"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "Mamba flagship smem redesign",
+      "phaseIndex": 1,
+      "phaseTitle": "Redesign",
+      "agentId": "ae00ce39717afc318",
+      "isolation": "worktree",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782367356644,
+      "queuedAt": 1782367307525,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/fused/sm_90 — Mamba-3 flagship TC megakernel smem rede…",
+      "promptPreview": "ISOLATED GIT WORKTREE of /workspace/SuperGrok1.5 (Edit/Write/Bash/build/run freely). GOAL: make the FLAGSHIP Mamba-3 TC megakernel (d=2048, L=24) actually LAUNCH on H100 — currently unlaunchable: fused_mamba_megakernel_tc reinterprets dynamic smem as MambaSampleSmem = 19.56 MB/block (88x over the 227 KB cap) -> cudaErrorInvalidValue.\nSPEC: /workspace/impl_diffs/mamba_smem_redesign.md — read IN FUL…",
+      "lastProgressAt": 1782369993632,
+      "tokens": 289745,
+      "toolCalls": 140,
+      "durationMs": 2636987,
+      "resultPreview": "{\"area\":\"csrc/fused/sm_90 — Mamba-3 flagship TC megakernel smem redesign (model_stage_mamba3.cuh, model_stage_mamba_tc.cuh, fused_mamba_megakernel.cuh, mamba3_layout.cuh, mamba_flagship_layout.cuh, mega_mamba_real_adamw_tc.cu)\",\"level_a_done\":true,\"level_b_done\":true,\"launches_at_flagship\":true,\"dyn_smem_kb\":192.97,\"small_byte_identical\":true,\"commit_sha\":\"d75d178bbc3c7c180276f94a41cab12ade4d3b1a\"…"
+    }
+  ],
+  "totalTokens": 289745,
+  "totalToolCalls": 140
+}

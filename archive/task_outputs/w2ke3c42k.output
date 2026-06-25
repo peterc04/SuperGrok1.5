@@ -1,0 +1,242 @@
+{
+  "summary": "Five parallel READ-ONLY tracks producing apply-ready specs: TP kernel Par-template + in-kernel NVSHMEM all-reduce, TMA megakernel wiring, ViT flagship, Mamba flagship, datasets Layer-A",
+  "agentCount": 5,
+  "logs": [
+    "Track specs: 5/5"
+  ],
+  "result": [
+    {
+      "name": "tp_kernel",
+      "area": "csrc/fused/sm_90 — TP in-kernel device-NVSHMEM all-reduce: template the production decoder megakernel on ParConfig + CommCtx, Megatron-shard in_proj/ff, symmetric-heap allocator split",
+      "spec_path": "/workspace/impl_diffs/tp_kernel.md",
+      "files_changed": [
+        "/workspace/impl_diffs/tp_kernel.md"
+      ],
+      "gate_commands": [
+        "CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q",
+        "bash scripts/compile_to_object.sh tests/hw/tp_loopback_binding.cu",
+        "NVSHMEM_HOME=/usr/local/lib/python3.11/dist-packages/nvidia/nvshmem; bash scripts/compile_to_object.sh tests/hw/tp_loopback_binding.cu -DSG_HAS_NVSHMEM=1 -rdc=true -I$NVSHMEM_HOME/include"
+      ],
+      "confidence": "medium-high",
+      "risks": [
+        "LOAD-BEARING DEADLOCK CONSTRAINT (§1): the naive plan in tp_nvshmem.md §5.3 / tp_layer.cuh ('drop tr.rendezvous(bar) into the per-tile loop') DEADLOCKS. The production P1 loop (fused_decoder_megakernel.cuh:840) grid-strides over n_tiles per CTA, so different CTAs reach a grid-wide bar.sync() a different number of times -> arrival count never equals n_ctas. The spec's EDIT C.3 requires a GRID-LOCKSTEP P1 restructure (gated if constexpr(Par::kTPComm)) where every CTA reaches each rendezvous the same number of rounds, with !active rounds still calling rendezvous. This is the hardest part and the most likely to need on-silicon iteration at the 8xH100 window.",
+        "EDITS C/D/E land in kernel-track tracked files and need a GPU build loop; they are pinned to verbatim anchors (all confirmed current this session) but are not byte-exact-applied here (READ-ONLY).",
+        "D.1 two-body-vs-DRY-forwarder: the spec defaults to KEEPING the original dectc_forward_tile/backward_tile bodies verbatim and adding NEW _impl templates (zero risk to the shipped path); the DRY forwarder option must only be used if the PTX gate proves it identical (dummy GridBarrier{nullptr,...} is dead under folded if constexpr but must be PTX-verified).",
+        "Attention head-localization (H_loc = kHeads/TP) is the one correctness touch BEYOND the 4 reduce points (column-parallel in_proj gives each rank H/P heads); flagged in §6 NOTE, mechanical but required.",
+        "Symmetric-heap host bootstrap (nvshmem_team_split_strided for the TP team + the collective nvshmem_malloc ordering) is host glue NOT in the kernel files; it is the 8xH100 window's first task.",
+        "The WEIGHT-SHARD host plan (partition_tensor_parallel, dist_step.md §6.C.5) that actually feeds per-rank sharded params/grad/state to the launcher and shrinks Nmax=kDecMaxTensorNumel/TP is upstream of this kernel track (Python/host), referenced not specced here."
+      ],
+      "summary": "Wrote /workspace/impl_diffs/tp_kernel.md (1380 lines): APPLY-READY spec turning the dist_step.md §6.C/6.D + tp_nvshmem.md plan into exact edits, now that NVSHMEM 3.7.0 IS installed (corrects tp_nvshmem.md §0). VERIFIED LIVE: install at $NVSHMEM_HOME with sm_90 device bitcode; all 9 device symbols the design needs are present (header-grepped, table in §0); the team-scoped nvshmemx_barrier_block(team) IS exposed (host/nvshmemx_coll_api.h:112), which RESOLVES the tp_nvshmem.md §3.1 version-dependent follow-up. COMPILE-VALIDATED: gate 2 (baseline loopback, no NVSHMEM) COMPILE_OK; gate 3 (loopback -DSG_HAS_NVSHMEM=1 -rdc=true) COMPILE_OK; and a standalone probe of my EXACT EDIT A NvshmemTransport body (nvshmem_team_translate_pe + nvshmem_ptr + nvshmem_quiet + nvshmemx_barrier_block + the void*<->nvshmem_team_t cast) compiles rc=0 against the installed 3.7.0 RDC headers. Five edits: (A) tp_transport.cuh harden NvshmemTransport with team scope + quiet + team-block barrier + a make_transport_from_comm<Par> helper (apply-now, byte-identical when OFF); (B) parallel_config.cuh widen CommCtx with sym-heap base/stride/team-pe/size (apply-now, POD, SingleGPU defaults); (C) fused_decoder_megakernel.cuh thread <OptId Opt, class Par=SingleGPU> + trailing CommCtx comm={} into kernel+launcher + the §1 grid-lockstep P1 restructure; (D) model_stage_decoder_tc.cuh thread <Par,Transport> into the tile fns + wrap the 4 reduce points (①/②/①'/②') in if constexpr(Par::kTPComm) with the loopback-validated sharded partial GEMM + tp_allreduce_sum_fixed_order; (E) launcher: nvshmem_malloc'd symmetric tp_sym_heap split out of the cudaMalloc workspace (the §2 forced allocator change), CommCtx population, TP-degree dispatch (allow-list {1,8}). Every OLD snippet verified verbatim against the live files (parallel_config.cuh:106-120, launcher:46-72/199-202, mega:672-678/1511-1515/99-100, model_stage:57-61, tp_transport:156-181/231-233). KEY CORRECTION made vs the naive plan: EDIT C.1 includes go INSIDE the wgmma guard (#if SG_TUNED_GEMM_IMPL==WGMMA, after line 100), NOT the unconditional top block — adding tp_layer.cuh to the top would pull model_stage_decoder_tc.cuh into the SCALAR build and break its byte-identity. Symmetric-heap sizing derived: ~26MB/PE real multi-GPU (ctas_per_pe·2·kTileM·d), the 216MB figure is the single-grid loopback bound. Default build (Par=SingleGPU, no -DSG_HAS_NVSHMEM) is byte-for-byte the legacy <Opt> kernel — every new symbol is behind if constexpr(Par::kTPComm) or #if SG_HAS_NVSHMEM; PTX-diff gate is test_decoder_tc.py."
+    },
+    {
+      "name": "tma_wire",
+      "area": "csrc/backends/cuda/sm_90/{wgmma.cuh,tile_pipeline.cuh,cute_tma_desc.h(new)} + csrc/fused/sm_90/{model_stage_decoder_tc.cuh,fused_decoder_megakernel.cuh,mega_decoder_real_adamw_tc.cu} + csrc/fused/megakernel_common.cuh + csrc/bindings/dispatch.cpp — wire the gated TMA load into the persistent-megakernel fwd/dX A/B staging (CuTe step 4.2, LEVER ①)",
+      "spec_path": "/workspace/impl_diffs/tma_wire.md",
+      "files_changed": [
+        "/workspace/impl_diffs/tma_wire.md"
+      ],
+      "gate_commands": [
+        "CUDA_VISIBLE_DEVICES=0 bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu -DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1 -DSG_TUNED_GEMM_ENGINE=1 -DSG_TUNED_GEMM_TMA=1",
+        "CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q"
+      ],
+      "confidence": "medium",
+      "risks": [
+        "The host wbf_f offset helper (dec_tc_wbf_base_floats, §6.1) duplicates the kernel carve chain; the kernel's runtime sg2_ws_base +1 8-byte-align bump (carve line 745, conditional on kDecTotalElems being odd) plus the 16B-align bump cannot be byte-verified read-only against the host helper. MITIGATED by §6.1b which adds a TMA-ON-only assert in the kernel carve (no-op under -DNDEBUG) so it is a compile-once/run-once check; OFF builds untouched. If it fires, the lead nudges the helper by the 1-float align.",
+        "Two trailing-param adds in §7.2/§7.3 (the B operand column origin tmaBn0 widening SG_DEC_TMA_TILE_PARAMS to a 4-tuple, and a dedicated CTA-local DecTcSmem::tma_bar[1] mbarrier word threaded like pipeBars) are flagged as needing the lead's compile loop to finalize — they are mechanical (one struct member + one widened macro tuple) and fully inside #if SG_TUNED_GEMM_TMA, so OFF stays byte-identical, but they are not 100% read-only-resolvable.",
+        "The TMA descriptor box (no-swizzle Major-K INTERLEAVE, §3) must land smem BYTE-FOR-BYTE identical to the cp.async ring's canonical map idx(mn,k)=(k/8)*(MN*8)+mn*8+(k%8). This is the one thing only silicon can prove; the gate-2-with-TMA-ON run (inject -DSG_TUNED_GEMM_ENGINE=1 -DSG_TUNED_GEMM_TMA=1 into the JIT cflags) is the proof — a mismatch fails parity LOUD, not silently.",
+        "PersistentContext grows by 2 trailing defaulted fields; this is byte-safe ONLY because BOTH the real struct (megakernel_common.cuh:263) and the by-value dispatch.cpp CUDA mirror (dispatch.cpp:185) are appended in lock-step (§4+§5). All 13 aggregate-init sites use 5-value brace-init (verified) so they stay valid; no sizeof(PersistentContext) dependency exists. The gfx942 HIP mirror is a separate struct and is NOT touched.",
+        "dec_acts_bind/dec_wbf_bind widened from __device__ to __host__ __device__ (§6.2b) so the host build can call them; bodies are pure pointer arithmetic (no device intrinsics) so device codegen is byte-identical, but this is a qualifier change to two hot-path helpers and should be PTX-diffed OFF-vs-baseline.",
+        "First landing wires TMA only into the SHIPPED S=2 ring (RS<=2 branch) and to fwd/dX (the step-stable operands); dW stays cp.async (its transposed-strided gather is not TMA-reachable unless SG_TUNED_DEC_DW_STAGE=1), and the PIPE=1 deeper ring / PIPE=2 producer-consumer engine keep cp.async. So LEVER ① is closed for the gate's path but dW (the single biggest hand-cp.async cost) is explicitly left for the DW_STAGE follow-on."
+      ],
+      "summary": "Wrote /workspace/impl_diffs/tma_wire.md (1366 lines): the apply-ready realization of tma.md's DOCUMENTED-BUT-DEFERRED §5. I first verified the live tree (grep + read): tma.md's §2-4 device primitive is NOT yet applied and cute_tma_desc.h does not exist, so the spec is self-contained — it re-anchors §2-4 VERBATIM against the LIVE post-steps-1-3 wgmma.cuh (every OLD snippet checked byte-for-byte: wgmma.cuh:126-148/687-697, megakernel_common.cuh:263-276, dispatch.cpp:185-191, model_stage_decoder_tc.cuh:321-325/709-715/880-882/1181-1201, fused_decoder_megakernel.cuh:655-657/767-776/1547-1559, mega_decoder_real_adamw_tc.cu:30) then adds the §5 wiring. Key design decisions resolving the hard parts: (1) the host CUtensorMap build lives in the SINGLE shared launch entry launch_fused_decoder_megakernel_tc (covers tc_train_step, the real launcher, and sg2 in one edit; the gate TU mega_decoder_real_adamw_tc.cu routes through it), keyed/cached on (workspace,T,B,nCTA) like the existing workspace cache; (2) the descriptor SET is a compile-time enum of 16*L operands (8 weight C1/C1-T + 8 acts) with __host__ __device__ index helpers in the dectc namespace so the host build and the device fetch share ONE formula; (3) the descriptor is threaded to the producer via the EXACT SG_DEC_PIPE_BARS_ARG / SG_DEC_FINE_* macro idiom the codebase already proves byte-identical-when-OFF — trailing-defaulted params dereferenced only inside #if SG_TUNED_GEMM_TMA, expanding to NOTHING when OFF so producer/wrappers/tile-fns are textually unchanged; (4) the PersistentContext gets 2 trailing defaulted fields appended in lock-step to BOTH the real struct and the by-value dispatch.cpp CUDA mirror (the load-bearing ABI point — the struct is passed by value across the launcher TU boundary). Transport-only: the descriptor is no-swizzle Major-K INTERLEAVE so the landed smem bytes equal the cp.async ring, and issue_k's ascending-k k=0-overwrite/k>0-accumulate wgmma sequence is untouched -> fp64 parity + A/A/A by construction. I flagged honestly (Section 0 + Risks) the 3 things read-only precision cannot fully close: the wbf_f host offset vs the kernel's runtime align bumps (mitigated by a TMA-ON-only assert in §6.1b), two mechanical trailing-param adds (tmaBn0 + DecTcSmem::tma_bar), and that the byte-identical-smem claim's final proof is gate-2-with-TMA-ON on silicon."
+    },
+    {
+      "name": "vit_flagship",
+      "area": "grokking_optimizers/megakernel_codegen.py (ViT _vit_* emitters) + csrc/fused/sm_90/model_stage_vit_tc.cuh + fused_vit_megakernel.cuh + NEW csrc/fused/sm_90/vit_flagship_layout.cuh",
+      "spec_path": "/workspace/impl_diffs/vit_flagship.md",
+      "files_changed": [
+        "/workspace/impl_diffs/vit_flagship.md",
+        "grokking_optimizers/megakernel_codegen.py",
+        "csrc/fused/sm_90/model_stage_vit_tc.cuh",
+        "csrc/fused/sm_90/fused_vit_megakernel.cuh",
+        "csrc/fused/sm_90/vit_flagship_layout.cuh (NEW, generated)"
+      ],
+      "gate_commands": [
+        "python -m grokking_optimizers.megakernel_codegen --vit-layout > /tmp/v.cuh && diff /tmp/v.cuh csrc/fused/sm_90/vit_layout.cuh",
+        "python -m grokking_optimizers.megakernel_codegen --vit-layout-flagship > csrc/fused/sm_90/vit_flagship_layout.cuh",
+        "bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_vit_real_adamw_tc.cu -DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_FUSED_SM90_VIT_LAYOUT_CUH_=1 -include csrc/fused/sm_90/vit_flagship_layout.cuh"
+      ],
+      "confidence": "high",
+      "risks": [
+        "Muon table->formula (Edits 2.1+3.2) is VALUE-identical at L=2 but NOT PTX-byte-identical (the kVitMuon2D .const array becomes an inlined accessor + closed-form vit_is_muon_2d). This is the Muon cell, separate from the AdamW gate TU; the L=2 AdamW gate (test_vit_megakernel.py / test_l3tc_tail_gate.py) does not exercise Muon NS and the routing membership set is preserved exactly. If a Muon-cell byte-identity gate exists, treat as value-identical.",
+        "VitTcSmem.spec[] grows +7.36 KB at L=48 (sizeof(VitDwSpec)=40 B x (194-10)). Byte-identical at L=2 (spec[10]). Not re-measured at L=48 (read-only); gate-3 compile is the real smem-budget check, mirroring the decoder flagship.",
+        "The task's gate-3 passes -DSG_DEC_SCALAR_MEGAKERNEL=0 (the DECODER scalar gate) which is a no-op for the ViT TU (whose scalar gate is SG_VIT_SCALAR_MEGAKERNEL, default 1). Gate-3 as written also compiles the legacy scalar ViT megakernel at flagship dims; this is harmless for a green compile (the flagship body omits the <227KB assert; the sizeof==kVitSampleSmemBytes assert holds since both recompute from the same formula; the 2.25 MB cap is a runtime refusal, not a compile error). Lead may add -DSG_VIT_SCALAR_MEGAKERNEL=0 to match the decoder-flagship convention.",
+        "A green flagship compile proves layout-table correctness + that the L-generalized TC backward compiles at SG_VIT_LAYERS=48; whether 1-CTA/SM occupancy holds at flagship dims is a property of the kernel's per-tile smem design (per-layer VitTileScratch caches in HBM workspace), same caveat as the decoder flagship.",
+        "gfx942/tpu untouched (all C++ edits under csrc/fused/sm_90/ ViT TC headers; codegen adds an sm_90-only emitter + flag)."
+      ],
+      "summary": "Wrote /workspace/impl_diffs/vit_flagship.md: apply-ready spec mirroring the decoder flagship (flagship.md) + flagship_dw.md work for ViT, in two parts. PART 1 (codegen, FILE 1): add _VIT_FLAGSHIP_D/HEADS/LAYERS=1664/16/48 mirror constant (heads mirrored explicitly since _vit_heads(1664)=26 != flagship 16); parameterize _vit_param_sizes by (layers,vocab,patch,npatch) and _vit_layout_body by (layers,vocab,patch,npatch,heads with a None->_vit_heads default); switch the 4 body f-string header lines from globals to params; add vit_flagship_layout_header() (standalone header, own guard SG_FUSED_SM90_VIT_FLAGSHIP_LAYOUT_CUH_, takes the SCALED else-smem-block since d!=128) + a --vit-layout-flagship CLI flag. All defaults equal the historical globals so --vit-layout stays byte-identical (verified: current codegen reproduces committed vit_layout.cuh byte-for-byte). PART 2 (TC backward, FILES 2+3): generalize every 2-layer-pinned enumeration to vit::kLayers via formulas proven byte-identical at L=2 -> kVitNumDwSpecs=2+4L (=10), kNumLnVec=4L+2 (=10), kVitNumMuon2D=2+4L+1 (=11). Replaced the kVitMuon2D __constant__ array with vit_muon_2d(mi) accessor + closed-form vit_is_muon_2d (per-layer base=4+12li, kinds {0,2,8,10}; head 4+12L+2; lead patch_proj{1}/pos{3}); replaced kLnVecTensorIdx array with vit_lnvec_tensor_idx(v) (8+12li+kind, norm at 4+12L/4+12L+1); generalized vittc_build_dw_specs (s<8->s<4L loop, spec[9]->spec[1+4L] head, head tidx 30/31->4+12L+2/+3) and the dw_total_tiles/run_tile/decode/run_tile_splitk/reduce_splitk/biases signatures+loops from [10]/s<10 to [kVitNumDwSpecs]; fixed the two norm-slot literals 8*kD/9*kD->(4L+0/4L+1)*kD in vittc_backward_tile; pointed vittc_lnvec_reduce at the formula; bumped VitTcSmem.spec[10]->spec[kVitNumDwSpecs] and the Muon driver loop's kVitMuon2D[mi]->vit_muon_2d(mi) + a comment. All literal tables reproduced verbatim at L=2 (proofs in the spec). Flagship layout: 584 tensors, total 1,596,200,417 elems, max numel 11,075,584, largest offset <INT32_MAX (exact int32 tables). Confirmed no pp_stage_vit consumer exists (unlike decoder), so removing the two __constant__ arrays breaks no other TU. All OLD snippets verified verbatim against live files incl. whitespace."
+    },
+    {
+      "name": "mamba_flagship",
+      "area": "grokking_optimizers/megakernel_codegen.py (Mamba emitters) + csrc/fused/sm_90/{model_stage_mamba_tc,fused_mamba_megakernel}.cuh + NEW mamba_flagship_layout.cuh",
+      "spec_path": "/workspace/impl_diffs/mamba_flagship.md",
+      "files_changed": [
+        "/workspace/SuperGrok1.5/grokking_optimizers/megakernel_codegen.py",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_mamba_tc.cuh",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/fused_mamba_megakernel.cuh",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/mamba_flagship_layout.cuh"
+      ],
+      "gate_commands": [
+        "python -m grokking_optimizers.megakernel_codegen --mamba-layout > /tmp/m.cuh && diff /tmp/m.cuh csrc/fused/sm_90/mamba3_layout.cuh",
+        "python -m grokking_optimizers.megakernel_codegen --mamba-layout-flagship > csrc/fused/sm_90/mamba_flagship_layout.cuh",
+        "bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu -DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_FUSED_SM90_MAMBA3_LAYOUT_CUH_=1 -include csrc/fused/sm_90/mamba_flagship_layout.cuh"
+      ],
+      "confidence": "high",
+      "risks": [
+        "GATE TYPO (must fix to run gate 3): the task's 3rd gate_command predefines -DSG_FUSED_SM90_MAMBA_LAYOUT_CUH_=1 (no '3'), but the committed layout's real include guard is SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_ (with '3', mamba3_layout.cuh:1). With the no-3 macro the committed body is NOT skipped -> kMamba* symbols defined twice -> redefinition error. Spec provides the corrected -D (with '3'); mirrors decoder gate (flagship.md EDIT 6).",
+        "n_heads=64 not 32: the flagship layout emits SG_MB_NHEADS=64 (derived d_inner//head_dim=4096//64). This is CORRECT - eager Mamba3Layer (mamba3_block.py:310-313) ignores the config's num_heads:32 and derives n_heads; _raw_model passes head_dim=64, not num_heads. A reviewer expecting 32 from the config row would see the layout as 'wrong' but it matches the eager model.",
+        "Muon-scratch LATENT bug fixed (Edit 2.2): old kMbMuonMaxNumel=mb::kXProj*mb::kDInner assumes x_proj is the largest 2D weight - true only at d=128. At flagship (and even bench d=1024) in_proj dominates (16,777,216 vs x_proj 2,359,296), so the old literal under-sizes the Muon NS scratch ~7x -> OOB in the Muon cell. Fix derives from kMambaMaxTensorNumel (byte-identical 86016 at d=128, correct everywhere). Verified global-max tensor is always a 2D Muon weight at all 3 configs.",
+        "Muon table->formula PTX is value-identical NOT byte-identical (Edits 2.1+3.1): affects only the Muon optimizer cell (distinct from the gated AdamW TU). Proven value-identical (tidx,rows,cols) + membership at L=2; AdamW L=2 parity/determinism gates unaffected (Muon block is if-constexpr'd dead for AdamW; dormant spec[8]->spec[kMbNumDwSpecs] with kMbNumDwSpecs==8 is byte-identical).",
+        "smem/HBM at flagship will NOT fit single-GPU as-is (same caveat as decoder flagship.md RISK 2/4): scalar Mamba megakernel MambaSampleSmem placeholder ~20MB >> 228KB cap (flagship header drops the <228KB assert since SG_MB_SCALAR_MEGAKERNEL=0, TC engine uses static MbTcSmem); and mb_tc_workspace_floats carves nCTA*kMambaTotalElems (~668GB) per-CTA grad partial. Compile gate proves layout/symbol/table correctness only, NOT occupancy>=1 or single-GPU trainability (the TP8.ZeRO-3 mesh is the intended target)."
+      ],
+      "summary": "Wrote /workspace/impl_diffs/mamba_flagship.md as apply-ready OLD/NEW edits mirroring the decoder flagship work (templates flagship.md + flagship_dw.md). FILE 1 (megakernel_codegen.py): parameterize _mamba_param_sizes and _mamba_layout_body by a `layers` kwarg (default _MAMBA_LAYERS), add _MAMBA_FLAGSHIP_D/_LAYERS=(2048,24), add mamba_flagship_layout_header() and the --mamba-layout-flagship CLI flag. FILE 2 (model_stage_mamba_tc.cuh): convert the 2-layer-pinned kMbMuon2D[17] __constant__ table to an L-general formula mb_muon_2d(mi) + closed-form mb_is_muon_2d(t) (kMbNumMuon2D=7*L+3), and FIX kMbMuonMaxNumel (was mb::kXProj*mb::kDInner, a d=128 coincidence that under-sizes the Muon NS scratch 7x at flagship -> derive from kMambaMaxTensorNumel, byte-identical at d=128). FILE 3 (fused_mamba_megakernel.cuh): Muon driver kMbMuon2D[mi]->mb_muon_2d(mi); dormant MbTcSmem::spec[8]->spec[mbtc::kMbNumDwSpecs] (fixed 8, byte-identical); stale comment fixes. NEW: mamba_flagship_layout.cuh emitted by gate 2.\n\nVERIFIED (read-only, no repo edits): (a) the parameterized emitter regenerates the committed mamba3_layout.cuh BYTE-IDENTICAL (gate 1 passes on a scratch copy); (b) the flagship header emits correctly - 485 tensors, total 1,265,411,169, n_heads=64, d_inner=4096, dt_rank=128, x_proj=576, d_ff=4096, offsets consistent + int32-safe (max offset 1,265,411,072 < INT32_MAX), well-formed braces, distinct own guard, bench-style smem block (no <228KB cap assert); (c) mb_muon_2d/mb_is_muon_2d reproduce all 17 (tidx,rows,cols) + membership at L=2 exactly; (d) all 8 FILE 2/3 OLD snippets match the live files exactly once.\n\nKEY FINDING the task framing did not anticipate: Mamba-3 has NO conv1d and the TC production path is the scalar per-sample fwd+bwd (model_stage_mamba_tc.cuh documents MbDwSpec/spec[8] as a dormant Mamba-1 vestige), so there is NO dW-spec builder and NO per-layer LN/SSM reduce table to generalize - the fwd/bwd weight binds, layer loops, smem arrays, and the P3 AdamW tail are ALREADY mb::kLayers-general via i++ walks. The ONLY 2-layer-pinned enumeration is kMbMuon2D. The per-layer SSM state (A_log/D/B_bias/Bhat_bias/C_bias/Chat_bias + 4 B/C-norm) is all ndim==1 (handled by the AdamW tail, not Muon-2D) and bound positionally - no enumeration table needed. Also flagged a gate-command typo (MAMBA vs MAMBA3 guard)."
+    },
+    {
+      "name": "datasets",
+      "area": "grokking_race_v2.py",
+      "spec_path": "/workspace/impl_diffs/datasets_v2.md",
+      "files_changed": [
+        "/workspace/impl_diffs/datasets_v2.md",
+        "/workspace/SuperGrok1.5/grokking_race_v2.py",
+        "/workspace/SuperGrok1.5/grokking_optimizers/dataset_sources.py"
+      ],
+      "gate_commands": [
+        "python grokking_race_v2.py --gpus 2 --optimizers adamw --num-seeds 1 --early-stop-max-steps 300 --no-status-server --output /tmp/smoke",
+        "python -c \"import grokking_race_v2\""
+      ],
+      "confidence": "high",
+      "risks": [
+        "Edit 2.9b sites 2-6 share the identical call line `    opt=_maybe_wrap_cuda_graph(opt, c)`; v2 disambiguates each with a unique 3-line OLD block (the line TWO above each call differs at every site, verified live), so exact-match is unambiguous. If a future edit changes an optimizer constructor's last kwarg line, the relevant OLD block must be re-captured. Post-apply guard: `grep -n _maybe_wrap_cuda_graph grokking_race_v2.py` must be empty (7 occurrences today: def :895 + calls :983,:1090,:1387,:1424,:1452,:1512).",
+        "Live line numbers had NOT drifted from v1 datasets.md except cosmetic range labels; all OLD snippets re-copied verbatim from the current 2505-line file. If the file is edited before apply, re-verify the ~10 anchor regions.",
+        "DEFAULT_CONFIG ships `train_view_rows: None`; a literal None would break int(None) in the module. The dispatcher (Edit 2.2) pops a falsy train_view_rows from its copy so the module's .get(default) fires. This coupling between Edit 2.1 and 2.2 must be applied together.",
+        "evaluate() micro-batch path (0<micro_batch<n) is a sum/÷n restatement of the mean — only reachable on the scaled (non-modular) path, never on the byte-identical mod-97 gate. Cross-chunk fp32 add order differs from a single giant forward; this is a scaled-path numeric, NOT a gate concern.",
+        "dataset_sources stub tensors are synthetic and shaped to the CURRENT size-pinned kernels (decoder seq=4, mamba seq_len=8, vit 16x49, classes=p); a real scaled run needing resized vocab/patch/class requires Layer-B kernel regen, explicitly OUT OF SCOPE here."
+      ],
+      "summary": "Re-validated and refined /workspace/impl_diffs/datasets.md into apply-ready /workspace/impl_diffs/datasets_v2.md against the live grokking_race_v2.py (2505 lines). All OLD snippets copied verbatim; line numbers re-checked (no drift). Spec adds: (1) NEW grokking_optimizers/dataset_sources.py — a torch-only, no-download importable stub returning the legacy 6-tuple (fixed streaming train VIEW + fixed eval PROBE) for FineWeb-Edu/decoder, ImageNet-1k/vit, GiftEvalPretrain/mamba, deterministic by (seed,step,salt) for A/A/A; (2) Edit 2.1 DEFAULT_CONFIG DEFAULT-OFF knobs (data_source=modular + train_batch_size/train_view_rows/eval_probe_rows/eval_micro_batch/early_stop_mode=acc/plateau_patience/min_delta); (3) Edit 2.2 make_data_for_task dispatch (modular branch = literal original 4 lines, byte-identical; non-modular lazily imports the stub); (4) Edit 2.3 evaluate() inert-when-OFF fixed-probe-capped micro-batched forward (micro_batch<=0 → original single-shot); (5) Edit 2.4 EarlyStopper mode=acc default + loss-PLATEAU branch (acc tail = literal original); (6) Edits 2.5/2.6a/2.6b _stopper + _eval_log thread loss to stopper only in loss-mode; (7) Edits 2.7a/2.7b/2.8 capped final eval threaded via _fin function-attribute set in _tr (no signature widening) + plateau-aware confirm; (8) Edit 2.9 remove dead _maybe_wrap_cuda_graph def + 6 identity calls. KEY REFINEMENT vs v1: Edit 2.9b rewritten as 6 unique exact-match OLD->NEW blocks (v1 hand-waved 'apply by line number bottom-up' for the 5 shared sites) — verified the line two-above each call differs at every site, so a 3-line OLD block is globally unique; order-independent. Confirmed dead-code KEEPs: MambaModel/SelectiveSSMLayer are LIVE (tests/hw/test_mamba_megakernel.py:37-39 does `import grokking_race_v2 as g; g.MambaModel(...)`; mamba_oracle.py/mamba3_oracle.py transcribe SelectiveSSMLayer), and _maybe_checkpoint is live in all three model forwards — only _maybe_wrap_cuda_graph removed. Verified evaluate() has one real caller (_fin :815) and EarlyStopper one caller (_stopper :691), so new default-valued params are backward-compatible. mod-97 path byte-identical when all knobs at default; no CLI flag added so the gate stays modular. Embedded new-module body AST-validated (158 lines OK); live file AST OK."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Tracks"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "TP kernel Par-template + in-kernel NVSHMEM all-reduce",
+      "phaseIndex": 1,
+      "phaseTitle": "Tracks",
+      "agentId": "afb1c2d52d32841dd",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782352714379,
+      "queuedAt": 1782352714350,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/fused/sm_90 — TP in-kernel device-NVSHMEM all-reduce: …",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits: for EACH file give the EXACT current snippet (copy VERBATIM from the live file, enough to be unique) as OLD + the NEW replacement; new files in full. A mismatched OLD fails to apply, so be precise.\nVERIFIED CONTEXT (this session): production path = the L…",
+      "lastProgressAt": 1782353576184,
+      "tokens": 184311,
+      "toolCalls": 46,
+      "durationMs": 861805,
+      "resultPreview": "{\"area\":\"csrc/fused/sm_90 — TP in-kernel device-NVSHMEM all-reduce: template the production decoder megakernel on ParConfig + CommCtx, Megatron-shard in_proj/ff, symmetric-heap allocator split\",\"spec_path\":\"/workspace/impl_diffs/tp_kernel.md\",\"files_changed\":[\"/workspace/impl_diffs/tp_kernel.md\"],\"gate_commands\":[\"CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q\"…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "TMA megakernel wiring (close the 72%/15x GEMM)",
+      "phaseIndex": 1,
+      "phaseTitle": "Tracks",
+      "agentId": "a50ef4f3e6a273a01",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782352714380,
+      "queuedAt": 1782352714351,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/backends/cuda/sm_90/{wgmma.cuh,tile_pipeline.cuh,cute_…",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits: for EACH file give the EXACT current snippet (copy VERBATIM from the live file, enough to be unique) as OLD + the NEW replacement; new files in full. A mismatched OLD fails to apply, so be precise.\nVERIFIED CONTEXT (this session): production path = the L…",
+      "lastProgressAt": 1782353600411,
+      "tokens": 224039,
+      "toolCalls": 59,
+      "durationMs": 886031,
+      "resultPreview": "{\"area\":\"csrc/backends/cuda/sm_90/{wgmma.cuh,tile_pipeline.cuh,cute_tma_desc.h(new)} + csrc/fused/sm_90/{model_stage_decoder_tc.cuh,fused_decoder_megakernel.cuh,mega_decoder_real_adamw_tc.cu} + csrc/fused/megakernel_common.cuh + csrc/bindings/dispatch.cpp — wire the gated TMA load into the persistent-megakernel fwd/dX A/B staging (CuTe step 4.2, LEVER ①)\",\"spec_path\":\"/workspace/impl_diffs/tma_wir…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "ViT flagship (layout + dW-generalization)",
+      "phaseIndex": 1,
+      "phaseTitle": "Tracks",
+      "agentId": "a38ac3d8d01fa1c09",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782352714381,
+      "queuedAt": 1782352714351,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "grokking_optimizers/megakernel_codegen.py (ViT _vit_* emitt…",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits: for EACH file give the EXACT current snippet (copy VERBATIM from the live file, enough to be unique) as OLD + the NEW replacement; new files in full. A mismatched OLD fails to apply, so be precise.\nVERIFIED CONTEXT (this session): production path = the L…",
+      "lastProgressAt": 1782353197556,
+      "tokens": 148252,
+      "toolCalls": 30,
+      "durationMs": 483175,
+      "resultPreview": "{\"area\":\"grokking_optimizers/megakernel_codegen.py (ViT _vit_* emitters) + csrc/fused/sm_90/model_stage_vit_tc.cuh + fused_vit_megakernel.cuh + NEW csrc/fused/sm_90/vit_flagship_layout.cuh\",\"spec_path\":\"/workspace/impl_diffs/vit_flagship.md\",\"files_changed\":[\"/workspace/impl_diffs/vit_flagship.md\",\"grokking_optimizers/megakernel_codegen.py\",\"csrc/fused/sm_90/model_stage_vit_tc.cuh\",\"csrc/fused/sm_…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "Mamba flagship (layout + dW-generalization)",
+      "phaseIndex": 1,
+      "phaseTitle": "Tracks",
+      "agentId": "ade53567a1c9a086f",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782352714382,
+      "queuedAt": 1782352714351,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "grokking_optimizers/megakernel_codegen.py (Mamba emitters) …",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits: for EACH file give the EXACT current snippet (copy VERBATIM from the live file, enough to be unique) as OLD + the NEW replacement; new files in full. A mismatched OLD fails to apply, so be precise.\nVERIFIED CONTEXT (this session): production path = the L…",
+      "lastProgressAt": 1782353373258,
+      "tokens": 152778,
+      "toolCalls": 42,
+      "durationMs": 658875,
+      "resultPreview": "{\"area\":\"grokking_optimizers/megakernel_codegen.py (Mamba emitters) + csrc/fused/sm_90/{model_stage_mamba_tc,fused_mamba_megakernel}.cuh + NEW mamba_flagship_layout.cuh\",\"spec_path\":\"/workspace/impl_diffs/mamba_flagship.md\",\"files_changed\":[\"/workspace/SuperGrok1.5/grokking_optimizers/megakernel_codegen.py\",\"/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_mamba_tc.cuh\",\"/workspace/SuperGrok1.…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "datasets Layer-A (FineWeb/ImageNet/GiftEval)",
+      "phaseIndex": 1,
+      "phaseTitle": "Tracks",
+      "agentId": "a2dc5515f3a1a37a4",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782352714382,
+      "queuedAt": 1782352714351,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "grokking_race_v2.py",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits: for EACH file give the EXACT current snippet (copy VERBATIM from the live file, enough to be unique) as OLD + the NEW replacement; new files in full. A mismatched OLD fails to apply, so be precise.\nVERIFIED CONTEXT (this session): production path = the L…",
+      "lastProgressAt": 1782352987302,
+      "tokens": 103699,
+      "toolCalls": 17,
+      "durationMs": 272920,
+      "resultPreview": "{\"area\":\"grokking_race_v2.py\",\"spec_path\":\"/workspace/impl_diffs/datasets_v2.md\",\"files_changed\":[\"/workspace/impl_diffs/datasets_v2.md\",\"/workspace/SuperGrok1.5/grokking_race_v2.py\",\"/workspace/SuperGrok1.5/grokking_optimizers/dataset_sources.py\"],\"gate_commands\":[\"python grokking_race_v2.py --gpus 2 --optimizers adamw --num-seeds 1 --early-stop-max-steps 300 --no-status-server --output /tmp/smok…"
+    }
+  ],
+  "totalTokens": 813079,
+  "totalToolCalls": 194
+}

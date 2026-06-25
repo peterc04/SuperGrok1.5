@@ -1,0 +1,5 @@
+[notice] To update, run: python -m pip install --upgrade pip
+/usr/local/bin/ninja
+1.13.0.git.kitware.jobserver-pipe-1
+=== retry UPGRADED build+measure (cached) ===
+launched upgraded build pid 42697 -> /workspace/phase1/UPGRADED_d2048.out

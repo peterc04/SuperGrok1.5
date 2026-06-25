@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+RuntimeError: TC megakernel launch failed (opt_id=7): out of memory
+[supergrok11]  step    1  loss=4.58505
+[supergrok11]  step    2  loss=4.51358
+[supergrok11]  step    3  loss=4.44829
+[supergrok11]  step   10  loss=3.66813
+[supergrok11]  step   20  loss=2.74664
+[stderr] tail: /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/muon_redo.log: file truncated
+[supergrok11]  step   30  loss=2.70855
+[supergrok11]  step   40  loss=2.70285
+[supergrok11]  step   50  loss=2.70390
+[supergrok11]  step   60  loss=2.70184
+[supergrok11]  step   70  loss=2.69981
+[supergrok11]  step   80  loss=2.69853
+[supergrok11]  step   90  loss=2.69729
+[supergrok11]  step  100  loss=2.69683

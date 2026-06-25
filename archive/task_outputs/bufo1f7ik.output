@@ -1,0 +1,1 @@
+MAMBA_EXIT=0  COMPILE_OK tu=csrc/fused/sm_90/mega_mamba_real_adamw_tc.cu

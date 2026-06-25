@@ -1,0 +1,3 @@
+gpu5 vit done
+/tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/run_nsys_cell.sh: line 12: 161638 Killed                  CUDA_VISIBLE_DEVICES=$GPU $NSYS profile -t cuda -o $OUT --force-overwrite=true python3 $SCR/nsys_runner.py $MODEL $OPT $NSTEP > ${OUT}.runlog 2>&1
+/tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/run_nsys_cell.sh: line 12: 169071 Killed                  CUDA_VISIBLE_DEVICES=$GPU $NSYS profile -t cuda -o $OUT --force-overwrite=true python3 $SCR/nsys_runner.py $MODEL $OPT $NSTEP > ${OUT}.runlog 2>&1

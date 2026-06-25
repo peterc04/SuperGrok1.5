@@ -1,0 +1,6 @@
+BUILD_EXIT=0
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+[2/2] c++ mega_decoder_sg2_tc.cuda.o -shared -L/usr/local/lib/python3.11/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o mega_decoder_staged_sg2.so
+Loading extension module mega_decoder_staged_sg2...
+SG2 .so built in 165.4s, TOTAL=1475884899

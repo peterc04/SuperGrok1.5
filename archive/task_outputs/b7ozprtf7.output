@@ -1,0 +1,60 @@
+[rank3]:     loss, _g = mod.tc_train_step_tp8(params, tokens, targets, state,
+[rank3]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]: RuntimeError: CUDA error: an illegal memory access was encountered
+[rank3]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[rank3]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+[rank3]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/workspace/SuperGrok1.5/tuning/_tp8_run.py", line 207, in <module>
+[rank0]:     raise SystemExit(main())
+[rank0]:                      ^^^^^^
+[rank0]:   File "/workspace/SuperGrok1.5/tuning/_tp8_run.py", line 169, in main
+[rank0]:     loss, _g = mod.tc_train_step_tp8(params, tokens, targets, state,
+[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: RuntimeError: CUDA error: an illegal memory access was encountered
+[rank0]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[rank0]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+[rank0]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[rank0]:[W625 07:23:25.924327570 ProcessGroupNCCL.cpp:1168] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+W0625 07:23:25.739000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188351 closing signal SIGTERM
+W0625 07:23:25.740000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188352 closing signal SIGTERM
+W0625 07:23:25.740000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188353 closing signal SIGTERM
+W0625 07:23:25.741000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188354 closing signal SIGTERM
+W0625 07:23:25.742000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188355 closing signal SIGTERM
+W0625 07:23:25.742000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188356 closing signal SIGTERM
+W0625 07:23:25.743000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 188358 closing signal SIGTERM
+E0625 07:23:27.890000 128025384944768 torch/distributed/elastic/multiprocessing/api.py:833] failed (exitcode: 1) local_rank: 6 (pid: 188357) of binary: /usr/bin/python
+Traceback (most recent call last):
+  File "/usr/local/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 348, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/launcher/api.py", line 133, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/launcher/api.py", line 264, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+tuning/_tp8_run.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-06-25_07:23:25
+  host      : e4af379d6fcc
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 188357)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

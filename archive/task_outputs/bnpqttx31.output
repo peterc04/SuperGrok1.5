@@ -1,0 +1,5 @@
+=== import smoke (prebuilt _ops) ===
+torch 2.4.1+cu124 ndev 8
+pkg import OK: /workspace/SuperGrok1.5/grokking_optimizers/__init__.py
+ops callables: 5
+['detect_arch', 'fused_step', 'sg2_fused_step', 'sg2_meta_optimizer_tail', 'sg2_ws_stride']

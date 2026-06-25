@@ -1,0 +1,6 @@
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/hw/test_mamba_tc.py::test_tc_single_step_grad_parity - Assertion...
+FAILED tests/hw/test_mamba_tc.py::test_tc_proj_dw_exact_on_own_operands - Run...
+2 failed, 3 passed, 1 warning in 57.36s
+=== EXIT 1 ===

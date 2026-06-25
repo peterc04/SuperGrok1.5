@@ -1,0 +1,85 @@
+==> /workspace/phase6/dec_probe.log <==
+[decoder-multiopt] loaded /workspace/flagship_build/mega_decoder_multiopt_adamw/mega_decoder_multiopt_adamw.so
+  d=1600 layers=48 seq=4 vocab=99 params=1,475,884,899
+==> /workspace/phase6/vit_run.log <==
+==> /workspace/phase6/mamba_run.log <==
+==> /workspace/phase6/dec_probe.log <==
+  [adamw      ] step=3112.919ms  1.46 TF/s  (0.15% peak)  intensity=82.82 FLOP/B  loss0=4.495
+CSV,decoder,adamw,1600,1475884899,3112.9192,1.4555,0.1472,82.8249,4.5309e+12,5.4705e+10
+  [lion       ] step=2870.625ms  1.58 TF/s  (0.16% peak)  intensity=82.82 FLOP/B  loss0=4.132
+CSV,decoder,lion,1600,1475884899,2870.6248,1.5784,0.1596,82.8249,4.5309e+12,5.4705e+10
+==> /workspace/phase6/mamba_run.log <==
+[mamba-multiopt] build done in 82.3s
+[mamba-multiopt] d=2048 layers=24 seq=8 vocab=99 params=1,265,411,169
+  [adamw      ] FAILED: CUDA error: invalid argument
+CSVFAIL,mamba,adamw,2048,1265411169,RuntimeError('CUDA error: invalid argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace be
+  [lion       ] FAILED: CUDA error: invalid argument
+CSVFAIL,mamba,lion,2048,1265411169,RuntimeError('CUDA error: invalid argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace be
+  [grokfast   ] FAILED: CUDA error: invalid argument
+CSVFAIL,mamba,grokfast,2048,1265411169,RuntimeError('CUDA error: invalid argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace be
+  [grokadamw  ] FAILED: CUDA error: invalid argument
+CSVFAIL,mamba,grokadamw,2048,1265411169,RuntimeError('CUDA error: invalid argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace be
+  [neuralgrok ] FAILED: CUDA error: invalid argument
+CSVFAIL,mamba,neuralgrok,2048,1265411169,RuntimeError('CUDA error: invalid argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace be
+==> /workspace/phase6/dec_probe.log <==
+  [grokfast   ] step=3486.090ms  1.30 TF/s  (0.13% peak)  intensity=82.82 FLOP/B  loss0=4.143
+CSV,decoder,grokfast,1600,1475884899,3486.0903,1.2997,0.1314,82.8249,4.5309e+12,5.4705e+10
+  [grokadamw  ] step=4019.833ms  1.13 TF/s  (0.11% peak)  intensity=82.82 FLOP/B  loss0=4.123
+CSV,decoder,grokadamw,1600,1475884899,4019.8325,1.1271,0.1140,82.8249,4.5309e+12,5.4705e+10
+==> /workspace/phase6/vit_run.log <==
+[vit-multiopt] build done in 187.5s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+  [adamw      ] FAILED: CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Process 3227253 has 24.38 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 1.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,adamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Proce
+  [lion       ] FAILED: CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Process 3227253 has 24.38 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 1.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,lion,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Proce
+  [grokfast   ] FAILED: CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Process 3227253 has 24.38 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 1.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokfast,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Proce
+  [grokadamw  ] FAILED: CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Process 3227253 has 24.38 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 1.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokadamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Proce
+  [neuralgrok ] FAILED: CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Process 3227253 has 24.38 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 1.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,neuralgrok,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 91.75 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.81 GiB is free. Proce
+==> /workspace/phase6/dec_probe.log <==
+  [neuralgrok ] step=4002.946ms  1.13 TF/s  (0.11% peak)  intensity=82.82 FLOP/B  loss0=4.133
+CSV,decoder,neuralgrok,1600,1475884899,4002.9460,1.1319,0.1144,82.8249,4.5309e+12,5.4705e+10
+==> /workspace/phase6/vit_run.log <==
+[vit-multiopt] build done in 0.1s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+  [adamw      ] FAILED: CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Process 3231865 has 24.40 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 25.86 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,adamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Proce
+  [lion       ] FAILED: CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Process 3231865 has 24.40 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 25.86 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,lion,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Proce
+  [grokfast   ] FAILED: CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Process 3231865 has 24.40 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 25.86 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokfast,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Proce
+  [grokadamw  ] FAILED: CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Process 3231865 has 24.40 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 25.86 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokadamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Proce
+  [neuralgrok ] FAILED: CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Process 3231865 has 24.40 GiB memory in use. Of the allocated memory 23.79 GiB is allocated by PyTorch, and 25.86 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,neuralgrok,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 82.03 GiB. GPU 0 has a total capacity of 79.20 GiB of which 54.79 GiB is free. Proce
+[vit-multiopt] build done in 186.7s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+  [adamw      ] FAILED: TC vit megakernel launch failed (opt_id=0): out of memory
+CSVFAIL,vit,adamw,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=0): out of memory')
+  [lion       ] FAILED: TC vit megakernel launch failed (opt_id=1): out of memory
+CSVFAIL,vit,lion,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=1): out of memory')
+  [grokfast   ] FAILED: TC vit megakernel launch failed (opt_id=2): out of memory
+CSVFAIL,vit,grokfast,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=2): out of memory')
+  [grokadamw  ] FAILED: TC vit megakernel launch failed (opt_id=3): out of memory
+CSVFAIL,vit,grokadamw,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=3): out of memory')
+  [neuralgrok ] FAILED: TC vit megakernel launch failed (opt_id=6): out of memory
+CSVFAIL,vit,neuralgrok,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=6): out of memory')
+[vit-multiopt] build done in 0.1s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+  [adamw      ] FAILED: CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process 3236045 has 74.94 GiB memory in use. Of the allocated memory 69.49 GiB is allocated by PyTorch, and 5.61 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,adamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+  [lion       ] FAILED: CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process 3236045 has 74.94 GiB memory in use. Of the allocated memory 69.49 GiB is allocated by PyTorch, and 5.61 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,lion,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+  [grokfast   ] FAILED: CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process 3236045 has 74.94 GiB memory in use. Of the allocated memory 69.49 GiB is allocated by PyTorch, and 5.61 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokfast,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+  [grokadamw  ] FAILED: CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process 3236045 has 74.94 GiB memory in use. Of the allocated memory 69.49 GiB is allocated by PyTorch, and 5.61 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,grokadamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+  [neuralgrok ] FAILED: CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process 3236045 has 74.94 GiB memory in use. Of the allocated memory 69.49 GiB is allocated by PyTorch, and 5.61 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+CSVFAIL,vit,neuralgrok,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+[vit-multiopt] build done in 0.1s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+[vit-multiopt] build done in 0.1s
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417

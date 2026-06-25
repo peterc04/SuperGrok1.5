@@ -1,0 +1,11 @@
+GPU_BUSY: 8/8 GPUs working
+GPU_IDLE: only 0/8 GPUs busy — backlog draining, REFILL the job manifest now
+GPU_BUSY: 8/8 GPUs working
+GPU_IDLE: only 3/8 GPUs busy — backlog draining, REFILL the job manifest now
+GPU_BUSY: 8/8 GPUs working
+GPU_IDLE: only 1/8 GPUs busy — backlog draining, REFILL the job manifest now
+GPU_BUSY: 7/8 GPUs working
+GPU_IDLE: only 4/8 GPUs busy — backlog draining, REFILL the job manifest now
+GPU_BUSY: 6/8 GPUs working
+GPU_IDLE: only 4/8 GPUs busy — backlog draining, REFILL the job manifest now
+GPU_BUSY: 5/8 GPUs working

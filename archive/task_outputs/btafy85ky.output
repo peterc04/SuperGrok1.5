@@ -1,0 +1,14 @@
+[supergrok15]  step    1  loss=4.58505
+[supergrok15]  step    2  loss=4.51391
+[supergrok15]  step    3  loss=4.45619
+[supergrok15]  step   10  loss=3.78738
+[supergrok15]  step   20  loss=2.77729
+[supergrok15]  step   30  loss=2.71566
+[supergrok15]  step   40  loss=2.70673
+[supergrok15]  step   50  loss=2.70860
+[supergrok15]  step   60  loss=2.70542
+[supergrok15]  step   70  loss=2.70249
+[supergrok15]  step   80  loss=2.70022
+[supergrok15]  step   90  loss=2.69866
+[supergrok15]  step  100  loss=2.69737
+[supergrok15] DONE loss 4.5850 -> 2.6974 (decreased? True; finite? True) 9048ms/step -> /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/staged_supergrok15_s0.json

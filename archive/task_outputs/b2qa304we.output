@@ -1,0 +1,6 @@
+  using sg::algorithms::adamw_step;
+  using sg::algorithms::adamw_step;
+[adamw/seed0] params=1,475,884,899 D=1600 L=48 NT=582 GH=4 | opt=adamw(id=0) lr=0.003 steps=2 ncta=8 seed=0 | build=164.3s
+Traceback (most recent call last):
+    loss, _ = mod.tc_train_step_opt(
+torch.OutOfMemoryError

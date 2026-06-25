@@ -1,0 +1,3 @@
+gpu5 vit-fast done
+DONE vit:neuralgrok (gpu 5)
+    100.0     307857317653          8  38482164706.6  38483176852.0  38465388158  38489647079    8128738.7  void sg::fused::sm90::fused_vit_megakernel_tc<(sg::fused::sm90::OptId)6, sg::fused::par::ParConfig<…

@@ -1,0 +1,4 @@
+[runtime split] spawning aot: /usr/bin/python3 -m grokking_optimizers.compile --aot-only -O adamw -M decoder -A sm_90 --out /workspace/tune_out/adamw_decoder --bayesian-trials 50 --max-tune-seconds 900
+[runtime split] spawning jit: /usr/bin/python3 -m grokking_optimizers.compile --jit-only -O adamw -M decoder -A sm_90 --out /workspace/tune_out/adamw_decoder --bayesian-trials 50 --max-tune-seconds 900
+adamw/decoder/sm_90:   0%|          | 0/4 [00:00<?, ?phase/s] adamw/decoder/sm_90:  50%|█████     | 2/4 [00:19<00:19,  9.79s/phase] , jit-autotune[build] FAILED — no .so produced; see /workspace/tune_out/adamw_decoder/compile_adamw_decoder_sm_90.txt for the full error log
+[compile] FAILED — build() returned None for adamw/decoder/sm_90 (runtime=jit). See /workspace/tune_out/adamw_decoder/compile_adamw_decoder_sm_90.txt for details.

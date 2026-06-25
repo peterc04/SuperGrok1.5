@@ -1,0 +1,40 @@
+Using /root/.cache/torch_extensions/py311_cu124 as PyTorch extensions root...
+Loading extension module mega_mamba_real_adamw_tc...
+____________________ test_tc_proj_dw_exact_on_own_operands _____________________
+
+    @_GATE
+    def test_tc_proj_dw_exact_on_own_operands():
+        """(2) The output-stationary dW GEMM (K=T) is bit-exact on the kernel's OWN
+        stored bf16 acts: dump dY_dyout[L1], X_ygated[L1], contract fp32 ascending-t,
+        compare to the kernel's out_proj.weight[L1] grad slice. ~1e-6 isolates the dW
+        GEMM from the operand-chain bf16 divergence (calibrates the per-tensor tol)."""
+        mod = _build_tc_module()
+        _disable_tf32()
+        dev = "cuda"
+        named = _eager_mamba3_named(seed=7)
+        B = 128
+        g = torch.Generator().manual_seed(11)
+        tokens = torch.randint(0, VOCAB, (B, SEQ), generator=g)
+        targets = torch.randint(0, P_HEAD, (B,), generator=g)
+        params = _flat(named).to(dev)
+        total = int(mod.TOTAL)
+        state = torch.zeros(3 * total, dtype=torch.float32, device=dev)
+        _, kgrad = _run_tc_step(mod, params.clone(), tokens.to(dev), targets.to(dev),
+                                state, lr=1e-3, betas=(0.9, 0.98), wd=0.0, eps=1e-8, step=1)
+        kgrad = kgrad.cpu().double()
+        # dump reads the CACHED GPU workspace; params is used only for device+nCTA → pass the GPU tensor.
+>       dY, X = mod.tc_dump_outproj_operands(params, B)   # [T*d], [T*d_inner] fp32 (CPU)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       RuntimeError: tc_dump_outproj_operands: obsolete on the Mamba-3 scalar path (no stored bf16 projection acts; dW is in the full-grad partial).
+
+tests/hw/test_mamba_tc.py:551: RuntimeError
+=============================== warnings summary ===============================
+../../../../../usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58
+  /usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+    import pynvml  # type: ignore[import]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/hw/test_mamba_tc.py::test_tc_single_step_grad_parity - Assertion...
+FAILED tests/hw/test_mamba_tc.py::test_tc_proj_dw_exact_on_own_operands - Run...
+2 failed, 3 passed, 1 warning in 1062.20s (0:17:42)

@@ -1,0 +1,8 @@
+EXIT=1
+Emitting ninja build file /workspace/flagship_build/mega_decoder_staged/build.ninja...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+  using sg::algorithms::adamw_step;
+  using sg::algorithms::adamw_step;
+[adamw/seed0] params=1,475,884,899 D=1600 L=48 NT=582 GH=4 | opt=adamw(id=0) lr=0.003 steps=6 ncta=4 seed=0 | build=167.4s
+Traceback (most recent call last):
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 5.50 GiB. GPU 0 has a total capacity of 79.20 GiB of which 3.50 GiB is free. Process 3283987 has 516.00 MiB memory in use. Process 3284604 has 75.19 GiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

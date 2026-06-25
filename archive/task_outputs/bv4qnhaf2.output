@@ -1,0 +1,16 @@
+============================================================
+/tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/sanwrap.sh FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-06-25_07:27:04
+  host      : e4af379d6fcc
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 188815)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+=== exit; sanitizer rank0 head ===

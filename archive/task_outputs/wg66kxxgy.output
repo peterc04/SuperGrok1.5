@@ -1,0 +1,63 @@
+{
+  "summary": "Parallel WORKTREE-ISOLATED apply+build+gate of the ViT-flagship, Mamba-flagship, and datasets specs — each agent applies its spec to an isolated copy, runs its gate, reports pass + exact deviations",
+  "agentCount": 3,
+  "logs": [
+    "parallel[0] failed: Failed to resolve base branch \"origin/main\": git rev-parse failed",
+    "parallel[1] failed: Failed to resolve base branch \"origin/main\": git rev-parse failed",
+    "parallel[2] failed: Failed to resolve base branch \"origin/main\": git rev-parse failed",
+    "Applied: 0/3 gates passed"
+  ],
+  "result": [
+    null,
+    null,
+    null
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Apply"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "apply ViT flagship",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "error": "Failed to resolve base branch \"origin/main\": git rev-parse failed",
+      "queuedAt": 1782353391237,
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5 — you may freely Edit/Write/Bash/build in it; your changes do NOT touch other agents. Your job: APPLY one apply-ready spec, then BUILD+GATE it, and report the result precisely.\nPROCEDURE: (1) Read the spec file IN FULL. (2) For EACH OLD/NEW block, apply the edit with an exact-match Edit (the OLD blocks were copied verbatim fro…",
+      "lastProgressAt": 1782353398358
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "apply Mamba flagship",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "error": "Failed to resolve base branch \"origin/main\": git rev-parse failed",
+      "queuedAt": 1782353391237,
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5 — you may freely Edit/Write/Bash/build in it; your changes do NOT touch other agents. Your job: APPLY one apply-ready spec, then BUILD+GATE it, and report the result precisely.\nPROCEDURE: (1) Read the spec file IN FULL. (2) For EACH OLD/NEW block, apply the edit with an exact-match Edit (the OLD blocks were copied verbatim fro…",
+      "lastProgressAt": 1782353399331
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "apply datasets Layer-A",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "error": "Failed to resolve base branch \"origin/main\": git rev-parse failed",
+      "queuedAt": 1782353391237,
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5 — you may freely Edit/Write/Bash/build in it; your changes do NOT touch other agents. Your job: APPLY one apply-ready spec, then BUILD+GATE it, and report the result precisely.\nPROCEDURE: (1) Read the spec file IN FULL. (2) For EACH OLD/NEW block, apply the edit with an exact-match Edit (the OLD blocks were copied verbatim fro…",
+      "lastProgressAt": 1782353400300
+    }
+  ],
+  "totalTokens": 0,
+  "totalToolCalls": 0
+}

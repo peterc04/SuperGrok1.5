@@ -1,0 +1,4 @@
+EXIT=1
+[supergrok2/seed0] params=1,475,884,899 D=1600 L=48 NT=582 GH=4 | opt=supergrok2(id=10) lr=0.001 steps=8 ncta=1 seed=0 | build=165.9s
+Traceback (most recent call last):
+RuntimeError: SG2 TC megakernel launch failed: out of memory

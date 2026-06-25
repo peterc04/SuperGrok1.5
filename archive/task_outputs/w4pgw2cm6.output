@@ -1,0 +1,84 @@
+{
+  "summary": "READ-ONLY deep dead-code analysis: confirm the removable build/scan/session artifacts, reachability-check the true source for provably-dead code, and produce the apply-ready removal spec + the post-cleanup LOC/language report (deliverable #2)",
+  "agentCount": 2,
+  "logs": [
+    "Dead-code analysis: 8089139 removable lines identified"
+  ],
+  "result": [
+    {
+      "name": "deadcode_artifacts",
+      "area": "committed NON-SOURCE artifacts + final LOC report",
+      "spec_path": "/workspace/impl_diffs/deadcode_artifacts.md",
+      "removable_lines": 8089083,
+      "confidence": "high",
+      "risks": [
+        "build untouched: MANIFEST.in/setup.py/package_data ship none of the artifacts; no __init__.py in any artifact dir",
+        "only artifact reference is inside _scan_prep.sh (itself removed); post-apply grep returns nothing",
+        "results/ KEPT (reference benchmark data, referenced by README + 7 tuning scripts + .gitignore deliverable note)"
+      ],
+      "summary": "Verified all four named artifact sets are provably dead (zero source/build/test/CI references; only self-references and references inside the to-be-removed _scan_prep.sh). Apply-ready rm list at /workspace/impl_diffs/deadcode_artifacts.md removes 528 git-tracked files = 8,089,083 text lines (95.73% of committed repo text). Breakdown: _dectc_codegen/ (64 files, ~7.95M lines of nvcc .ii/.cpp/.gpu/.ptx/.c/.cubin/.fatbin intermediate dumps), _scan/ (43 files, ~91K lines of secret/PII scan output + chunks), _scan_prep.sh + _scan_prep.log (the standalone scan generator + its log), claude_session_archive/ (419 files, ~87K lines of Claude session transcripts/tool-results). No in-file edits needed in any surviving source — the only artifact reference lives in _scan_prep.sh which is itself deleted. Packaging (MANIFEST.in/setup.py/pyproject) ships none of these; no __init__.py so none are importable. results/ is FLAGGED TO KEEP as curated reference benchmark data (referenced by README, HARDWARE_VALIDATION, AUTOTUNE_LINKAGE, and 7 tuning scripts; .gitignore explicitly marks results/h100_grokking_race/ a deliverable). Recomputed cloc-style LOC report (git-tracked, excl third_party/.git/pycache): WHOLE REPO 8,450,093 text lines / 1,562 text files / 688 binaries / 2,250 files; TRUE SOURCE after removal 361,010 lines / 1,047 text files / 675 binaries / 1,722 files (4.27% of current). Post-apply verification grep confirmed clean."
+    },
+    {
+      "name": "deadcode_source",
+      "area": "deadcode_source",
+      "spec_path": "/workspace/impl_diffs/deadcode_source.md",
+      "removable_lines": 56,
+      "confidence": "high",
+      "risks": [
+        "see structured risks above"
+      ],
+      "summary": "Reachability-checked the TRUE SOURCE (grokking_optimizers/*.py, csrc/**, tests/**, tuning/**, root *.py). Found exactly ONE provably-dead path: the obsolete tc_dump_outproj_operands on the Mamba scalar-TC cell. Its C++ body is an unconditional TORCH_CHECK(false, \"...obsolete...\") stub; the only caller is test_tc_proj_dw_exact_on_own_operands, which is SKIPPED on CPU CI and can only RuntimeError on real sm_90 hardware (not a parity/determinism/math-drift gate). Spec removes: the cu function + its calibration comment (mega_mamba_real_adamw_tc.cu lines 140-158), its pybind .def (lines 245-246), and the sole-caller test + one separator blank (test_mamba_tc.py lines 529-563), with verbatim OLD snippets. Total 56 lines (optional docstring prose not counted). The other task-flagged candidates are NOT removable and are documented as KEEP/absent: (2a) MambaModel/SelectiveSSMLayer are LIVE (oracle ground-truth for test_mamba_megakernel.py); (2b) _maybe_wrap_cuda_graph does not exist (0 hits) and grokking_race_v2.py is owned by datasets_v2.md; (3a) the dead mega_<model>_<opt>.cu cells were already deleted (33 sm_90 .cu absent; gfx942 .hip include the existing fused_megakernel.hip.hpp); (3b) verify_all.py's references to absent shims are a LIVE CI gate, not dead code; (4) decoder/vit tc_dump_ff2_operands are real working functions (KEEP), no dead #if/commented blocks found, _maybe_checkpoint duplicates are all in-file reachable. Spec at /workspace/impl_diffs/deadcode_source.md."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Analyze"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "removable artifacts audit + LOC report",
+      "phaseIndex": 1,
+      "phaseTitle": "Analyze",
+      "agentId": "a5c3513a56c5de1a5",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782363088384,
+      "queuedAt": 1782363088365,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "committed NON-SOURCE artifacts + final LOC report",
+      "promptPreview": "READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write your spec to /workspace/impl_diffs/<AREA>.md as an apply-ready removal list (exact paths to delete + exact in-file OLD snippets to remove, VERBATIM). PROJECT: the production path is the L3-TC persistent wgmma megakernel; the 33 _tc cells + the prebuilt _ops + the 3 model layouts + the gfx942/tpu trees must STAY; on…",
+      "lastProgressAt": 1782363621275,
+      "tokens": 70800,
+      "toolCalls": 23,
+      "durationMs": 532891,
+      "resultPreview": "{\"area\":\"committed NON-SOURCE artifacts + final LOC report\",\"spec_path\":\"/workspace/impl_diffs/deadcode_artifacts.md\",\"removable_lines\":8089083,\"confidence\":\"high\",\"risks\":[\"build untouched: MANIFEST.in/setup.py/package_data ship none of the artifacts; no __init__.py in any artifact dir\",\"only artifact reference is inside _scan_prep.sh (itself removed); post-apply grep returns nothing\",\"results/ K…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "source reachability dead-code (line-by-line)",
+      "phaseIndex": 1,
+      "phaseTitle": "Analyze",
+      "agentId": "aec13e7eda9367b8b",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782363088385,
+      "queuedAt": 1782363088365,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "deadcode_source",
+      "promptPreview": "READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write your spec to /workspace/impl_diffs/<AREA>.md as an apply-ready removal list (exact paths to delete + exact in-file OLD snippets to remove, VERBATIM). PROJECT: the production path is the L3-TC persistent wgmma megakernel; the 33 _tc cells + the prebuilt _ops + the 3 model layouts + the gfx942/tpu trees must STAY; on…",
+      "lastProgressAt": 1782363494144,
+      "tokens": 101557,
+      "toolCalls": 52,
+      "durationMs": 405759,
+      "resultPreview": "{\"area\":\"deadcode_source\",\"spec_path\":\"/workspace/impl_diffs/deadcode_source.md\",\"removable_lines\":56,\"confidence\":\"high\",\"risks\":[\"see structured risks above\"],\"summary\":\"Reachability-checked the TRUE SOURCE (grokking_optimizers/*.py, csrc/**, tests/**, tuning/**, root *.py). Found exactly ONE provably-dead path: the obsolete tc_dump_outproj_operands on the Mamba scalar-TC cell. Its C++ body is a…"
+    }
+  ],
+  "totalTokens": 172357,
+  "totalToolCalls": 75
+}

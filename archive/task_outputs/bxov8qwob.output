@@ -1,0 +1,6 @@
+...................                                                      [100%]
+=============================== warnings summary ===============================
+../../../../../usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+19 passed, 1 warning in 141.14s (0:02:21)

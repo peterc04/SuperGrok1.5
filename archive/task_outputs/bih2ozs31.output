@@ -1,0 +1,8 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[smoke-adamw] params=1,475,884,899 D=1600 L=48 | opt=adamw(id=0) lr=0.003 steps=5 seed=0 | build=107.7s
+[smoke-adamw]  step    1  loss=4.58505
+[smoke-adamw]  step    2  loss=4.33890
+[smoke-adamw]  step    3  loss=4.04579
+[smoke-adamw]  step    5  loss=3.44510
+[smoke-adamw] DONE loss 4.5850 -> 3.4451 (decreased>1.0? True; finite? True) 2606ms/step -> /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/smoke_adamw.json

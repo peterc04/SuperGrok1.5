@@ -1,0 +1,4 @@
+GATE_EXIT=0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+19 passed, 1 warning in 109.94s (0:01:49)

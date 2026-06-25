@@ -1,0 +1,11 @@
+VIT EVENT:
+  [adamw      ] FAILED: TC vit megakernel launch failed (opt_id=0): out of memory
+CSVFAIL,vit,adamw,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=0): out of memory')
+  [lion       ] FAILED: TC vit megakernel launch failed (opt_id=1): out of memory
+CSVFAIL,vit,lion,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=1): out of memory')
+  [grokfast   ] FAILED: TC vit megakernel launch failed (opt_id=2): out of memory
+CSVFAIL,vit,grokfast,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=2): out of memory')
+  [grokadamw  ] FAILED: TC vit megakernel launch failed (opt_id=3): out of memory
+CSVFAIL,vit,grokadamw,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=3): out of memory')
+  [neuralgrok ] FAILED: TC vit megakernel launch failed (opt_id=6): out of memory
+CSVFAIL,vit,neuralgrok,1664,1596200417,RuntimeError('TC vit megakernel launch failed (opt_id=6): out of memory')

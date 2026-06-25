@@ -1,0 +1,7 @@
+VIT RESULT:
+[vit-multiopt] d=1664 layers=48 seq=17 vocab=97 params=1,596,200,417
+CSVFAIL,vit,adamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+CSVFAIL,vit,lion,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+CSVFAIL,vit,grokfast,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+CSVFAIL,vit,grokadamw,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process
+CSVFAIL,vit,neuralgrok,1664,1596200417,OutOfMemoryError('CUDA out of memory. Tried to allocate 5.95 GiB. GPU 0 has a total capacity of 79.20 GiB of which 4.26 GiB is free. Process

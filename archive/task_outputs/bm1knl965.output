@@ -1,0 +1,15 @@
+[rank3]: RuntimeError: CUDA error: an illegal memory access was encountered
+[rank3]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[rank3]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+[rank0]: Traceback (most recent call last):
+[rank0]: RuntimeError: CUDA error: an illegal memory access was encountered
+[rank0]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[rank0]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 348, in wrapper
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+tuning/_tp8_run.py FAILED
+  <NO_OTHER_FAILURES>
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html

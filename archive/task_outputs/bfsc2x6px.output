@@ -1,0 +1,5 @@
+[GPU1] launching adamw (ncta=4, steps=100)
+[GPU2] launching looksam (ncta=4, steps=100)
+[GPU4] launching supergrok11 (ncta=4, steps=100)
+[GPU1] adamw exit=0
+[GPU1] launching lion (ncta=4, steps=100)

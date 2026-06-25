@@ -1,0 +1,9 @@
+DEC SWEEP DONE:
+SAT,decoder,adamw,B128,cap8,3112.4822,1.4557,0.1472
+SAT,decoder,adamw,B512,cap8,5393.9546,3.3600,0.3397
+SAT,decoder,adamw,B128,cap16,2282.3621,1.9852,0.2007
+SAT,decoder,adamw,B512,cap16,2832.7322,6.3979,0.6469
+SAT,decoder,adamw,B128,cap32,1790.8131,2.5301,0.2558
+SAT,decoder,adamw,B512,cap32,2143.4114,8.4555,0.8550
+SAT,decoder,adamw,B128,cap64,1548.3995,2.9262,0.2959
+BEST: 8.46 TF/s (0.85% peak) at B=512 cap=32 step=2143.41ms

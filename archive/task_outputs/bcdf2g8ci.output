@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+torch.OutOfMemory[stderr] tail: /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/smoke_adamw.log: file truncated
+Error: CUDA out of memory. Tried to allocate 5.50 GiB. GPU 0 has a total capacity of 79.20 GiB of which 3.50 GiB is free. Process 3283987 has 516.00 MiB memory in use. Process 3284604 has 75.19 GiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[adamw/seed0]  step    1  loss=4.58505
+[adamw/seed0]  step    2  loss=4.33890
+[adamw/seed0]  step    3  loss=4.04579
+[adamw/seed0]  step    6  loss=3.17671
+[adamw/seed0] DONE

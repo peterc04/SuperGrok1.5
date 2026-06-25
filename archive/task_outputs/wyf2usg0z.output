@@ -1,0 +1,105 @@
+{
+  "summary": "Two parallel READ-ONLY design specs: 3D-5D adaptive parallelism with Expert Parallelism as the 5th axis (degree inferred from front-end params), and size/config-adaptive kernel specialization (CTA-tiling) via if-constexpr config templating",
+  "agentCount": 2,
+  "logs": [
+    "Adaptive design specs: 2/2"
+  ],
+  "result": [
+    {
+      "name": "adaptive_parallelism",
+      "area": "csrc/fused/sm_90/parallel_config.cuh + grokking_optimizers/parallel/* + grokking_race_v2.py front-end (adaptive 3D-5D mesh: EP 5th axis + front-end ParConfig inference)",
+      "spec_path": "/workspace/impl_diffs/adaptive_parallelism.md",
+      "files_changed": [
+        "/workspace/impl_diffs/adaptive_parallelism.md"
+      ],
+      "gate_commands": [
+        "python -c \"import grokking_optimizers.parallel\"",
+        "python -m pytest tests/ -k \"parallel or config\" -q",
+        "bash scripts/compile_to_object.sh tests/hw/tp_loopback_binding.cu"
+      ],
+      "confidence": "high",
+      "risks": [
+        "EP is HONESTLY INERT for the entire current model roster: decoder/vit/mamba declare NO model-level experts (grokking_race_v2.py num_experts keys are ALL sg2_* = the SuperGrok2 OPTIMIZER's PEER meta-net, never a model layer), so the front-end inference returns EP=1 for every race model and the EP kernel branch is never instantiated. EP is delivered as the FUTURE-MoE-model seam (byte-identical when OFF), not a working expert dispatch. Verified live: model_num_experts disambiguation skips the optimizer key.",
+        "The kernel-side EP expert-dispatch BODY (ep_transport.cuh all-to-all + the routed/grouped expert GEMM) is a SCOPED FOLLOW-ON, not authored here (it needs a model with experts + a GPU build loop, the same split tp_kernel.md uses for the TP reduce body). What lands now is the complete compile-time + host seam: the ParConfig EP axis, the EP CommCtx fields, the EP team (already in distributed.py mesh), and the if-constexpr(Par::kEPComm) gate points.",
+        "EP MUST be the 6th template param positioned AFTER Z and defaulted to 1 (ParConfig<DP,TP,PP,SP,Z,int EP=1>). Verified by grep that all five live ParConfig<...> sites use exactly 5 args; placing EP before Z or non-defaulted would break the SingleGPU alias + the test_parallel_instantiation allow-list and violate byte-identity. Compile-proven: legacy 5-arg + 6-arg EP both compile; EP=1 folds kEPComm to false.",
+        "The EP-AUTO degree heuristic in infer_parallel_config (largest divisor of DP <= n_experts) is a sensible default but a real MoE model should pass expert_parallel= explicitly; on the recommended TP=world / DP=1 saturation mesh EP would be 1 even for a MoE model unless DP is freed (lower TP), since EP sub-divides DP per distributed.py.",
+        "EDIT D (package export) makes import grokking_optimizers.parallel pull torch (auto_config imports distributed.ParallelConfig, which imports torch at top). This is already the case on this box (gate 1 passes today with torch present); a torch-free parallel import would need the ParallelConfig import moved call-time (noted as optional in the spec)."
+      ],
+      "summary": "Authored /workspace/impl_diffs/adaptive_parallelism.md — apply-ready spec upgrading the fixed 4D mesh to ADAPTIVE 3D-5D, with all VERBATIM OLD snippets byte-exact against the live files and every edit compile-proven this session. (1) EDIT A/B add EP as the 5th axis on ParConfig as a TRAILING, DEFAULTED 6th template param (ParConfig<DP,TP,PP,SP,Z,int EP=1>) plus kEP/kEPComm gates (mirroring kTP/kTPComm exactly) and five ep_* CommCtx fields (mirroring the tp_* team wiring exactly), with the in-kernel expert all-to-all/dispatch gating spelled out under if constexpr(Par::kEPComm) and the expert-dispatch megakernel body honestly scoped as a flagged follow-on. (2) EDIT C is a new pure-Python grokking_optimizers/parallel/auto_config.py with infer_parallel_config: base 3D DPxTPxPP, +SP iff sequence model (decoder/ViT/Mamba all sequence-eligible, SP pinned 1 per the kernel static_assert), +EP iff the model declares experts (num_experts>1 / moe flag) — with the load-bearing disambiguation that model-MoE != the SG2 optimizer PEER experts. It honors world=8, the run_harness.md TP=world saturation mesh, and maps to the ParConfig<...> template the launcher dispatches via AdaptivePlan. EDIT D exports it; EDIT E extends the test_parallel_instantiation allow-list with the EP point + EP-fold static_asserts. (3) Byte-identical when OFF: every 5-arg ParConfig site resolves EP=1 (kEPComm=false, all EP branches fold), the dense CommCtx ABI is preserved, and the current 4D flagship path is unchanged. CRITICAL HONEST FINDING (verified live): EP is inert for the entire current roster — no race model has a model-level MoE, so the front-end returns EP=1 for all of them; EP is the future-MoE seam, byte-identical-when-OFF, not a working dispatch. All three gate commands pass at baseline (8 passed/2 skipped; nvcc instantiation 3 passed; loopback COMPILE_OK), and a scratch nvcc harness proved the 6-arg ParConfig + widened CommCtx + EP-fold + extended allow-list all compile while SP=2 stays loudly rejected. gfx942/tpu untouched."
+    },
+    {
+      "name": "size_adaptive",
+      "area": "grokking_optimizers/megakernel_codegen.py + the megakernel tile/occupancy config (csrc/fused/sm_90/*.cuh tile knobs, ring stages, CTA/occupancy) + the autotuner (tuning/ + compile.py autotune)",
+      "spec_path": "/workspace/impl_diffs/size_adaptive.md",
+      "files_changed": [
+        "/workspace/impl_diffs/size_adaptive.md"
+      ],
+      "gate_commands": [
+        "python -m grokking_optimizers.megakernel_codegen --decoder-layout > /tmp/d.cuh && diff /tmp/d.cuh csrc/fused/sm_90/decoder_layout.cuh",
+        "python -c \"import grokking_optimizers.megakernel_codegen\"",
+        "python -m grokking_optimizers.megakernel_codegen --decoder-knobs",
+        "CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q"
+      ],
+      "confidence": "HIGH for the apply-now Python/POD edits (A,B,D — both task gate commands verified green on baseline this session, all verbatim anchors confirmed byte-exact); MEDIUM-HIGH for the kernel-track Sz threading (C, OFF-path provably identical); SCOPED-ONLY for the real CTA-tiled body (§7).",
+      "risks": [
+        "The CTA-tiled (occupancy>1) megakernel body is a REAL kernel change deliberately left as precise scoping (§7), NOT byte-exact: the persistent GridBarrier assumes 1 CTA/SM (n_ctas==gridDim.x), so occupancy>1 needs a Hopper thread-block cluster (cluster.sync + distributed-smem) for the intra-tile join, a cluster launch (cudaLaunchKernelEx), and an on-silicon bit-exact parity gate before SizeLarge is routed by production dispatch.",
+        "The LARGE-tier predicate (d>=1024 OR n_tiles<n_sms) is a documented judgment call; it correctly classifies the 3 named tiers (production=small, bench/flagship=large) but the true cross-over should be re-measured on silicon once §7 lands. It is tunable in one place (decoder_knobs_for_size).",
+        "Memory composition: CTA-tiling grows nCTA, and the SG2 per-CTA scratch is linear in nCTA, so the large tier must pair CTA-tiling (P1 latency) with the run_harness.md auto_ncta cap (SG2 footprint) — flagged for the §4 large-tier retune, not yet encoded.",
+        "Autotuner cache hygiene: the new size_tier dim must stay OUT of _LIVE_TUNING_DIMS until §7 makes the large tier emit distinct SASS (else it false-splits the cache on binary-identical configs); flagged inline per the compile.py:1280 dead-dim precedent.",
+        "EDIT C composes with the still-pending tp_kernel.md launcher Par edit; the §5.4 MERGE NOTE specifies the combined head <OptId Opt, class Par, class Sz> and the comm forward — apply order is irrelevant since each axis defaults independently, but the three <Opt> launcher references must match whatever Par state the live launcher is in."
+      ],
+      "summary": "Authored /workspace/impl_diffs/size_adaptive.md: an apply-ready spec for SIZE/CONFIG-adaptive megakernel specialization, the self-designing megakernel made concrete. It adds a compile-time SizeConfig template axis that mirrors par::ParConfig exactly and is gated by the same if-constexpr-on-config mechanism that folds the distributed all-reduce. Five edits: (A) parallel_config.cuh SizeConfig<CtaTile,CtasPerTile,ClusterDim,TileN> + SizeSmall/SizeLarge aliases (POD, additive, default SizeSmall = shipped predicates = byte-identical); (B) megakernel_codegen.py decoder_knobs_for_size(d,layers,T,n_sms) size-tier selector + DEC_SIZE_TIERS + a --decoder-knobs CLI (pure Python, the production/bench/flagship tiers keep their CURRENT knobs so today's gates stay green; CTA-tiling carried via size_config not the -D knobs on this increment); (C) fused_decoder_megakernel.cuh threads <class Sz = par::SizeSmall> onto kernel+launcher with additive if-constexpr(Sz::kCtaTile) / if-constexpr(Sz::kUseCluster) NO-OP seams at the P1 loop + launch shape (byte-identical OFF; the seams are the §7 landing points); (D) compile.py adds a size_tier autotune dim + _decoder_size_tier_pins delegating to the codegen selector (one source of truth, leads with small=defaults so canonical build is byte-identical). The selector composes with ParConfig (distributed+large => CTA-tiling + all-reduce; single+small => neither). The real CTA-tiled occupancy>1/cluster body is precisely SCOPED in §7 (the GridBarrier 1-CTA/SM assumption, tile ownership across P1/P2/P3, cluster distributed-smem) as the GPU-window follow-on. Every verbatim OLD anchor was confirmed byte-exact against the live files; both task gate commands (--decoder-layout diff, module import) verified green on the baseline this session."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Design"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "3D-5D adaptive + Expert Parallelism (EP)",
+      "phaseIndex": 1,
+      "phaseTitle": "Design",
+      "agentId": "aef5260d2c47452a5",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782355156327,
+      "queuedAt": 1782355156306,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/fused/sm_90/parallel_config.cuh + grokking_optimizers/…",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits (VERBATIM OLD copied from the live file + NEW replacement; new files in full).\nVERIFIED CONTEXT (this session): production path = the L3-TC PERSISTENT wgmma megakernel (1 CTA/SM, hand GridBarrier, fwd-bwd-opt fused in ONE __global__ launch). It is now TEM…",
+      "lastProgressAt": 1782355776956,
+      "tokens": 207456,
+      "toolCalls": 35,
+      "durationMs": 620628,
+      "resultPreview": "{\"area\":\"csrc/fused/sm_90/parallel_config.cuh + grokking_optimizers/parallel/* + grokking_race_v2.py front-end (adaptive 3D-5D mesh: EP 5th axis + front-end ParConfig inference)\",\"spec_path\":\"/workspace/impl_diffs/adaptive_parallelism.md\",\"files_changed\":[\"/workspace/impl_diffs/adaptive_parallelism.md\"],\"gate_commands\":[\"python -c \\\"import grokking_optimizers.parallel\\\"\",\"python -m pytest tests/ -…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "size/config-adaptive kernel specialization (CTA-tiling)",
+      "phaseIndex": 1,
+      "phaseTitle": "Design",
+      "agentId": "af3682bc3735263dd",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782355156329,
+      "queuedAt": 1782355156306,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "grokking_optimizers/megakernel_codegen.py + the megakernel …",
+      "promptPreview": "You are READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits (VERBATIM OLD copied from the live file + NEW replacement; new files in full).\nVERIFIED CONTEXT (this session): production path = the L3-TC PERSISTENT wgmma megakernel (1 CTA/SM, hand GridBarrier, fwd-bwd-opt fused in ONE __global__ launch). It is now TEM…",
+      "lastProgressAt": 1782355702122,
+      "tokens": 189015,
+      "toolCalls": 33,
+      "durationMs": 545793,
+      "resultPreview": "{\"area\":\"grokking_optimizers/megakernel_codegen.py + the megakernel tile/occupancy config (csrc/fused/sm_90/*.cuh tile knobs, ring stages, CTA/occupancy) + the autotuner (tuning/ + compile.py autotune)\",\"spec_path\":\"/workspace/impl_diffs/size_adaptive.md\",\"files_changed\":[\"/workspace/impl_diffs/size_adaptive.md\"],\"gate_commands\":[\"python -m grokking_optimizers.megakernel_codegen --decoder-layout >…"
+    }
+  ],
+  "totalTokens": 396471,
+  "totalToolCalls": 68
+}

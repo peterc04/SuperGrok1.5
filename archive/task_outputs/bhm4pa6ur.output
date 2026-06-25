@@ -1,0 +1,8 @@
+cells found: 33
+adamw/decoder
+adamw/mamba
+adamw/vit
+grokadamw/decoder
+grokadamw/mamba
+=== launching 33-cell runtime sweep across 8 H100s (background) ===
+sweep pid=12666

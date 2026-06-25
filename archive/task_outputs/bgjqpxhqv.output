@@ -1,0 +1,10 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+L48_COMPILE_EXIT=0
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    23616 bytes stack frame, 3956 bytes spill stores, 3976 bytes spill loads
+ptxas info    : Used 255 registers, 23616 bytes cumulative stack size, 25360 bytes smem

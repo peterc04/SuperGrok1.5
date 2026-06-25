@@ -1,0 +1,8 @@
+=== done count: 7/7 after 465s ===
+-rw-r--r-- 1 root root 3725 Jun 25 04:14 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_adamw_s0.json
+-rw-r--r-- 1 root root 3739 Jun 25 04:14 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_adamw_s1.json
+-rw-r--r-- 1 root root 3727 Jun 25 04:14 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_adamw_s2.json
+-rw-r--r-- 1 root root 3738 Jun 25 04:17 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_grokadamw_s0.json
+-rw-r--r-- 1 root root 3727 Jun 25 04:16 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_grokfast_s0.json
+-rw-r--r-- 1 root root 3720 Jun 25 04:15 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_lion_s0.json
+-rw-r--r-- 1 root root 3734 Jun 25 04:17 /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/loss_neuralgrok_s0.json

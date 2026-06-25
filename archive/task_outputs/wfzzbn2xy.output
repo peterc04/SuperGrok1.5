@@ -1,0 +1,133 @@
+{
+  "summary": "Three parallel WORKTREE apply-agents on DISJOINT file sets: TP remainder (C.3 loop + D reduce-points + E launcher heap), memory-strategy seam (mem_config + planner), and EP + size-adaptive seams; each applies+builds+gates+commits, reports sha to cherry-pick",
+  "agentCount": 3,
+  "logs": [
+    "Apply-remaining: 3/3 gates passed; shas 4d60173d 2493dcc0 ec3ae503"
+  ],
+  "result": [
+    {
+      "name": "tp_remainder",
+      "area": "tp_remainder",
+      "applied_clean": true,
+      "gate_pass": true,
+      "commit_sha": "4d60173d4788fe705b453d367a4c75d1a9e1a557",
+      "deviations": [
+        "EDIT D used the spec's SAFE two-body shape (not the DRY forwarder): the SingleGPU dectc_forward_tile/dectc_backward_tile bodies are left BYTE-IDENTICAL and untouched; the TP path lives in NEW dectc_forward_tile_impl/dectc_backward_tile_impl<Par,Transport> + dectc_*_tile_tp wrappers. The spec explicitly sanctions this as the zero-risk default ('two bodies, zero risk to the shipped path'). No back-compat forwarders through the impl were needed since the originals are kept verbatim.",
+        "Attention head-localization on the kTPComm path was SCOPED OUT (recorded in-code as a deviation). The spec (§6 NOTE / §12) flags H_loc=kHeads/P + the local-shard qkv stride as 'the one extra correctness touch BEYOND the four reduce points' and as 'the part most likely to need an on-silicon iteration at the 8xH100 window'. dectc_attn_fwd_tile/_bwd_tile hardcode 3*dec::kD stride and dec::kHeads; a correct rewrite is a deeper change. On the kTPComm _impl, attention runs full-width (the four linear-projection reduces + col-parallel forward widths ARE applied exactly). This does NOT affect any of the three mandatory gates (all SingleGPU/loopback). The 8-GPU attention-shard remains for the saturation-window task.",
+        "EDIT E.2: instead of adding a trailing 'int tp_size' to the SINGLE definition (which would change the mangled symbol and break dispatch.cpp's existing extern, a file I do not own), I added the tp_size param to the definition AND a 17-arg back-compat forwarder overload with the EXACT original boundary that dispatch.cpp links today (forwards tp_size=1). The shipped _ops symbol is byte-identical and dispatch.cpp needs no edit; a future dispatch.cpp caller reaches the TP path via the 18-arg overload.",
+        "Touched tp_transport.cuh (NOT in my owned-four list, it is TP-foundation): added '#include <cuda_bf16.h>' + two forward declarations of tp_rowparallel_fwd_partial_tile/tp_colparallel_dx_partial_tile. REQUIRED to break the tp_layer.cuh<->model_stage_decoder_tc.cuh include cycle (tp_layer includes the tile header, but the tile _impl references tp:: helpers defined in tp_layer): the qualified-name first-phase lookup needs the decls in the transport header the tile body includes. Additive only; existing structs/helpers untouched; SingleGPU gate confirms no regression.",
+        "tp_layer.cuh (owned): fixed a pre-existing weight-dtype bug. The four partial-GEMM helpers declared Wshard as 'const float*', but EDIT D passes the bf16 weight cache (wb.*[li]) while the loopback test passes fp32 params; dectc_gemm_fwd_f32/_dx_f32 have BOTH a bf16-W and an fp32-W overload. Templated the helpers on the weight dtype (class WT) so overload resolution picks the right GEMM body per caller. Both the loopback (fp32) and the megakernel (bf16) now compile; the corrected stale 'Wshard is fp32' comment too."
+      ],
+      "gate_output_tail": "decoder TC pytest (MANDATORY SingleGPU byte-identity): 19 passed, 1 warning in 152.04s. | gate2 default TC compile: COMPILE_OK tu=csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu (-DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1). | loopback no-NVSHMEM: COMPILE_OK. | loopback NVSHMEM RDC (-DSG_HAS_NVSHMEM=1 -rdc=true): COMPILE_OK. | full ParTP8+NvshmemTransport launcher RDC: COMPILE_OK.",
+      "diffstat": "5 files changed, 614 insertions(+), 45 deletions(-) — fused_decoder_megakernel.cuh +114/-, mega_decoder_real_adamw_tc_launcher.cu +84/-, model_stage_decoder_tc.cuh +415/-, tp_layer.cuh +23/-, tp_transport.cuh +23/-",
+      "summary": "Landed ALL of the decoder TP track (the hardest track), gated byte-identical OFF, plus the full 8-GPU launcher/NVSHMEM bootstrap. EDIT C.3: the grid-lockstep P1 restructure in fused_decoder_megakernel.cuh — `if constexpr(!Par::kTPComm)` is the LITERAL byte-identical grid-stride loop; the kTPComm branch is the n_rounds/active lockstep variant so every CTA hits tr.rendezvous(bar) a grid-uniform number of times (the §1 deadlock fix); tr is constructed only inside that branch (the spec's RECOMMENDED PTX-clean move); launcher templated <Opt,Par> with the nCTA%TP assert and comm forward. EDIT D: two-body dectc_forward_tile_impl/backward_tile_impl<Par,Transport> with the FOUR all-reduce points (① out_proj fwd, ② ff2 fwd, ②' ff0 dX, ①' in_proj dX) wrapped in if constexpr(Par::kTPComm) reusing the loopback-validated tp_rowparallel_fwd_partial_tile/tp_colparallel_dx_partial_tile/tp_allreduce_sum_fixed_order, plus the col-parallel forward width ternaries, plus the _tp wrappers; the SingleGPU tile entries are left untouched/byte-identical (the spec's SAFE default). EDIT E: nvshmem_malloc symmetric tp_sym_heap split out of the cudaMalloc workspace, dec_tc_ensure_tp_sym_heap collective sizer, CommCtx population, and the TP-degree dispatch allow-list {1,8} for AdamW — all #if SG_HAS_NVSHMEM; a 17-arg back-compat forwarder keeps the shipped _ops symbol byte-identical so dispatch.cpp needs no edit. Support fixes: tp_layer.cuh helpers templated on weight dtype (fp32 loopback + bf16 megakernel both compile), and fwd-decls+cuda_bf16 added to tp_transport.cuh to break the include cycle. GATES: decoder TC pytest 19/19 (SingleGPU byte-identical, MANDATORY) PASS; both task gate_commands PASS; loopback NVSHMEM RDC compile PASS; and the full ParTP8+NvshmemTransport launcher RDC compile PASS (the 8-GPU path my EDIT E enables). REMAINING for the 8xH100 window (honestly scoped, in deviations + in-code comments): the attention head-localization (H_loc=kHeads/P local-shard qkv) — the one correctness touch beyond the four reduces the spec itself defers to on-silicon iteration; the host weight-shard plan (dist_step.md §6.C.5, explicitly out of this kernel track); and the host TP-team nvshmem_team_split_strided bootstrap (host glue, not in these files)."
+    },
+    {
+      "name": "memory_strategy",
+      "area": "memory_strategy",
+      "applied_clean": true,
+      "gate_pass": true,
+      "commit_sha": "2493dcc031527a644a837fd128059c1eccfe3235",
+      "deviations": [
+        "mem_strategy.py: the spec imported a sibling module `grokking_optimizers.parallel.flagship_budget` (the pending run_harness.md NEW FILE 1) that is NOT on disk. A module-level `from ... import flagship_budget as fb` would have made the gate `python -c \"import grokking_optimizers.parallel.mem_strategy\"` fail with ImportError. Per the spec's own §1.5 fallback note, I rebound `fb` to a thin internal adapter (`_FlagshipBudgetAdapter`) over the live, on-disk `grokking_optimizers.parallel.resource_planner` (same fused_decoder_megakernel.cuh dec_tc_*_floats scratch formulas), exposing exactly the flagship_budget-style names the spec's planner body uses (per_rank_budget/dec_tc_acts_floats/auto_ncta/H100_SAFETY_GIB/FLAGSHIP_*). The public surface (Hardware/MemPlan/plan_memory_strategy), the escalation order, and the emitted SG_MEM_* macros are byte-for-byte as the spec wrote them. When flagship_budget lands, the adapter block is the only thing to swap.",
+        "mem_strategy.py: added a `_bind_budget_model` helper (not in the spec verbatim) so the adapter's scratch math uses the run's true (total_params, layers, opt, B, hardware) rather than only the flagship pin — required because resource_planner.per_rank_budget takes a ModelConfig/HardwareConfig/Mesh, not flagship_budget's positional (opt, tp, pp, dp, zero3, ncta, B) signature. For non-flagship sizes it solves d from total~=12*L*d^2; for the exact flagship (total+layers match) it keeps the committed dims so arithmetic reproduces to the byte.",
+        "mem_config.cuh: added `#include <cstdint>` (the spec block had none) so the spec-specified `int64_t stage_tile_floats` field is well-formed and the header is self-contained/CPU-compilable, matching the sibling parallel_config.cuh convention. No semantic change.",
+        "Gate cmd 1: my AREA gate_commands list `python -c \"import grokking_optimizers.parallel.mem_strategy\"` (verified PASS). The spec doc §6 text lists `import ...zero3` as the literal first command; I verified BOTH import cleanly. Ran the AREA-specified command.",
+        "Scalar-gate convention: PROCEDURE says decoder TC builds mirror -DSG_DEC_SCALAR_MEGAKERNEL=0. The TU references SG_DEC_SCALAR_MEGAKERNEL via #if but does not define it locally (default undefined => 0 => TC path), so the gate command compiles the TC megakernel correctly WITHOUT needing the flag; I ran the gate_commands EXACTLY as the spec lists them (no extra scalar flag) and it passed."
+      ],
+      "gate_output_tail": "$ python -c \"import grokking_optimizers.parallel.mem_strategy\"  ->  IMPORT_RC=0 (GATE1_OK)\n$ bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu -DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1\nCOMPILE_OK tu=csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu\nGATE2_RC=0\n(extra) tests/test_mem_strategy.py: 10 passed; tests/test_resource_planner.py: 10 passed (no regression); standalone header g++ -std=c++17 compile: HEADER_CXX_OK (static_assert !InHbm::kAnyOffHbm holds)",
+      "diffstat": " csrc/fused/sm_90/mem_config.cuh              |  55 +++++\n grokking_optimizers/parallel/mem_strategy.py | 308 +++++++++++++++++++++++++++\n tests/test_mem_strategy.py                   | 149 +++++++++++++\n 3 files changed, 512 insertions(+)",
+      "summary": "Applied ONLY item A of memory_strategy.md (the APPLY-READY planner + gate POD + CPU test), leaving items C/D/E (real offload/recompute/streaming kernel bodies) untouched as instructed.\n\nThree NEW/disjoint files, all byte-identical-when-OFF:\n1. grokking_optimizers/parallel/mem_strategy.py (NEW, /workspace/SuperGrok1.5/.claude/worktrees/wf_02366187-925-2/grokking_optimizers/parallel/mem_strategy.py) - plan_memory_strategy escalates in-HBM -> nCTA-cap -> recompute -> offload -> stream PURELY by memory fit (fit(footprint_after_strategy, usable_hbm)), NEVER by GPU count. Hardware/MemPlan PODs; MemPlan.gate_macros() emits {SG_MEM_OFFLOAD_OPT, SG_MEM_RECOMPUTE_ACTS, SG_MEM_STREAM_LAYERS, SG_MEM_STREAM_DEPTH}. Pure-Python, no torch/GPU.\n2. csrc/fused/sm_90/mem_config.cuh (NEW) - MemConfig<OffloadOpt,RecomputeActs,StreamLayers,StreamDepth> all-static-constexpr gate POD + MemRuntime staging seam; default `using InHbm = MemConfig<false,false,false,0>` is the byte-identical sibling to par::SingleGPU (static_assert verifies kAnyOffHbm==false). No edit to parallel_config.cuh.\n3. tests/test_mem_strategy.py (NEW) - 10 CPU gates: all-OFF default macros, escalation order (recompute<offload<stream), fit-driven-not-gpu-count (same 10B model = heavy machinery on 1 small GPU, in-HBM on 8 GPUs w/ TP=8), 4-key macro contract, honest fits=False on no-fit.\n\nByte-identical guarantee: no TU #includes mem_config.cuh yet and the default path emits no -DSG_MEM_* macros, so the shipped in-HBM decoder PTX is unchanged (gate cmd 2 COMPILE_OK proves non-regression). Did NOT apply EDIT A3 (harness wiring in tuning/flagship_distributed.py) because that target file is not on disk and is owned by the run_harness/harness round; the planner's gate_macros() is the ready seam for it.\n\nBoth spec gate_commands PASS. New + existing (resource_planner) test suites green. Working tree clean (all dirty *.pyc and the pytest_cache nodeids churn restored before commit)."
+    },
+    {
+      "name": "ep_size",
+      "area": "ep_size",
+      "applied_clean": true,
+      "gate_pass": true,
+      "commit_sha": "ec3ae503372b816bfc832b61ed7eac1f76fb9381",
+      "deviations": [
+        "megakernel_codegen.py line-number drift: spec adaptive_parallelism.md/size_adaptive.md cited CLI anchors at lines 1667/1719, but live file had them at 1755/1811 (--decoder-layout-flagship / --vit-layout argparse block and the args.decoder_layout_flagship main() handler). Anchor TEXT matched verbatim, so the exact-match Edits applied unchanged; only the line numbers drifted. No other drift.",
+        "size_adaptive.md EDIT C (fused_decoder_megakernel.cuh <class Sz> threading + P1/launch seams) and EDIT D (compile.py size_tier autotuner dim + _decoder_size_tier_pins) were NOT applied: they are outside my owned AREA (AREA = parallel_config.cuh, auto_config.py, megakernel_codegen.py, tests/). EDIT C is kernel-track and EDIT D touches compile.py; both are scoped follow-ons per the task ('apply the APPLY-NOW Python/POD parts; the real CTA-tiled occupancy>1 kernel body is a scoped follow-on'). The SizeConfig POD + SizeSmall/SizeLarge aliases + decoder_knobs_for_size selector (the seams those edits hang off) ARE landed.",
+        "OBSERVATION (no code change made): with the spec's verbatim DEC_SIZE_TIERS table (production T = 512*_DEC_SEQ) and live _DEC_SEQ=4, the production tier T=2048 -> n_tiles=ceil(2048/128)=16 < n_sms=132, so the spec's verbatim _dec_is_large grid-underfill trigger classifies production as 'large' (par::SizeLarge). The spec's §9 companion narrative expected production->SizeSmall. I applied the spec's predicate + table EXACTLY as written (verbatim); the production-as-large outcome is a faithful literal consequence of the spec text against the live _DEC_SEQ value. No gate tests --decoder-knobs classification, so all four gates remain green. I did not alter the spec's verbatim code to chase the narrative expectation."
+      ],
+      "gate_output_tail": "GATE1 import grokking_optimizers.parallel: OK (rc=0). GATE2 --decoder-layout diff vs csrc/fused/sm_90/decoder_layout.cuh: byte-identical (empty diff). GATE3 bash scripts/compile_to_object.sh tests/hw/tp_loopback_binding.cu: COMPILE_OK tu=tests/hw/tp_loopback_binding.cu. GATE4 python -m pytest tests/ -k \"parallel or config\" -q: 9 passed, 2 skipped, 300 deselected, 1 warning in 14.46s. Extra: SizeConfig predicates compile-checked OK; EP allow-list harness compiles 6-arg ParConfig<1,1,1,1,Z3,8> with kEP==8/kEPComm==true/kIsSingleGPU==false and all 5-arg legacy points fold kEP==1/kEPComm==false.",
+      "diffstat": "5 files changed, 601 insertions(+), 24 deletions(-). csrc/fused/sm_90/parallel_config.cuh +153/-, grokking_optimizers/megakernel_codegen.py +146, grokking_optimizers/parallel/__init__.py +12, grokking_optimizers/parallel/auto_config.py +264 (new), tests/hw/test_parallel_instantiation.py +50/-.",
+      "summary": "Applied the APPLY-NOW Python/POD parts of BOTH specs within my owned AREA, all four gate_commands green, committed clean (5 source files only; all dirty *.pyc/.pytest_cache restored first).\n\nadaptive_parallelism.md: (A.1) EP is now the trailing-defaulted 6th ParConfig template param `template<int DP,int TP,int PP,int SP,ZeROStage Z,int EP=1>` with kEP/kEPComm; EP folds into kIsSingleGPU (`&& EP==1`), kEmitComm, and the degree static_assert (`&& EP>=1`). (B) CommCtx widened with 5 POD ep_* fields (ep_comm_handle/ep_sym_heap/ep_heap_stride_floats/ep_team_local_pe/ep_team_n_pes) mirroring the TP block, single-GPU defaults. (C) NEW grokking_optimizers/parallel/auto_config.py: infer_parallel_config (base 3D DP×TP×PP, +SP if sequence model, +EP if model-level experts), AdaptivePlan dataclass, is_sequence_model/model_num_experts/has_model_experts (with the honest sg2_* optimizer-key disambiguation), parconfig_template/to_parallel_config. (D) exported the symbols from parallel/__init__.py. (E) tests/hw/test_parallel_instantiation.py allow-list gained the +EP frontier point DP1_TP1_EP8_ZeRO3 and the EP-fold static_asserts (kEP/kEPComm + the EP-default-1 byte-identity proof).\n\nsize_adaptive.md (the parts in my AREA): (A) SizeConfig<bool CtaTile,int CtasPerTile,int ClusterDim,int TileN> POD + kCtaTile/kCtasPerTile/kClusterDim/kTileN/kUseCluster predicates + the degenerate-point static_assert, plus SizeSmall (the byte-identical default, TileN==SG_TUNED_TILE_N) and SizeLarge aliases, inserted after the SingleGPU alias. (B) megakernel_codegen.py: decoder_knobs_for_size(d,layers,T,n_sms) size-tier selector + _DEC_KNOB_DEFAULTS + _dec_is_large predicate + DEC_SIZE_TIERS + decoder_knobs_report + the --decoder-knobs CLI flag (inspection only, emits no header).\n\nByte-identity preserved: every live 5-arg ParConfig<...> site resolves EP=1 -> kEPComm=false; SingleGPU/SizeSmall paths unchanged; --decoder-layout output byte-identical; loopback TU compiles unchanged. EDIT C (kernel <class Sz> threading) and EDIT D (compile.py autotuner dim) of size_adaptive are out-of-AREA scoped follow-ons and were intentionally not authored. Files: /workspace/SuperGrok1.5/.claude/worktrees/wf_02366187-925-3/csrc/fused/sm_90/parallel_config.cuh, .../grokking_optimizers/parallel/auto_config.py, .../grokking_optimizers/parallel/__init__.py, .../grokking_optimizers/megakernel_codegen.py, .../tests/hw/test_parallel_instantiation.py."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Apply"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "TP remainder (C.3 loop + D reduce-pts + E launcher heap)",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "agentId": "a33291db7220a2fda",
+      "isolation": "worktree",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782356837645,
+      "queuedAt": 1782356619490,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "tp_remainder",
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5, branched from the FULL current state (3 flagships decoder/ViT/Mamba + datasets + CuTe atoms + TP FOUNDATION already present: tp_transport.cuh has the device-NVSHMEM all-reduce, parallel_config.cuh has CommCtx, fused_decoder_megakernel.cuh is template<OptId Opt, class Par=SingleGPU>). Freely Edit/Write/Bash/build.\nPROCEDURE: (…",
+      "lastProgressAt": 1782358348695,
+      "tokens": 179830,
+      "toolCalls": 75,
+      "durationMs": 1511049,
+      "resultPreview": "{\"area\":\"tp_remainder\",\"applied_clean\":true,\"gate_pass\":true,\"commit_sha\":\"4d60173d4788fe705b453d367a4c75d1a9e1a557\",\"deviations\":[\"EDIT D used the spec's SAFE two-body shape (not the DRY forwarder): the SingleGPU dectc_forward_tile/dectc_backward_tile bodies are left BYTE-IDENTICAL and untouched; the TP path lives in NEW dectc_forward_tile_impl/dectc_backward_tile_impl<Par,Transport> + dectc_*_ti…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "memory-strategy seam (offload/recompute/streaming planner + gate)",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "agentId": "a1e9c9bc187fd55f0",
+      "isolation": "worktree",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782357031769,
+      "queuedAt": 1782356619491,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "memory_strategy",
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5, branched from the FULL current state (3 flagships decoder/ViT/Mamba + datasets + CuTe atoms + TP FOUNDATION already present: tp_transport.cuh has the device-NVSHMEM all-reduce, parallel_config.cuh has CommCtx, fused_decoder_megakernel.cuh is template<OptId Opt, class Par=SingleGPU>). Freely Edit/Write/Bash/build.\nPROCEDURE: (…",
+      "lastProgressAt": 1782357484144,
+      "tokens": 92204,
+      "toolCalls": 32,
+      "durationMs": 452368,
+      "resultPreview": "{\"area\":\"memory_strategy\",\"applied_clean\":true,\"gate_pass\":true,\"commit_sha\":\"2493dcc031527a644a837fd128059c1eccfe3235\",\"deviations\":[\"mem_strategy.py: the spec imported a sibling module `grokking_optimizers.parallel.flagship_budget` (the pending run_harness.md NEW FILE 1) that is NOT on disk. A module-level `from ... import flagship_budget as fb` would have made the gate `python -c \\\"import grokk…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "EP 5th axis + size-adaptive CTA-tiling seams",
+      "phaseIndex": 1,
+      "phaseTitle": "Apply",
+      "agentId": "ac400068016eeaf8e",
+      "isolation": "worktree",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782357251078,
+      "queuedAt": 1782356619491,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "ep_size",
+      "promptPreview": "You operate in an ISOLATED GIT WORKTREE copy of /workspace/SuperGrok1.5, branched from the FULL current state (3 flagships decoder/ViT/Mamba + datasets + CuTe atoms + TP FOUNDATION already present: tp_transport.cuh has the device-NVSHMEM all-reduce, parallel_config.cuh has CommCtx, fused_decoder_megakernel.cuh is template<OptId Opt, class Par=SingleGPU>). Freely Edit/Write/Bash/build.\nPROCEDURE: (…",
+      "lastProgressAt": 1782357927994,
+      "tokens": 129857,
+      "toolCalls": 49,
+      "durationMs": 676916,
+      "resultPreview": "{\"area\":\"ep_size\",\"applied_clean\":true,\"gate_pass\":true,\"commit_sha\":\"ec3ae503372b816bfc832b61ed7eac1f76fb9381\",\"deviations\":[\"megakernel_codegen.py line-number drift: spec adaptive_parallelism.md/size_adaptive.md cited CLI anchors at lines 1667/1719, but live file had them at 1755/1811 (--decoder-layout-flagship / --vit-layout argparse block and the args.decoder_layout_flagship main() handler). A…"
+    }
+  ],
+  "totalTokens": 401891,
+  "totalToolCalls": 156
+}

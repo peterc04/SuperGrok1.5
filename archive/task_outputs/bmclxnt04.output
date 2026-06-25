@@ -1,0 +1,45 @@
+
+/workspace/SuperGrok1.5/csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy$83'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py$82'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE10ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE9ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE8ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm905dectc28dectc_backward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc27dectc_forward_tile_outlinedERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE4ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE7ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm905dectc19dectc_backward_tileERKNS1_10DecWeightsERKNS2_6DecWBfEiiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiPfSH_P13__nv_bfloat16SJ_SH_Py'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm905dectc18dectc_forward_tileERKNS1_10DecWeightsERKNS2_6DecWBfEiiRKNS2_7DecActsERKNS2_14DecTileScratchEPKiSG_P13__nv_bfloat16SI_PfPy'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0ENS0_3par9ParConfigILi1ELi1ELi1ELi1ELNS4_9ZeROStageE0ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+ptxas info    : (C7509) Potential Performance Loss: wgmma.mma_async instructions are serialized due to the presence of Extern calls in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0ENS0_3par9ParConfigILi8ELi8ELi1ELi1ELNS4_9ZeROStageE3ELi1EEEEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES9_fiNS1_13FusedOptStateENS4_7CommCtxE'
+[2/2] c++ _tp8_scratch_pybind.cuda.o -shared -L/usr/local/lib/python3.11/dist-packages/nvidia/nvshmem/lib -l:libnvshmem_device.a -l:libnvshmem_host.so.3 -Wl,-rpath,/usr/local/lib/python3.11/dist-packages/nvidia/nvshmem/lib -L/usr/local/lib/python3.11/dist-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart -o sg_tp8_scratch.so
+Loading extension module sg_tp8_scratch...
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+  File "/workspace/SuperGrok1.5/tuning/_tp8_run.py", line 72, in build_tp8_module
+    mod = load(
+          ^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1312, in load
+    return _jit_compile(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 1747, in _jit_compile
+    return _import_module_from_library(name, build_directory, is_python_module)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py", line 2141, in _import_module_from_library
+    module = importlib.util.module_from_spec(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 573, in module_from_spec
+  File "<frozen importlib._bootstrap_external>", line 1233, in create_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+ImportError: /workspace/.torch_ext/sg_tp8_scratch/sg_tp8_scratch.so: undefined symbol: __cudaRegisterLinkedBinary_91996956_22__tp8_scratch_pybind_cu_3c53edab

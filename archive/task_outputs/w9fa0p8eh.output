@@ -1,0 +1,51 @@
+{
+  "summary": "Sustained GPU-saturating roofline campaign (deliverable #1): build + measure achieved TF/s (wallclock + analytical FLOPs) and analytical arithmetic intensity for the flagship cells across GPUs 1-7, then plot the roofline graph vs the H100 bf16 ceiling",
+  "agentCount": 1,
+  "logs": [
+    "Roofline: 10 cells; graph /workspace/phase6/roofline_flagship.png; peak% 0.027..0.160"
+  ],
+  "result": {
+    "cells_measured": 10,
+    "graph_path": "/workspace/phase6/roofline_flagship.png",
+    "csv_path": "/workspace/phase6/roofline_flagship.csv",
+    "peak_pct_range": "0.027..0.160",
+    "blockers": [
+      "MAMBA flagship (d=2048/L24) is unlaunchable on H100 -> all 5 mamba cells blocked. Root cause confirmed live AND in source: the TC megakernel reinterprets its DYNAMIC shared memory as MambaSampleSmem (model_stage_mamba3.cuh:142), which caches BOTH layers' full per-sample activations in smem (layer_in[24][8][2048] + 24x LayerAct with x_in/g_pre/u_mlp[8][4096] etc). sizeof = kMambaSmemBytes = 20,513,956 bytes (19.56 MB). launch_fused_mamba_megakernel_tc (fused_mamba_megakernel.cuh:1311-1340) requests that as dyn_smem; the H100 per-block opt-in cap is 232,448 bytes (227 KB), so the request is 88.3x over -> the <<<grid,block,20MB>>> launch returns cudaErrorInvalidValue ('CUDA error: invalid argument'). This is architectural (one CTA holds an entire sample's both-layer activation cache), NOT a fixable launcher param, and reducing it would change the flagship kernel itself. Confirmed live on GPU3 with the cached mega_mamba_multiopt.so.",
+      "STAGED-OPT cells pending (~18 cells: Prodigy/Muon/LookSAM/SG11/SG2/SuperGrok2 x 3 models). The cached multiopt .so files only expose the 5 single-launch elementwise OptIds (AdamW=0, Lion=1, Grokfast=2, GrokAdamW=3, NeuralGrok=6) via tc_train_step_opt. The staged optimizers need per-CTA staged-opt scratch (LookSAM sam_backup+sam_grad = 2*total, Muon NS, SG2 meta-net) that the bench layout deliberately elides (SG_*_BENCH_LAYOUT=1 sets kStagedOptScratch=false); enabling it OOMs at flagship d (e.g. LookSAM alone = 2*1.6B*4 = 12.8GB on top of the nCTA*total grad-partial workspace).",
+      "ViT flagship is workspace-memory-bound: the TC megakernel's per-CTA grad-partial workspace is nCTA*total floats (8*1.596B*4 = 51 GB at ncta_cap=8), so ncta_cap=8 OOMs even at B=64; measured at ncta_cap=4/B=64 (only 4 of 132 SMs) -> step ~37 s, ~0.28 TF/s. Honest for that config but not occupancy-comparable to the decoder's ncta_cap=8.",
+      "ncu HW counters remain DENIED in-container (perf-counter perms); all timing is nsys cuda_gpu_kern_sum as required.",
+      "GPUs 1,2,4 were occupied by another agent (~78 GB each) for part of the run; measurement was confined to GPUs 3,5 with keep-busy on 6,7 (GPU 0 left reserved)."
+    ],
+    "summary": "Built an all-nsys (ncu-free) roofline ceiling test of the flagship cells and measured 10 of them: decoder (d=1600/L48, 1.476B params) x {AdamW, Lion, Grokfast, GrokAdamW, NeuralGrok} and ViT (d=1664/L48, 1.596B params) x the same 5 elementwise optimizers. Method per cell: ran the cached OptId-generic multiopt .so (tc_train_step_opt) under `nsys profile -t cuda` for 5+30 (decoder) / 2+6 (ViT) steps, then `nsys stats --report cuda_gpu_kern_sum` and extracted the fused_<model>_megakernel_tc row. Since the L3-TC megakernel is ONE __global__ launch/step (verified: it is 99.9-100.0% of GPU time with <0.3% inter-step variance), its nsys total/instances IS the authoritative per-step GPU time. ACHIEVED TF/s = analytic GEMM FLOPs/step / per-step kernel seconds; arithmetic intensity = GEMM FLOPs / bytes-moved (params+state+grad+acts, bf16). Results: decoder 1.14-1.58 TF/s (0.116-0.160% of the 989 TF/s bf16 ceiling, I=82.8 FLOP/B, ncta_cap=8/B=128); ViT 0.27-0.28 TF/s (0.027-0.029%, I=170.8, ncta_cap=4/B=64, memory-forced). The cells sit far below the roofline because each is a SINGLE persistent megakernel occupying only ncta_cap of 132 SMs (compute/occupancy-bound, not HBM-bound) — the graph title and per-cluster annotations make this explicit. nsys-measured decoder times match the prior CUDA-event wallclock to ~0.16% (3107.8 vs 3112.9 ms), confirming the all-nsys methodology is consistent for a uniform graph. RE-MEASURED the decoder cells with nsys (prior run was wallclock) per the brief. Deliverables: /workspace/phase6/roofline_flagship.png (x=intensity log, y=achieved TF/s log, H100 bf16 roofline with 989 TF/s ridge + 3.35 TB/s HBM3 slope, each cell labelled model:opt) and /workspace/phase6/roofline_flagship.csv (10 rows incl. batch_B, ncta_cap_SMs, nsys_kernel_per_step_ns, achieved_tf_s, pct_of_989tfs_peak, intensity, flops, bytes, instances). Kept GPUs 6,7 saturated with a sustained decoder-megakernel keep-busy loop (100% util, ~44 GB each) throughout, and ran measurements on GPUs 3,5 (GPUs 1,2,4 were held by another agent; GPU 0 left reserved). All 10 nsys-rep + kern artifacts are under /workspace/phase6/nsys/. Mamba's 5 cells could not be measured: the flagship d=2048/L24 megakernel needs 19.56 MB of dynamic shared memory per block (88x over the H100 227 KB cap) and cannot launch on any H100 — an architectural limit of the Mamba-3 both-layers-in-smem design, confirmed both in source and live."
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Roofline"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "roofline campaign (flagship cells)",
+      "phaseIndex": 1,
+      "phaseTitle": "Roofline",
+      "agentId": "a24ed538dbffc64ae",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782362606699,
+      "queuedAt": 1782362606679,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "/workspace/phase6/roofline_flagship.png",
+      "promptPreview": "You are on the 8x H100 box at /workspace/SuperGrok1.5 (Edit/Write/Bash/build/run; do NOT commit, do NOT touch the .claude/worktrees other agents use). GOAL: a ROOFLINE CEILING test of the FLAGSHIP cells (deliverable #1) — and keep GPUs 1-7 BUSY the whole time (a sustained job, not short bursts). ncu HW counters are DENIED, so do it ncu-FREE.\nMEASUREMENT TOOL — USE nsys (NOT CUDA-event wallclock, N…",
+      "lastProgressAt": 1782366494038,
+      "tokens": 147889,
+      "toolCalls": 94,
+      "durationMs": 3887339,
+      "resultPreview": "{\"cells_measured\":10,\"graph_path\":\"/workspace/phase6/roofline_flagship.png\",\"csv_path\":\"/workspace/phase6/roofline_flagship.csv\",\"peak_pct_range\":\"0.027..0.160\",\"blockers\":[\"MAMBA flagship (d=2048/L24) is unlaunchable on H100 -> all 5 mamba cells blocked. Root cause confirmed live AND in source: the TC megakernel reinterprets its DYNAMIC shared memory as MambaSampleSmem (model_stage_mamba3.cuh:142…"
+    }
+  ],
+  "totalTokens": 147889,
+  "totalToolCalls": 94
+}

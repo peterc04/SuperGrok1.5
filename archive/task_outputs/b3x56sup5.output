@@ -1,0 +1,4 @@
+[run] ONE fwd-bwd-AdamW step ...
+[result] LAUNCHED OK. loss=4.577683 finite_loss=True finite_grad=True grad_absmax=6.2168e+00
+LAUNCH_OK
+=== EXIT 0 ===

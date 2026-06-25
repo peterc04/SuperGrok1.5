@@ -1,0 +1,149 @@
+{
+  "summary": "Parallel READ-ONLY: 3 agents each produce an apply-ready spec — flagship dW-spec layer-generalization, no-ncu phase-resolved decoder profiler, and TMA step-4 GEMM-load rewrite",
+  "agentCount": 3,
+  "logs": [
+    "Specs complete: 3/3"
+  ],
+  "result": [
+    {
+      "name": "flagship_dw",
+      "area": "flagship_dw",
+      "spec_path": "/workspace/impl_diffs/flagship_dw.md",
+      "files_changed": [
+        "csrc/fused/sm_90/model_stage_decoder_tc.cuh",
+        "csrc/fused/sm_90/fused_decoder_megakernel.cuh",
+        "csrc/fused/sm_90/pp_stage_decoder_tc.cuh"
+      ],
+      "gate_commands": [
+        "CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q",
+        "bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu -DWITH_CUTLASS -DSG_TUNED_GEMM_IMPL=1 -DSG_DEC_SCALAR_MEGAKERNEL=0 -DSG_FUSED_SM90_DECODER_LAYOUT_CUH_=1 -include csrc/fused/sm_90/decoder_flagship_layout.cuh"
+      ],
+      "confidence": "high — the spec generalizes every L=2-pinned enumeration in the decoder TC backward path to dec::kLayers via formulas verified byte-identical at L=2 (dW wi/bi/head, LN-vec tensor idx, Muon-2D table, all spec[9]/s<9/pre[10] bounds). All index formulas were proven to reproduce the exact current literals at L=2 against megakernel_codegen.py _decoder_param_sizes (the single source of truth) and the flagship layout (kDecNumTensors=582, norm=578/579, out=580/581). MOST of FILE1+FILE2 was applied live by the lead during my verification and matches my NEW text exactly; only FILE3 Edit 3.1 (pp_stage) remains and its OLD block still matches. Lower-confidence item: I could not measure sizeof(DecTcSmem) at L=48 (read-only, no build) — the spec[193] growth (+13.25 KB) is budgeted to fit both the 48 KB static cap (S=2, ~31 KB) and the 228 KB dynamic cap (default flagship PIPE=1/S=4 routes to dynamic smem), but the 2nd gate_command is the real check.",
+      "risks": [
+        "IN-FLIGHT HALF-APPLIED STATE: while I verified (read-only), the lead applied FILE1 + FILE2 Edits 2.1/2.2/2.3 live, so the repo currently has kLnVecTensorIdx + kDecMuon2D ARRAYS REMOVED. The ONLY remaining un-applied code edit is FILE3 Edit 3.1 (pp_stage_decoder_tc.cuh:314 still reads dectc::kLnVecTensorIdx[v]). Until 3.1 is applied, tests/hw/pp_stage_binding.cu will NOT compile (undeclared identifier). Its OLD block still matches the live file.",
+        "Muon-cell compile dependency: the megakernel is template<OptId>; the discarded `if constexpr (Opt==OptId::Muon)` branch still requires dectc::kDecMuon2D to be a DECLARED name (non-dependent). So removing the array (FILE1 Edit 1.2) WITHOUT applying FILE2 Edit 2.2 breaks BOTH gate_commands (incl. the AdamW TU). Edit 2.2 is now applied — but this coupling means FILE1 and FILE2 Edit 2.2 must land together.",
+        "DecTcSmem.spec[] is the ONLY layer-dependent smem member (FILE2 Edit 2.1): 9*72B (L=2) -> 193*72B (L=48) = +13.25 KB. The dW WORKSPACE (HBM acts/transpose/split-K) carves are ALREADY L-general (dec_tc_acts_floats / dec_dw_transpose_elems / kDecDwMaxTiles all loop dec::kLayers) and the launcher's per-step dW work is n_dw=dectc_dw_total_tiles(spec) (RUNTIME-counted, NOT a 2-pinned literal) — so no HBM-workspace L-pin remains. The smem delta is the only budget concern; verify via the 2nd gate_command's ptxas at L=48.",
+        "#pragma unroll over kDecNumDwSpecs in dectc_dw_biases (Edit 1.11): byte-identical 9-trip unroll at L=2, but fully unrolls a 193-trip prefix loop + declares pre[194] (local-memory) at L=48 — functionally correct, larger code + local traffic in the bias pass. Kept as-is to guarantee L=2 byte-identity; if L=48 codegen bloats, gate a `#pragma unroll 1` behind `if constexpr (dec::kLayers>2)`.",
+        "Muon table->formula (Edits 1.2/2.2) is VALUE-identical at L=2 but NOT PTX-identical (a .const array became the inlined dec_muon_2d() accessor + closed-form dec_is_muon_2d). The L=2 gate (test_decoder_tc.py) exercises AdamW, not Muon, so this is unobserved by the gate; if a separate Muon-cell byte-identity gate exists, treat as value-identical not PTX-identical.",
+        "pp_stage_decoder_tc.cuh is NOT made fully L-general — only its kLnVecTensorIdx read is migrated (Edit 3.1, mandatory). Its internal spec[9]/s<9/pre[10] bias-prefix + owns_* stay L=2-form; pp_stage compiles ONLY at L=2 (tests/hw/pp_stage_binding.cu, no flagship layout) where those are correct. If pp_stage is ever run at L=48 it needs the same kDecNumDwSpecs treatment."
+      ],
+      "summary": "The flagship's one remaining functional blocker was that the decoder TC backward path hardcoded the 2-layer form in five places: the dW spec enumeration (wi[9]/bi[9]/spec[8]/head 28/29, s<8, s<9), the LN-vec γ/β reduce (kNumLnVec=10, the kLnVecTensorIdx constant table, gn_normw/b at 8*d/9*d), the Muon 2D-weight table (kDecMuon2D[11]/dec_is_muon_2d), the DecTcSmem spec[9] member, and every spec[9]/pre[10] bound across the dW helpers. The spec generalizes all of these to dec::kLayers via three new constexpr quantities (kDecNumDwSpecs=4L+1, kNumLnVec=4L+2, kDecNumMuon2D=2+4L+1) and three index formulas (dec_lnvec_tensor_idx, dec_muon_2d, the inlined dW wi/bi derivation), each proven byte-identical to the current literals at L=2 against megakernel_codegen.py's _decoder_param_sizes (12 tensors/layer, weight tidx=2+12li+{0,2,8,10}, head=2+12L+2). The constant arrays become formulas because a __device__ __constant__ brace-list can't be loop-filled to ~194 entries at L=48. The forward weight-cache (dectc_wbf_convert), DecActs, DecTileScratch, and all HBM-workspace carves were already L-general (verified) and need no change. At L=2 kDecNumDwSpecs==9 so the gate (test_decoder_tc.py, d=128/L=2) is unaffected; the win is that the SAME code now enumerates 193 dW specs + 194 LN-vec slots + 195 Muon matrices at the flagship L=48."
+    },
+    {
+      "name": "profiler",
+      "area": "profiler",
+      "spec_path": "/workspace/impl_diffs/profiler.md",
+      "files_changed": [
+        "tuning/decoder_phase_profile.py (NEW)",
+        "csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu (OPTIONAL, profile-only #ifdef SG_DEC_PROFILE block)"
+      ],
+      "gate_commands": [
+        "python tuning/decoder_phase_profile.py --help",
+        "CUDA_VISIBLE_DEVICES=0 python tuning/decoder_phase_profile.py --steps 20"
+      ],
+      "confidence": "high — the phase profiler already exists and is byte-identical-when-off; the deliverable is one NEW orchestrator file that reuses already-exported pybind symbols + the existing decoder_bench.build_variant/measure, so it builds and runs cleanly. The embedded harness was AST-parsed OK (311 lines). The only OLD/NEW repo edit is OPTIONAL and verbatim-verified against lines 328-332, entirely inside #ifdef SG_DEC_PROFILE (production _ops never defines it). Main residual uncertainty: first-run JIT compile of the d=2048 bench TU takes minutes and needs an idle GPU + the FWD_STAGES=4 dynamic-smem path to fit 1 CTA/SM (the launcher already certifies this and refuses otherwise).",
+      "risks": [
+        "The task names a NEW macro SG_DEC_TC_PHASE_PROF; I deliberately did NOT add it — its exact behavior (clock64 phase reads + __device__ buffer, #if-erase to byte-identical when 0) is ALREADY realized by the shipped SG_DEC_PROFILE. Adding a second redundant macro would be churn and risk the byte-identical guarantee. If the lead specifically wants that macro NAME, it would be a pure rename of the existing flag (not recommended).",
+        "attn / LN+softmax are NOT separately stamped — they are fused inside the coarse P1_fwd/P1_bwd tile calls. The harness surfaces them only as the derived (coarse fwd/bwd) minus (Σ fine GEMM-ring) remainder via --fine. Getting them as first-class separate slots WOULD require a kernel edit (new clock64 brackets around the LN/softmax/attn sub-regions); the spec calls this out honestly rather than faking it.",
+        "The decoder_bench.py docstring is STALE (says d=1024); the live layout is d=2048 (decoder_layout.cuh:40). The harness defaults to --d 2048 and labels correctly, but anyone trusting the bench docstring could be confused — noted in the spec.",
+        "Occupancy: the harness reports '1 CTA/SM by design' unless the OPTIONAL pybind getter (mod.tc_occupancy_blocks_per_sm) is applied, which surfaces the exact cudaOccupancyMaxActiveBlocksPerMultiprocessor integer. The by-design path is sound (launcher refuses if occ<1) but is an inference, not a live API read, without the optional edit.",
+        "First JIT build is slow and the script auto-pins an idle GPU via nvidia-smi; if all 8 GPUs are busy it falls back to least-loaded with a WARNING (noisier clock64 critical path)."
+      ],
+      "summary": "A complete phase profiler ALREADY EXISTS for the decoder megakernel: an 8-slot coarse clock64 critical-path profiler behind SG_DEC_PROFILE (fwd/bwd/B1/dW-GEMM/grad-asm/opt-tail/B2/B0) in fused_decoder_megakernel.cuh, plus a 10-slot fine GEMM-ring sub-profiler (ISSUE/WAIT/WGMMA/EPI/BARRIER for fwd and dX rings) behind SG_DEC_PROFILE_FWD_FINE in model_stage_decoder_tc.cuh, both #if-erasing to byte-identical when off, both read host-side via tc_profile_read()/tc_profile_read_fwd_fine(), and both already driven by tuning/decoder_bench.py --profile which builds the d=2048 SG_DEC_BENCH_LAYOUT bench TU. So no kernel edit is needed. The deliverable is ONE new file, tuning/decoder_phase_profile.py: a thin, 8-GPU-idle-aware orchestrator that reuses decoder_bench.build_variant/measure to build the d=2048 profile TU, run N steps over 3 reps, and print a per-phase ms + %-of-step table with a 'where the time goes' roll-up, the fwd/dX drain-vs-compute fine split (the 'why'), the achieved CTAs/SM (1 by design — the persistent grid barrier requires it), and the single-launch nsys command (ncu counters are denied, consistent with MEMORY.md). The spec also includes an OPTIONAL, verbatim-OLD/NEW, profile-only pybind getter to surface the exact occupancy integer. Per the baked config the expected bottleneck is the fwd/dX GEMMs (~56% of step, cp.async-drain-bound → FWD_STAGES=4 deeper ring) plus the staging-bound dW GEMM (SG_TUNED_DEC_DW_STAGE=1)."
+    },
+    {
+      "name": "tma",
+      "area": "csrc/backends/cuda/sm_90/wgmma.cuh (TMA staging, CuTe step 4)",
+      "spec_path": "/workspace/impl_diffs/tma.md",
+      "files_changed": [
+        "csrc/backends/cuda/sm_90/wgmma.cuh",
+        "csrc/backends/cuda/sm_90/cute_tma_desc.h (NEW)"
+      ],
+      "gate_commands": [
+        "CUDA_VISIBLE_DEVICES=0 bash scripts/compile_to_object.sh csrc/backends/cuda/sm_90/wgmma_selftest.cu -DSG_TUNED_GEMM_ENGINE=1 -DSG_TUNED_GEMM_TMA=1",
+        "CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q"
+      ],
+      "confidence": "med — the two applied units (the SG_TUNED_GEMM_TMA knob + device tma_load_kmajor_tile primitive in wgmma.cuh, and the host cute_tma_desc.h builder) are high-confidence: OFF (default) is byte-identical by #if-erasure so gate 2 passes by construction (the shipped decoder TU never defines SG_TUNED_GEMM_TMA), and ON the primitive uses only already-included CuTe SM90_TMA_LOAD::copy / prefetch_tma_descriptor / TmaDescriptor with verified signatures (make_tma_copy 5-arg form copy_traits_sm90_tma.hpp:1242/1312, get_tma_descriptor returns CUtensorMap const* :116-117 — fixed the deref, Layout_K_INTER_Atom :98) so gate 1 compiles. Confidence is MED not HIGH only because the full perf payoff (actually routing the megakernel producer through TMA) is the documented-not-applied §5 wiring — the hardest, multi-file part — which I deliberately did not turn into apply-ready OLD/NEW edits since it cannot be made provably byte-identical-when-OFF across all fwd/dX call sites + PersistentContext + launcher with read-only precision, and is not needed to pass either gate.",
+      "risks": [
+        "TMA in this persistent runtime-carved kernel is the hardest piece (plan §C.1, §6b): CuTe has NO device-side CUtensorMap encode in v3.6.0, so descriptors MUST be host-built over step-stable bases. The applied spec lands the device primitive + host builder; the actual producer wiring is documented (§5) not applied.",
+        "dW transposed-strided gather is NOT TMA-reachable in this spec and STAYS on cp.async (the single biggest hand-cp.async cost is left untouched) — it becomes TMA-reachable only via the existing SG_TUNED_DEC_DW_STAGE contiguous-transpose scratch (path a) or a transpose-encoding descriptor (path b, the subtle/risky part flagged out of scope). This is the prompt's explicit fallback scoping, stated honestly.",
+        "Step-stability VERIFIED for fwd/dX (tok.workspace cudaMalloc'd once per B and reused, launcher.cu:55-71; T/nCTA fixed; all region offsets pure functions of (ws,T,B,nCTA)) — but if a future caller varies B per step or reallocs the workspace mid-run, host descriptors go stale and must be rebuilt (the launcher cache keyed on (base,T,B), like the workspace cache, handles this — noted in §4).",
+        "The §5 wiring requires factoring dec_acts_bind/dec_wbf_bind offset math into a __host__ __device__ helper so host descriptors and device carve agree byte-for-byte; a drift there = silent wrong reads. Mitigation noted (single source of the offset expression).",
+        "cute_tma_desc.h constructs a host-side cute::Tensor (the only Tensor in the change) — host-only, no device register cost — but it must be included ONLY in the launcher .cu, never the device megakernel TU (guarded with !__CUDACC_RTC__ + CUDACC_VER>=12); the device TU needs only the const void* descriptor pointer."
+      ],
+      "summary": "Spec'd CuTe step 4 (TMA staging) behind a new SG_TUNED_GEMM_TMA sub-knob of SG_TUNED_GEMM_ENGINE. Verified the load-bearing fact: the decoder's fwd/dX operand bases ARE step-stable (tok.workspace is cudaMalloc'd once per B and reused every step; T=B*kSeq and nCTA are fixed; every region offset is a pure function of (workspace,T,B,nCTA)), so host-built CUtensorMaps over those bases are valid — confirmed by reading the live launcher and kernel carve. The applied edits add (1) the SG_TUNED_GEMM_TMA knob + two CuTe TMA includes + a self-contained device tma_load_kmajor_tile / tma_prefetch_desc primitive to wgmma.cuh, all #if-erased when OFF so the shipped PTX/smem/regs are byte-identical and gate 2 passes by construction, and ON it compiles cleanly through wgmma_selftest.cu for gate 1; and (2) a NEW host-only header cute_tma_desc.h building the descriptors with make_tma_copy(SM90_TMA_LOAD{}, gtensor, slayout, cta_tiler, Int<1>{}) over the no-swizzle Major-K INTERLEAVE layout (byte-identical landed smem). The spec is honest that TMA is scoped to fwd/dX (step-stable, flat-K-major) only — the dW transposed-strided gather stays on cp.async — and that the full megakernel-producer wiring is documented (§5) not applied, because it cannot be made provably byte-identical-when-OFF across all sites read-only and is not needed to pass either gate. TMA is transport-only: the wgmma ascending-k fp32 accumulation is untouched, so fp64 parity + A/A/A hold bit-for-bit."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Investigate"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "flagship dW-spec L-generalization",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a531134472a3bba91",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782349606913,
+      "queuedAt": 1782349606885,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "flagship_dw",
+      "promptPreview": "You are READ-ONLY on the repo at /workspace/SuperGrok1.5 (Read/Grep/Glob freely; do NOT edit the repo, do NOT build/run — the lead applies+builds+gates). Deliverable: write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits — for EACH file to change give the EXACT current snippet to replace (copy it VERBATIM from the live file, enough lines to be unique) and the replacement, as clearly-delimited…",
+      "lastProgressAt": 1782350399475,
+      "tokens": 181798,
+      "toolCalls": 58,
+      "durationMs": 792562,
+      "resultPreview": "{\"area\":\"flagship_dw\",\"spec_path\":\"/workspace/impl_diffs/flagship_dw.md\",\"files_changed\":[\"csrc/fused/sm_90/model_stage_decoder_tc.cuh\",\"csrc/fused/sm_90/fused_decoder_megakernel.cuh\",\"csrc/fused/sm_90/pp_stage_decoder_tc.cuh\"],\"gate_commands\":[\"CUDA_VISIBLE_DEVICES=0 GATE_SEED=42 python -m pytest tests/hw/test_decoder_tc.py -q\",\"bash scripts/compile_to_object.sh csrc/fused/sm_90/mega_decoder_real…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "no-ncu phase-resolved decoder profiler",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "ab48e6430dd6716f7",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782349606915,
+      "queuedAt": 1782349606885,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "profiler",
+      "promptPreview": "You are READ-ONLY on the repo at /workspace/SuperGrok1.5 (Read/Grep/Glob freely; do NOT edit the repo, do NOT build/run — the lead applies+builds+gates). Deliverable: write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits — for EACH file to change give the EXACT current snippet to replace (copy it VERBATIM from the live file, enough lines to be unique) and the replacement, as clearly-delimited…",
+      "lastProgressAt": 1782349895784,
+      "tokens": 98919,
+      "toolCalls": 24,
+      "durationMs": 288869,
+      "resultPreview": "{\"area\":\"profiler\",\"spec_path\":\"/workspace/impl_diffs/profiler.md\",\"files_changed\":[\"tuning/decoder_phase_profile.py (NEW)\",\"csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu (OPTIONAL, profile-only #ifdef SG_DEC_PROFILE block)\"],\"gate_commands\":[\"python tuning/decoder_phase_profile.py --help\",\"CUDA_VISIBLE_DEVICES=0 python tuning/decoder_phase_profile.py --steps 20\"],\"confidence\":\"high — the phase p…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "TMA step-4 GEMM-load rewrite",
+      "phaseIndex": 1,
+      "phaseTitle": "Investigate",
+      "agentId": "a64a53d92d21ff51d",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782349606916,
+      "queuedAt": 1782349606885,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/backends/cuda/sm_90/wgmma.cuh (TMA staging, CuTe step …",
+      "promptPreview": "You are READ-ONLY on the repo at /workspace/SuperGrok1.5 (Read/Grep/Glob freely; do NOT edit the repo, do NOT build/run — the lead applies+builds+gates). Deliverable: write /workspace/impl_diffs/<AREA>.md as APPLY-READY edits — for EACH file to change give the EXACT current snippet to replace (copy it VERBATIM from the live file, enough lines to be unique) and the replacement, as clearly-delimited…",
+      "lastProgressAt": 1782349956944,
+      "tokens": 186089,
+      "toolCalls": 28,
+      "durationMs": 350028,
+      "resultPreview": "{\"area\":\"csrc/backends/cuda/sm_90/wgmma.cuh (TMA staging, CuTe step 4)\",\"spec_path\":\"/workspace/impl_diffs/tma.md\",\"files_changed\":[\"csrc/backends/cuda/sm_90/wgmma.cuh\",\"csrc/backends/cuda/sm_90/cute_tma_desc.h (NEW)\"],\"gate_commands\":[\"CUDA_VISIBLE_DEVICES=0 bash scripts/compile_to_object.sh csrc/backends/cuda/sm_90/wgmma_selftest.cu -DSG_TUNED_GEMM_ENGINE=1 -DSG_TUNED_GEMM_TMA=1\",\"CUDA_VISIBLE_D…"
+    }
+  ],
+  "totalTokens": 466806,
+  "totalToolCalls": 110
+}

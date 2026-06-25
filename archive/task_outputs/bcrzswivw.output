@@ -1,0 +1,13 @@
+csrc/fused/sm_90/mega_mamba3_adamw.cu
+csrc/fused/sm_90/mega_transformer_decoder_adamw.cu
+csrc/fused/sm_90/mega_vit_adamw.cu
+=== compile one generated mega cell (decoder/adamw) with CUTLASS, timed ===
+COMPILE_FAIL rc=1 tu=csrc/fused/sm_90/mega_transformer_decoder_adamw.cu
+csrc/fused/sm_90/mega_transformer_decoder_adamw.cu:11:10: fatal error: csrc/fused/sm_90/fused_megakernel.cuh: No such file or directory
+   11 | #include "csrc/fused/sm_90/fused_megakernel.cuh"
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+compilation terminated.
+
+real	0m2.785s
+user	0m10.263s
+sys	0m0.556s

@@ -1,0 +1,7 @@
+running UPGRADED-kernel cached build (3 variants from CURRENT baked source) + measure...
+[nvcc-baseline] ===== variant A: regular-nvcc (vanilla flags, split-K=4) =====
+[nvcc-baseline][A] split-K=4 fast_math=True
+    mod = _build_bench_variant(label, nvcc_flags, splitk, fast_math,
+  File "/workspace/SuperGrok1.5/scripts/nvcc_baseline.py", line 293, in _build_bench_variant
+    raise RuntimeError("Ninja is required to load C++ extensions")
+RuntimeError: Ninja is required to load C++ extensions

@@ -1,0 +1,1 @@
+VIT_EXIT=0  COMPILE_OK tu=csrc/fused/sm_90/mega_vit_real_adamw_tc.cu

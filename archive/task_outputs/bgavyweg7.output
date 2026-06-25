@@ -1,0 +1,6 @@
+=== compile the COMMITTED real _tc cell (production path), with TC impl ===
+COMPILE_OK tu=csrc/fused/sm_90/mega_decoder_real_adamw_tc.cu
+
+real	0m50.183s
+user	0m49.336s
+sys	0m4.747s

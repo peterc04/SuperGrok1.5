@@ -1,0 +1,54 @@
+{
+  "summary": "The north-star run: ONE flagship 1.5B decoder across all 8 H100s via TP8 + in-kernel device-NVSHMEM all-reduce (NvshmemTransport), verifying cross-rank loss agreement + finite descending loss",
+  "agentCount": 1,
+  "logs": [
+    "8-GPU flagship: ran=true in-kernel-nvshmem=true agree=false descends=false"
+  ],
+  "result": {
+    "ran_8gpu": true,
+    "tp_allreduce_in_kernel": true,
+    "cross_rank_agree": false,
+    "loss_descends": false,
+    "steps": 0,
+    "per_rank_gib": 0,
+    "blockers": [
+      "RUNTIME FAULT (the precise blocker): the full flagship megakernel kTPComm path faults on the FIRST launch with an illegal global memory access. compute-sanitizer (memcheck) on all 8 ranks pinpointed 87 'Invalid __global__ write of size 4 bytes' inside fused_decoder_megakernel_tc<OptId::AdamW, par::ParConfig<8,8,1,1,Z3>>+0x1dc30, by thread (192,0,0) block(11,0,0). Faulting target 0x12603c400 (~4.93 GB, a wild cudaMalloc-range pointer) is out of bounds, ~35 GiB BELOW the nearest NVSHMEM symmetric allocation at 0xa02000000. This is the first time the device NvshmemTransport drove the REAL megakernel end-to-end (confirmed: device symbols nvshmemx_barrier_block + nvshmemi_transfer_quiet/amo/enforce are linked into the .so and the kTPComm ParConfig<8,8,1,1,Z3> kernel is present, so it is the NvshmemTransport, NOT loopback). The bug is in COMMITTED kernel source (csrc/fused/sm_90/) which the task forbids editing.",
+      "COVERAGE GAP that hid this: the validated in-kernel TP loopback gate (tests/hw/test_tp_loopback.py + tp_loopback_binding.cu) only exercises a standalone FFN at d=128/dff=512 with LoopbackTransport — it never ran the full flagship decoder megakernel (d=1600, L=48) on the kTPComm path. So 'compiles under ParTP8 + loopback math correct' did not cover the real megakernel's TP activation/heap indexing at flagship dims.",
+      "CONTRIBUTING kernel-source issue #1 (head divisibility): flagship SG_DEC_HEADS=25 is NOT divisible by TP=8. model_stage_decoder_tc.cuh's kTPComm attention computes Hloc=kHeads/TP=3, Dloc=kD/TP=200, but the documented invariant (line ~1515) is Dloc==Hloc*kDhead (=3*64=192 != 200). The caller passes Hloc=3 rather than the 'Hloc==0 => no-op' the header says it should pass when kHeads%P!=0, so the head-localized attention runs in an inconsistent partial-width regime at flagship dims.",
+      "CONTRIBUTING kernel-source issue #2 (no per-rank weight offset): dectc_wbf_convert (model_stage_decoder_tc.cuh:556) and dec_bind(params) read the FULL weight matrices with full-layout kDecOffsets IDENTICALLY on every rank; comm.tp_rank is never used to offset the weight cache. The col/row-parallel GEMMs then use only the FIRST nout/P or Kin/P slice on every rank, so even if the IMA were fixed, all 8 ranks would compute the SAME slice-0 and the in-kernel all-reduce would sum 8 identical partials (not a correct sharded full-width 1.476B model). The tp_layer.cuh helpers are designed to receive a rank-distinct Wshard pointer, but model_stage_decoder_tc.cuh passes the full-cache base (wb.in_w[li]/wb.out_w[li]).",
+      "BUILD-SYSTEM gap (worked around, non-committed): torch.utils.cpp_extension.load() does NOT emit the nvcc -dlink device-link step for -rdc=true TUs, leaving __cudaRegisterLinkedBinary unresolved at import. Worked around with a manual 3-step build (tuning/_tp8_build.sh): nvcc -c -rdc=true; nvcc -dlink -Xcompiler -fPIC -lnvshmem_device (NAMED form — '-l:libnvshmem_device.a' leaves nvshmemi_transfer_quiet/device_state_d undefined); c++ host-link. Also needed -U__CUDA_NO_HALF/BFLOAT16_OPERATORS__ (torch injects -D...; NVSHMEM's device coll reduce.cuh needs the half/bf16 operators).",
+      "WIRING gap in the committed harness (worked around, non-committed): the committed pybind mega_decoder_real_adamw_tc.cu::tc_train_step calls launch_fused_decoder_megakernel_tc<AdamW> (SingleGPU, tp_size=1, no CommCtx) — it NEVER fires the in-kernel TP path. The TP8 dispatch (ParTP8 + dec_tc_ensure_tp_sym_heap + CommCtx + NvshmemTransport) lives only in the launcher's 18-arg mega_decoder_real_adamw_tc(...,int tp_size) tp_size==8 arm. Reached it via a non-committed scratch pybind (tuning/_tp8_scratch_pybind.cu) that #includes the committed launcher and calls it with tp_size=8 — no committed kernel source edited."
+    ],
+    "summary": "North-star TP8 + ZeRO-3 flagship run reached the real device in-kernel NVSHMEM all-reduce end-to-end for the first time, and surfaced a genuine runtime bug in committed kernel source that the prior validation never exercised.\n\nWHAT IS VALIDATED THIS SESSION (all passing):\n- 8-GPU NVSHMEM bring-up smoke (UID bootstrap + team_split(0,1,8) + symmetric malloc + cross-rank all-reduce): PASS on all 8 ranks, result 36.0 bit-exact (team handle minted = 7).\n- Dry-run TP8 plan for all 8 ranks: per-rank Nmax = 1,280,000 (== kDecMaxTensorNumel/TP = 10,240,000/8), per-rank resident params = 185,644,899 of 1,475,884,899, budget TOTAL = 40.92 GiB FITS (SG2 worst case), sym heap 13.1 MB, PE range (0,1,8) pure-TP-world.\n- Built the flagship TC megakernel with -DSG_HAS_NVSHMEM=1 -rdc=true + a manual device-link against libnvshmem_device (torch JIT load() can't dlink RDC). Verified D=1600, L=48, TOTAL=1,475,884,899 (flagship layout swap took).\n- The kernel uses the REAL device NvshmemTransport, NOT loopback: device symbols nvshmemx_barrier_block + nvshmemi_transfer_quiet/amo_nonfetch/enforce_consistency are linked into the .so, and the kTPComm fused_decoder_megakernel_tc<AdamW, ParConfig<8,8,1,1,Z3>> kernel is present. All 8 ranks launched it via the tp_size=8 dispatch arm.\n\nTHE BLOCKER (honest, precisely scoped): the full flagship megakernel kTPComm path FAULTS on the first launch — compute-sanitizer caught 87 Invalid 4-byte __global__ writes inside fused_decoder_megakernel_tc<AdamW,ParConfig<8,8,1,1,Z3>>+0x1dc30 (wild pointer ~4.9 GB, 35 GiB below the NVSHMEM heap). 0 steps completed, so no loss / cross-rank agreement / per-rank GiB could be measured. Root cause is in committed kernel source (csrc/fused/sm_90/), which this task forbids editing: (1) the in-kernel TP path was only ever validated on a tiny standalone d=128 FFN loopback, never the real megakernel; (2) flagship kHeads=25 is not divisible by TP=8, violating the head-local attention invariant Dloc==Hloc*kDhead (200 vs 192); (3) the weight cache reads full-matrix offsets identically on every rank (no comm.tp_rank weight offset), so the math would be degenerate even without the crash.\n\nNON-COMMITTED scratch wiring added (no committed source touched; only .pyc caches changed): tuning/_tp8_scratch_pybind.cu (calls the launcher's tp_size=8 arm — the committed tc_train_step only ever calls the SingleGPU path), tuning/_tp8_build.sh (the -rdc dlink torch omits), tuning/_tp8_run.py (the torchrun driver). All at absolute paths under /workspace/SuperGrok1.5/tuning/. Sanitizer log: /tmp/claude-0/-/6354dc07-b50f-40a0-8748-5189102539d3/scratchpad/san_rank0.log."
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Run"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "flagship one-model-across-8 run",
+      "phaseIndex": 1,
+      "phaseTitle": "Run",
+      "agentId": "a94e207b5772d59d7",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782371074560,
+      "queuedAt": 1782371074537,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "North-star TP8 + ZeRO-3 flagship run reached the real devic…",
+      "promptPreview": "You are on the 8x H100 box at /workspace/SuperGrok1.5 (Edit/Write/Bash/build/run; you may make NON-committed scratch wiring like the multiopt runners, but do NOT edit committed kernel source). All 8 GPUs are FREE. GOAL: run ONE flagship 1.5B decoder ACROSS ALL 8 GPUs via TENSOR PARALLELISM (TP8) + ZeRO-3, using the validated IN-KERNEL device-NVSHMEM all-reduce — the north-star one-model-across-8 r…",
+      "lastProgressAt": 1782372623757,
+      "tokens": 234106,
+      "toolCalls": 129,
+      "durationMs": 1549196,
+      "resultPreview": "{\"ran_8gpu\":true,\"tp_allreduce_in_kernel\":true,\"cross_rank_agree\":false,\"loss_descends\":false,\"steps\":0,\"per_rank_gib\":0,\"blockers\":[\"RUNTIME FAULT (the precise blocker): the full flagship megakernel kTPComm path faults on the FIRST launch with an illegal global memory access. compute-sanitizer (memcheck) on all 8 ranks pinpointed 87 'Invalid __global__ write of size 4 bytes' inside fused_decoder_…"
+    }
+  ],
+  "totalTokens": 234106,
+  "totalToolCalls": 129
+}

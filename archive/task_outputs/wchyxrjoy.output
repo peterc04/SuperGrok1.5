@@ -1,0 +1,89 @@
+{
+  "summary": "READ-ONLY design specs for the two flagship kernel blockers: Mamba smem layer-streaming (unlaunchable 19.56MB/block) and ViT Fork-B grad-partial elimination (memory-bound nCTA*total)",
+  "agentCount": 2,
+  "logs": [
+    "Kernel-redesign specs: 2/2 (feasible: 2)"
+  ],
+  "result": [
+    {
+      "name": "mamba_smem_redesign",
+      "area": "csrc/fused/sm_90/{model_stage_mamba3.cuh, fused_mamba_megakernel.cuh, model_stage_mamba_tc.cuh}",
+      "spec_path": "/workspace/impl_diffs/mamba_smem_redesign.md",
+      "feasible": true,
+      "confidence": "high",
+      "risks": [
+        "Layer-streaming alone is NOT enough to LAUNCH at flagship. Verified field-by-field: dropping the x-kLayers factor (layer_in[L]+act[L] = 95.4% of the 19.56MB) brings dyn_smem to 1784.85 KB, still ~7.86x over the 227 KB H100 opt-in cap, because the per-sample SEQ x {DINNER,DFF,D} working set is itself huge at d=2048 (~13 buffers of 64-128 KB). cudaFuncSetAttribute still rejects 1.74 MB. The spec is exact on this Level A and gives the deeper Level B (stream the big scratch to HBM -> ~120.85 KB resident, fits; or tile over d_inner/d_ff) as structure+formulas, since a full streamed rewrite of every mb_* device fn is too large for verbatim diffs.",
+        "Existing doc impl_diffs/mamba_flagship.md:660 is INCORRECT and may mislead the applier: it claims the TC engine uses the small static MbTcSmem not MambaSampleSmem. Verified false: fused_mamba_megakernel_tc reinterprets dynamic smem as MambaSampleSmem (line 547) and requests kMambaSmemBytes (line 1311); MbTcSmem (line 419) is declared but never instantiated in the TC body. The smem redesign must target MambaSampleSmem, not MbTcSmem.",
+        "Streamed-acts HBM cost is large: per-CTA-per-layer full LayerAct replay = nCTA * 24*(8*2048+187440) floats ~ nCTA*18.66MB (~2.4GB at 132 CTAs). Acceptable HBM but far heavier than the decoder Fork-B bf16 per-T acts; bf16 storage (decoder-style) would halve it but perturbs flagship numerics (no oracle there) and is a follow-up.",
+        "Ring correctness: kMbActsRing must be >=2 so writing dst into layer_in[mb_ring(li+1)] does not clobber hin=layer_in[mb_ring(li)] still being spilled. Spelled out, but a future edit that reads layer_in[li-1] after producing li would need a deeper ring.",
+        "Level-B fn_xhat shrink ([SEQ][D]->[1][D], saves ~56KB) is blocked by fn_xhat being REUSED as a d-wide scratch in mb_swiglu_bwd/mb_mixer_bwd; that reuse must move to a separate SEQ x D HBM slab. Flagged as Level B, not the minimal change."
+      ],
+      "summary": "Wrote apply-ready spec to /workspace/impl_diffs/mamba_smem_redesign.md. Confirmed the live diagnosis: the production TC kernel fused_mamba_megakernel_tc uses MambaSampleSmem as dynamic smem (fused_mamba_megakernel.cuh:547) and requests dyn_smem=kMambaSmemBytes (line 1311); at flagship (d=2048,L=24) sizeof(MambaSampleSmem)=19.564MB (verified field-by-field, matches the prompt), so cudaFuncSetAttribute returns cudaErrorInvalidValue -> unlaunchable. Verified prod=53961 floats=210.79KB matches the pinned kMambaSmemFloats=53961, and the layer-arrays (layer_in[L]+act[L]) are 95.4% of the flagship total. The spec mirrors the decoder's layer-independent DecTcSmem + DecActs: a compile-time gate kMbStreamSmem (TRUE only when the all-layers struct exceeds 227KB -> FALSE at d=128/d=1024 -> SMALL byte-identical) selects a one-LayerAct + kMbActsRing(=2) layer_in ring struct, with cross-layer acts (layer_in[li], full LayerAct[li]) moved to a new per-CTA HBM MbActsHbm region carved from tok.workspace front and bound by mb_acts_bind (DecActs mirror). Gives VERBATIM OLD + NEW for: the gated struct extents + mb_smem_la/mb_ring helpers (model_stage_mamba3.cuh:142-208), the fwd/bwd per-layer loop spill/refill+ring restructure (918-946, 1273-1316), the MbActsHbm bind helpers, the mb_tc_workspace_floats acts term + kernel workspace partition (565-611), and the mb_tc_dyn_smem_bytes() launch sites (1283,1311). All new code is if-constexpr(kMbStreamSmem)/zero-width gated so the d=128 TU folds to the shipped code -> test_mamba_tc.py byte-identical. HONEST verdict: this Level A redesign (the prompt's core ask) is exact and removes the x-kLayers blowup (19.56MB->1.74MB) but does NOT by itself clear 227KB at flagship (still 1784.85KB); Level B (also stream the big SEQ x {DINNER,DFF} scratch to HBM -> ~120.85KB resident, or tile over d_inner/d_ff) is required to actually launch and is given as precise structure + exact formulas, not full verbatim body. Spec also corrects an inaccurate claim in the existing mamba_flagship.md."
+    },
+    {
+      "name": "vit_forkb",
+      "area": "csrc/fused/sm_90/{model_stage_vit_tc.cuh, fused_vit_megakernel.cuh, mega_vit_real_adamw_tc_launcher.cu}",
+      "spec_path": "/workspace/impl_diffs/vit_forkb.md",
+      "feasible": true,
+      "confidence": "high",
+      "risks": [
+        "The literal task is a no-op: the ViT TC PERSISTENT megakernel (fused_vit_megakernel_tc + vit_tc_workspace_floats, driven by tc_train_step / mega_vit_real_adamw_tc_launcher.cu) ALREADY has the decoder Fork-B grad-partial elimination. vit_tc_workspace_floats (fused_vit_megakernel.cuh:479) has NO nCTA*total term and already carries the HBM acts buffer + P2 output-stationary dW + split-K dW reduce + cls/pos owner-scan. The nCTA*total = 51GB term exists ONLY in the gated, non-production scalar kernel fused_vit_megakernel (#if SG_VIT_SCALAR_MEGAKERNEL), allocated by the gate-only scalar_train_step (mega_vit_real_adamw_tc.cu:335). Launcher comment line 14 states this verbatim.",
+        "The stated end-goal 'flagship ViT runs at ncta_cap=8 within 80GB' is NOT reachable by any grad-partial change. At the grid-saturating batch (B>=8448 to fill 132 tiles of kTileM=1088; bench uses B=8704) the Fork-B HBM acts buffer (vit_tc_acts_floats) is ~379GB and scales with batch — it dwarfs any grad partial. That is an activation-memory/recompute/batch problem, not a grad-partial one. Per tuning/roofline.py BATCH_SATURATION_SWEEP, the 1-CTA/SM megakernel saturates at B~2k and VRAM is NOT the binding constraint (<8GB at B=131072, d=128); the real cap is occupancy (1 CTA/SM), not HBM.",
+        "The ONE byte-identical-safe reduction still available (EDIT 2A in the spec): flip SG_TUNED_VIT_DW_SPLITK 4->1 (model_stage_vit_tc.cuh:107-109). This zeroes vit_dw_part_floats (the only ViT-specific nonzero workspace term the decoder further removed) for -25.5GB at flagship; the kernel takes the single-CTA dW branch which is bit-identical to the G>1 reduce at G=1, so test_vit_tc.py (grad-parity vs bf16 oracle + determinism, both G-agnostic) stays green. CAVEAT: ViT lacks the decoder's contiguous-transpose dW staging (no SG_TUNED_VIT_DW_STAGE/dYt/Xt), so G=1 dW runs the scalar transposed-strided gather with no grid-fill -> SLOWER P2 dW at flagship. This is a memory<->dW-speed trade, parity-safe.",
+        "EDIT 2B (porting the decoder contiguous-transpose dW staging to make G=1 fast) is a ~150-LOC port (full decoder->ViT symbol map given in the spec) and is OUT OF SCOPE: it is a SPEED enabler for 2A, not a memory fix (its transpose scratch is itself batch-bound, tens of GB at flagship), and the task is byte-identical-at-small-size."
+      ],
+      "summary": "The decoder Fork-B grad-partial elimination is ALREADY ported to the production ViT TC persistent megakernel: vit_tc_workspace_floats (fused_vit_megakernel.cuh:479) has no nCTA*total term and already does HBM bf16 acts + output-stationary/split-K dW into the reused workspace. The 51GB nCTA*total partial exists only in the gated, never-shipped scalar kernel. So the literal task is a no-op. The single byte-identical-safe win remaining is flipping SG_TUNED_VIT_DW_SPLITK 4->1 (mirrors the decoder's G=1 default), which zeroes the split-K dW partial for -25.5GB at flagship and keeps test_vit_tc.py green (one #define edit; no launcher/workspace edits, all downstream keys off kVitDwSplitK). But this does NOT reach 'ncta_cap=8 within 80GB' at flagship: the binding term is the Fork-B acts buffer (~379GB at the grid-saturating batch), a separate activation-memory problem. At the batch the megakernel actually saturates (B~2k), the workspace already fits ncta_cap=8 and occupancy (1 CTA/SM), not HBM, is the real cap. Spec at /workspace/impl_diffs/vit_forkb.md with VERBATIM OLD/NEW for EDIT 2A, the full 2B mapping, exact workspace formula, file:line insertion points, and an honest feasibility verdict."
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Design"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "Mamba smem layer-streaming redesign",
+      "phaseIndex": 1,
+      "phaseTitle": "Design",
+      "agentId": "ab27ec9782ec07d18",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782366726804,
+      "queuedAt": 1782366726786,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/fused/sm_90/{model_stage_mamba3.cuh, fused_mamba_megak…",
+      "promptPreview": "READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write an apply-ready spec to /workspace/impl_diffs/<AREA>.md (VERBATIM OLD snippets + NEW). PROJECT: production path = the L3-TC PERSISTENT wgmma megakernel (1 CTA/SM, GridBarrier, fwd-bwd-opt fused). HARD GATE: the change MUST be byte-identical at the SMALL (production/test) size — the model pytest (tests/hw/test_<model…",
+      "lastProgressAt": 1782367209665,
+      "tokens": 151715,
+      "toolCalls": 31,
+      "durationMs": 482861,
+      "resultPreview": "{\"area\":\"csrc/fused/sm_90/{model_stage_mamba3.cuh, fused_mamba_megakernel.cuh, model_stage_mamba_tc.cuh}\",\"spec_path\":\"/workspace/impl_diffs/mamba_smem_redesign.md\",\"feasible\":true,\"confidence\":\"high\",\"risks\":[\"Layer-streaming alone is NOT enough to LAUNCH at flagship. Verified field-by-field: dropping the x-kLayers factor (layer_in[L]+act[L] = 95.4% of the 19.56MB) brings dyn_smem to 1784.85 KB, …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "ViT Fork-B grad-partial elimination",
+      "phaseIndex": 1,
+      "phaseTitle": "Design",
+      "agentId": "af4b734c7aee36f50",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782366726805,
+      "queuedAt": 1782366726786,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "csrc/fused/sm_90/{model_stage_vit_tc.cuh, fused_vit_megaker…",
+      "promptPreview": "READ-ONLY on /workspace/SuperGrok1.5 (Read/Grep/Glob; do NOT edit/build/run). Write an apply-ready spec to /workspace/impl_diffs/<AREA>.md (VERBATIM OLD snippets + NEW). PROJECT: production path = the L3-TC PERSISTENT wgmma megakernel (1 CTA/SM, GridBarrier, fwd-bwd-opt fused). HARD GATE: the change MUST be byte-identical at the SMALL (production/test) size — the model pytest (tests/hw/test_<model…",
+      "lastProgressAt": 1782367163556,
+      "tokens": 153856,
+      "toolCalls": 43,
+      "durationMs": 436751,
+      "resultPreview": "{\"area\":\"csrc/fused/sm_90/{model_stage_vit_tc.cuh, fused_vit_megakernel.cuh, mega_vit_real_adamw_tc_launcher.cu}\",\"spec_path\":\"/workspace/impl_diffs/vit_forkb.md\",\"feasible\":true,\"confidence\":\"high\",\"risks\":[\"The literal task is a no-op: the ViT TC PERSISTENT megakernel (fused_vit_megakernel_tc + vit_tc_workspace_floats, driven by tc_train_step / mega_vit_real_adamw_tc_launcher.cu) ALREADY has the…"
+    }
+  ],
+  "totalTokens": 305571,
+  "totalToolCalls": 74
+}

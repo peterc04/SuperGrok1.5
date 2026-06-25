@@ -1,0 +1,446 @@
+{
+  "summary": "Exhaustive cover-to-cover re-read of SuperGrok1.5: full docs, full kernel sources, prebuilt artifacts (static disasm), session archive, .perf audits",
+  "agentCount": 11,
+  "logs": [
+    "[docs:state+ledgers] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[compile:build+cache+autotune] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[harness:race+models] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[kernel:vit+mamba L3-TC] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[kernel:decoder L3-TC] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[perf:.perf audits] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[opt:tail+staged+SG2] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[wiring:dispatch+launchers] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "[artifacts:prebuilt+disasm] failed: API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+    "Phase0b deep-read complete: 11/11"
+  ],
+  "result": [
+    {
+      "name": "01_docs_state",
+      "area": "01_docs_state",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "02_perf_dir",
+      "area": "02_perf_dir",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "03_kernel_decoder",
+      "area": "03_kernel_decoder",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "04_kernel_vit_mamba",
+      "area": "04_kernel_vit_mamba",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "05_tc_substrate",
+      "area": "sm_90 WGMMA substrate + L3 megakernel coordination (csrc/backends/cuda/sm_90/{wgmma,mma,primitives,tile_pipeline,warp_specialize}.cuh + wgmma_selftest.cu, csrc/fused/megakernel_common.cuh, csrc/common/{platform.h,types.h,utils.cuh})",
+      "files_fully_read": [
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/wgmma.cuh",
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/mma.cuh",
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/primitives.cuh",
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/tile_pipeline.cuh",
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/warp_specialize.cuh",
+        "/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/wgmma_selftest.cu",
+        "/workspace/SuperGrok1.5/csrc/fused/megakernel_common.cuh",
+        "/workspace/SuperGrok1.5/csrc/common/platform.h",
+        "/workspace/SuperGrok1.5/csrc/common/types.h",
+        "/workspace/SuperGrok1.5/csrc/common/utils.cuh"
+      ],
+      "key_findings": [
+        "Hand-rolled ss-WGMMA (HGMMA) substrate is wgmma.cuh: emits wgmma.mma_async.sync.aligned.m64nNk16.f32.bf16.bf16 with BOTH operands in smem ('ss') via 64-bit descriptors, fp32 register accumulators (WgmmaAccum<N>, N/2 regs), explicit per-shape overloads for N in {8,16,32,64,96,128} (wgmma.cuh:439-563). wgmma.cuh:18 states it is 'the only WGMMA path inside the kernel'.",
+        "Choreography helpers all inline PTX .sync.aligned: wgmma_fence (wgmma.cuh:374), wgmma_commit_group (:385), wgmma_wait_group<N> with 'n'(N) immediate (:398). wgmma_mainloop_kchain (:617-644) runs ascending-k: k=0 ScaleD=0 overwrite, k>0 ScaleD=1 accumulate, one fence before / commit+wait_group<0> after; DescGen callback makes pipelined==unpipelined bit-identical (gate c).",
+        "Smem matrix descriptor SmemDesc{uint64_t} packs addr[13:0]>>4, LBO>>4 @[29:16], SBO>>4 @[45:32], swizzle @[63:62] (wgmma.cuh:219-241). Canonical Major-K builders use LBO=MN*16 bytes, SBO=128 bytes (:274-288). Required smem layout is the cute Major-K INTERLEAVE: idx(mn,k)=(k/8)*(MN*8)+mn*8+(k%8) (:251-257) — NOT plain row-major.",
+        "Swizzle enum: NONE=0,128B=1,64B=2,32B=3 (cute LayoutType, NOT size-ascending). The gated/tested correctness path ships kSwizzleNone; 128B-swizzle is perf-phase-only and unmeasured (wgmma.cuh:157-172).",
+        "CONFIRMED: tile_pipeline.cuh ring uses cp.async (.cg.16), NOT TMA. tile_pipeline.cuh:199-204 explicitly says so; producer issues prim::cp_async_cg_16 (primitives.cuh:497, 'cp.async.cg.shared.global [%0],[%1],16'), then cp_async_commit + cp_async_wait_group<0> + fence_async_proxy + mbarrier.arrive. Mbarrier is the cross-warpgroup ready-signal only, NOT byte-counting (does not use cp.async.mbarrier.arrive).",
+        "GridBarrier (megakernel_common.cuh:147-255): sense-reversing with two global atomics g_arrived + g_generation. Leader: __syncthreads -> sample my_gen (volatile) -> __threadfence RELEASE -> atomicAdd(g_arrived,1); last arriver atomicExch(g_arrived,0) -> __threadfence -> atomicAdd(g_generation,1); others spin on g_generation==my_gen with __nanosleep exponential backoff (32->cap 1024); then __threadfence ACQUIRE. Exactly 2 fences/CTA/barrier. Needs NO cooperative launch.",
+        "GridBarrier::sync_reset(int* reset_counter) (megakernel_common.cuh:222-254): identical but last arriver also atomicExch(reset_counter,0) BEFORE the generation bump, folding the TaskQueue counter reset into the barrier critical section (4->2 grid barriers per L3 step). Caller passes ctx.g_next_task.",
+        "setmaxnreg producer/consumer split: warp_specialize.cuh:159-171 warpgroup_reg_dealloc<N> ('setmaxnreg.dec.sync.aligned.u32') / warpgroup_reg_alloc<N> ('setmaxnreg.inc.sync.aligned.u32'). Driven by SG_TUNED_PROD_REGS=40 / SG_TUNED_CONS_REGS=232 (tile_pipeline.cuh:92-97), applied in tc_pipelined_gemm_m64nNk16 (tile_pipeline.cuh:291-294); 0 disables.",
+        "TMA/UTMALDG lives ONLY inside CUTLASS (mma.cuh): cuTensorMapEncode is called inside op.initialize()->make_tma_copy_*_sm90, baked into params_ (mma.cuh:83-153). Grep-verified: NO raw cp.async.bulk.tensor or UTMALDG PTX anywhere in csrc. CUTLASS is host-launched, device-non-callable, and EXPLICITLY REJECTED for the L3 persistent-megakernel path (wgmma.cuh:13-18). mma.cuh is gated behind -DWITH_CUTLASS (#error without it, mma.cuh:875).",
+        "TaskQueue (megakernel_common.cuh:91-117) = single global atomic counter g_next_task; next()=atomicAdd(g_next_task,1) IS the work-steal (no static partition). next_block broadcasts via smem. sm_id() reads %%smid (megakernel_common.cuh:65) for one-persistent-CTA-per-SM L2-warm pinning.",
+        "warp_specialize.cuh Mbarrier (:72-138) wraps one 8-byte smem word: init/inval/arrive_expect_tx (mbarrier.arrive.expect_tx.shared.b64) / arrive / try_wait.parity / wait. elect_one_sync (:41) = elect.sync (one leader PER WARP). fence_async_proxy (:143) = fence.proxy.async.shared::cta, exactly one per hand-off (loose = >10% regression).",
+        "tile_pipeline init_barriers uses count=128 per barrier with ALL 128 threads arriving; an earlier init(1)+per-warp-elect draft DEADLOCKED because elect.sync gives one leader per warp = 4 arrivals on a count-1 barrier (tile_pipeline.cuh:172-188). Documented correctness fix.",
+        "wgmma_selftest.cu is TEST-ONLY: JIT-loaded via torch cpp_extension.load by tests/hw/test_wgmma_substrate.py, defines its own PYBIND11_MODULE, EXCLUDED from setup.py _ops glob to avoid PyInit__ops collision (setup.py:455-468). Gates a/b/c/d/e; uses TransA=0,TransB=0 and wgmma_frag_decode for epilogue.",
+        "primitives.cuh provides the cp.async substrate (cp_async_cg_16/ca_4/commit/wait_group<N>/wait_all, :471-547), reductions (warp/block f32 + redux.sync.add.u32), L2PersistScope RAII (cudaAccessPolicyWindow, NOT hand-PTX createpolicy due to CUDA-13.1 ptxas bug, :387-468), and the REAL DSMEM cluster tree cluster_reduce_sum_f32_dsmem (map_shared_rank+cluster.sync, ENABLE_DSMEM_REDUCE default 0, :629)."
+      ],
+      "upgraded_or_artifact_notes": [
+        "The prompt's named upgraded levers SG_TUNED_DEC_FWD_PIPE and SG_TUNED_VIT_P1_SUBTILE_S and the _dectc_codegen deep_s3/deep_s4/postedit PTX-edit variants are NOT in any assigned file (grep-verified absent from csrc/backends/cuda/sm_90/* and megakernel_common.cuh). They live in model-stage headers (model_stage_decoder_tc.cuh / model_stage_vit_tc.cuh, confirmed to consume this substrate via tc_pipelined_gemm / make_desc_A_kmajor / WgmmaAccum references) and the _dectc_codegen/ tree.",
+        "The perf levers THIS substrate scope OWNS — the foundation the upgraded variants tune on top of: SG_TUNED_TILE_N=128, SG_TUNED_TILE_M=128 (wgmma.cuh:133-138); SG_TUNED_PIPE_DEPTH=2, SG_TUNED_WG_COUNT=2, SG_TUNED_PROD_REGS=40, SG_TUNED_CONS_REGS=232 (tile_pipeline.cuh:86-97); SG_TUNED_MEGA_BLOCK=256 (megakernel_common.cuh:50); SG_TUNED_PSCAN_BLOCK=512 (types.h:42). All #ifndef-guarded so the autotuner injects -DSG_TUNED_* per-TU; the baked-upgraded variants are pre-tuned values of exactly these knobs. The DEC_FWD_PIPE +1.49x deeper-ring lever tunes PIPE_DEPTH.",
+        "No prebuilt binaries are in the assigned read scope (all 10 are source headers + one .cu). Prebuilt cubins/objects live under build/, .build_cache/, nvcc_baseline_build/, task11_bench_build/, _dectc_codegen/ (seen in root listing) — flagged for the artifact reader, not read here.",
+        "mma.cuh CUTLASS GEMM flavors are all 128x128x64 tile / 1x1x1 cluster / FP32 accumulate / KernelScheduleAuto: Sm90Gemm, Sm90GemmBT (LayoutBT templated B/Bt), Sm90GemmBTOut (typed output, no fp32 scratch+cast), Sm90GemmAT (ColumnMajor-A At for ViT wgrad). Two DOCUMENT-STOPs reject small-M and Cooperative-large-M variants (double nvcc cost near OOM, unmeasured no-GPU win). TF32 path reinterprets float as tfloat32_t; explicitly NOT bit-identical to scalar FP32. Operator cache (16-slot thread_local, keyed {M,N,K,A,B,C}) reuses baked TMA descriptors on hit."
+      ],
+      "corrections": [
+        "The hand-rolled megakernel staging path uses cp.async, NOT TMA — any prior-pass claim that the L3 megakernel hand-writes TMA staging is wrong for these files: TMA exists ONLY inside CUTLASS's auto-generated CollectiveBuilder mainloop. mma.cuh:145-153 itself notes there is no hand-written TMA staging in mma.cuh to inject elect/mbarrier into.",
+        "DEVIATION: the wgmma.cuh API doc (wgmma.cuh:418-421) says the canonical operand orientation is TransA=0,TransB=1, but the actually-gated/exercised path (tile_pipeline.cuh:335-339 and wgmma_selftest.cu:110-111) uses TransA=0,TransB=0 ('both Major-K, cute Major::K==0'). The TransB=0 form is what is validated against torch.",
+        "wgmma_selftest.cu must NOT be counted as part of the shipped setup.py build — it is JIT-loaded test-only and is explicitly filtered out of the _ops glob (PyInit__ops collision), per setup.py:455-468.",
+        "The 'CUTLASS WGMMA path' (mma.cuh) and the 'in-kernel ss-wgmma path' (wgmma.cuh) are two distinct mechanisms; CUTLASS is rejected for the L3 persistent megakernel (device-non-callable). Conflating them would mis-attribute TMA to the megakernel."
+      ],
+      "digest_path": "/workspace/phase0b/sm90_wgmma_substrate.md"
+    },
+    {
+      "name": "06_opt_stages",
+      "area": "06_opt_stages",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "07_dispatch_launchers",
+      "area": "07_dispatch_launchers",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "08_prebuilt_artifacts",
+      "area": "08_prebuilt_artifacts",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "09_session_archive",
+      "area": "Session archive (claude_session_archive/) + the UPGRADED L3-TC kernel variants (baked perf levers + _dectc_codegen PTX-edit tree) + prebuilt binaries provenance + the under-read committed docs (CODEBASE_EXPLAINED.md / OPTIMIZATION_LEDGER.md / SESSION_STATE.md)",
+      "files_fully_read": [
+        "/workspace/PHASE0_CONTEXT.md",
+        "/workspace/SuperGrok1.5/OPTIMIZATION_LEDGER.md (entire, 169 lines)",
+        "/workspace/SuperGrok1.5/SESSION_STATE.md (entire, 125 lines)",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decoder_tc.cuh:1-285 (the full lever-doc region)",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_vit_tc.cuh:1-245 (the full lever-doc region)",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/fused_decoder_megakernel.cuh:360-529 (dynamic-smem gate region)",
+        "/workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu (entire, 374 lines)",
+        "/workspace/SuperGrok1.5/_dectc_codegen/grid.cpp",
+        "/workspace/SuperGrok1.5/_dectc_codegen/sizeprobe.cpp",
+        "/workspace/SuperGrok1.5/_dectc_codegen/{baseline,deep_s3,deep_s4,postedit_default}/err.log",
+        "CODEBASE_EXPLAINED.md:120-167, 360-420, 452-477 (upgrade-relevant sections; skim-read elsewhere)"
+      ],
+      "key_findings": [
+        "The tuned perf levers are BAKED as the #ifndef header defaults (NOT build flags): SG_TUNED_DEC_FWD_PIPE=1 (model_stage_decoder_tc.cuh:186), SG_TUNED_DEC_FWD_STAGES=4 (:189), SG_TUNED_DEC_DW_STAGE=1 (:145), SG_TUNED_DEC_DW_SPLITK=1 (:101), SG_TUNED_VIT_P1_SUBTILE_S=8 (model_stage_vit_tc.cuh:169).",
+        "Headline wins (OPTIMIZATION_LEDGER.md): decoder deeper cp.async ring PIPE=1/STAGES=4 = +1.49x (920.6->618.5 ms, roofline 4.35%->6.475%, :63-78); decoder dW contiguous-staging DW_STAGE=1 = +2.05x (1889.8->920.7 ms, 2.08%->4.35%, :60-61); ViT B1 sub-tile S=8 = +4.02x (5768->1434 ms, B1_barrier 51.2%->41.9%, :149-158). Cumulative decoder 1889->618 ms = 3.05x.",
+        "The static->dynamic smem conversion is the UNBLOCKER for STAGES>=3: gate SG_DEC_TC_DYNAMIC_SMEM = (SG_TUNED_DEC_FWD_PIPE && (SG_TUNED_DEC_FWD_STAGES>2)) at fused_decoder_megakernel.cuh:464-468; places DecTcSmem in extern __shared__ sg_dectc_pool[] + cudaFuncSetAttribute(MaxDynamicSharedMemorySize) since the deeper ring busts the 48KB static cap (legal-max 49.64KB at S=4). Allocation-only -> parity by construction.",
+        "The prebuilt grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so (33MB) IS the UPGRADED build: shipped fused_decoder_megakernel_tc<AdamW> reports SHARED:26384 + 1731 sg_dectc_pool references (the dynamic-smem deep-ring path), NOT the 44436 static baseline. Confirmed via cuobjdump --dump-resource-usage / --dump-elf, CPU-only.",
+        "PIPE=2 (producer/consumer mbarrier engine) LOST its tournament to the simpler deeper-ring entry-a: 857 vs 618 ms (model_stage_decoder_tc.cuh:186, OPTIMIZATION_LEDGER.md:78). The reverted P0 dW-pipelining (-11.6%) is the mechanism lesson: dW is 97%-staging/3%-MMA (staging-bound -> fix staging), fwd/dX are drain-bound (-> deeper ring hides the WAIT).",
+        "Mechanism doctrine validated by --fwd-fine sub-profiler: pre-KEEP fwd ring WAIT 43% vs WGMMA 31%, dX WAIT 56% vs 20% (drain-bound, deeper ring right). POST-KEEP the rings are now WGMMA-COMPUTE-bound (P1_fwd WGMMA 46.6% vs WAIT 9.9%, CODEBASE_EXPLAINED.md:400-404) -> S>4 buffering measured-unlikely to help; remaining headroom is GEMM efficiency.",
+        "META-LESSON (OPTIMIZATION_LEDGER.md:142-147): the decoder GEMM-staging win does NOT generalize. ViT dW-staging twin REVERTED (only +4.5% + gate-RED on sg2/vit) because ViT is non-GEMM-surface-bound (B1 imbalance, dW only 3%); Mamba M0 DEFERRED (scan-bound, parity-risky, d=128-bound). Profile each model's bottleneck before picking its lever.",
+        "ViT win is reported two ways (reconcile, not contradiction): 5768->1434 ms = 4.02x is the WALL-step speedup; B1_barrier 51.2%->41.9% is the residual barrier SHARE after the fix. Both from OPTIMIZATION_LEDGER.md:151-167 + SESSION_STATE.md:26.",
+        "BUG-04 is a queued open item, not a found bug: SESSION_STATE.md:106 = mamba staged-opt scratch gate (kMbStagedOptScratch byte-identical) to unblock muon/neuralgrok/looksam mamba cells (OOM at d>=1024). The string 'BUG-04' appears in zero archived jsonl.",
+        "Shipped TC launcher mega_decoder_real_adamw_tc_launcher.cu is OptId-generic: one host launcher dispatches 11 opt tails over the SAME validated wgmma kernel (fwd+bwd+grad-reduce opt-independent; only P3 apply_optimizer<Opt> differs). STAGED prodigy/muon + SAM-coupled SG11/SG15/LookSAM are single-launch in-kernel phases; SG2 has its own mega_decoder_sg2_tc entry (26 meta-net HBM ptrs)."
+      ],
+      "upgraded_or_artifact_notes": [
+        "_dectc_codegen/ is a CPU research work-bench for the static->dynamic-smem deep-ring conversion (NOT a shipped artifact). Statically decoded all variants: baseline/ = static SHARED:44436 (early/larger-tile probe); postedit_default/ cubin is BYTE-IDENTICAL to baseline (md5 67922b84... -> the 'postedit' PTX-edit pipeline is a no-op/round-trip verification at the default config); deep_s3_ptx/ = the dynamic-smem variant (SHARED:26384 + extern sg_dectc_pool, cubin 312376B differs, +reg pressure %r 4041->4250); deep_s3/deep_s4 = STAGES=3 vs STAGES=4 object-only compile probes (deep_s3.o != deep_s4.o).",
+        "sizeprobe.cpp + grid.cpp are host CPU calculators that produced the smem-budget numbers baked in fused_decoder_megakernel.cuh:461-463 (default TILE 128/128/IL2: S=2 17.64 / S=3 25.64 / S=4 33.64 KB; legal-max 256/128/IL4: S=4 49.64 KB = the only >48KB case the gate routes). grid.cpp prints the per-(TILE_M,TILE_N,IL,S) >48KB crossover.",
+        "Every _dectc_codegen err.log = the BENIGN ptxas note '(C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers' on fused_decoder_megakernel_tc<OptId=0> — present in the shipped build too, not an error.",
+        "Prebuilt binaries inventory: grokking_optimizers/_ops.so (33MB, the shipped UPGRADED fused build, 5 callables, 4 embedded cubins mega_{decoder,mamba,vit}_real_adamw_tc_launcher + sg2_meta_tail); nvcc_baseline_build/fastmath/_ops.so (Track-D plain-nvcc baseline); tune11_out/grokking_compiled_adamw_decoder_sm_90a_<hash>/*.so x10 (autotuner outputs); task11_bench_build/{A_sk4,B_sk4,C_sk2}/ (A/B/C split-K bench builds for #11). _ops build.log:270 nvcc line carries NO SG_TUNED_* -D (levers come from header defaults); TC launcher TUs get -DSG_TUNED_GEMM_IMPL=1 per-source.",
+        "Shipped _ops decoder_tc cubin SHARED:26384 matches deep_s3_ptx (the S=3 dynamic-smem size ~25.64KB), confirming the shipped build runs the dynamic-smem deep-ring path. (The baked default is STAGES=4 = 33.64KB sizeof; the cubin's reported static SHARED is the residual after dynamic externalization — the full DecTcSmem rides the dynamic sg_dectc_pool.)"
+      ],
+      "corrections": [
+        "REFINEMENT to PHASE0_CONTEXT.md §3: the prebuilt _ops.so is specifically the UPGRADED deep-ring dynamic-smem build (statically verified: SHARED:26384 + 1731 sg_dectc_pool refs), not merely 'imports & runs'. A rebuild reproduces the upgrade because the levers are baked header defaults, not build flags.",
+        "The DECODER DW_SPLITK default is now 1 (not 2 or 4): the +2.05x DW_STAGE=1 contiguous-staging obsoleted split-K (it was only a scalar-dW grid-fill mitigation). model_stage_decoder_tc.cuh:98-101, OPTIMIZATION_LEDGER.md:61. PHASE0_CONTEXT §6 C13 noted MB-removed but not this DEC default change.",
+        "The exact upgrade tokens (deep_s3, deep_s4, postedit, SUBTILE, _dectc_codegen, SG_TUNED_DEC_FWD_PIPE, FWD_STAGES) return ZERO hits across all 195 archived jsonl: the FINAL baking happened in a session NOT in claude_session_archive/. The archived sessions hold the earlier exploration (deeper-ring discovery via --fwd-fine, B1 imbalance profiling, dectc per-cell wiring). The committed docs (OPTIMIZATION_LEDGER/SESSION_STATE/CODEBASE_EXPLAINED) are the authoritative provenance and are mutually consistent.",
+        "_dectc_codegen/baseline (static 44436) must NOT be mistaken for the shipped config (dynamic 26384). postedit_default==baseline is a no-op verification; deep_s3_ptx is the real dynamic-smem variant.",
+        "PHASE0_CONTEXT correctly noted Mamba-3 stages are scalar; corroborated here — Mamba M0 wgmma-projections is DEFERRED (scan-bound/parity-risky/d=128-smem-bound, OPTIMIZATION_LEDGER.md:129-140), and the ViT dW-staging twin was REVERTED, so the deeper-ring/DW-staging/subtile upgrades are DECODER+ViT only."
+      ],
+      "digest_path": "/workspace/phase0b/SESSION_ARCHIVE_AND_UPGRADED_L3TC.md"
+    },
+    {
+      "name": "10_harness_models",
+      "area": "10_harness_models",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    },
+    {
+      "name": "11_compile_build",
+      "area": "11_compile_build",
+      "files_fully_read": [],
+      "key_findings": [],
+      "upgraded_or_artifact_notes": [],
+      "corrections": [
+        "AGENT NULL"
+      ],
+      "digest_path": ""
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "DeepRead"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "docs:state+ledgers",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a0a5e1dd41ed69a53",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387915,
+      "queuedAt": 1782337387880,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/_dectc_codegen/sizeprobe.cpp",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337444768,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 147746,
+      "toolCalls": 21,
+      "durationMs": 56853
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "perf:.perf audits",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a35feec5d2073c6b7",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387917,
+      "queuedAt": 1782337387880,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/.perf/author_queue3_report.json",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337446597,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 150887,
+      "toolCalls": 33,
+      "durationMs": 58680
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "kernel:decoder L3-TC",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "aa1771e1f68775ddf",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387918,
+      "queuedAt": 1782337387880,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/csrc/fused/sm_90/model_stage_decode…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337445822,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 140742,
+      "toolCalls": 13,
+      "durationMs": 57904
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "kernel:vit+mamba L3-TC",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a67bbb60dee069c6c",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387918,
+      "queuedAt": 1782337387880,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/csrc/fused/sm_90/fused_mamba_megake…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337445661,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 175519,
+      "toolCalls": 15,
+      "durationMs": 57742
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "substrate:wgmma+pipeline",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a2f8d8377526dd150",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782337387919,
+      "queuedAt": 1782337387880,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "sm_90 WGMMA substrate + L3 megakernel coordination (csrc/ba…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337697346,
+      "tokens": 128641,
+      "toolCalls": 19,
+      "durationMs": 309426,
+      "resultPreview": "{\"area\":\"sm_90 WGMMA substrate + L3 megakernel coordination (csrc/backends/cuda/sm_90/{wgmma,mma,primitives,tile_pipeline,warp_specialize}.cuh + wgmma_selftest.cu, csrc/fused/megakernel_common.cuh, csrc/common/{platform.h,types.h,utils.cuh})\",\"files_fully_read\":[\"/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/wgmma.cuh\",\"/workspace/SuperGrok1.5/csrc/backends/cuda/sm_90/mma.cuh\",\"/workspace/Super…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "opt:tail+staged+SG2",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a9c59abd1d7079a4b",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387920,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/csrc/fused/sm_90/opt_stage_supergro…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337446839,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 132324,
+      "toolCalls": 21,
+      "durationMs": 58919
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "wiring:dispatch+launchers",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a1d9349d3f3edbbb2",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387920,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "Bash",
+      "lastToolSummary": "cd /workspace/SuperGrok1.5 echo \"=== VIT P1 SUBTILE knob ==…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337447626,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 155383,
+      "toolCalls": 18,
+      "durationMs": 59706
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "artifacts:prebuilt+disasm",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a22bc61a8c6e7c44d",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387921,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "Write",
+      "lastToolSummary": "/workspace/phase0b/PREBUILT_ARTIFACTS_AND_UPGRADED_L3TC.md",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782338093599,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 125283,
+      "toolCalls": 39,
+      "durationMs": 705678
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "archive:prior session",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a16fbeda4b850d142",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1782337387921,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Session archive (claude_session_archive/) + the UPGRADED L3…",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782338007623,
+      "tokens": 153600,
+      "toolCalls": 41,
+      "durationMs": 619702,
+      "resultPreview": "{\"area\":\"Session archive (claude_session_archive/) + the UPGRADED L3-TC kernel variants (baked perf levers + _dectc_codegen PTX-edit tree) + prebuilt binaries provenance + the under-read committed docs (CODEBASE_EXPLAINED.md / OPTIMIZATION_LEDGER.md / SESSION_STATE.md)\",\"files_fully_read\":[\"/workspace/PHASE0_CONTEXT.md\",\"/workspace/SuperGrok1.5/OPTIMIZATION_LEDGER.md (entire, 169 lines)\",\"/workspa…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "harness:race+models",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a4b650636681072d3",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387922,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/grokking_optimizers/dispatch.py",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337445651,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 156247,
+      "toolCalls": 14,
+      "durationMs": 57729
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "compile:build+cache+autotune",
+      "phaseIndex": 1,
+      "phaseTitle": "DeepRead",
+      "agentId": "a966f91d17e5a4990",
+      "model": "claude-opus-4-8[1m]",
+      "state": "error",
+      "startedAt": 1782337387922,
+      "queuedAt": 1782337387881,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "/workspace/SuperGrok1.5/grokking_optimizers/compile.py",
+      "promptPreview": "Repo root: /workspace/SuperGrok1.5. You are a Phase-0b EXHAUSTIVE reader. A prior pass GREP-SKIMMED and MISSED things (prebuilt binaries, the upgraded L3-TC kernel, the session archive, CODEBASE_EXPLAINED.md). Your job: READ YOUR ASSIGNED FILES COMPLETELY — every line, paging through any truncation with offset/limit until you reach EOF. Do NOT grep-skim; actually read. Cite file:line. The codebase…",
+      "lastProgressAt": 1782337445524,
+      "error": "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      "tokens": 114851,
+      "toolCalls": 17,
+      "durationMs": 57602
+    }
+  ],
+  "totalTokens": 1581223,
+  "totalToolCalls": 251
+}

@@ -1,0 +1,7 @@
+=== build process exited ===
+ls: cannot access '/workspace/.torch_ext/sg_tp8_scratch/_tp8_scratch_dlink.o': No such file or directory
+-rwxrwxrwx 1 root root 1965936 Jun 25 07:16 /workspace/.torch_ext/sg_tp8_scratch/sg_tp8_scratch.so
+=== symbol check ===
+1
+=== device nvshmem symbols pulled? ===
+3
