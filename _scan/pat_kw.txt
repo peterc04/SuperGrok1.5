@@ -1,1 +1,0 @@
-(pass(word|wd)|secret|api[_-]?key|access[_-]?key|client[_-]?secret|auth[_-]?token|bearer |private[_-]?key|credential)["' ]{0,3}[:=]
