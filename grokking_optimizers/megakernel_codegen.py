@@ -593,6 +593,143 @@ _DEC_BENCH_D = 2048
 _DEC_FLAGSHIP_D, _DEC_FLAGSHIP_HEADS, _DEC_FLAGSHIP_LAYERS = 1600, 25, 48
 
 
+# ── SIZE/CONFIG-ADAPTIVE kernel specialization (the self-designing megakernel) ──
+# The codegen picks the megakernel's tile/occupancy KNOBS by WORKLOAD SIZE, the
+# same way distributed.py's ParallelConfig picks the all-reduce by parallelism
+# DEGREE. SMALL configs (the d=128 production race) keep the persistent 1-CTA/SM
+# shape — overhead dominates, CTA-tiling would only add cross-CTA traffic. LARGE
+# configs (d=2048 bench, the d=1600/L=48 flagship) turn on CTA-TILING (occupancy>1
+# / clusters — bottleneck LEVER 2: the measured ~20% grid-barrier idle at d=2048 is
+# cross-CTA load imbalance, fixed by more CTAs per output tile). The threshold is a
+# function of (d, layers, T=B*seq, n_sms): a workload is LARGE when ONE persistent
+# wave (1 CTA/SM) cannot keep the SMs busy through the per-tile fwd/bwd — i.e. when
+# the token-tile count is small relative to n_sms (few tiles ⇒ idle SMs ⇒ the grid
+# barrier waits on the slowest) OR the per-tile GEMM N-range is wide enough to split
+# across cooperating CTAs (d large).
+#
+# CONTRACT (the §1 byte-identical-when-OFF invariant): the THREE shipped tiers
+# (d=128 production, d=2048 bench, d=1600 flagship) MUST keep their CURRENT knobs so
+# today's gates stay green. CTA-tiling is reported in the tier's `size_config` field
+# (consumed by the launcher's SizeConfig template arg, EDIT C) but does NOT change
+# the emitted -DSG_TUNED_* tile macros for those tiers on THIS increment — the knob
+# values below are exactly the in-header #ifndef defaults the live build uses
+# (model_stage_decoder_tc.cuh / fused_decoder_megakernel.cuh). The selector is the
+# stable seam the §7 CTA-tiled body + a future retuned-large-tier knob set hang off.
+#
+# Each tier is (predicate, knobs, size_config) where:
+#   * predicate(d, layers, T, n_sms) -> bool  : is this tier selected?
+#   * knobs : dict of SG_TUNED_* -> value     : the -D macros emitted for the tier
+#             (FIRST-MATCH wins; values == the live #ifndef defaults today).
+#   * size_config : the parallel_config.cuh SizeConfig alias name the launcher
+#                   instantiates (par::SizeSmall / par::SizeLarge). This is what
+#                   carries CTA-tiling into the kernel (EDIT C), NOT the knobs dict.
+#
+# THE LIVE #ifndef DEFAULTS (single source — keep == the kernel headers):
+_DEC_KNOB_DEFAULTS = {
+    "SG_TUNED_TILE_M":              128,   # model_stage_decoder_tc.cuh:76
+    "SG_TUNED_TILE_N":              128,   # model_stage_decoder_tc.cuh:79
+    "SG_TUNED_DEC_GEMM_STAGES":     2,     # model_stage_decoder_tc.cuh:91
+    "SG_TUNED_DEC_GEMM_INTERLEAVE": 2,     # model_stage_decoder_tc.cuh:114
+    "SG_TUNED_DEC_DW_SPLITK":       1,     # model_stage_decoder_tc.cuh:101
+    "SG_TUNED_DEC_FWD_PIPE":        0,     # model_stage_decoder_tc.cuh:249 (off)
+    "SG_TUNED_DEC_FWD_STAGES":      2,     # model_stage_decoder_tc.cuh:261 (inherits)
+    "SG_TUNED_DEC_DW_STAGE":        0,     # model_stage_decoder_tc.cuh:210 (scalar)
+}
+
+# H100 SM count — the n_sms the launcher reads at runtime
+# (cudaDevAttrMultiProcessorCount). Mirrored here so the selector is a pure function
+# the codegen + a CPU test can evaluate; the launcher passes the REAL n_sms.
+_DEC_DEFAULT_N_SMS = 132
+
+
+def _dec_token_tiles(T: int, tile_m: int) -> int:
+    """Token-tile count = ceil(T / TILE_M). The P1 loop grid-strides over these
+    (fused_decoder_megakernel.cuh P1). Few tiles vs n_sms ⇒ idle SMs (LEVER 2)."""
+    return (T + tile_m - 1) // tile_m
+
+
+def _dec_is_large(d: int, layers: int, T: int, n_sms: int,
+                  tile_m: int = 128) -> bool:
+    """LARGE-tier predicate: CTA-tiling pays off. A workload is LARGE when the
+    persistent 1-CTA/SM wave under-fills the grid OR the model width is large enough
+    that one output tile's N-range is worth splitting across cooperating CTAs.
+
+    Two structural triggers (either ⇒ LARGE):
+      (1) WIDTH: d >= 1024 — the in_proj/ff GEMM N-range (3d / 4d) is wide enough
+          that 2 CTAs per tile each get a full wgmma N-tile, and the per-CTA weight
+          residency halves (the d=2048 bench + the d=1600 flagship both clear this).
+      (2) GRID UNDER-FILL: ceil(T/TILE_M) < n_sms — fewer token tiles than SMs, so a
+          1-CTA/SM wave leaves SMs idle and the grid barrier waits on the slowest
+          (the measured ~20% idle). CTA-tiling assigns multiple CTAs per tile to use
+          the otherwise-idle SMs.
+    SMALL otherwise (the d=128 production race: d<1024 AND enough tiles to fill the
+    grid ⇒ the persistent shape wins, overhead dominates)."""
+    if d >= 1024:
+        return True
+    if _dec_token_tiles(T, tile_m) < n_sms:
+        return True
+    return False
+
+
+def decoder_knobs_for_size(d: int, layers: int, T: int,
+                           n_sms: int = _DEC_DEFAULT_N_SMS) -> dict:
+    """SELECT the megakernel tile/occupancy knobs for ONE workload size. Returns
+    {"knobs": {SG_TUNED_*: val}, "size_config": "par::SizeSmall"|"par::SizeLarge",
+     "tier": "small"|"large"}.
+
+    This is the self-designing megakernel's size→knobs map, the analogue of
+    distributed.py mapping degrees→ParConfig. The THREE shipped tiers keep their
+    CURRENT knobs (the live #ifndef defaults) so today's gates stay green; the
+    `size_config` field is what carries CTA-tiling into the kernel via the launcher's
+    SizeConfig template arg (EDIT C). Only a future retuned-large-tier (or the §7
+    CTA-tiled body) changes the emitted -D knobs for the large tier — and it does so
+    HERE, in one place, gated on `tier == "large"`.
+
+    PURE function: no torch, no GPU. The launcher re-derives the same tier from the
+    runtime (d, layers, T, n_sms) so the codegen-emitted knobs and the runtime
+    SizeConfig agree (the dual-surface contract, mirroring flagship_budget.py)."""
+    knobs = dict(_DEC_KNOB_DEFAULTS)
+    large = _dec_is_large(d, layers, T, n_sms, tile_m=knobs["SG_TUNED_TILE_M"])
+    if large:
+        # LARGE tier. CTA-tiling carried via size_config (par::SizeLarge); the
+        # emitted -D knobs stay at the live defaults on THIS increment (byte-
+        # identical to today's d=2048/flagship build — the §1 contract). A future
+        # large-tier retune (or the §7 CTA-tiled body) edits THIS branch only.
+        return {"knobs": knobs, "size_config": "par::SizeLarge", "tier": "large"}
+    # SMALL tier (the d=128 production race): the persistent 1-CTA/SM shape.
+    return {"knobs": knobs, "size_config": "par::SizeSmall", "tier": "small"}
+
+
+# The named decoder size tiers the build/autotuner enumerate (d=128 production,
+# d=2048 bench, d=1600/L=48 flagship). Each entry is the (d, layers, T) the tier is
+# evaluated at; T uses a representative B per tier (the production race B, the bench
+# B, the flagship B from run_harness.md). The autotuner's size_tier dim (EDIT D)
+# iterates these names; the build emits decoder_knobs_for_size(*tier) per variant.
+DEC_SIZE_TIERS = {
+    # name        (d,                 layers,             T = B * seq)
+    "production": (_DEC_D,            _DEC_LAYERS,         512 * _DEC_SEQ),   # d=128, the race
+    "bench":      (_DEC_BENCH_D,      _DEC_LAYERS,        4096 * _DEC_SEQ),   # d=2048 roofline
+    "flagship":   (_DEC_FLAGSHIP_D,  _DEC_FLAGSHIP_LAYERS, 512 * _DEC_SEQ),  # d=1600,L=48
+}
+
+
+def decoder_knobs_report(n_sms: int = _DEC_DEFAULT_N_SMS) -> str:
+    """Human-readable table of the size→knobs selection for every named tier —
+    printed by `--decoder-knobs` so the operator/diff SEES which tier turns on
+    CTA-tiling and that the shipped tiers keep their knobs. Emits NO header."""
+    lines = ["decoder size-adaptive knob selection  (n_sms=%d)" % n_sms,
+             "  %-11s %5s %6s %8s  %-14s  %s"
+             % ("tier", "d", "layers", "T", "size_config", "knobs(non-default)")]
+    for name, (d, layers, T) in DEC_SIZE_TIERS.items():
+        sel = decoder_knobs_for_size(d, layers, T, n_sms)
+        nondef = {k: v for k, v in sel["knobs"].items()
+                  if v != _DEC_KNOB_DEFAULTS[k]}
+        lines.append("  %-11s %5d %6d %8d  %-14s  %s"
+                     % (name, d, layers, T, sel["size_config"],
+                        nondef if nondef else "(all default)"))
+    return "\n".join(lines)
+
+
 def _decoder_param_sizes(d: int = _DEC_D, *, layers: int = _DEC_LAYERS,
                          vocab: int = _DEC_VOCAB, seq: int = _DEC_SEQ) -> List[int]:
     """Per-tensor numel in named_parameters() order (mirror of decoder_oracle.py
@@ -1756,6 +1893,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="emit the FLAGSHIP (d=1600, layers=48) L3-REAL decoder "
                          "weight-layout header "
                          "(csrc/fused/sm_90/decoder_flagship_layout.cuh)")
+    ap.add_argument("--decoder-knobs", action="store_true",
+                    help="print the SIZE-ADAPTIVE tile/occupancy knob selection for "
+                         "every named decoder size tier (production/bench/flagship): "
+                         "which tier turns on CTA-tiling + the emitted -DSG_TUNED_* "
+                         "knobs. Emits NO header (inspection only).")
     ap.add_argument("--vit-layout", action="store_true",
                     help="emit the PHASE-2 L3-REAL ViT weight-layout header "
                          "(csrc/fused/sm_90/vit_layout.cuh)")
@@ -1810,6 +1952,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.decoder_layout_flagship:
         sys.stdout.write(decoder_flagship_layout_header())
+        return 0
+
+    if args.decoder_knobs:
+        sys.stdout.write(decoder_knobs_report() + "\n")
         return 0
 
     if args.vit_layout:
