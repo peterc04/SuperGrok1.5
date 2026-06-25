@@ -42,3 +42,4 @@ gate_seed*.log
 p[0-9]_*.log
 .task*_*.log
 .regpressure/
+.session_context/
