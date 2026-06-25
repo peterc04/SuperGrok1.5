@@ -308,6 +308,12 @@ def make_real_batch(B: int, seed: int, device):
 # ───────────────────────── the rank worker (live run) ─────────────────────────
 
 def run_rank(args) -> int:
+    # On the --nvshmem path, set the NVLS-disable container knobs BEFORE
+    # init_process_group: the RunPod container forbids NVLink-SHARP multicast
+    # cuMemMap, which hits NCCL's NVLS path (and NVSHMEM's) at TP>2. Importing the
+    # ext module applies NVSHMEM_DISABLE_NVLS=1 / NCCL_NVLS_ENABLE=0 via setdefault.
+    if args.nvshmem:
+        import grokking_optimizers.nvshmem_bringup_ext  # noqa: F401,PLC0415
     import torch  # noqa: PLC0415
     import torch.distributed as dist  # noqa: PLC0415
     from grokking_optimizers.distributed import DistributedContext  # noqa: PLC0415
@@ -344,16 +350,38 @@ def run_rank(args) -> int:
     _dctx = DistributedContext.from_config(cfg)
 
     # NVSHMEM TP-team bootstrap (only on the real device-initiated path).
+    # This is the REAL bring-up (the GOAL's capability track): it JIT-builds the
+    # host NVSHMEM pybind, drives nvshmem_init via the UID bootstrap broadcast over
+    # this NCCL PG, carves the TP team with nvshmem_team_split_strided, and runs the
+    # collective nvshmem_malloc of the symmetric tp_sym_heap — all matching the
+    # launcher's dec_tc_ensure_tp_sym_heap + EDIT-E CommCtx fields exactly. The
+    # resolved CommCtx fields (team handle + symmetric heap ptr) are what the launcher
+    # reads on the kTPComm path. Replaces the old TPBootstrapBlocked stub.
+    nvshmem_fields = None
     if args.nvshmem:
-        def _uid_bcast(uid):  # tiny torch.distributed broadcast of the UID blob
+        from grokking_optimizers.nvshmem_bringup_ext import (  # noqa: PLC0415
+            bringup_tp_team_live,
+        )
+
+        def _uid_bcast(uid):  # fixed-length torch.distributed broadcast of the UID
             import torch as _t  # noqa: PLC0415
-            buf = _t.zeros(1, dtype=_t.uint8, device=device)  # placeholder seam
+            # 128-byte nvshmemx_uniqueid_t blob; rank 0 supplies the minted bytes.
+            n = len(uid) if uid is not None else 128
+            buf = _t.zeros(n, dtype=_t.uint8, device=device)
+            if rank == 0 and uid is not None:
+                buf.copy_(_t.frombuffer(bytearray(uid), dtype=_t.uint8).to(device))
             dist.broadcast(buf, src=0)
-            return uid
+            return bytes(buf.cpu().numpy().tobytes())
         try:
-            team = bootstrap_tp_team(tp_boot, uid_broadcast=_uid_bcast)
+            _nv_mod, nvshmem_fields = bringup_tp_team_live(
+                tp_boot, uid_broadcast=_uid_bcast, device_ordinal=local_rank,
+                verbose_build=args.verbose_build)
             if rank == 0:
-                print(f"[rank0] NVSHMEM TP team bootstrapped (handle={team})",
+                print(f"[rank0] NVSHMEM TP team bootstrapped LIVE: "
+                      f"handle={nvshmem_fields['tp_comm_handle']} "
+                      f"tp_team_n_pes={nvshmem_fields['tp_team_n_pes']} "
+                      f"sym_heap=0x{nvshmem_fields['tp_sym_heap_ptr']:x} "
+                      f"stride_floats={nvshmem_fields['tp_heap_stride_floats']:,}",
                       flush=True)
         except TPBootstrapBlocked as e:
             raise SystemExit(f"[rank{rank}] NVSHMEM bring-up blocked: {e}")
