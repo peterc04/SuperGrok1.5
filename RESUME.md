@@ -9,7 +9,7 @@ guide restores the rest. The git repo (`/workspace/SuperGrok1.5/.git`), all deli
 ```bash
 pip install nvidia-nvshmem-cu12 optuna ruff nvidia-ml-py     # session-added deps (deleted on closure)
 cd /workspace/SuperGrok1.5
-git config user.email "pcoy400@gmail.com" && git config user.name "SuperGrok2 session"
+git config user.email "<owner-email>" && git config user.name "SuperGrok2 session"
 # restore the persistent memory (originals were at /root/.claude/... = deleted):
 mkdir -p /root/.claude/projects/-/memory && cp .session_memory/*.md /root/.claude/projects/-/memory/
 # NVSHMEM env for the 8-GPU path:

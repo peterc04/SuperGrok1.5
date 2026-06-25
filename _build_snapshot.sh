@@ -76,7 +76,7 @@ log "git init + single snapshot commit"
 cd "$SNAP" || exit 1
 git init -q
 git config user.name "Peter Coy"
-git config user.email "pcoy400@gmail.com"
+git config user.email "<owner-email>"
 git add -A -f
 log "  staged $(git diff --cached --name-only | wc -l) files; committing..."
 git commit -q -m "snapshot: full self-contained environment (source + build cache + binaries + vendored CUTLASS + env recipe)
