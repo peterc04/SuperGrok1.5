@@ -77,6 +77,8 @@
 #include "csrc/fused/sm_90/mamba3_layout.cuh"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstddef>
+#include <type_traits>
 #include <math_constants.h>
 
 namespace sg { namespace fused { namespace sm90 {
@@ -136,24 +138,88 @@ __device__ __forceinline__ float mb_softplus_grad(float x) {  // sigmoid(x)
     return mb_sigmoid(x);
 }
 
+// ── Layer-streaming smem extent (decoder DecTcSmem mirror). On the SMALL/bench
+//    path (kMbStreamSmem==false) the per-sample smem caches ALL layers exactly as
+//    before → byte-identical. On the flagship path it caches ONE layer + a ring of
+//    block-inputs; the cross-layer acts persist in the HBM MbActsHbm workspace
+//    (mb_acts_bind), exactly as the decoder keeps per-layer acts in DecActs. ──
+constexpr int kMbSmemLayers  = kMbStreamSmem ? 1            : mb::kLayers;
+constexpr int kMbLayerInRing = kMbStreamSmem ? kMbActsRing : mb::kLayers;
+// Map a model layer index li∈[0,kLayers) to its smem LayerAct slot / layer_in ring
+// slot. SMALL: identity (li). Flagship: act always slot 0; layer_in ring = li%ring.
+__device__ __forceinline__ int mb_smem_la(int li) { return kMbStreamSmem ? 0 : li; }
+__device__ __forceinline__ int mb_ring(int li)    { return kMbStreamSmem ? (li % kMbActsRing) : li; }
+// fn_xhat row index: SMALL keeps all kSeq rows (identity); STREAMED keeps only the
+// LAST position (row 0). The head/final-norm fwd+bwd touch ONLY position kSeq-1, so
+// mapping kSeq-1 -> 0 is exact. (fn_xhat's d-wide bwd-scratch reuse moves to `dr2`.)
+__device__ __forceinline__ int mb_fnx(int s)      { return kMbStreamSmem ? 0 : s; }
+
+// ── Level B: HBM-backed 2D buffer PROXY. On the streamed path the big per-sample
+//    SEQ×W scratch buffers (x_in,z,y_scan,h1,g_pre,u_mlp,adj_a/b/c,wff_a/b,dh,dr,
+//    final_in) are NOT stored in smem — the struct holds this 8-byte proxy whose
+//    base points into the per-CTA HBM scratch region (mb_scratch_bind). operator[]
+//    yields the row pointer so EVERY existing access — buf[s][c], &buf[0][0],
+//    &buf[s][0] — reads byte-for-byte the same source text. On SMALL the field is a
+//    REAL float[Rows][Cols] smem array (this proxy is never instantiated), so the
+//    SMALL struct + sizeof + all accesses are bit-identical to the shipped code.
+//    `Cols` is the compile-time row stride (== the buffer width). ────────────────
+template <int Cols>
+struct MbHbmBuf2D {
+    float* base_;
+    __device__ __forceinline__ float* operator[](int s) const { return base_ + (int64_t)s * Cols; }
+};
+// Set the HBM base of a buffer field. Overloaded so the SAME bind code compiles for
+// BOTH field types: a no-op for the SMALL real-array types (.base_ doesn't exist there),
+// the pointer-set for the streamed proxy. (if constexpr can't guard a non-template
+// member access — it would be ill-formed-when-discarded — so route through this.)
+template <int Cols>
+__device__ __forceinline__ void mb_set_base(MbHbmBuf2D<Cols>& b, float* p) { b.base_ = p; }
+template <typename T>
+__device__ __forceinline__ void mb_set_base(T& /*real_array_or_char0*/, float* /*p*/) {}
+// Row base of a buffer field as float* (works for both the proxy and a real array; for
+// the streamed-only char[0] dr2 the catch-all returns nullptr — that case is unused on
+// SMALL). Overloaded so the SMALL `char[0] dr2` never gets a `[0][0]` (ill-formed).
+template <int Cols>
+__device__ __forceinline__ float* mb_buf_base(MbHbmBuf2D<Cols>& b) { return b.base_; }
+template <int Rows, int Cols>
+__device__ __forceinline__ float* mb_buf_base(float (&a)[Rows][Cols]) { return &a[0][0]; }
+template <typename T>
+__device__ __forceinline__ float* mb_buf_base(T& /*char[0] dr2 on SMALL (unused)*/) { return nullptr; }
+// Conditional field type: real smem array on SMALL, the HBM proxy on the streamed
+// path. `Rows` is the SMALL row count; `Cols` the width (== HBM stride). The proxy
+// ignores Rows (its extent is the HBM slab's), but we keep it for documentation.
+template <int Rows, int Cols>
+using MbBuf2D = ::std::conditional_t<kMbStreamSmem, MbHbmBuf2D<Cols>, float[Rows][Cols]>;
+// Zero-smem-on-SMALL variant: a ZERO-LENGTH char array on SMALL (occupies 0 bytes —
+// the nvcc/gcc/clang flexible-array extension, so the SMALL struct stays byte-identical:
+// sizeof == kMambaSmemBytes), the HBM proxy on the streamed path. Used for `dr2`, the
+// streamed-only SEQ×D backward scratch that replaces fn_xhat's d-wide reuse.
+template <int Cols>
+using MbBuf2DStreamOnly = ::std::conditional_t<kMbStreamSmem, MbHbmBuf2D<Cols>, char[0]>;
+
 // ── Per-CTA scratch for one sample. POD held in smem (one instance per CTA).
 //    BOTH layers' forward activations are cached. The scan complex STATE is NOT
 //    here (per-thread registers — the seq=8 exploit). ──────────────────────────
 struct MambaSampleSmem {
     // Cross-block residual stream: the INPUT to each block (= residual x), and
     // the final-block output feeding the head norm.
-    float layer_in[mb::kLayers][mb::kSeq][mb::kD];   // block input (residual)
-    float final_in[mb::kSeq][mb::kD];                // final-block output -> head
+    // STREAMED (kMbStreamSmem): layer_in is a kMbActsRing-deep ring (cross-layer acts
+    // persist in HBM MbActsHbm); SMALL: all layers cached → byte-identical extent.
+    float layer_in[kMbLayerInRing][mb::kSeq][mb::kD];   // block input (residual); ring on streamed
+    // final_in -> HBM proxy on the streamed path (per-sample transient → not resident).
+    MbBuf2D<mb::kSeq, mb::kD> final_in;              // final-block output -> head
     // Per-block cached forward activations (both blocks): the values the backward
     // reads. The block-level "h1" (= x + mixer_out) is cached so mlp_norm's input
     // and the mixer-residual reconstruction are available in the backward.
+    // STREAMING NOTE: the SMALL (smem) caches are grouped FIRST (contiguous), the big
+    // SEQ×{DINNER,D,DFF} buffers (HBM proxies on the streamed path) LAST. The streamed
+    // fwd/bwd flat-copy ONLY the contiguous small-cache prefix to/from per-layer HBM
+    // (mb_acts_small); the big buffers are bound per-layer directly into HBM (no spill).
+    // Reordering vs the shipped struct is behavior-identical (fields accessed by name);
+    // SMALL sizeof is unchanged → byte-identical.
     struct LayerAct {
-        // --- mixer pre-norm (RMSNorm_mix) cache: only the recip (xhat recomputed
-        //     in bwd from the raw block input layer_in[li], saving kSeq*kD floats) ---
+        // ── SMALL CACHES (smem; flat-copied to per-layer HBM on the streamed path) ──
         float mixn_r[mb::kSeq];                // rsqrt(mean(x^2)+eps)
-        // --- mixer internals ---
-        float x_in[mb::kSeq][mb::kDInner];     // in_proj first half (= x_main, scan/x_proj/D input)
-        float z[mb::kSeq][mb::kDInner];        // in_proj second half (gate)
         float dt_lr[mb::kSeq][mb::kDtRank];    // dt_proj input (x_proj slice)
         float dt_pre[mb::kSeq][mb::kNHeads];   // dt_proj out + bias (PRE-softplus, per head)
         float A_mod[mb::kSeq][mb::kNHeads];    // x_proj A_mod slice (per head)
@@ -169,26 +235,36 @@ struct MambaSampleSmem {
         // post-norm+bias 2-vector streams (the scan reads these):
         float Bbar[mb::kSeq][mb::kStateC][2];  // (Br2, Bi2)
         float Cbar[mb::kSeq][mb::kStateC][2];  // (Cr2, -Ci2)
-        float y_scan[mb::kSeq][mb::kDInner];   // selective-scan output (per channel)
-        // --- block inter-residual + mlp pre-norm (RMSNorm_mlp) cache ---
-        float h1[mb::kSeq][mb::kD];            // x + mixer_out (mlp_norm input; raw x for mlpn bwd)
         float mlpn_r[mb::kSeq];                // mlp_norm rms recip (xhat recomputed from h1 in bwd)
-        // --- SwiGLU internals ---
-        float g_pre[mb::kSeq][mb::kDff];       // gate_proj out (pre-SiLU)
-        float u_mlp[mb::kSeq][mb::kDff];       // up_proj out
-    } act[mb::kLayers];
-    // Final-norm caches (last position used) + head logits.
-    float fn_xhat[mb::kSeq][mb::kD];
+        // ── BIG BUFFERS (HBM proxies on the streamed path; per-layer-bound) ──
+        MbBuf2D<mb::kSeq, mb::kDInner> x_in;    // in_proj first half (= x_main, scan/x_proj/D input)
+        MbBuf2D<mb::kSeq, mb::kDInner> z;       // in_proj second half (gate)
+        MbBuf2D<mb::kSeq, mb::kDInner> y_scan;  // selective-scan output (per channel)
+        MbBuf2D<mb::kSeq, mb::kD>      h1;       // x + mixer_out (mlp_norm input; raw x for mlpn bwd)
+        MbBuf2D<mb::kSeq, mb::kDff>    g_pre;    // gate_proj out (pre-SiLU)
+        MbBuf2D<mb::kSeq, mb::kDff>    u_mlp;    // up_proj out
+    } act[kMbSmemLayers];                       // one layer on streamed; all layers on SMALL
+    // Final-norm caches. STREAMED: only the last position is ever read (head/final-norm
+    // fwd+bwd touch kSeq-1), so fn_xhat shrinks to [1][D]; SMALL keeps [kSeq][D] (the
+    // backward reuses it as a d-wide scratch — that reuse moves to the HBM `dr2` slab
+    // on the streamed path). Index fn_xhat by mb_fnx(s) (last->0 on streamed).
+    float fn_xhat[kMbFnXhatRows][mb::kD];
     float fn_r[mb::kSeq];
     float logits[mb::kPHead];
-    // Backward adjoint scratch (reused across the per-block chain).
-    float dh[mb::kSeq][mb::kD];                // running grad wrt block output
-    float dr[mb::kSeq][mb::kD];                // RMSNorm-bwd output / residual scratch
-    float adj_a[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
-    float adj_b[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
-    float adj_c[mb::kSeq][mb::kDInner];        // d_inner-wide scratch
-    float wff_a[mb::kSeq][mb::kDff];           // d_ff-wide scratch (MLP)
-    float wff_b[mb::kSeq][mb::kDff];           // d_ff-wide scratch (MLP)
+    // Backward adjoint scratch (reused across the per-block chain). Big SEQ×{D,DINNER,
+    // DFF} buffers -> HBM proxy on the streamed path.
+    MbBuf2D<mb::kSeq, mb::kD>      dh;          // running grad wrt block output
+    MbBuf2D<mb::kSeq, mb::kD>      dr;          // RMSNorm-bwd output / residual scratch
+    MbBuf2D<mb::kSeq, mb::kDInner> adj_a;       // d_inner-wide scratch
+    MbBuf2D<mb::kSeq, mb::kDInner> adj_b;       // d_inner-wide scratch
+    MbBuf2D<mb::kSeq, mb::kDInner> adj_c;       // d_inner-wide scratch
+    MbBuf2D<mb::kSeq, mb::kDff>    wff_a;       // d_ff-wide scratch (MLP)
+    MbBuf2D<mb::kSeq, mb::kDff>    wff_b;       // d_ff-wide scratch (MLP)
+    // STREAMED-ONLY HBM scratch: the SEQ×D backward scratch that SMALL borrows from
+    // fn_xhat[0..kSeq-1] (mb_swiglu_bwd/mb_mixer_bwd dxn/dh1n staging). On SMALL this
+    // is a ZERO-byte placeholder (kMbFnXhatRows==kSeq there → the real fn_xhat is used
+    // and dr2 is never referenced); on streamed it is a full SEQ×D HBM slab.
+    MbBuf2DStreamOnly<mb::kD>      dr2;
     float xproj[mb::kSeq][mb::kXProj];         // x_proj fwd out / dx_proj staging
     // scan-bwd cross-channel reduce targets (head-shared), per timestep:
     float dBbar[mb::kSeq][mb::kStateC][2];
@@ -200,12 +276,132 @@ struct MambaSampleSmem {
     // cap of 227 KB — the full 256-slot red pushed sizeof past it by ~0.5 KB).
     float red[64];
 };
-// SAFETY: the launcher opts into kMambaSmemBytes of DYNAMIC smem (mamba3_layout.cuh).
-// PIN the layout constant to the actual struct here so a field added without
+// SAFETY: the launcher opts into the EXACT sizeof(MambaSampleSmem) (SMALL path pins
+// it to kMambaSmemBytes; streamed path requests sizeof directly via
+// mb_tc_dyn_smem_bytes()). PIN the SMALL layout constant so a field added without
 // updating kMambaSmemFloats fails the BUILD (vs. silently under-allocating).
-static_assert((int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
-              "model_stage_mamba3: sizeof(MambaSampleSmem) drifted from "
+//   SMALL: sizeof == kMambaSmemBytes EXACTLY (the moved fields are real smem arrays
+//     of unchanged widths; the reorder is behavior-identical; dr2 is a zero-byte
+//     char[0] → byte-identical to the shipped struct).
+//   STREAMED: sizeof is the proxy-pointer footprint (the big buffers carry only an
+//     8-byte base each); it must be ≤ kMbStreamSmemBytes (the documented float-count
+//     bound, which omits the ~120 B of proxy pointers + alignment pad) AND ≤ the H100
+//     227 KB opt-in cap. The kMbStreamSmemBytes bound is the gate's headroom witness.
+static_assert(kMbStreamSmem || (int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
+              "model_stage_mamba3: SMALL sizeof(MambaSampleSmem) drifted from "
               "kMambaSmemBytes (mamba3_layout.cuh). Update kMambaSmemFloats.");
+static_assert(!kMbStreamSmem || (int64_t)sizeof(MambaSampleSmem) <= 227 * 1024,
+              "model_stage_mamba3: streamed sizeof(MambaSampleSmem) exceeds the H100 "
+              "227 KB opt-in cap — move more per-sample scratch to HBM (Level B).");
+
+// ════════════════════════════════════════════════════════════════════════════
+//  LAYER-STREAMING HBM scratch (Level A + B; decoder DecActs mirror). On the
+//  streamed (flagship) path the per-CTA HBM region holds (carved from tok.workspace
+//  FRONT, one slice per CTA):
+//    PER-LAYER (li∈[0,kLayers), the backward replays them):
+//      layer_in[li]  SEQ·D                       block residual input
+//      small[li]     kMbLayerActSmallFloatsExact the LayerAct small caches (flat)
+//      x_in/z/y_scan[li]  SEQ·DINNER each        big mixer buffers
+//      h1[li]        SEQ·D                        block inter-residual
+//      g_pre/u_mlp[li]    SEQ·DFF each           SwiGLU buffers
+//    TRANSIENT (single copy, reused within one layer's fwd/bwd):
+//      final_in, dh, dr, dr2  SEQ·D each
+//      adj_a/adj_b/adj_c      SEQ·DINNER each
+//      wff_a/wff_b            SEQ·DFF each
+//  On the SMALL/bench path mb_acts_stride_floats()==0 → zero carve → byte-identical.
+// ════════════════════════════════════════════════════════════════════════════
+// LayerAct small-cache float prefix (== offsetof(LayerAct, x_in)/sizeof(float); the
+// static_assert below pins it). Field order (small caches first):
+//   mixn_r SEQ + dt_lr SEQ·DTRANK + dt_pre/A_mod/u_lam 3·SEQ·NHEADS + theta SEQ·STATEC
+//   + Br/Bi/Cr/Ci 4·SEQ·STATEC + 4 rms recips (Br_r/Bi_r/Cr_r/Ci_r) 4·SEQ
+//   + Bbar+Cbar 2·SEQ·STATEC·2 + mlpn_r SEQ
+constexpr int64_t kMbLayerActSmallFloatsExact =
+    (int64_t)mb::kSeq * (1 + mb::kDtRank + 3*mb::kNHeads + mb::kStateC
+        + 4*mb::kStateC + 4 + 1)
+    + (int64_t)mb::kSeq * (2*mb::kStateC*2);
+
+// Per-layer HBM float stride (one li): layer_in + small + x_in + z + y_scan + h1
+//   + g_pre + u_mlp.
+__host__ __device__ __forceinline__ int64_t mb_acts_perlayer_floats() {
+    return (int64_t)mb::kSeq*mb::kD                       // layer_in
+         + kMbLayerActSmallFloatsExact                    // small caches
+         + 3*(int64_t)mb::kSeq*mb::kDInner                // x_in,z,y_scan
+         + (int64_t)mb::kSeq*mb::kD                        // h1
+         + 2*(int64_t)mb::kSeq*mb::kDff;                  // g_pre,u_mlp
+}
+// Transient (single) HBM floats: final_in,dh,dr,dr2 (4·SEQ·D) + adj_a/b/c (3·SEQ·DINNER)
+//   + wff_a/b (2·SEQ·DFF).
+__host__ __device__ __forceinline__ int64_t mb_acts_transient_floats() {
+    return 4*(int64_t)mb::kSeq*mb::kD
+         + 3*(int64_t)mb::kSeq*mb::kDInner
+         + 2*(int64_t)mb::kSeq*mb::kDff;
+}
+// Per-CTA float stride of the streamed scratch (0 on the non-streamed path → no carve).
+__host__ __device__ __forceinline__ int64_t mb_acts_stride_floats() {
+    if (!kMbStreamSmem) return 0;
+    return (int64_t)mb::kLayers * mb_acts_perlayer_floats() + mb_acts_transient_floats();
+}
+
+// HBM views for one CTA. base_cta = the acts region front + cta*mb_acts_stride_floats().
+struct MbActsHbm {
+    float* base;        // CTA slice front (per-layer region)
+    float* transient;   // transient region front (after the per-layer region)
+};
+__device__ __forceinline__ MbActsHbm mb_acts_bind(float* base_cta) {
+    MbActsHbm a;
+    a.base = base_cta;
+    a.transient = base_cta + (int64_t)mb::kLayers * mb_acts_perlayer_floats();
+    return a;
+}
+__device__ __forceinline__ float* mb_acts_layer_base(const MbActsHbm& a, int li) {
+    return a.base + (int64_t)li * mb_acts_perlayer_floats();
+}
+__device__ __forceinline__ float* mb_acts_layer_in(const MbActsHbm& a, int li) {
+    return mb_acts_layer_base(a, li);  // first sub-slab in the per-layer region
+}
+__device__ __forceinline__ float* mb_acts_small(const MbActsHbm& a, int li) {
+    return mb_acts_layer_base(a, li) + (int64_t)mb::kSeq*mb::kD;
+}
+// Bind the TRANSIENT proxies (single copy) into `sm`. No-op on SMALL (the fields are
+// real arrays, never proxies).
+__device__ __forceinline__ void mb_scratch_bind_transient(MambaSampleSmem* sm, const MbActsHbm& a) {
+    if constexpr (kMbStreamSmem) {
+        float* t = a.transient;
+        mb_set_base(sm->final_in, t);  t += (int64_t)mb::kSeq*mb::kD;
+        mb_set_base(sm->dh,       t);  t += (int64_t)mb::kSeq*mb::kD;
+        mb_set_base(sm->dr,       t);  t += (int64_t)mb::kSeq*mb::kD;
+        mb_set_base(sm->dr2,      t);  t += (int64_t)mb::kSeq*mb::kD;
+        mb_set_base(sm->adj_a,    t);  t += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(sm->adj_b,    t);  t += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(sm->adj_c,    t);  t += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(sm->wff_a,    t);  t += (int64_t)mb::kSeq*mb::kDff;
+        mb_set_base(sm->wff_b,    t);  t += (int64_t)mb::kSeq*mb::kDff;
+    } else { (void)sm; (void)a; }
+}
+// Bind the per-layer BIG buffers of LayerAct slot `la_slot` to layer `li`'s HBM region.
+// Called at the top of each fwd/bwd layer iteration on the streamed path.
+__device__ __forceinline__ void mb_scratch_bind_layer(MambaSampleSmem* sm, const MbActsHbm& a,
+                                                      int li, int la_slot) {
+    if constexpr (kMbStreamSmem) {
+        MambaSampleSmem::LayerAct* la = &sm->act[la_slot];
+        float* p = mb_acts_layer_base(a, li)
+                 + (int64_t)mb::kSeq*mb::kD              // skip layer_in
+                 + kMbLayerActSmallFloatsExact;          // skip small caches
+        mb_set_base(la->x_in,   p);  p += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(la->z,      p);  p += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(la->y_scan, p);  p += (int64_t)mb::kSeq*mb::kDInner;
+        mb_set_base(la->h1,     p);  p += (int64_t)mb::kSeq*mb::kD;
+        mb_set_base(la->g_pre,  p);  p += (int64_t)mb::kSeq*mb::kDff;
+        mb_set_base(la->u_mlp,  p);  p += (int64_t)mb::kSeq*mb::kDff;
+    } else { (void)sm; (void)a; (void)li; (void)la_slot; }
+}
+// PIN: the small-cache prefix float count must match the actual LayerAct layout (the
+// first big-buffer member x_in must start exactly at kMbLayerActSmallFloatsExact). A
+// field add/reorder that breaks the flat small-cache copy fails the BUILD here.
+static_assert(kMbLayerActSmallFloatsExact * (int64_t)sizeof(float)
+                  == (int64_t)offsetof(MambaSampleSmem::LayerAct, x_in),
+              "model_stage_mamba3: kMbLayerActSmallFloatsExact drifted from "
+              "offsetof(LayerAct,x_in) — the streamed small-cache prefix is wrong.");
 
 // ── Typed views over the flat weight blob using the generated offsets. The
 //    ORDER MUST match _mamba_param_sizes() / named_parameters() EXACTLY. ────────
@@ -906,20 +1102,24 @@ __device__ inline void mb_swiglu_fwd(const MambaWeights::Layer& L,
 //  + block_forward. Caches BOTH blocks' activations into sm->act[li]. Returns NLL.
 // ════════════════════════════════════════════════════════════════════════
 __device__ inline float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
-                                    int target, MambaSampleSmem* sm) {
-    // Embedding + positional -> layer_in[0].
+                                    int target, MambaSampleSmem* sm, MbActsHbm acts = {}) {
+    // STREAMED: bind the transient HBM proxies once (no-op on SMALL).
+    mb_scratch_bind_transient(sm, acts);
+    // Embedding + positional -> layer_in[ring 0].
     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
         const int s = idx / mb::kD, j = idx % mb::kD;
-        sm->layer_in[0][s][j] = w.tok[(int64_t)tokens_s[s] * mb::kD + j]
+        sm->layer_in[mb_ring(0)][s][j] = w.tok[(int64_t)tokens_s[s] * mb::kD + j]
                               + w.pos[(int64_t)s * mb::kD + j];
     }
     __syncthreads();
 
     for (int li = 0; li < mb::kLayers; ++li) {
         const MambaWeights::Layer& L = w.layer[li];
-        MambaSampleSmem::LayerAct* a = &sm->act[li];
-        float* hin = &sm->layer_in[li][0][0];   // block input (residual)
-        // --- mixer sub-block: h1 = hin + mixer(RMSNorm_mix(hin)) ---
+        MambaSampleSmem::LayerAct* a = &sm->act[mb_smem_la(li)];   // streamed: slot 0
+        // STREAMED: bind this layer's big-buffer proxies to layer li's HBM region.
+        mb_scratch_bind_layer(sm, acts, li, mb_smem_la(li));
+        float* hin = &sm->layer_in[mb_ring(li)][0][0];   // block input (residual); ring on streamed
+        // --- mixer sub-block: h1 = hin + mixer(RMSNorm_mix(hin)) --- (UNCHANGED MATH)
         // xhat written to throwaway scratch (adj_c) — only the recip is cached; the
         // backward recomputes xhat from the raw block input layer_in[li].
         mb_rmsnorm_fwd(hin, L.mixn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mixn_r[0],
@@ -937,12 +1137,29 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
         mb_rmsnorm_fwd(&a->h1[0][0], L.mlpn_w, &sm->dr[0][0], &sm->adj_c[0][0], &a->mlpn_r[0],
                        sm->red, mb::kD, mb::kD);   // h1n -> sm->dr
         mb_swiglu_fwd(L, &sm->dr[0][0], a, mo, sm);  // mlp_out -> sm->adj_b (kD-strided)
-        float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0] : &sm->final_in[0][0];
+        // STREAMED: the next block input goes to the ring slot for li+1; SMALL: layer_in[li+1].
+        float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[mb_ring(li + 1)][0][0]
+                                            : &sm->final_in[0][0];
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
             dst[s * mb::kD + j] = a->h1[s][j] + mo[s * mb::kD + j];   // h2 = h1 + mlp_out
         }
         __syncthreads();
+        // STREAMED ONLY: spill this layer's block input + LayerAct small caches to HBM so
+        // the backward can replay them (the smem ring slot / act slot 0 is reused by li+1).
+        // The big LayerAct buffers (x_in,z,y_scan,h1,g_pre,u_mlp) are ALREADY in layer li's
+        // HBM region (bound by mb_scratch_bind_layer) → no spill. On SMALL this folds out
+        // (the whole struct holds every layer).
+        if constexpr (kMbStreamSmem) {
+            float* hin_hbm = mb_acts_layer_in(acts, li);
+            for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x)
+                hin_hbm[idx] = hin[idx];
+            float* sm_hbm = mb_acts_small(acts, li);
+            const float* sm_src = reinterpret_cast<const float*>(a);   // small caches are the prefix
+            for (int64_t idx = threadIdx.x; idx < kMbLayerActSmallFloatsExact; idx += blockDim.x)
+                sm_hbm[idx] = sm_src[idx];
+            __syncthreads();
+        }
     }
 
     // Final RMSNorm (LAST position) + head -> logits -> NLL.
@@ -954,7 +1171,7 @@ __device__ inline float mb_forward_sample(const MambaWeights& w, const int* toke
     if (threadIdx.x == 0) sm->fn_r[mb::kSeq - 1] = r;
     for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) {
         float xh = hlast[j] * r;
-        sm->fn_xhat[mb::kSeq - 1][j] = xh;
+        sm->fn_xhat[mb_fnx(mb::kSeq - 1)][j] = xh;   // streamed: row 0 (only last pos kept)
         sm->adj_a[0][j] = xh * w.norm_w[j];   // hn (RMSNorm, NO bias) -> adj_a[0]
     }
     __syncthreads();
@@ -1217,7 +1434,15 @@ __device__ inline void mb_swiglu_bwd(const MambaWeights::Layer& L, const MambaGr
 // ════════════════════════════════════════════════════════════════════════
 __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad& g,
                                     const int* tokens_s, int target, int B,
-                                    MambaSampleSmem* sm) {
+                                    MambaSampleSmem* sm, MbActsHbm acts = {}) {
+    // STREAMED: bind the transient HBM proxies once (no-op on SMALL).
+    mb_scratch_bind_transient(sm, acts);
+    // The d-wide backward scratch the swiglu/mixer bwd stage dxn/dh1n into: SMALL
+    // borrows fn_xhat[0..kSeq-1] (free — the head is done); STREAMED uses the dedicated
+    // SEQ×D HBM slab dr2 (fn_xhat is shrunk to the last position only).
+    float* fnx_scratch;
+    if constexpr (kMbStreamSmem) fnx_scratch = mb_buf_base(sm->dr2);
+    else                         fnx_scratch = &sm->fn_xhat[0][0];
     // ── CE bwd: dlogits = (softmax - onehot)/B. ──
     float lmax = -CUDART_INF_F;
     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) lmax = fmaxf(lmax, sm->logits[o]);
@@ -1232,7 +1457,7 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
     }
     __syncthreads();
     // ── head: logits = hn @ out_w^T + out_b ; hn = fn_xhat[last]*norm_w (NO bias). ──
-    const float* xh = &sm->fn_xhat[mb::kSeq - 1][0];
+    const float* xh = &sm->fn_xhat[mb_fnx(mb::kSeq - 1)][0];
     for (int o = threadIdx.x; o < mb::kPHead; o += blockDim.x) {
         float dl = sm->logits[o];
         g.out_b[o] += dl;
@@ -1273,8 +1498,22 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
     for (int li = mb::kLayers - 1; li >= 0; --li) {
         const MambaWeights::Layer& L = w.layer[li];
         const MambaGrad::Layer& G = g.layer[li];
-        MambaSampleSmem::LayerAct* a = &sm->act[li];
-        float* hin = &sm->layer_in[li][0][0];   // block input (raw x for mixer_norm bwd)
+        MambaSampleSmem::LayerAct* a = &sm->act[mb_smem_la(li)];   // streamed: slot 0
+        // STREAMED: bind this layer's big-buffer proxies to layer li's HBM region, then
+        // refill the block input + LayerAct small caches from HBM into the single smem
+        // slot (the fwd spilled them; the big buffers are read in place from HBM).
+        mb_scratch_bind_layer(sm, acts, li, mb_smem_la(li));
+        float* hin = &sm->layer_in[mb_ring(li)][0][0];   // block input (raw x for mixer_norm bwd)
+        if constexpr (kMbStreamSmem) {
+            const float* hin_hbm = mb_acts_layer_in(acts, li);
+            for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x)
+                hin[idx] = hin_hbm[idx];
+            float* sm_dst = reinterpret_cast<float*>(a);   // small caches are the prefix
+            const float* sm_hbm = mb_acts_small(acts, li);
+            for (int64_t idx = threadIdx.x; idx < kMbLayerActSmallFloatsExact; idx += blockDim.x)
+                sm_dst[idx] = sm_hbm[idx];
+            __syncthreads();
+        }
         // h2 = h1 + mlp(mlp_norm(h1)). dh2 = sm->dh.
         //   dh1 = dh2 (residual) + rmsnorm_bwd(swiglu_bwd(dh2)).
         // recompute h1n = mlp_norm(h1) = (h1 * mlpn_r) * mlpn_w  (xhat from the raw h1).
@@ -1283,11 +1522,11 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
             sm->dr[s][j] = (a->h1[s][j] * a->mlpn_r[s]) * L.mlpn_w[j];   // h1n
         }
         __syncthreads();
-        // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n -> sm->fn_xhat (free: head done).
-        mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+        // swiglu bwd: dmlp_out = dh2 (sm->dh) -> dh1n -> fnx_scratch (SMALL: fn_xhat; streamed: dr2).
+        mb_swiglu_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], fnx_scratch, sm);
         // rmsnorm_mlp bwd (raw-x variant: recompute xhat from h1 * mlpn_r). dh1n in
-        //   sm->fn_xhat; out dh1_mlpnorm -> sm->dr (ldDx=kD).
-        mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], &a->h1[0][0], &a->mlpn_r[0], L.mlpn_w,
+        //   fnx_scratch; out dh1_mlpnorm -> sm->dr (ldDx=kD).
+        mb_rmsnorm_bwd_rawx(fnx_scratch, &a->h1[0][0], &a->mlpn_r[0], L.mlpn_w,
                             &sm->dr[0][0], G.mlpn_w, sm->red, mb::kD, mb::kD);
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;
@@ -1302,10 +1541,10 @@ __device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad
             sm->dr[s][j] = (hin[s * mb::kD + j] * a->mixn_r[s]) * L.mixn_w[j];   // xn
         }
         __syncthreads();
-        // mixer bwd: dmix_out = dh1 (sm->dh) ; xn in sm->dr ; out dxn -> sm->fn_xhat.
-        mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], &sm->fn_xhat[0][0], sm);
+        // mixer bwd: dmix_out = dh1 (sm->dh) ; xn in sm->dr ; out dxn -> fnx_scratch.
+        mb_mixer_bwd(L, G, &sm->dr[0][0], a, &sm->dh[0][0], fnx_scratch, sm);
         // rmsnorm_mix bwd (raw-x variant: recompute xhat from hin * mixn_r).
-        mb_rmsnorm_bwd_rawx(&sm->fn_xhat[0][0], hin, &a->mixn_r[0], L.mixn_w,
+        mb_rmsnorm_bwd_rawx(fnx_scratch, hin, &a->mixn_r[0], L.mixn_w,
                             &sm->dr[0][0], G.mixn_w, sm->red, mb::kD, mb::kD);
         for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
             const int s = idx / mb::kD, j = idx % mb::kD;

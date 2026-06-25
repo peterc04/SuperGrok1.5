@@ -132,13 +132,21 @@ namespace sg { namespace fused { namespace sm90 {
 
 #if SG_MB_SCALAR_MEGAKERNEL
 // Compile-time guard: the byte budget the launcher uses (kMambaSmemBytes) MUST
-// equal sizeof(MambaSampleSmem). model_stage_mamba3.cuh already static_asserts
-// the same equality (it pins kMambaSmemFloats to the actual struct); we restate
-// it here so this header is self-contained and a drift fails loudly at this TU.
-static_assert((int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
+// equal sizeof(MambaSampleSmem) on the SMALL/bench (non-streamed) path. On the
+// streamed flagship path the launcher requests sizeof directly (mb_tc_dyn_smem_bytes),
+// so the pin is conditional. model_stage_mamba3.cuh already static_asserts the same.
+static_assert(kMbStreamSmem || (int64_t)sizeof(MambaSampleSmem) == kMambaSmemBytes,
               "fused_mamba_megakernel: sizeof(MambaSampleSmem) != the documented "
               "kMambaSmemBytes in mamba3_layout.cuh — update kMambaSmemFloats.");
 #endif  // SG_MB_SCALAR_MEGAKERNEL
+
+// Per-CTA dynamic smem the Mamba kernels request: the streamed (one-layer +
+// scratch-to-HBM) size on the flagship path, the all-layers size on SMALL/bench
+// (byte-identical request there). On the streamed path we request the EXACT
+// sizeof(MambaSampleSmem) (what the kernel reinterprets) so it can never under-allocate.
+__host__ __device__ __forceinline__ int mb_tc_dyn_smem_bytes() {
+    return kMbStreamSmem ? (int)sizeof(MambaSampleSmem) : (int)kMambaSmemBytes;
+}
 
 // Rebase a FusedOptState's per-element state pointers to a parameter-tensor slice
 // at `off` within the flat [m|v|extra] layout. Per-TENSOR fields and all scalars
@@ -314,7 +322,7 @@ cudaError_t launch_fused_mamba_megakernel(
     err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
     if (err != cudaSuccess) return err;
 
-    const int dyn_smem = (int)kMambaSmemBytes;   // 145124 B (≈141.72 KB)
+    const int dyn_smem = mb_tc_dyn_smem_bytes();   // streamed on flagship, all-layers on SMALL
 
     // (1) Opt in to >48 KB dynamic smem for THIS kernel. Without this the launch
     //     fails with cudaErrorInvalidValue (the static 48 KB default applies).
@@ -512,9 +520,12 @@ __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nC
     // MAMBA-3 scalar design: the per-CTA partial is the FULL grad [total] (not the
     // acts + tile-scratch + dW-split + non-GEMM-partial of the old wgmma Fork-B).
     // Layout order MUST match the kernel's pointer derivations:
-    //   [nCTA*total | loss(nCTA) | loss_out(1) | opt_reduce(2nCTA+1) |
+    //   [nCTA*acts_stride | nCTA*total | loss(nCTA) | loss_out(1) | opt_reduce(2nCTA+1) |
     //    sam_backup+sam_grad(2*total) | muon | sg2 (| profiler)].
-    return (int64_t)nCTA * kMambaTotalElems          // per-CTA FULL grad partial
+    // STREAMED (flagship) layer-streaming scratch region, carved FRONT (decoder DecActs
+    // mirror). Zero on the SMALL/bench path (mb_acts_stride_floats()==0) → byte-identical.
+    return (int64_t)nCTA * mbtc::mb_acts_stride_floats()   // [nCTA] per-CTA cross-layer+scratch acts
+         + (int64_t)nCTA * kMambaTotalElems          // per-CTA FULL grad partial
          + nCTA + 1                                  // loss slots + reduced loss
          + mb_tc_opt_reduce_floats(nCTA)             // STAGED-opt (Prodigy) reduce slots
          + mb_tc_looksam_floats()                    // SAM 2nd-bwd scratch [sam_backup|sam_grad]
@@ -564,7 +575,9 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     // dw_part are unused on this path (kept zero-width in mb_tc_workspace_floats).
     float* ws = tok.workspace;
     const int64_t total_p = kMambaTotalElems;
-    float* part_base = ws;                                  // [nCTA * total]
+    // STREAMED layer-streaming acts region (front); zero-width on SMALL/bench → part_base == ws.
+    float* acts_base = ws;                                   // [nCTA * mb_acts_stride_floats()]
+    float* part_base = acts_base + (int64_t)nCTA * mbtc::mb_acts_stride_floats();
     float* loss_part = part_base + (int64_t)nCTA * total_p; // [nCTA]
     float* loss_out  = loss_part + nCTA;                    // [1]
     float* dw_part   = loss_out + 1;                        // unused (kept for layout parity)
@@ -609,6 +622,9 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
 #endif
 
     float* my_part = part_base + (int64_t)cta * total_p;   // this CTA's FULL grad partial
+    // STREAMED: this CTA's layer-streaming acts/scratch slice (zero-width on SMALL).
+    mbtc::MbActsHbm acts = mbtc::mb_acts_bind(acts_base + (int64_t)cta * mbtc::mb_acts_stride_floats());
+    (void)acts;   // referenced only on the streamed fwd/bwd (if constexpr kMbStreamSmem)
     MambaWeights w = mb_bind(params);
     MambaGrad g = mb_bind_grad(my_part);
 
@@ -634,8 +650,8 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
             if (threadIdx.x < mb::kSeq) tok_s[threadIdx.x] = tok.tokens[(int64_t)b * mb::kSeq + threadIdx.x];
             if (threadIdx.x == 0) tgt_s = tok.targets[b];
             __syncthreads();
-            float nll = mb_forward_sample(w, tok_s, tgt_s, &sm);
-            mb_backward_sample(w, g, tok_s, tgt_s, B, &sm);
+            float nll = mb_forward_sample(w, tok_s, tgt_s, &sm, acts);
+            mb_backward_sample(w, g, tok_s, tgt_s, B, &sm, acts);
             if (threadIdx.x == 0) nll_acc += nll;
             __syncthreads();
         }
@@ -1280,7 +1296,7 @@ int mb_tc_launched_nctas(int dev, int ncta_cap) {
     // MAMBA-3: the per-sample MambaSampleSmem (~227 KB) is DYNAMIC smem → one
     // block/SM (occ=1) by design. Query occ with the REAL dynamic-smem request
     // (and opt in first, else the query assumes the 48 KB static default).
-    const int dyn_smem = (int)kMambaSmemBytes;
+    const int dyn_smem = mb_tc_dyn_smem_bytes();   // streamed on flagship, all-layers on SMALL
     cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
     int occ = 0;
@@ -1308,7 +1324,7 @@ cudaError_t launch_fused_mamba_megakernel_tc(
     // MAMBA-3: DYNAMIC smem opt-in (the per-sample MambaSampleSmem ~227 KB). Three
     // mandatory steps (cudaFuncSetAttribute + dyn_smem in the occ query + dyn_smem
     // at <<<>>>); one block/SM by design (occ=1, smem-bound).
-    const int dyn_smem = (int)kMambaSmemBytes;
+    const int dyn_smem = mb_tc_dyn_smem_bytes();   // streamed on flagship, all-layers on SMALL
     err = cudaFuncSetAttribute((const void*)&fused_mamba_megakernel_tc<Opt, Par>,
                                cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
     if (err != cudaSuccess) return err;

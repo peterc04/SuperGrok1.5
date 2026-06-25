@@ -83,6 +83,17 @@ constexpr int kMbNumDwSpecs = 8;
 __host__ __device__ __forceinline__ int64_t mb_acts_floats(int /*T*/) { return 0; }
 __host__ __device__ __forceinline__ int64_t mb_dw_part_floats(int /*G*/) { return 0; }
 
+// ── Layer-streaming HBM scratch helpers: DEFINED in model_stage_mamba3.cuh (at
+//    sg::fused::sm90 scope, since the fwd/bwd sample fns there reference them and
+//    that header is parsed first). Re-export the workspace-sizing helpers into the
+//    mbtc:: namespace so fused_mamba_megakernel.cuh's mb_tc_workspace_floats keeps
+//    its mbtc:: spelling. ──
+using ::sg::fused::sm90::MbActsHbm;
+using ::sg::fused::sm90::mb_acts_stride_floats;
+using ::sg::fused::sm90::mb_acts_perlayer_floats;
+using ::sg::fused::sm90::mb_acts_transient_floats;
+using ::sg::fused::sm90::mb_acts_bind;
+
 // ── Per-model Muon 2D-weight set (the ndim==2 parameters Muon's P2.7 Newton-Schulz
 //    orthogonalizes; ndim==1/other weights take the AdamW aux tail). Now a FORMULA
 //    (mb_muon_2d / mb_is_muon_2d), L-general: 2 + 7*L + 1 matrices (tok, pos, 7
@@ -344,6 +355,13 @@ __device__ inline float mb_forward_sample_tp(
         (void)active; (void)tr; (void)bar; (void)slot_pub; (void)slot_red;
         return mb_forward_sample(w, tokens_s, target, sm);
     } else {
+        // SCOPE: the kTPComm path indexes sm->layer_in[li]/sm->act[li] for ALL layers
+        // (no streaming), so it is incompatible with the streamed (flagship) smem. TP at
+        // flagship-streamed scale would need this body streamed too (out of this track).
+        // (Par-dependent so it only fires when THIS branch is actually instantiated.)
+        static_assert(!Par::kTPComm || !kMbStreamSmem,
+                      "mb_forward_sample_tp: kTPComm + layer-streamed smem not supported "
+                      "(the TP body caches all layers; stream it before TP-at-flagship).");
         // ── kTPComm forward. The SSM body is replicated (unsharded mb_* device
         //    fns); the two ROW-parallel projections (mixer out_proj, swiglu down)
         //    publish a partial → rendezvous → fixed-order reduce. The replicated
