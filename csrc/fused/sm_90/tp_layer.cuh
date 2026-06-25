@@ -190,15 +190,18 @@ __host__ __device__ __forceinline__ int tp_colqkv_full_row(int d, int P, int r, 
 //  THE PER-TILE TP BLOCK FUNCTIONS (the megakernel-tiling math). All reuse the
 //  PRODUCTION wgmma tile GEMMs (dectc_gemm_fwd_f32 / dectc_gemm_dx_f32 — fp32
 //  accumulate, kTileM=128-row tiles, identical staging) on the rank's DENSE
-//  shard; zero new GEMM math. `Wshard` is fp32 (the params blob dtype; the GEMM
-//  converts to bf16 on read exactly like the unsharded path).
+//  shard; zero new GEMM math. `Wshard` is templated on the weight dtype (WT):
+//  the loopback test passes fp32 params (const float*, the fp32→bf16-on-read
+//  GEMM overload); the production megakernel passes the PRECONVERTED bf16 cache
+//  (const __nv_bfloat16*, DecWBf::*). dectc_gemm_fwd_f32/_dx_f32 overload on the
+//  W pointer type, so the right body is selected automatically for each caller.
 //
 //  COLUMN-parallel forward:  Y_own[M, Nout/P] = X[M,Kin] @ Wshard^T.
 //  Comm-free; the output IS the rank's feature shard.
 // ─────────────────────────────────────────────────────────────────────────
-template <int N>
+template <int N, class WT>
 __device__ __forceinline__ void tp_colparallel_fwd_tile(
-        const __nv_bfloat16* __restrict__ X, const float* __restrict__ Wshard,
+        const __nv_bfloat16* __restrict__ X, const WT* __restrict__ Wshard,
         float* __restrict__ Yown, int Kin, int Nout_local,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     dectc::dectc_gemm_fwd_f32<N>(X, Wshard, Yown, Kin, Nout_local, sA, sB);
@@ -207,10 +210,10 @@ __device__ __forceinline__ void tp_colparallel_fwd_tile(
 // ROW-parallel forward PARTIAL: Ypart[M, Nout] = X_own[M, Kin/P] @ Wshard^T,
 // written DIRECTLY into this PE's symmetric slot (the publish). The caller then
 // crosses the rendezvous and runs the fixed-order reduce (all-reduce point ①/②).
-template <int N, class Transport>
+template <int N, class Transport, class WT>
 __device__ __forceinline__ void tp_rowparallel_fwd_partial_tile(
         const Transport& tr, int64_t slot_off,
-        const __nv_bfloat16* __restrict__ Xown, const float* __restrict__ Wshard,
+        const __nv_bfloat16* __restrict__ Xown, const WT* __restrict__ Wshard,
         int Kin_local, int Nout,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     dectc::dectc_gemm_fwd_f32<N>(Xown, Wshard, tr.local(slot_off),
@@ -220,9 +223,9 @@ __device__ __forceinline__ void tp_rowparallel_fwd_partial_tile(
 // ROW-parallel backward dX (comm-free): dXown[M, Kin/P] = dY[M, Nout] @ Wshard.
 // dY is the FULL-width adjoint (the row-parallel output was all-reduced, so its
 // adjoint is replicated); Wshard is the rank's [Nout, Kin/P] dense col-shard.
-template <int N>
+template <int N, class WT>
 __device__ __forceinline__ void tp_rowparallel_dx_tile(
-        const __nv_bfloat16* __restrict__ dY, const float* __restrict__ Wshard,
+        const __nv_bfloat16* __restrict__ dY, const WT* __restrict__ Wshard,
         float* __restrict__ dXown, int Kin_local, int Nout,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     dectc::dectc_gemm_dx_f32<N>(dY, Wshard, dXown, Kin_local, Nout, sA, sB);
@@ -231,10 +234,10 @@ __device__ __forceinline__ void tp_rowparallel_dx_tile(
 // COLUMN-parallel backward dX PARTIAL (the conjugate comm point ①'/②'):
 // dXpart[M, Kin] = dYown[M, Nout/P] @ Wshard, published to the symmetric slot;
 // caller rendezvous + fixed-order reduce ⇒ dX = Σ_pe dXpart.
-template <int N, class Transport>
+template <int N, class Transport, class WT>
 __device__ __forceinline__ void tp_colparallel_dx_partial_tile(
         const Transport& tr, int64_t slot_off,
-        const __nv_bfloat16* __restrict__ dYown, const float* __restrict__ Wshard,
+        const __nv_bfloat16* __restrict__ dYown, const WT* __restrict__ Wshard,
         int Kin, int Nout_local,
         __nv_bfloat16* sA, __nv_bfloat16* sB) {
     dectc::dectc_gemm_dx_f32<N>(dYown, Wshard, tr.local(slot_off),

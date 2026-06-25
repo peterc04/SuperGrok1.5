@@ -70,6 +70,7 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>   // __nv_bfloat16 (the sharded partial-GEMM fwd-decl signatures)
 
 #include "csrc/fused/megakernel_common.cuh"   // GridBarrier (the in-kernel rendezvous)
 
@@ -81,6 +82,28 @@
 #endif
 
 namespace sg { namespace fused { namespace sm90 { namespace tp {
+
+// ─────────────────────────────────────────────────────────────────────────
+//  FORWARD DECLARATIONS of the sharded partial-GEMM helpers (DEFINED in
+//  tp_layer.cuh — which includes model_stage_decoder_tc.cuh for the dectc_gemm_*
+//  bodies). The decoder tile header (model_stage_decoder_tc.cuh) includes THIS
+//  header and references these by qualified name inside dectc_*_tile_impl, so
+//  the first-phase name lookup needs the declarations here even though the
+//  definitions land later in tp_layer.cuh (the include cycle: tp_layer →
+//  model_stage_decoder_tc → tp_transport). Signatures MUST match tp_layer.cuh.
+// ─────────────────────────────────────────────────────────────────────────
+template <int N, class Transport, class WT>
+__device__ __forceinline__ void tp_rowparallel_fwd_partial_tile(
+        const Transport& tr, int64_t slot_off,
+        const __nv_bfloat16* __restrict__ Xown, const WT* __restrict__ Wshard,
+        int Kin_local, int Nout,
+        __nv_bfloat16* sA, __nv_bfloat16* sB);
+template <int N, class Transport, class WT>
+__device__ __forceinline__ void tp_colparallel_dx_partial_tile(
+        const Transport& tr, int64_t slot_off,
+        const __nv_bfloat16* __restrict__ dYown, const WT* __restrict__ Wshard,
+        int Kin, int Nout_local,
+        __nv_bfloat16* sA, __nv_bfloat16* sB);
 
 // ─────────────────────────────────────────────────────────────────────────
 //  LoopbackTransport — single-process symmetric-heap simulation (the 1-GPU

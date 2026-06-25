@@ -694,11 +694,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     __shared__ DecTcSmem sm;
 #endif
     GridBarrier bar = ctx.barrier();
-    // TP transport (folds to nothing on SingleGPU — kTPComm==false). Built once;
-    // the four reduce points (model_stage_decoder_tc.cuh ①/②/①'/②') read `tr`.
-    // make_transport_from_comm picks Loopback (no NVSHMEM) or Nvshmem (-DSG_HAS_NVSHMEM).
-    auto tr = ::sg::fused::sm90::tp::make_transport_from_comm<Par>(comm);
-    (void)tr;  // unused on SingleGPU (if-constexpr'd out below) — silence the warn
+    // TP transport: constructed ONLY inside the kTPComm P1 branch (EDIT C.3 below)
+    // via make_transport_from_comm<Par>(comm), so NOTHING TP-related is named on
+    // the SingleGPU path — the cleanest PTX identity (tp_kernel.md §5 RECOMMENDED).
+    (void)comm;  // default-constructed POD, unread on SingleGPU
     // SAM-coupled cells run the tile fwd+bwd TWICE (P1 + P2.4); route BOTH their
     // passes through the out-of-line shims (one shared frame, campaign C2). The
     // single-pass cells keep the inline bodies -- byte-identical allocation.
@@ -845,34 +844,78 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
 #ifdef SG_DEC_PROFILE
     unsigned long long prof_fwd = 0, prof_bwd = 0;
 #endif
-    for (int ti = cta; ti < n_tiles; ti += nCTA) {
-        const int g0 = ti * nrows_tile;
-        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+    if constexpr (!Par::kTPComm) {
+        // ░░ DEFAULT / SingleGPU path — BYTE-IDENTICAL to the pre-Par kernel. ░░
+        for (int ti = cta; ti < n_tiles; ti += nCTA) {
+            const int g0 = ti * nrows_tile;
+            const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
 #ifdef SG_DEC_PROFILE
-        __syncthreads(); unsigned long long _c0 = clock64();
+            __syncthreads(); unsigned long long _c0 = clock64();
 #endif
-        float nll;
-        if constexpr (kSamCoupled)
-            nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
-                                                     tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
-        else
-            nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
-                                            sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+            float nll;
+            if constexpr (kSamCoupled)
+                nll = dectc::dectc_forward_tile_outlined(w, wb, g0, nrows, acts, sc, tok.tokens,
+                                                         tok.targets, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+            else
+                nll = dectc::dectc_forward_tile(w, wb, g0, nrows, acts, sc, tok.tokens, tok.targets,
+                                                sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
 #ifdef SG_DEC_PROFILE
-        __syncthreads(); unsigned long long _c1 = clock64();
+            __syncthreads(); unsigned long long _c1 = clock64();
 #endif
-        if constexpr (kSamCoupled)
-            dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
-                                                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
-        else
-            dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
-                                       my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+            if constexpr (kSamCoupled)
+                dectc::dectc_backward_tile_outlined(w, wb, g0, nrows, B, acts, sc, tok.targets,
+                                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
+            else
+                dectc::dectc_backward_tile(w, wb, g0, nrows, B, acts, sc, tok.targets,
+                                           my_lnvec, sc.work2, sm.sA, sm.sB, sm.red SG_DEC_PIPE_BARS_ARG);
 #ifdef SG_DEC_PROFILE
-        __syncthreads(); unsigned long long _c2 = clock64();
-        if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+            __syncthreads(); unsigned long long _c2 = clock64();
+            if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
 #endif
-        if (threadIdx.x == 0) nll_acc += nll;
-        __syncthreads();
+            if (threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
+    } else {
+        // ░░ kTPComm path — GRID-LOCKSTEP so tr.rendezvous(bar) at the 4 reduce
+        //    points (model_stage_decoder_tc.cuh ①/②/①'/②') is reached the SAME
+        //    number of times by every CTA on this GPU (§1 deadlock fix). All CTAs
+        //    of THIS GPU cooperate on the SAME tile each round; the tile fns thread
+        //    <Par,Transport> + (tr, bar, slot) so the reduce fires inside fwd/bwd.
+        //
+        //    ROUND COUNT is GRID-UNIFORM: the activations are REPLICATED across TP
+        //    ranks (TP shards WEIGHTS, not the batch), so every PE/GPU sees the
+        //    SAME T ⇒ SAME n_tiles ⇒ SAME n_rounds. The loopback (P virtual PEs in
+        //    ONE grid) and the real multi-GPU (P grids) BOTH satisfy this.
+        //
+        //    The two slot offsets (publish / reduced) are this CTA's lane in the
+        //    symmetric heap: slot_base = (cta_within_pe) * 2 * tp_tile_slot_floats.
+        auto tr = ::sg::fused::sm90::tp::make_transport_from_comm<Par>(comm);
+        const int P            = tr.n_pes();
+        const int ctas_per_pe  = nCTA / P;                 // launcher asserts nCTA % P == 0
+        const int cta_in_pe    = ::sg::fused::sm90::tp::LoopbackTransport::cta_within_pe(cta, nCTA, P);
+        const int64_t slot_pub = (int64_t)cta_in_pe * 2 * ::sg::fused::sm90::tp::tp_tile_slot_floats();
+        const int64_t slot_red = slot_pub + ::sg::fused::sm90::tp::tp_tile_slot_floats();
+        // Tiles THIS CTA's PE owns: contiguous per-PE tile blocks, grid-strided by
+        // ctas_per_pe within the PE group. n_rounds is the grid-uniform max.
+        const int tiles_per_round = ctas_per_pe;           // CTAs of one PE per round
+        const int n_rounds = (n_tiles + tiles_per_round - 1) / tiles_per_round;
+        for (int rd = 0; rd < n_rounds; ++rd) {
+            const int ti = rd * tiles_per_round + cta_in_pe;
+            const bool active = (ti < n_tiles);
+            const int g0    = active ? ti * nrows_tile : 0;
+            const int nrows = active ? ((T - g0) < nrows_tile ? (T - g0) : nrows_tile) : 0;
+            // fwd+bwd with the TP reduce inside (the tile fns call tr.rendezvous(bar)
+            // at ①/②/①'/②' UNCONDITIONALLY each round, so every CTA rendezvouses the
+            // same number of times even when !active — the §1 lockstep invariant).
+            float nll = dectc::dectc_forward_tile_tp<Par>(
+                w, wb, g0, nrows, active, acts, sc, tok.tokens, tok.targets,
+                sm.sA, sm.sB, sm.red, tr, bar, slot_pub, slot_red SG_DEC_PIPE_BARS_ARG);
+            dectc::dectc_backward_tile_tp<Par>(
+                w, wb, g0, nrows, active, B, acts, sc, tok.targets,
+                my_lnvec, sc.work2, sm.sA, sm.sB, sm.red, tr, bar, slot_pub, slot_red SG_DEC_PIPE_BARS_ARG);
+            if (active && threadIdx.x == 0) nll_acc += nll;
+            __syncthreads();
+        }
     }
     if (threadIdx.x == 0) loss_part[cta] = nll_acc;
 #ifdef SG_DEC_PROFILE
@@ -1516,11 +1559,11 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
 // saturation); a memory-constrained TEST passes a small cap so the per-CTA
 // scratch fits (the scratch is nCTA×slab). Determinism is preserved per fixed
 // nCTA (the dW/embedding owner maps are functions of nCTA).
-template <OptId Opt>
+template <OptId Opt, class Par = ::sg::fused::par::SingleGPU>
 cudaError_t launch_fused_decoder_megakernel_tc(
         PersistentContext ctx, float* params, DecoderTokenCtx tok,
         float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
-        int ncta_cap = 0) {
+        int ncta_cap = 0, const ::sg::fused::par::CommCtx& comm = {}) {
     int dev = 0;
     cudaError_t err = cudaGetDevice(&dev);
     if (err != cudaSuccess) return err;
@@ -1539,7 +1582,7 @@ cudaError_t launch_fused_decoder_megakernel_tc(
 #if SG_DEC_TC_DYNAMIC_SMEM
     const int dyn_smem = (int)sizeof(DecTcSmem);
     err = cudaFuncSetAttribute(
-        (const void*)&fused_decoder_megakernel_tc<Opt>,
+        (const void*)&fused_decoder_megakernel_tc<Opt, Par>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem);
     if (err != cudaSuccess) return err;
 #else
@@ -1547,7 +1590,7 @@ cudaError_t launch_fused_decoder_megakernel_tc(
 #endif
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_decoder_megakernel_tc<Opt>, SG_TC_MEGA_BLOCK,
+        &occ, (const void*)&fused_decoder_megakernel_tc<Opt, Par>, SG_TC_MEGA_BLOCK,
         /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
@@ -1561,6 +1604,11 @@ cudaError_t launch_fused_decoder_megakernel_tc(
     // splitk) that sums to KS exactly for any KS≥G, so it works at the production
     // truncated B (e.g. 4176, where head KS=B/16=261 is NOT divisible by G=4).
     if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
+    // TP lockstep precondition (kTPComm only): the grid-lockstep P1 (kernel C.3)
+    // partitions nCTA into Par::kTP contiguous PE groups, so nCTA must divide by TP.
+    if constexpr (Par::kTPComm) {
+        if ((launch_ctas % (unsigned)Par::kTP) != 0) return cudaErrorInvalidValue;
+    }
 
     if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
@@ -1571,8 +1619,8 @@ cudaError_t launch_fused_decoder_megakernel_tc(
     // sizeof(DecTcSmem) on the deep-ring path (dyn_smem, opt-in already set + the
     // ≥1-CTA cert passed above). Same grid/block/stream either way — 1 CTA/SM (the
     // persistent grid-barrier requires it) is preserved.
-    fused_decoder_megakernel_tc<Opt><<<grid, block, dyn_smem, stream>>>(
-        ctx, params, tok, grad, lr, step, st);
+    fused_decoder_megakernel_tc<Opt, Par><<<grid, block, dyn_smem, stream>>>(
+        ctx, params, tok, grad, lr, step, st, comm);
     return cudaGetLastError();
 }
 
