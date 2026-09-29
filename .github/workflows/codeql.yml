@@ -1,11 +1,7 @@
 name: CodeQL
 
 # GitHub-native static analysis (SAST). Runs on push/PR to main and weekly.
-# Python is analysed in the default (no-build) mode. C/C++ (the CUDA/HIP
-# sources) is intentionally NOT analysed here because CodeQL's cpp extractor
-# needs a real compile and this repo's csrc/ requires a CUDA/ROCm toolchain
-# that GitHub-hosted runners lack — that path is covered by the cpp_structural
-# job in ci.yml instead.
+# Python is analysed in the default (no-build) mode.
 
 on:
   push:

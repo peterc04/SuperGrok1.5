@@ -1,19 +1,34 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "torch>=2.0.0", "ninja"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "grokking-optimizers"
-version = "3.0.0"
-description = "C++/CUDA/HIP/JAX optimizer suite with SuperGrok v2 (Mamba-3 + PEER + GRU meta-net)"
+name = "supergrok"
+version = "0.1.0"
+description = "Grokking-optimizer race: pure-PyTorch reference optimizers and a DeepSeek-V4.1-Flash model"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 readme = "README.md"
-dependencies = ["torch>=2.0.0"]
+dependencies = ["torch>=2.4", "numpy", "matplotlib", "tqdm"]
 
 [project.optional-dependencies]
-jax = ["jax>=0.4.0", "jaxlib>=0.4.0"]
-test = ["pytest", "numpy"]
+test = ["pytest", "ruff"]
 
 [project.urls]
 Homepage = "https://github.com/peterc04/SuperGrok1.5"
+
+[tool.setuptools.packages.find]
+include = ["grokking_optimizers*", "deepseek_v41*", "grokking_race*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: longer CPU runs (deselect with -m 'not slow')"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["tests/reference_deepseek"]  # the official DeepSeek code, kept verbatim
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "B", "PLE", "I"]
+ignore = ["E741", "E731", "B905"]
