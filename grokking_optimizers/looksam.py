@@ -143,6 +143,7 @@ class LookSAM(torch.optim.Optimizer):
         return sd
 
     def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)  # do not consume the caller's dict
         extra = state_dict.pop("looksam", None)
         super().load_state_dict(state_dict)
         if extra is not None:

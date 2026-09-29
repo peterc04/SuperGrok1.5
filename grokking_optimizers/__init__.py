@@ -87,14 +87,14 @@ def _build_muon(
 
 
 def _build_supergrok11(model, policy="uniform", layer_ids="blocks", **hp):
-    """``layer_ids="blocks"``: layer-wise beta1 counts transformer blocks (``"tensor"``: the legacy tensor index)."""
+    """``layer_ids="blocks"``: layer-wise beta1 counts transformer blocks; ``"tensor"``: the legacy tensor
+    index (position in the model's parameter order, whatever the grouping)."""
     groups = _param_groups(model, policy, hp.get("lr", 1e-3), hp.get("weight_decay", 1.0))
-    if layer_ids == "blocks":
-        names = [n for n, _ in model.named_parameters()]
-        by_param = dict(zip((p for _, p in model.named_parameters()), block_layer_ids(names)))
+    if layer_ids in ("blocks", "tensor"):
+        named = list(model.named_parameters())
+        ids = block_layer_ids([n for n, _ in named]) if layer_ids == "blocks" else range(len(named))
+        by_param = dict(zip((p for _, p in named), ids))
         layer_ids = [by_param[p] for g in groups for p in g["params"]]
-    elif layer_ids == "tensor":
-        layer_ids = None
     return SuperGrok11(groups, layer_ids=layer_ids, **hp)
 
 

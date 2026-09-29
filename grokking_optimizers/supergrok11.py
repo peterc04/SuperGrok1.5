@@ -212,6 +212,8 @@ class SuperGrok11(torch.optim.Optimizer):
             raise ValueError("need warmup_steps >= 0, warmup_ramp >= 1 and non-negative frequencies")
         if max_correction_ratio is not None and max_correction_ratio < 0:
             raise ValueError("max_correction_ratio must be >= 0")
+        if max_correction_ratio is not None and meta_grad == "first_order" and meta_chunk is not None:
+            raise ValueError("max_correction_ratio needs whole-tensor norms: use meta_chunk=None with first_order")
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
         self.alpha_init, self.lamb, self.kappa = alpha_init, lamb, kappa
         self.gamma, self.gamma_alpha = gamma, gamma_alpha
@@ -252,7 +254,8 @@ class SuperGrok11(torch.optim.Optimizer):
         return 0.0 if t <= self.warmup_steps else min(1.0, (t - self.warmup_steps) / self.warmup_ramp)
 
     def layer_alpha(self, i: int) -> float:
-        """``alpha_i = clamp(alpha * (1 - gamma_alpha) ** (n - 1 - i), 0, 1)``, ``i`` the tensor index."""
+        """``alpha_i = clamp(alpha * (1 - gamma_alpha) ** (max(n - 1, 1) - i), 0, 1)``, ``i`` the tensor index
+        (the legacy formula, including its ``max``)."""
         scale = 1.0 if self.gamma_alpha == 0.0 else (1.0 - self.gamma_alpha) ** (max(self._n - 1, 1) - i)
         return max(0.0, min(1.0, self.alpha * scale))
 
@@ -328,6 +331,15 @@ class SuperGrok11(torch.optim.Optimizer):
         S = [None if p.grad is None else self._sharpness(p).to(dt) for p in allp]
         return allp, hp, G, S
 
+    def _shape_correction(self, g: torch.Tensor, corr: torch.Tensor) -> torch.Tensor:
+        """The zero-gradient mask and the optional ratio cap, applied alike in the real and the virtual step."""
+        if self.zero_grad_policy == "mask":
+            corr = torch.where(g == 0, torch.zeros_like(corr), corr)
+        if self.max_correction_ratio is not None:
+            bound = self.max_correction_ratio * torch.linalg.vector_norm(g)
+            corr = corr * torch.clamp(bound / (torch.linalg.vector_norm(corr) + 1e-30), max=1.0)
+        return corr
+
     def meta_step(self, meta_loss: Callable, train_meta_loss: Callable | None = None) -> torch.Tensor:
         """Train the meta-net at the current parameters; never touches ``p`` or ``p.grad``."""
         if self.meta_objective == "lookahead" and train_meta_loss is None:
@@ -349,7 +361,7 @@ class SuperGrok11(torch.optim.Optimizer):
                 )
                 (-(smart * torch.cat([v.reshape(-1) for v in vg]) / vnorm).sum()).backward()
             elif self.meta_grad == "exact":
-                smart = self.meta_net(
+                corr = self.meta_net.correction(
                     torch.cat([G[k].reshape(-1) for k in idx]), torch.cat([S[k].reshape(-1) for k in idx])
                 )
                 virtual, off = [], 0
@@ -358,9 +370,10 @@ class SuperGrok11(torch.optim.Optimizer):
                         virtual.append(p.detach())
                         continue
                     lr, wd = hp[p]
-                    sm = smart[off : off + p.numel()].reshape(p.shape)
+                    sm = g + self._shape_correction(g, corr[off : off + p.numel()].reshape(p.shape))
                     off += p.numel()
-                    virtual.append((p.detach().to(sm.dtype) * (1.0 - lr * wd) - lr * sm).to(p.dtype))
+                    wdt = torch.promote_types(p.dtype, sm.dtype)
+                    virtual.append((p.detach().to(wdt) * (1.0 - lr * wd) - lr * sm.to(wdt)).to(p.dtype))
                 held = meta_loss(virtual)
                 obj = held + train_meta_loss(virtual) if self.meta_objective == "lookahead" else held
                 obj.backward()
@@ -368,7 +381,10 @@ class SuperGrok11(torch.optim.Optimizer):
                 base = [
                     p.detach()
                     if g is None
-                    else (p.detach().to(g.dtype) * (1.0 - hp[p][0] * hp[p][1]) - hp[p][0] * g)
+                    else (
+                        p.detach().to(torch.promote_types(p.dtype, g.dtype)) * (1.0 - hp[p][0] * hp[p][1])
+                        - hp[p][0] * g
+                    )
                     .to(p.dtype)
                     .requires_grad_(True)
                     for p, g in zip(allp, G)
@@ -384,6 +400,7 @@ class SuperGrok11(torch.optim.Optimizer):
                     uf, gf, sf = uk.detach().to(G[k].dtype).reshape(-1), G[k].reshape(-1), S[k].reshape(-1)
                     for a in range(0, gf.numel(), chunk):
                         corr = self.meta_net.correction(gf[a : a + chunk], sf[a : a + chunk])
+                        corr = self._shape_correction(gf[a : a + chunk], corr)  # whole tensor if capped
                         (-lr * (uf[a : a + chunk] * corr).sum()).backward()
         self.meta_opt.step()
         self.last_meta_loss = held.detach()
@@ -422,12 +439,9 @@ class SuperGrok11(torch.optim.Optimizer):
                         gate = torch.sigmoid(self.gate_temperature * cosine(g, mu, self.gate_eps))
                     else:
                         gate = torch.ones((), dtype=g.dtype, device=g.device)
-                    corr = (gate * (ramp * self.lamb * self.layer_alpha(self._index[p]))) * mu
-                    if self.zero_grad_policy == "mask":
-                        corr = torch.where(g == 0, torch.zeros_like(corr), corr)
-                    if self.max_correction_ratio is not None:
-                        bound = self.max_correction_ratio * torch.linalg.vector_norm(g)
-                        corr = corr * torch.clamp(bound / (torch.linalg.vector_norm(corr) + 1e-30), max=1.0)
+                    corr = self._shape_correction(
+                        g, (gate * (ramp * self.lamb * self.layer_alpha(self._index[p]))) * mu
+                    )
                     g_hat = g + corr
                     if stats is not None:
                         stats.append(
@@ -462,7 +476,12 @@ class SuperGrok11(torch.optim.Optimizer):
 
     # ---- introspection ----
     def diagnostics(self) -> dict:
-        """State of every component, for the race log (syncs the device; call it at evals only)."""
+        """State of every component, for the race log (syncs the device; call it at evals only).
+
+        ``meta_loss`` is the held-out loss at the last meta step's virtual point: with the correction for
+        ``meta_grad="exact"``, without it for ``"first_order"``. The gate / correction statistics are from the
+        last step run with ``track_stats`` on (the race turns it on only for the step before an evaluation).
+        """
         net = self.meta_net
         out = {
             "alpha": self.alpha,

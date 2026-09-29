@@ -343,6 +343,10 @@ component, in plain PyTorch:
 * The race logs what every component is doing at each evaluation: α, r, φ's bias, the
   gate (mean/min/max), the size of the correction relative to the gradient, the share of
   coordinates whose sign the correction flips, and the mean sharpness.
+* Two deliberate departures from the legacy meta step, so the meta-net is trained on what
+  it is deployed on: it sees the *clipped* gradient (legacy: raw), and the virtual step
+  applies the same zero-gradient mask (and optional cap) as the real one. Both matter
+  only when a tensor's gradient norm exceeds 1 or has exact zeros.
 * Race settings: the legacy race's values (λ = 1.0, the last value you raced), β1 decaying
   per **transformer block** rather than per tensor (per tensor, γ = 0.1 would leave most of
   the 290 tensors of even the tiny model with β1 < 0.1), and no correction on

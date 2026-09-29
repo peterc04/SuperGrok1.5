@@ -35,7 +35,9 @@ Optimizer hooks (class attributes)
     ``train_meta_loss(params)``, the training cross-entropy at substituted
     parameters. ``uses_step_loss``: ``step()`` gets the iteration's ``loss``.
     ``wants_losses``: after every evaluation the loop calls
-    ``opt.set_losses(train_loss, meta_batch_loss, train_acc=train_acc)``.
+    ``opt.set_losses(train_loss, meta_batch_loss, train_acc=train_acc)``, with
+    the training loss and accuracy on the part of the training split the
+    optimizer actually trains on (the meta slice excluded).
     Every forward an optimizer runs itself leaves the MoE router's load
     statistics untouched.
 
@@ -209,6 +211,9 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     model.train()
     t_wall, step = time.time(), 0
     for step in range(1, cfg.max_steps + 1):
+        evaluating = step % cfg.eval_every == 0 or step == 1 or step == cfg.max_steps
+        if hasattr(opt, "track_stats"):  # per-step diagnostics only where they are read
+            opt.track_stats = evaluating
         kind = opt.upcoming_step_kind() if hasattr(opt, "upcoming_step_kind") else "step"
         measure = kind not in flop_table
         _sync(device)
@@ -226,13 +231,15 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         if not torch.isfinite(loss):
             r.stopping_reason = "non_finite_loss"
             break
-        if step % cfg.eval_every == 0 or step == 1 or step == cfg.max_steps:
+        if evaluating:
             model.eval()
             tl, ta = evaluate(fwd, t.x_train, t.y_train, task.num_classes, cfg.eval_batch)
             vl, va = evaluate(fwd, t.x_val, t.y_val, task.num_classes, cfg.eval_batch)
             el, ea = evaluate(fwd, t.x_test, t.y_test, task.num_classes, cfg.eval_batch)
-            if getattr(opt, "wants_losses", False):
-                opt.set_losses(tl, evaluate(fwd, x_meta, y_meta, task.num_classes, cfg.eval_batch)[0], train_acc=ta)
+            if getattr(opt, "wants_losses", False):  # the split the optimizer trains on vs its held-out slice
+                il, ia = evaluate(fwd, x_tr, y_tr, task.num_classes, cfg.eval_batch)
+                ml = evaluate(fwd, x_meta, y_meta, task.num_classes, cfg.eval_batch)[0]
+                opt.set_losses(il, ml, train_acc=ia)
             model.train()
             r.steps.append(step)
             for k, v in zip(

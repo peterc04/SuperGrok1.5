@@ -478,3 +478,42 @@ def test_registry_builds_blockwise_on_deepseek():
         ids = {name_of[p]: opt._layer[p] for p in opt._layer}
         assert ids["embed.weight"] == 0 and ids["layers.0.attn_norm.weight"] == 1
         assert ids["layers.5.ffn_norm.weight"] == 6 and ids["head.weight"] == 7
+
+
+def test_virtual_step_masks_zero_gradients_like_the_real_step():
+    idle = torch.nn.Parameter(torch.randn(5, dtype=torch.float64))
+    net = SharpnessMetaNet().double()
+    with torch.no_grad():
+        net.rescale.fill_(0.3)
+        net.net[2].bias.fill_(0.1)  # phi(0, 0) != 0
+    opt = SuperGrok11([idle], meta_net=net, zero_grad_policy="mask", meta_objective="lookahead_val", meta_lr=0.0)
+    idle.grad = torch.zeros_like(idle)
+    seen = {}
+
+    def meta_loss(params):
+        seen["v"] = params[0].detach().clone()
+        return (params[0] ** 2).sum()
+
+    opt.meta_step(meta_loss)
+    assert torch.equal(seen["v"], idle.detach() * (1 - 1e-3 * 1.0))  # decay only: no correction where g == 0
+
+
+def test_load_state_dict_does_not_consume_the_checkpoint():
+    from grokking_optimizers import LookSAM, NeuralGrok
+
+    for cls in (LookSAM, NeuralGrok, SuperGrok11):
+        opt = cls(tiny_mlp().parameters())
+        sd = opt.state_dict()
+        keys = set(sd)
+        cls(tiny_mlp().parameters()).load_state_dict(sd)
+        assert set(sd) == keys, cls.__name__
+
+
+def test_tensor_layer_ids_follow_model_order_under_grouping():
+    from deepseek_v41 import build_model
+
+    torch.manual_seed(0)
+    model = build_model("tiny", vocab_size=13, max_seq_len=8)
+    opt = build_optimizer("supergrok11", model, policy="deepseek", layer_ids="tensor")
+    order = {p: i for i, (_, p) in enumerate(model.named_parameters())}
+    assert all(opt._layer[p] == order[p] for p in opt._layer)
