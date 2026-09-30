@@ -42,4 +42,7 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
+      - name: Reference implementations for the cross-checks (Meta's Distributed Shampoo, Python >= 3.12)
+        if: matrix.python-version == '3.12'
+        run: pip install --no-deps "torch-shampoo @ git+https://github.com/facebookresearch/optimizers@d24a1491797e5bf2c2985d8789f3a28293d87a6f"
       - run: pytest -q

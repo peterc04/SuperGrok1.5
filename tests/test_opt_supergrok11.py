@@ -517,3 +517,26 @@ def test_tensor_layer_ids_follow_model_order_under_grouping():
     opt = build_optimizer("supergrok11", model, policy="deepseek", layer_ids="tensor")
     order = {p: i for i, (_, p) in enumerate(model.named_parameters())}
     assert all(opt._layer[p] == order[p] for p in opt._layer)
+
+
+@pytest.mark.parametrize("meta_grad", ["exact", "first_order"])
+def test_correction_cap_keeps_the_first_meta_step_finite(meta_grad):
+    """fp32, default init (r = 0, so the correction is exactly zero): the cap must not NaN the meta-gradient."""
+    x, y = batch()
+    model = tiny_mlp()
+    xo, yo = batch(seed=7)
+    opt = SuperGrok11(
+        model.parameters(),
+        max_correction_ratio=1.0,
+        meta_update_freq=1,
+        meta_grad=meta_grad,
+        sam_rho=0.0,
+        warmup_steps=0,
+    )
+    for _ in range(3):
+        opt.zero_grad()
+        F.cross_entropy(model(x), y).backward()
+        opt.step(meta_loss=meta_losses(model, x, y, xo, yo)[0], train_meta_loss=meta_losses(model, x, y, xo, yo)[1])
+    assert all(torch.isfinite(q).all() for q in opt.meta_net.parameters())
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+    assert opt.meta_net.rescale.item() != 0.0  # it did learn

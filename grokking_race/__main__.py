@@ -1,7 +1,7 @@
 """Command line: ``python -m grokking_race [options]``.
 
 Default: DeepSeek-V4.1-Flash (``tiny`` preset) on modular division, 50% train,
-seeds 42/123/456, all nine optimizers plus the SuperGrok 1.1 frozen-meta control, single device.
+seeds 42/123/456, all ten optimizers plus the SuperGrok 1.1 frozen-meta control, single device.
 """
 
 from __future__ import annotations

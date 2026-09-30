@@ -30,6 +30,7 @@ from .looksam import LookSAM
 from .muon import Muon, muon_param_groups
 from .neuralgrok import NeuralGrok
 from .prodigy import Prodigy
+from .shampoo import Shampoo
 from .supergrok11 import SharpnessMetaNet, SuperGrok11, block_layer_ids
 
 BASE = dict(lr=1e-3, betas=(0.9, 0.98), weight_decay=1.0)
@@ -98,6 +99,30 @@ def _build_supergrok11(model, policy="uniform", layer_ids="blocks", **hp):
     return SuperGrok11(groups, layer_ids=layer_ids, **hp)
 
 
+def _build_shampoo(model, policy="uniform", shampoo_on="matrices", lr=1e-3, weight_decay=1.0, **hp):
+    """Shampoo on the hidden matrices (``shampoo_on="matrices"``: the parameters Muon orthogonalizes) and
+    Adam, Shampoo's own grafting method, on embeddings, tables, norms and other vectors. ``"all"``
+    preconditions every parameter, tables included (memory and eigendecompositions grow with the table)."""
+    if shampoo_on not in ("matrices", "all"):
+        raise ValueError(f"shampoo_on must be 'matrices' or 'all', got {shampoo_on!r}")
+    if policy not in ("uniform", "deepseek"):
+        raise ValueError(f"unknown parameter policy {policy!r}")
+    roles = model.param_roles() if hasattr(model, "param_roles") else None
+    buckets: dict = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        role = roles[name] if roles is not None else None
+        is_matrix = role.kind == "matrix" if role is not None else p.ndim >= 2
+        decay, scale = (role.decay, role.lr_scale) if (policy == "deepseek" and role is not None) else (True, 1.0)
+        buckets.setdefault((shampoo_on == "all" or is_matrix, decay, scale), []).append(p)
+    groups = [
+        {"params": ps, "use_shampoo": use, "lr": lr * s, "weight_decay": weight_decay if d else 0.0}
+        for (use, d, s), ps in buckets.items()
+    ]
+    return Shampoo(groups, lr=lr, weight_decay=weight_decay, **hp)
+
+
 # The legacy race's SuperGrok 1.1 settings (lamb 1.0 was the last value raced) with every component on.
 SUPERGROK11 = dict(
     BASE,
@@ -156,6 +181,22 @@ OPTIMIZERS: dict[str, OptimizerSpec] = {
             ),
             _build_muon,
         ),
+        # Meta's Distributed Shampoo "replace Adam" recipe on the shared base: Adam grafting (step sizes are Adam's)
+        OptimizerSpec(
+            "shampoo",
+            Shampoo,
+            dict(
+                BASE,
+                epsilon=1e-12,
+                grafting_beta2=0.98,
+                grafting_epsilon=1e-8,
+                max_preconditioner_dim=1024,
+                precondition_frequency=10,
+                start_preconditioning_step=-1,
+                shampoo_on="matrices",
+            ),
+            _build_shampoo,
+        ),
         OptimizerSpec("supergrok11", SuperGrok11, dict(SUPERGROK11), _build_supergrok11),
         # control: the same optimizer with the learned correction and its SAM probe off, i.e. AdamW with
         # block-wise beta1 and a per-tensor clip, on the same data (it carves the same meta split)
@@ -193,6 +234,7 @@ __all__ = [
     "NeuralGrok",
     "Prodigy",
     "SharpnessMetaNet",
+    "Shampoo",
     "SuperGrok11",
     "OPTIMIZERS",
     "OptimizerSpec",

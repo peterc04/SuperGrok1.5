@@ -1,6 +1,6 @@
 # How the race's optimizers work
 
-This is the rundown of the nine optimizers in the grokking race: what each one
+This is the rundown of the ten optimizers in the grokking race: what each one
 does, what was wrong with it in the old code, how the new implementation is
 checked, what it costs, and whether it can plausibly run at 7–10B parameters on
 one H100 or at 552B on 64 H200s. SuperGrok 1.5 and SuperGrok 2 were removed; the
@@ -24,6 +24,7 @@ steps).
 | **Prodigy** | Adam with one global step size `d` estimated from distance travelled | 16 | 0 | `prodigyopt` 1.1.2: bit-exact (params and `d`) | not Prodigy: ℓ1 norm taken in the wrong place, ε not scaled by `d`, `lr` ignored |
 | **NeuralGrok** | a small MLP reweights each gradient tensor; trained by a one-step bilevel lookahead | 8 + amplifier | ≈ +1 fwd+bwd every T = 4 steps, plus the amplifier on every gradient entry | official NeuralOptGrok code: bit-exact | not NeuralGrok: `α = 10, β = 4` were misread flags; it was AdamW with a sign-flip hazard; v1 disabled it, v2 never trained the amplifier |
 | **Muon** (Kimi K3 per-head) | orthogonalize each weight matrix's momentum (Newton–Schulz); per-head blocks for attention queries | 4 (matrices), 8 (the rest, AdamW) | 0 (Newton–Schulz matmuls instead) | `torch.optim.Muon` semantics in fp32: < 1e-5 | could not step; sent embeddings and the output head through Newton–Schulz; no Nesterov |
+| **Shampoo** (Meta's Distributed Shampoo) | precondition each weight matrix by the inverse 4th roots of its accumulated row and column gradient covariances, `L^(-1/4) G R^(-1/4)`; step length grafted from Adam | 8 + 2 × (rows² + cols²) per matrix block (factors and their roots) | 0 (eigendecompositions every 10 steps instead) | Meta's `distributed_shampoo` (commit `d24a149`): bit-exact in 7 configurations, fp32 and fp64 | not in the old code |
 | **SuperGrok 1.1** | AdamW + a learned per-element correction φ(g, sharpness), cosine-gated, meta-trained by a one-step lookahead; layer-wise β1, clip, adaptive α | 12 + meta-net | SAM probe every 10 steps; meta step every 5 | naive transcription of the declared algorithm, all components on: < 1e-12; each component shown live; reductions to AdamW bit-exact | could only run in a CUDA kernel that dropped γ, the clip and adaptive α; its gate froze at 0.5; the learned correction collapsed training |
 
 "Bytes/param" is optimizer state only; the parameters and gradients themselves
@@ -47,7 +48,8 @@ add 8 bytes/param in fp32.
   (evaluation excluded, the same for everyone) and training FLOPs. FLOPs are
   measured with PyTorch's `FlopCounterMode` over everything an iteration runs:
   LookSAM's second pass, NeuralGrok's meta step and amplifier, Muon's
-  Newton–Schulz. It agrees with the textbook `6 × active params × tokens` to 0.6%
+  Newton–Schulz, Shampoo's eigendecompositions (the counter scores those as
+  zero; the race adds 9n³ each, Golub & Van Loan's count). It agrees with the textbook `6 × active params × tokens` to 0.6%
   for a plain step.
 * **Held-out data for meta-learners.** NeuralGrok, GrokAdamW and SuperGrok 1.1 need a
   loss on examples they do not train on. They get a 10% slice carved out of *their
@@ -284,6 +286,73 @@ which the race's FLOP count includes.
 **Old code.** `step()` raised; the kernel had no Nesterov step and routed by
 `ndim == 2`, sending the embeddings and output head through Newton–Schulz.
 
+## Shampoo
+
+**What it does** (Gupta, Koren, Singer, ICML 2018; made practical by Anil et al.
+2020 and Shi et al. 2023). Adam gives every weight its own step size. Shampoo
+instead preconditions each weight *matrix* as a whole: it keeps two running
+covariances of the gradient `G`, one over rows and one over columns, and steps
+along
+
+```
+L ← β2 L + (1 − β2) G Gᵀ          R ← β2 R + (1 − β2) Gᵀ G
+direction = L^(-1/4) · M · R^(-1/4)          M = Adam's first moment (bias-corrected)
+```
+
+The race runs **Meta's Distributed Shampoo**, the implementation that won the
+2024 MLCommons AlgoPerf training-algorithms benchmark (28% faster than the
+baseline, external tuning), in its documented "replace Adam" recipe:
+
+* **Grafting from Adam.** Each block's step keeps Shampoo's *direction* but
+  takes the *length* of Adam's step for that block. With the race's shared lr,
+  betas and weight decay, a difference from AdamW is therefore the
+  preconditioner's doing.
+* **Blocking.** Dimensions up to `max_preconditioner_dim` = 1024 are merged
+  (small matrices become vectors, preconditioned by a full `d × d` matrix,
+  power −1/2), and anything larger is cut into 1024-wide blocks.
+* **Amortized roots.** The inverse roots come from an eigendecomposition of
+  `L / (1 − β2^t) + εI` (ε = 1e-12), recomputed every 10 steps. Before step 10
+  the step is Adam's.
+* **Which parameters.** The hidden matrices are preconditioned: the same ones
+  Muon orthogonalizes (attention and expert projections, router, mHC
+  mixers). Embeddings, Engram tables, norms and other vectors take Adam's
+  step, Shampoo's own grafting method. Preconditioning a hashed table's rows
+  would cost a 1024 × 1024 matrix per 1024 rows and mean nothing.
+  `shampoo_on="all"` preconditions everything.
+
+**How it relates to Muon.** With no accumulation (β2 = 0) and ε → 0,
+`(G Gᵀ)^(-1/4) G (Gᵀ G)^(-1/4) = U Vᵀ` for `G = U S Vᵀ`: exactly the
+orthogonalized gradient that Muon approximates with Newton–Schulz. Muon is
+Shampoo without memory; Shampoo whitens with statistics accumulated over many
+steps. In the plots they share a hue (Shampoo is cross-hatched,
+dash-dot-dot).
+
+**Checked.** Against Meta's own code (github.com/facebookresearch/optimizers
+at commit `d24a149`), step for step, in seven configurations: merged vectors,
+2-D blocks, Adam-then-Shampoo with amortized roots, no weight decay, an
+Adam-only group, β1 = 0, and fp64. The parameters are **bit-identical** in every
+one. The test runs whenever that package is installed (CI installs it on
+Python 3.12). Independently of it, the first step matches the textbook formula
+computed in fp64, the Adam phase matches `torch.optim.AdamW`, grafting gives
+each block Adam's step length, and a checkpoint resumes bit-exactly.
+
+**Cost and scale.** State per matrix block of `m × n`: the two factors and
+their inverse roots, `2(m² + n²)` floats, plus Adam's two moments. For
+1024 × 1024 blocks that is 4 floats per parameter (Meta packs the symmetric
+matrices and stores half; this port keeps them whole for clarity), so with
+Adam's moments about 24 bytes/param in fp32. Compute:
+* preconditioning every step, `2·2·1024³` FLOPs per 1M-parameter block, about 4
+  thousand FLOPs per parameter;
+* the eigendecompositions every 10 steps, `2·9·1024³` per block, about 2
+  thousand per parameter per step amortized.
+
+On the `h100` preset (8.69B parameters, 1.34B active) at the race's 18.6K-token
+full batch, that is roughly 40% on top of the model's own FLOPs. It is also
+slower per FLOP: eigendecompositions do not run on tensor cores. The race
+counts all of it. At 7–10B on one H100, Shampoo needs the CUDA phase's
+low-precision storage (bf16 or packed factors), and blocking at 1024 is what
+keeps it feasible at all.
+
 ## SuperGrok 1.1
 
 **What it is supposed to do.** Your own design: AdamW whose gradient is corrected,
@@ -416,6 +485,7 @@ before activations:
 | pure bf16 weights + grads, AdamW bf16 moments | 8 | 70 GB: fits, barely |
 | + Grokfast / GrokAdamW / LookSAM extra state | 12+ | 104 GB+: does not fit |
 | Prodigy (4 state tensors) | 20+ | does not fit in any regime |
+| Shampoo, 1024 blocks (factors and roots unpacked, plus Adam's moments) | 32 | does not fit; needs bf16 / packed factors |
 
 So the plain fp32 PyTorch race cannot run this preset on one H100; that is the
 job of the CUDA phase (bf16 or FP8 storage, stochastic rounding, fused
@@ -423,4 +493,4 @@ optimizer-in-backward, activation checkpointing). Two practical knobs until then
 the number of routed experts changes total parameters without changing
 per-token compute (`--model-overrides '{"n_routed_experts": 16}'` gives 2.65B,
 which fits with fp32 AdamW at 42 GB), and `--micro-batches` splits the
-16.8K-token full batch to bound activation memory without changing the maths.
+18.6K-token full batch (4,656 examples x 4 tokens) to bound activation memory without changing the maths.

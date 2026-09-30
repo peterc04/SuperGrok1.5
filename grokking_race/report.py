@@ -7,9 +7,10 @@
 
 Each optimizer keeps one color in every chart: the eight hues of a palette
 validated for color-vision deficiency (adjacent pairs), and AdamW, the
-baseline, in dark gray with a dashed line. A control run of an optimizer
-(SuperGrok 1.1 with its meta-net frozen) shares its parent's hue and is told
-apart by a dash-dot line and dotted hatching. No chart asks the reader to tell
+baseline, in dark gray with a dashed line. Two series share a hue and are told
+apart by pattern: the control run of SuperGrok 1.1 with its meta-net frozen
+(dash-dot line, dotted hatching) and Shampoo, which shares Muon's (dash-dot-dot
+line, cross hatching). No chart asks the reader to tell
 ten hues apart by color alone (eight hues cannot all be pairwise distinct): bars
 are labelled on their axis, and curves are drawn as small multiples, one
 optimizer highlighted per panel.
@@ -28,7 +29,7 @@ import numpy as np  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-from .results import RunResult, summarize  # noqa: E402
+from .results import RunResult, seeds_label, summarize  # noqa: E402
 
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 BASELINE = "#52514e"
@@ -53,15 +54,19 @@ NAMES = {
     "looksam": "LookSAM",
     "neuralgrok": "NeuralGrok",
     "muon": "Muon",
+    "shampoo": "Shampoo",
     "supergrok11": "SuperGrok 1.1",
     "supergrok11_frozen": "SuperGrok 1.1, frozen meta",
 }
 CONTROLS = {"supergrok11_frozen": "supergrok11"}  # control run -> the optimizer whose hue it shares
+# Eight hues for ten optimizers: Shampoo shares Muon's (both precondition each weight matrix as a whole; Muon is
+# Shampoo without accumulated statistics) and is told apart by pattern, like a control
+SHARED_HUE = {**CONTROLS, "shampoo": "muon"}
 BUDGET_ATTR = {"steps": "total_steps", "seconds": "train_time", "flops": "train_flops"}
 
 
 def color(name: str) -> str:
-    name = CONTROLS.get(name, name)
+    name = SHARED_HUE.get(name, name)
     if name == "adamw":
         return BASELINE
     if name in FIXED:
@@ -73,16 +78,20 @@ def label(name: str) -> str:
     return NAMES.get(name, name)
 
 
-def linestyle(name: str) -> str:
-    return "--" if name == "adamw" else "-." if name in CONTROLS else "-"
+def linestyle(name: str):
+    if name == "adamw":
+        return "--"
+    if name in CONTROLS:
+        return "-."
+    return (0, (4, 1.5, 1, 1.5, 1, 1.5)) if name in SHARED_HUE else "-"  # dash-dot-dot
 
 
 def hatch(name: str) -> str | None:
-    return "//" if name == "adamw" else ".." if name in CONTROLS else None
+    return "//" if name == "adamw" else ".." if name in CONTROLS else "xx" if name in SHARED_HUE else None
 
 
 def dnf_hatch(name: str) -> str:
-    return "..." if name in CONTROLS else "///"
+    return "..." if name in CONTROLS else "xxx" if name in SHARED_HUE else "///"
 
 
 def _style(ax, grid_axis="both"):
@@ -121,7 +130,12 @@ def _median_curve(runs, kind, attr, n=400):
         return None, None
     end = max(_x(r, kind)[-1] for r in live)
     grid = np.linspace(0, end, n)
-    curves = [np.interp(grid, _x(r, kind), getattr(r, attr)) for r in live]
+    # a seed that stopped because it grokked keeps its last value; one that diverged counts as failed from then on
+    dead = 0.0 if attr.endswith("accs") else math.inf
+    curves = [
+        np.interp(grid, _x(r, kind), getattr(r, attr), right=dead if r.stopping_reason == "non_finite_loss" else None)
+        for r in live
+    ]
     return grid, np.median(np.stack(curves), axis=0)
 
 
@@ -146,8 +160,8 @@ def plot_race(results: dict[str, list[RunResult]], path: str, title: str):
             open_ = [
                 (getattr(x, BUDGET_ATTR[kind]), x.stopping_reason == "non_finite_loss") for x in runs if not x.grokked
             ]
+            budget = max([getattr(x, BUDGET_ATTR[kind]) for x in runs] or [0])
             if r[key] is None:  # the (censored) median seed never grokked: outline over the largest budget spent
-                budget = max([getattr(x, BUDGET_ATTR[kind]) for x in runs] or [0])
                 ax.barh(
                     i,
                     budget,
@@ -158,7 +172,8 @@ def plot_race(results: dict[str, list[RunResult]], path: str, title: str):
                     linewidth=1.0,
                     linestyle=linestyle(name),
                 )
-                text = "DNF" + (f", {r['diverged']} diverged" if r["diverged"] else "")
+                text = "crashed" if r["crashed"] == r["seeds"] else "DNF"
+                text += f", {r['diverged']} diverged" if r["diverged"] else ""
             else:
                 ax.barh(
                     i,
@@ -184,8 +199,13 @@ def plot_race(results: dict[str, list[RunResult]], path: str, title: str):
                     linewidths=1.0,
                     **style,
                 )
-            # the value sits by its bar; a DNF label sits past everything drawn on the row
-            right = max(done + [r[key]]) if r[key] is not None else max(done + [x_ for x_, _ in open_] + [0])
+            # the value sits by its bar unless a marker would cover it; a DNF label sits past the budget spent
+            if r[key] is None:
+                right = budget
+            else:
+                right = max(done + [r[key]])
+                if any(right < x_ <= right + 0.15 * span for x_, _ in open_):
+                    right = max([right] + [x_ for x_, _ in open_])
             ax.text(right, i, f"  {text}", va="center", fontsize=8.5, color=INK if r[key] is not None else INK_2)
         ax.set_xlim(0, span * 1.25 if span > 0 else 1)
         if fmt:
@@ -194,7 +214,7 @@ def plot_race(results: dict[str, list[RunResult]], path: str, title: str):
         ax.set_title(TITLES[kind], fontsize=11, color=INK, loc="left")
     axes[0].set_yticks(range(len(rows)))
     axes[0].set_yticklabels(
-        [f"{label(r['optimizer'])}  ({r['grokked']}/{r['seeds'] - r['crashed']})" for r in rows],
+        [f"{label(r['optimizer'])}  ({seeds_label(r)})" for r in rows],
         fontsize=9.5,
         color=INK,
     )
@@ -203,11 +223,11 @@ def plot_race(results: dict[str, list[RunResult]], path: str, title: str):
         0.01,
         0.012,
         "Grokked = test accuracy held at or above the threshold; grokked seeds / seeds in brackets. Bars: median "
-        "over all seeds, a seed that did not grok counting as never, so the bar is DNF (hatched outline over the "
-        "budget spent)\nwhen half or more did not grok. Filled dots: seeds that grokked. Open circles: seeds that "
-        "did not, at the budget they used; crosses: seeds that diverged (non-finite loss).\nTraining time counts "
-        "training iterations only (evaluation excluded). FLOPs count every matrix multiply an iteration runs, "
-        "including extra SAM / meta passes and Newton-Schulz.",
+        "over all seeds, a seed that did not grok (or crashed) counting as never, so the bar is DNF (hatched "
+        "outline over the budget spent)\nwhen half or more did not grok. Filled dots: seeds that grokked. Open "
+        "circles: seeds that did not, at the budget they used; crosses: seeds that diverged (non-finite loss).\n"
+        "Training time counts training iterations only (evaluation excluded). FLOPs count every matrix multiply "
+        "an iteration runs, including extra SAM / meta passes, Newton-Schulz and Shampoo's eigendecompositions.",
         fontsize=8,
         color=INK_2,
     )
@@ -255,7 +275,7 @@ def plot_test_curves(results: dict[str, list[RunResult]], path: str, title: str,
             else:
                 ax.tick_params(labelbottom=False)
         axes[i][0].set_ylabel(
-            f"{label(name)}\n({row['grokked']}/{row['seeds'] - row['crashed']})",
+            f"{label(name)}\n({seeds_label(row)})",
             fontsize=9,
             color=INK,
             rotation=0,
@@ -310,7 +330,7 @@ def plot_detail(results: dict[str, list[RunResult]], path: str, title: str, thre
         ax.text(
             0.09,
             1.03,
-            f"{label(name)}  ({s['grokked']}/{s['seeds'] - s['crashed']} grokked)",
+            f"{label(name)}  ({seeds_label(s)} grokked)",
             transform=ax.transAxes,
             fontsize=10,
             color=INK,

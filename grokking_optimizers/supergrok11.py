@@ -336,8 +336,12 @@ class SuperGrok11(torch.optim.Optimizer):
         if self.zero_grad_policy == "mask":
             corr = torch.where(g == 0, torch.zeros_like(corr), corr)
         if self.max_correction_ratio is not None:
+            # scale down only where the cap binds; written so that the backward stays finite at a zero
+            # correction (r = 0 at initialization), where bound / ||corr|| would overflow
             bound = self.max_correction_ratio * torch.linalg.vector_norm(g)
-            corr = corr * torch.clamp(bound / (torch.linalg.vector_norm(corr) + 1e-30), max=1.0)
+            n = torch.linalg.vector_norm(corr)
+            over = n > bound
+            corr = torch.where(over, corr * (bound / torch.where(over, n, torch.ones_like(n))), corr)
         return corr
 
     def meta_step(self, meta_loss: Callable, train_meta_loss: Callable | None = None) -> torch.Tensor:

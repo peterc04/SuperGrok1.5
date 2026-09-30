@@ -19,12 +19,16 @@ Cost to grok, three ways
     FLOPs. FLOPs are counted by ``torch.utils.flop_counter.FlopCounterMode``
     (matrix-multiply FLOPs, the convention behind MFU) over *everything* an
     iteration runs: extra sharpness-aware or meta forward/backward passes,
-    Newton-Schulz iterations, amplifier networks. Each distinct kind of iteration
+    Newton-Schulz iterations, amplifier networks, and Shampoo's
+    eigendecompositions (9 n^3 each, a formula the counter lacks). Each distinct kind of iteration
     an optimizer performs (``opt.upcoming_step_kind()``, e.g. a NeuralGrok meta
     step vs a plain step) is measured exactly the first time it occurs; later
-    iterations of that kind reuse the count. If a later iteration of the same
-    kind had gradients on a different set of parameters (an idle MoE expert),
-    its FLOPs are approximate and counted in ``flops_approx_steps``. The
+    iterations of that kind reuse the count. An optimizer's own work can depend
+    on which parameters have a gradient (an idle MoE expert gets none: Muon
+    then skips its Newton-Schulz), so a kind is counted again whenever that set
+    is new for it, until two sets have given the same count (the kind does not
+    depend on it) or 16 counts are reached; iterations charged a count made
+    with a different set are reported in ``flops_approx_steps``. The
     counter's own overhead is kept out of the timing: a measured iteration is
     charged the median time of the unmeasured iterations of the same kind, or,
     for a kind that never recurs, the best-timed kind's median scaled by the
@@ -57,6 +61,7 @@ auxiliary-loss-free MoE load-balancing update, identically for every optimizer.
 
 from __future__ import annotations
 
+import math
 import statistics
 import time
 import zlib
@@ -84,12 +89,26 @@ class RunConfig:
     eval_batch: int = 0  # >0: evaluate in chunks of this many examples
     micro_batches: int = 1  # split the full batch into this many chunks and accumulate gradients (memory only)
     meta_frac: float = 0.10
+    flop_count_every_step: bool = False  # count FLOPs on every iteration (slow; exact ground truth for tests)
     same_train_data: bool = False  # True: every optimizer trains on the same inner split (meta slice held out for all)
     param_policy: str = "uniform"  # uniform (decay everything) | deepseek (DeepSeek's per-role decay / lr)
     model_overrides: dict = field(default_factory=dict)  # deepseek_v41.Config fields, e.g. engram_vocab_size
     peak_flops: float | None = None  # device peak FLOP/s for MFU (e.g. 989e12 for H100 SXM bf16 dense)
     hparams: dict = field(default_factory=dict)  # per-optimizer overrides
     progress: bool = True
+
+
+def _eigh_flops(a_shape, *args, out_shape=None, **kwargs) -> int:
+    """Symmetric eigendecomposition with eigenvectors, about 9 n^3 FLOPs (Golub & Van Loan, *Matrix
+    Computations*, 4th ed., sec. 8.3). PyTorch's counter has no formula for it and would count 0."""
+    *batch, n, _ = a_shape
+    return 9 * n**3 * math.prod(batch)
+
+
+MAX_FLOP_COUNTS_PER_KIND = 16  # FLOP-counted iterations per step kind, at most
+
+# FLOP formulas the counter lacks, for work some optimizers do (Shampoo's inverse roots)
+EXTRA_FLOP_FORMULAS = {torch.ops.aten._linalg_eigh: _eigh_flops}
 
 
 def _sync(device):
@@ -220,10 +239,13 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         return sum(p.numel() for p in param_list if p.grad is not None)
 
     stopper = EarlyStopper(cfg.threshold, cfg.patience)
-    flop_table: dict = {}  # step kind -> FLOPs of one iteration of that kind
-    flop_sig: dict = {}  # step kind -> grad_signature() of the measured iteration
-    step_kinds, step_times = [], []  # per iteration; time None where the FLOP counter was running
-    counter_times: dict = {}  # step kind -> wall time of the measured iteration (includes counter overhead)
+    flop_table: dict = {}  # (step kind, gradient signature) -> FLOPs of one such iteration
+    flop_invariant: set = set()  # kinds counted under two gradient signatures with equal FLOPs
+    n_measured: dict = {}  # step kind -> FLOP-counted iterations so far
+    step_kinds, step_sigs, step_times = [], [], []  # per iteration; time None where the counter was running
+    iter_flops: list = []  # per iteration, only with cfg.flop_count_every_step
+    counter_times: dict = {}  # step kind -> wall time of its first counted iteration (includes counter overhead)
+    last_sig = None
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     model.train()
@@ -233,23 +255,38 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         if hasattr(opt, "track_stats"):  # per-step diagnostics only where they are read
             opt.track_stats = evaluating
         kind = opt.upcoming_step_kind() if hasattr(opt, "upcoming_step_kind") else "step"
-        measure = kind not in flop_table
+        # count FLOPs for a kind's first iteration, and again whenever the set of parameters with a gradient
+        # (idle MoE experts get none) is new for the kind, unless the kind has shown its FLOPs do not depend on it
+        measure = (
+            cfg.flop_count_every_step
+            or kind not in n_measured
+            or (
+                kind not in flop_invariant
+                and (kind, last_sig) not in flop_table
+                and n_measured[kind] < MAX_FLOP_COUNTS_PER_KIND
+            )
+        )
         _sync(device)
         t0 = time.perf_counter()
         if measure:
-            with FlopCounterMode(display=False) as counter:
+            with FlopCounterMode(display=False, custom_mapping=EXTRA_FLOP_FORMULAS) as counter:
                 loss = iteration()
-            flop_table[kind] = counter.get_total_flops()
-            flop_sig[kind] = grad_signature()
         else:
             loss = iteration()
         _sync(device)
+        sig = last_sig = grad_signature()
         step_kinds.append(kind)
+        step_sigs.append(sig)
         step_times.append(None if measure else time.perf_counter() - t0)
         if measure:
-            counter_times[kind] = time.perf_counter() - t0
-        elif grad_signature() != flop_sig[kind]:
-            r.flops_approx_steps += 1  # a different set of parameters had gradients than when this kind was counted
+            flops = counter.get_total_flops()
+            iter_flops.append(flops)
+            counter_times.setdefault(kind, time.perf_counter() - t0)
+            n_measured[kind] = n_measured.get(kind, 0) + 1
+            flop_table[(kind, sig)] = flops
+            seen = {v for (k, _s), v in flop_table.items() if k == kind}
+            if len(seen) == 1 and sum(k == kind for k, _s in flop_table) > 1:
+                flop_invariant.add(kind)
 
         if not torch.isfinite(loss):
             r.stopping_reason = "non_finite_loss"
@@ -288,24 +325,38 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     for k, dt in zip(step_kinds, step_times):
         if dt is not None:
             by_kind.setdefault(k, []).append(dt)
+    kind_flops = {}  # step kind -> FLOPs of its first counted iteration
+    for (k, _s), v in flop_table.items():
+        kind_flops.setdefault(k, v)
+    if cfg.flop_count_every_step:
+        charged = iter_flops
+    else:
+        charged = []
+        for k, s in zip(step_kinds, step_sigs):
+            f = flop_table.get((k, s))
+            if f is None:  # a gradient set this kind was never counted with
+                f = kind_flops[k]
+                if k not in flop_invariant:
+                    r.flops_approx_steps += 1
+            charged.append(f)
     kind_time = {k: statistics.median(v) for k, v in by_kind.items()}
     ref = max(by_kind, key=lambda k: len(by_kind[k]), default=None)
-    for k in flop_table:  # a kind never timed without the counter: scale the best-timed kind by FLOPs
+    for k in kind_flops:  # a kind never timed without the counter: scale the best-timed kind by FLOPs
         if k not in kind_time:
-            if ref is not None and flop_table[ref] > 0:
-                kind_time[k] = kind_time[ref] * flop_table[k] / flop_table[ref]
+            if ref is not None and kind_flops[ref] > 0:
+                kind_time[k] = kind_time[ref] * kind_flops[k] / kind_flops[ref]
             else:
                 kind_time[k] = counter_times[k]  # nothing else to go on (a run of one iteration per kind)
     times = [dt if dt is not None else kind_time[k] for k, dt in zip(step_kinds, step_times)]
     cum_time, cum_flops, acc_t, acc_f = [], [], 0.0, 0
-    for k, dt in zip(step_kinds, times):
+    for dt, f in zip(times, charged):
         acc_t += dt
-        acc_f += flop_table[k]
+        acc_f += f
         cum_time.append(acc_t)
         cum_flops.append(acc_f)
     r.eval_train_time = [cum_time[s - 1] for s in r.steps]
     r.eval_flops = [cum_flops[s - 1] for s in r.steps]
-    r.flops_per_step_kind = {str(k): v for k, v in flop_table.items()}
+    r.flops_per_step_kind = {str(k): v for k, v in kind_flops.items()}
 
     r.total_steps = step
     r.wall_time = time.time() - t_wall

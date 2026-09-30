@@ -2,7 +2,7 @@
 
 Which optimizer makes a model *grok*, that is, generalize long after memorizing its
 training set, with the fewest gradient steps, seconds and FLOPs? This repository races
-nine optimizers on algorithmic tasks, using **DeepSeek-V4.1-Flash** as the trained model.
+ten optimizers on algorithmic tasks, using **DeepSeek-V4.1-Flash** as the trained model.
 
 It is a clean restart. The earlier code (SuperGrok 1.5/2, the CUDA/HIP/TPU kernels and the
 old race scripts) is in git history at commit `19c9d39`.
@@ -11,7 +11,7 @@ old race scripts) is in git history at commit `19c9d39`.
 
 | Path | What |
 |---|---|
-| `grokking_optimizers/` | The optimizers, as plain `torch.optim.Optimizer` classes: AdamW, Lion, Grokfast, GrokAdamW, LookSAM, Prodigy, NeuralGrok, Muon (Kimi K3 per-head) and SuperGrok 1.1 |
+| `grokking_optimizers/` | The optimizers, as plain `torch.optim.Optimizer` classes: AdamW, Lion, Grokfast, GrokAdamW, LookSAM, Prodigy, NeuralGrok, Muon (Kimi K3 per-head), Shampoo (Meta's Distributed Shampoo) and SuperGrok 1.1 |
 | `deepseek_v41/` | A trainable pure-PyTorch port of DeepSeek-V4.1-Flash (MoE, sparse attention, mHC, Engram) with size presets |
 | `grokking_race/` | The race: tasks, training loop, cost accounting, plots |
 | `tests/` | Every optimizer and the model checked against published or official reference code |
@@ -49,7 +49,8 @@ Useful options: `--tasks moddiv,chaindiv`, `--splits 10/90,50/50`, `--p 97`,
   steps, so 500 steps). The first crossing is recorded too.
 * **Cost to grok**, three ways: gradient steps, training wall-clock seconds (evaluation
   excluded) and training FLOPs. FLOPs are measured with PyTorch's `FlopCounterMode` and
-  include everything an optimizer runs itself: SAM passes, meta steps, Newton–Schulz.
+  include everything an optimizer runs itself: SAM passes, meta steps, Newton–Schulz,
+  Shampoo's eigendecompositions.
 * **Same starting point.** Every optimizer gets the same model initialization and data
   split per seed. Adam-family methods share lr 1e-3, betas (0.9, 0.98) and weight decay 1.0,
   and add only their own mechanism.

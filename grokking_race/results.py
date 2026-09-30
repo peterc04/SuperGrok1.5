@@ -60,8 +60,8 @@ class RunResult:
     meta_examples: int = 0  # its held-out slice of the train split (0: none)
     # curves, one entry per eval
     steps: list = field(default_factory=list)
-    train_losses: list = field(default_factory=list)  # on the whole train split
-    train_accs: list = field(default_factory=list)
+    train_losses: list = field(default_factory=list)  # on the train_examples it takes steps on (meta slice excluded)
+    train_accs: list = field(default_factory=list)  # same examples as train_losses
     test_losses: list = field(default_factory=list)
     test_accs: list = field(default_factory=list)
     eval_train_time: list = field(default_factory=list)  # cumulative training seconds at each eval
@@ -76,7 +76,7 @@ class RunResult:
     grok_flops: float | None = None
     first_cross_step: int | None = None
     best_test_acc: float = 0.0
-    final_train_acc: float = 0.0
+    final_train_acc: float = 0.0  # last train_accs entry
     final_test_acc: float = 0.0
     final_test_loss: float = 0.0
     # cost
@@ -109,8 +109,14 @@ def censored_median(runs: list[RunResult], attr: str) -> float | None:
     return m if math.isfinite(m) else None
 
 
+def seeds_label(row: dict) -> str:
+    """``grokked/seeds``, with crashed seeds called out (they count as not grokked)."""
+    return f"{row['grokked']}/{row['seeds']}" + (f", {row['crashed']} crashed" if row["crashed"] else "")
+
+
 def summarize(results: dict[str, list[RunResult]]) -> list[dict]:
-    """One row per optimizer, ranked by censored median grok step (all non-crashed seeds); DNF rows last."""
+    """One row per optimizer, ranked by the censored median grok step over all seeds (crashed and
+    non-grokking seeds count as never); rows that did not grok last."""
     rows = []
     for name, runs in results.items():
         live = [r for r in runs if not r.crashed]
@@ -122,9 +128,10 @@ def summarize(results: dict[str, list[RunResult]]) -> list[dict]:
                 "crashed": len(runs) - len(live),
                 "grokked": len(grokked),
                 "diverged": sum(r.stopping_reason == "non_finite_loss" for r in live),
-                "grok_step_median": censored_median(live, "grok_step"),
-                "grok_time_median": censored_median(live, "grok_train_time"),
-                "grok_flops_median": censored_median(live, "grok_flops"),
+                # a crashed seed did not grok either: it counts as never, so a crash can only hurt
+                "grok_step_median": censored_median(runs, "grok_step"),
+                "grok_time_median": censored_median(runs, "grok_train_time"),
+                "grok_flops_median": censored_median(runs, "grok_flops"),
                 "test_acc_mean": float(np.mean([r.final_test_acc for r in live])) if live else None,
                 "test_acc_std": float(np.std([r.final_test_acc for r in live])) if live else None,
                 "ms_per_step": float(np.mean([r.ms_per_step for r in live])) if live else None,
@@ -154,21 +161,20 @@ def _flops(x):
 
 def print_summary(results: dict[str, list[RunResult]], title: str, total_wall: float | None = None) -> None:
     rows = summarize(results)
-    width = 131
+    width = 138
     print("\n" + "=" * width)
     print(f"  GROKKING RACE | {title}")
     print("=" * width)
     print(
-        f"  {'#':>2} {'Optimizer':<19} {'Grokked':>8} {'Steps':>8} {'Seconds':>9} {'FLOPs':>9} "
+        f"  {'#':>2} {'Optimizer':<19} {'Grokked':>15} {'Steps':>8} {'Seconds':>9} {'FLOPs':>9} "
         f"{'Final test acc':>16} {'ms/step':>9} {'FLOPs/step':>11} {'MFU':>6} {'State MB':>9}"
     )
     print("  " + "-" * (width - 2))
     for i, r in enumerate(rows, 1):
-        ok = r["seeds"] - r["crashed"]
         test = "-" if r["test_acc_mean"] is None else f"{r['test_acc_mean']:.4f}±{r['test_acc_std']:.4f}"
         mfu = "-" if r["mfu"] is None else f"{100 * r['mfu']:.1f}%"
         print(
-            f"  {i:>2} {r['optimizer']:<19} {r['grokked']:>4}/{ok:<3} {_fmt(r['grok_step_median'], ',.0f'):>8} "
+            f"  {i:>2} {r['optimizer']:<19} {seeds_label(r):>15} {_fmt(r['grok_step_median'], ',.0f'):>8} "
             f"{_fmt(r['grok_time_median'], '.1f'):>9} {_flops(r['grok_flops_median']):>9} {test:>16} "
             f"{_fmt(r['ms_per_step'], '.2f'):>9} {_flops(r['flops_per_step']):>11} {mfu:>6} "
             f"{_fmt(r['state_mb'], '.1f'):>9}"

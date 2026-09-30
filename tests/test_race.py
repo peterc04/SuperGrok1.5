@@ -186,3 +186,13 @@ def test_bf16_autocast_runs_on_cpu():
     t = modular_division(11, 0.5, seed=0)
     r = train_one("adamw", 0, t, _cfg(dtype="bf16"))
     assert r.error is None and r.total_steps == 4 and all(math.isfinite(x) for x in r.train_losses)
+
+
+def test_flop_accounting_equals_counting_every_step_with_idle_experts():
+    """At p = 11 some MoE experts get no tokens on some steps, which changes Muon's own work (no Newton-Schulz
+    for them). Counting per (step kind, set of parameters with gradients) must equal counting every step."""
+    t = modular_division(11, 0.5, seed=0)
+    fast = train_one("muon", 0, t, _cfg(max_steps=10, eval_every=1, patience=100))
+    exact = train_one("muon", 0, t, _cfg(max_steps=10, eval_every=1, patience=100, flop_count_every_step=True))
+    assert fast.test_accs == exact.test_accs  # the counter does not change the numbers
+    assert fast.eval_flops == exact.eval_flops and fast.flops_approx_steps == 0
