@@ -6,7 +6,9 @@ published code does them:
 1. each tensor's gradient is clipped to norm ``gradient_clipping`` on its own;
 2. "layer-wise" momentum ``beta1_i = beta1 * (1 - gamma) ** i``, where ``i``
    counts the tensors *with a gradient* in the parameter group, in order (it is a
-   tensor index, not a transformer-layer index);
+   tensor index, not a transformer-layer index; when an MoE expert gets no tokens
+   on a step, every later tensor's ``beta1`` shifts for that step, exactly as in
+   the published code. At the race's full batch every expert gets tokens);
 3. an adaptive EMA decay ``alpha = alpha_init * exp(-kappa * signal)`` driven by
    a train/held-out loss gap (``set_losses``; with no losses set, alpha stays at
    ``alpha_init``).

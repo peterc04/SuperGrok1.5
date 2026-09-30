@@ -36,18 +36,25 @@ add 8 bytes/param in fp32.
   gradient descent. Each method adds only its own mechanism, so a difference in
   the race is attributable to that mechanism. Lion (lr 3e-4, wd 3.0) and Prodigy
   (lr 1.0, which multiplies its learned `d`) keep their own step-size conventions.
+* **Two splits, train and test**, exactly as in the original race scripts (a seeded
+  shuffle; the first 50% trains, the rest tests). No validation split. Test data is
+  only ever evaluated: no optimizer sees a test example, loss or accuracy.
 * **Grokked** means **test accuracy ≥ 95% held for 50 consecutive evals** (500
   steps). A single spike does not count; the first crossing is recorded separately.
+  Summaries use the median over *all* seeds, a seed that never grokked counting as
+  never, so an optimizer that groks on one lucky seed out of three is a DNF.
 * **Cost to grok is reported three ways:** gradient steps, training seconds
   (evaluation excluded, the same for everyone) and training FLOPs. FLOPs are
   measured with PyTorch's `FlopCounterMode` over everything an iteration runs:
   LookSAM's second pass, NeuralGrok's meta step and amplifier, Muon's
   Newton–Schulz. It agrees with the textbook `6 × active params × tokens` to 0.6%
   for a plain step.
-* **Held-out data for meta-learners.** NeuralGrok, GrokAdamW and SuperGrok 1.1 need held-out
-  losses. They get a 10% slice carved out of *their own* training split (so they
-  take gradients on 90% of it), every optimizer sees the same labelled examples in
-  total, and val/test never drive training. (The old race meta-trained on the same val split it used to stop.)
+* **Held-out data for meta-learners.** NeuralGrok, GrokAdamW and SuperGrok 1.1 need a
+  loss on examples they do not train on. They get a 10% slice carved out of *their
+  own* training split and take gradients on the other 90%, as the original NeuralGrok
+  race did. Every optimizer gets the same labelled examples; how it spends them is
+  part of its method. `--same-train-data` makes every optimizer train on the same
+  90% instead, for a data-matched comparison.
 * **MoE load balancing is the same for everyone.** After each step the router's
   selection bias moves by ±0.001 toward balanced load, computed from the step's
   own training forward only (extra forwards inside SAM or meta steps are excluded).

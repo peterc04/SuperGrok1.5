@@ -228,3 +228,16 @@ def test_engram_tables_follow_the_final_vocab_and_h100_is_7_to_10b():
         model = Transformer(get_config("h100", vocab_size=99))
     assert 7e9 < model.num_params() < 10e9
     assert 1.0e9 < model.num_active_params() < 2.0e9
+
+
+def test_mhc_mixing_stays_fp32_under_bf16_autocast():
+    from deepseek_v41.model import Block
+
+    torch.manual_seed(0)
+    x, res = torch.randn(2, 3, 8), torch.randn(2, 3, 4, 8)
+    post, comb = torch.rand(2, 3, 4), torch.rand(2, 3, 4, 4)
+    want_post, want_pre = Block.hc_post(x, res, post, comb), Block.hc_pre(res, post)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        got_post, got_pre = Block.hc_post(x, res, post, comb), Block.hc_pre(res, post)
+    assert got_post.dtype == torch.float32 and torch.equal(got_post, want_post)
+    assert got_pre.dtype == torch.float32 and torch.equal(got_pre, want_pre)

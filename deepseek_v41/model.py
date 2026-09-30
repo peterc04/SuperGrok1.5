@@ -102,12 +102,14 @@ def sink_attention(q, kv, mask, sink, scale):
     per-head logit that joins the softmax normalizer but carries no value. A
     query with no visible position therefore outputs zeros, as in the kernel.
     """
-    scores = torch.einsum("bshd,bnd->bshn", q.float(), kv.float()) * scale
-    scores = scores.masked_fill(~mask[:, :, None, :], float("-inf"))
-    b, s, h, _ = scores.shape
-    logits = torch.cat([scores, sink.float().view(1, 1, h, 1).expand(b, s, h, 1)], dim=-1)
-    probs = logits.softmax(dim=-1)[..., :-1]
-    return torch.einsum("bshn,bnd->bshd", probs, kv.float()).to(q.dtype)
+    with fp32_region(q):  # einsum -> bmm, which autocast would otherwise run in bf16
+        scores = torch.einsum("bshd,bnd->bshn", q.float(), kv.float()) * scale
+        scores = scores.masked_fill(~mask[:, :, None, :], float("-inf"))
+        b, s, h, _ = scores.shape
+        logits = torch.cat([scores, sink.float().view(1, 1, h, 1).expand(b, s, h, 1)], dim=-1)
+        probs = logits.softmax(dim=-1)[..., :-1]
+        out = torch.einsum("bshn,bnd->bshd", probs, kv.float())
+    return out.to(q.dtype)
 
 
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc: int, iters: int, eps: float):
@@ -222,8 +224,9 @@ class Indexer(nn.Module):
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
         q = rope_tail(q, freqs, self.rd)
         w = self.weights_proj(x) * (self.head_dim**-0.5 * self.n_heads**-0.5)
-        s = torch.einsum("bshd,btd->bsht", q.float(), index_k.float()).relu()
-        return (s * w.float().unsqueeze(-1)).sum(dim=2)
+        with fp32_region(q):
+            s = torch.einsum("bshd,btd->bsht", q.float(), index_k.float()).relu()
+            return (s * w.float().unsqueeze(-1)).sum(dim=2)
 
     @torch.no_grad()
     def select(self, scores, ctx: AttnContext):
@@ -576,12 +579,14 @@ class Block(nn.Module):
     @staticmethod
     def hc_pre(x, pre_mix):
         """Collapse the copies: sum_i pre_mix[i] * x[i]. [b,s,hc,d] x [b,s,hc] -> [b,s,d]"""
-        return torch.einsum("bsi,bsid->bsd", pre_mix, x.float()).to(x.dtype)
+        with fp32_region(x):
+            return torch.einsum("bsi,bsid->bsd", pre_mix, x.float()).to(x.dtype)
 
     @staticmethod
     def hc_post(x, residual, post, comb):
         """Expand back to copies and mix the residual in: y[j] = post[j] * x + sum_i comb[i, j] * residual[i]."""
-        y = post.unsqueeze(-1) * x.float().unsqueeze(-2) + torch.einsum("bsij,bsid->bsjd", comb, residual.float())
+        with fp32_region(x):
+            y = post.unsqueeze(-1) * x.float().unsqueeze(-2) + torch.einsum("bsij,bsid->bsjd", comb, residual.float())
         return y.to(residual.dtype)  # the residual stream keeps its (fp32) dtype under bf16 autocast
 
     def forward(self, x, pre_mix, ctx: AttnContext):
@@ -700,9 +705,11 @@ class Transformer(nn.Module):
         h = self.norm(h)
         with fp32_region(h):
             logits = F.linear(h.float(), self.head.weight.float())
+        terms = [layer.ffn.gate.balance_loss for layer in self.layers if layer.ffn.gate.balance_loss is not None]
+        for layer in self.layers:  # do not keep this forward's graph alive through the gates
+            layer.ffn.gate.balance_loss = None
         if not return_aux:
             return logits
-        terms = [layer.ffn.gate.balance_loss for layer in self.layers if layer.ffn.gate.balance_loss is not None]
         aux = self.cfg.balance_loss_alpha * torch.stack(terms).sum() if terms else logits.new_zeros(())
         return logits, aux
 

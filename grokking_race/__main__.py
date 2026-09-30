@@ -16,7 +16,7 @@ import torch
 from .notify import Notifier
 from .report import write_plots
 from .results import RunResult, print_summary, run_tag, save_json
-from .tasks import TASKS, default_val_ratio, make_task
+from .tasks import TASKS, make_task
 from .trainer import RunConfig, train_one
 
 
@@ -40,25 +40,18 @@ def main(argv=None):
     ap.add_argument("--splits", default="0.5", help="train fractions, e.g. '0.5' or '10/90,25/75,50/50'")
     ap.add_argument("--p", type=int, default=97, help="modulus")
     ap.add_argument("--chain-length", type=int, default=3)
-    ap.add_argument("--val-ratio", type=float, default=None, help="default: 0.05 at <=10%% train, else 0.10")
     ap.add_argument("--preset", default="tiny", help="DeepSeek-V4.1-Flash size preset (see deepseek_v41.PRESETS)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"])
     ap.add_argument("--compile", action="store_true", help="torch.compile the model")
     ap.add_argument("--max-steps", type=int, default=20_000)
     ap.add_argument("--eval-every", type=int, default=10)
-    ap.add_argument("--threshold", type=float, default=0.95, help="accuracy that counts as grokked (default 0.95)")
+    ap.add_argument("--threshold", type=float, default=0.95, help="test accuracy that counts as grokked (default 0.95)")
     ap.add_argument(
         "--patience",
         type=int,
         default=50,
-        help="evals the accuracy must stay >= threshold (default 50 evals x 10 steps = 500 steps)",
-    )
-    ap.add_argument(
-        "--grok-metric",
-        default="test",
-        choices=["test", "val"],
-        help="which split's accuracy defines grokking and stops the run (default: test)",
+        help="evals the test accuracy must stay >= threshold (default 50 evals x 10 steps = 500 steps)",
     )
     ap.add_argument("--eval-batch", type=int, default=0, help="chunk size for evaluation (0 = one pass)")
     ap.add_argument(
@@ -67,7 +60,19 @@ def main(argv=None):
         default=1,
         help="accumulate the full-batch gradient over this many chunks (memory only; same math)",
     )
-    ap.add_argument("--meta-frac", type=float, default=0.10, help="share of train held out for meta-learners")
+    ap.add_argument(
+        "--meta-frac",
+        type=float,
+        default=0.10,
+        help="share of the train split that optimizers with a held-out signal (NeuralGrok, GrokAdamW, SuperGrok) "
+        "keep for it instead of training on it",
+    )
+    ap.add_argument(
+        "--same-train-data",
+        action="store_true",
+        help="every optimizer trains on the same inner split (the --meta-frac slice is held out for all of them, "
+        "used only by optimizers that need a held-out signal)",
+    )
     ap.add_argument("--peak-tflops", type=float, default=None, help="device peak TFLOP/s, enables MFU")
     ap.add_argument("--hparams", default=None, help="JSON {optimizer: {name: value}} overrides")
     ap.add_argument(
@@ -98,10 +103,8 @@ def main(argv=None):
             f"DeepSeek-V4.1-Flash ({meta['preset']}) | {meta['task']} p={meta['p']} | "
             f"train {round(meta['frac_train'] * 100)}%"
         )
-        print_summary(results, title, metric=meta.get("grok_metric", "test"))
-        paths = write_plots(
-            results, os.path.dirname(args.replot), tag, title, meta["threshold"], meta.get("grok_metric", "test")
-        )
+        print_summary(results, title)
+        paths = write_plots(results, os.path.dirname(args.replot), tag, title, meta["threshold"])
         print("  wrote " + ", ".join(paths.values()))
         return
 
@@ -123,10 +126,10 @@ def main(argv=None):
         eval_every=args.eval_every,
         threshold=args.threshold,
         patience=args.patience,
-        grok_metric=args.grok_metric,
         eval_batch=args.eval_batch,
         micro_batches=args.micro_batches,
         meta_frac=args.meta_frac,
+        same_train_data=args.same_train_data,
         peak_flops=args.peak_tflops * 1e12 if args.peak_tflops else None,
         hparams=json.loads(args.hparams) if args.hparams else {},
         progress=not args.quiet,
@@ -142,17 +145,16 @@ def main(argv=None):
     t_all = time.time()
     for task_name in tasks:
         for ft in _parse_splits(args.splits):
-            vr = args.val_ratio if args.val_ratio is not None else default_val_ratio(ft)
             results: dict[str, list[RunResult]] = {n: [] for n in names}
             tag = run_tag(task_name, ft, args.preset)
-            first = make_task(task_name, args.p, ft, vr, seeds[0], args.chain_length)
+            first = make_task(task_name, args.p, ft, seeds[0], args.chain_length)
             print(
-                f"\n== {tag}: train/val/test = {first.sizes()}  seq_len {first.seq_len}  device {device}  "
+                f"\n== {tag}: train/test = {first.sizes()}  seq_len {first.seq_len}  device {device}  "
                 f"dtype {args.dtype}  seeds {seeds}"
             )
             for name in names:
                 for seed in seeds:
-                    task = make_task(task_name, args.p, ft, vr, seed, args.chain_length)
+                    task = make_task(task_name, args.p, ft, seed, args.chain_length)
                     t0 = time.time()
                     try:
                         r = train_one(name, seed, task, cfg)
@@ -165,7 +167,6 @@ def main(argv=None):
                             seed=seed,
                             task=task_name,
                             frac_train=ft,
-                            val_ratio=vr,
                             preset=args.preset,
                             dtype=args.dtype,
                             error=f"{type(e).__name__}: {e}"[:300],
@@ -173,7 +174,7 @@ def main(argv=None):
                         notify(
                             f"{name} seed {seed} crashed: {r.error}", title="Run crashed", priority=4, tags=["warning"]
                         )
-                    r.frac_train, r.val_ratio = ft, vr
+                    r.frac_train = ft
                     results[name].append(r)
                     status = f"grokked at step {r.grok_step}" if r.grokked else (r.stopping_reason or "crashed")
                     print(
@@ -188,13 +189,13 @@ def main(argv=None):
                             tags=["white_check_mark"],
                         )
             title = f"DeepSeek-V4.1-Flash ({args.preset}) | {task_name} p={args.p} | train {round(ft * 100)}%"
-            print_summary(results, title, time.time() - t_all, metric=args.grok_metric)
+            print_summary(results, title, time.time() - t_all)
             out = os.path.join(args.output, tag)
             meta = {
                 "task": task_name,
                 "p": args.p,
                 "frac_train": ft,
-                "val_ratio": vr,
+                "splits": "train/test",
                 "seeds": seeds,
                 "preset": args.preset,
                 "device": device,
@@ -203,14 +204,14 @@ def main(argv=None):
                 "eval_every": args.eval_every,
                 "threshold": args.threshold,
                 "patience": args.patience,
-                "grok_metric": args.grok_metric,
                 "meta_frac": args.meta_frac,
+                "same_train_data": args.same_train_data,
                 "param_policy": args.param_policy,
                 "model_overrides": cfg.model_overrides,
                 "torch": torch.__version__,
             }
             save_json(results, os.path.join(out, "results.json"), meta)
-            paths = write_plots(results, out, tag, title, args.threshold, args.grok_metric)
+            paths = write_plots(results, out, tag, title, args.threshold)
             print(f"  wrote {out}/results.json and {', '.join(os.path.basename(p) for p in paths.values())}")
     notify(
         f"Finished in {time.time() - t_all:.0f}s", title="Grokking race complete", priority=4, tags=["checkered_flag"]

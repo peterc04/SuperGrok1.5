@@ -42,6 +42,9 @@ Useful options: `--tasks moddiv,chaindiv`, `--splits 10/90,50/50`, `--p 97`,
 
 ## Race rules
 
+* **Two splits, train and test**, as in the original race scripts: a seeded shuffle of
+  every example, the first `frac_train` (default 50%) for training and the rest for
+  testing. There is no validation split. Test data is only ever evaluated.
 * **Grokked** = **test accuracy ≥ 95%, held for 50 consecutive evaluations** (every 10
   steps, so 500 steps). The first crossing is recorded too.
 * **Cost to grok**, three ways: gradient steps, training wall-clock seconds (evaluation
@@ -50,8 +53,9 @@ Useful options: `--tasks moddiv,chaindiv`, `--splits 10/90,50/50`, `--p 97`,
 * **Same starting point.** Every optimizer gets the same model initialization and data
   split per seed. Adam-family methods share lr 1e-3, betas (0.9, 0.98) and weight decay 1.0,
   and add only their own mechanism.
-* **Held-out data** for optimizers that need it (NeuralGrok, GrokAdamW, SuperGrok 1.1) is
-  carved out of their own training split. Validation and test never drive training.
+* **Held-out data** for optimizers that need it (NeuralGrok, GrokAdamW, SuperGrok 1.1) is a
+  10% slice carved out of their own training split; they train on the other 90%. Test
+  data never drives training: no optimizer sees a test example, loss or accuracy.
 
 Each run writes `results.json` plus four plots per task: the cost to grok in steps,
 seconds and FLOPs side by side (`race_*.png`); test accuracy against each of the three

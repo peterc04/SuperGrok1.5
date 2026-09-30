@@ -11,7 +11,7 @@ import numpy as np
 
 
 class EarlyStopper:
-    """Grokked = the watched accuracy stays >= ``threshold`` for ``patience`` consecutive evals.
+    """Grokked = test accuracy stays >= ``threshold`` for ``patience`` consecutive evals.
 
     ``grok_step`` is the first step of that held streak. ``first_cross_step``
     records the first eval that touched the threshold at all, held or not. (The
@@ -50,20 +50,18 @@ class RunResult:
     seed: int
     task: str
     frac_train: float
-    val_ratio: float
     preset: str = ""
     dtype: str = "fp32"
-    grok_metric: str = "test"
     hparams: dict = field(default_factory=dict)
     model_params: int = 0
     active_params: int = 0
     optimizer_state_bytes: int = 0
+    train_examples: int = 0  # examples this optimizer takes gradient steps on
+    meta_examples: int = 0  # its held-out slice of the train split (0: none)
     # curves, one entry per eval
     steps: list = field(default_factory=list)
-    train_losses: list = field(default_factory=list)
+    train_losses: list = field(default_factory=list)  # on the whole train split
     train_accs: list = field(default_factory=list)
-    val_losses: list = field(default_factory=list)
-    val_accs: list = field(default_factory=list)
     test_losses: list = field(default_factory=list)
     test_accs: list = field(default_factory=list)
     eval_train_time: list = field(default_factory=list)  # cumulative training seconds at each eval
@@ -76,11 +74,9 @@ class RunResult:
     grok_step: int | None = None
     grok_train_time: float | None = None
     grok_flops: float | None = None
-    grok_val_acc: float | None = None
     first_cross_step: int | None = None
-    best_metric_acc: float = 0.0
+    best_test_acc: float = 0.0
     final_train_acc: float = 0.0
-    final_val_acc: float = 0.0
     final_test_acc: float = 0.0
     final_test_loss: float = 0.0
     # cost
@@ -88,6 +84,7 @@ class RunResult:
     train_time: float = 0.0
     train_flops: float = 0.0
     flops_per_step_kind: dict = field(default_factory=dict)
+    flops_approx_steps: int = 0  # iterations charged their kind's FLOPs with a different set of gradients
     ms_per_step: float = 0.0
     tokens_per_sec: float = 0.0
     mfu: float | None = None
@@ -99,12 +96,21 @@ class RunResult:
         return self.error is not None
 
 
-def _median(xs):
-    return float(np.median(xs)) if xs else None
+def censored_median(runs: list[RunResult], attr: str) -> float | None:
+    """Median of ``attr`` over every seed, a seed that did not grok counting as never (+inf).
+
+    ``None`` when that median is not finite, i.e. when half or more of the seeds
+    did not grok: then the optimizer did not grok, whatever its luckiest seed did.
+    """
+    vals = [getattr(r, attr) if r.grokked else math.inf for r in runs]
+    if not vals:
+        return None
+    m = float(np.median(vals))
+    return m if math.isfinite(m) else None
 
 
 def summarize(results: dict[str, list[RunResult]]) -> list[dict]:
-    """One row per optimizer, ranked by median grok step (grokked seeds only); all-DNF rows last."""
+    """One row per optimizer, ranked by censored median grok step (all non-crashed seeds); DNF rows last."""
     rows = []
     for name, runs in results.items():
         live = [r for r in runs if not r.crashed]
@@ -115,9 +121,10 @@ def summarize(results: dict[str, list[RunResult]]) -> list[dict]:
                 "seeds": len(runs),
                 "crashed": len(runs) - len(live),
                 "grokked": len(grokked),
-                "grok_step_median": _median([r.grok_step for r in grokked]),
-                "grok_time_median": _median([r.grok_train_time for r in grokked]),
-                "grok_flops_median": _median([r.grok_flops for r in grokked]),
+                "diverged": sum(r.stopping_reason == "non_finite_loss" for r in live),
+                "grok_step_median": censored_median(live, "grok_step"),
+                "grok_time_median": censored_median(live, "grok_train_time"),
+                "grok_flops_median": censored_median(live, "grok_flops"),
                 "test_acc_mean": float(np.mean([r.final_test_acc for r in live])) if live else None,
                 "test_acc_std": float(np.std([r.final_test_acc for r in live])) if live else None,
                 "ms_per_step": float(np.mean([r.ms_per_step for r in live])) if live else None,
@@ -128,7 +135,7 @@ def summarize(results: dict[str, list[RunResult]]) -> list[dict]:
                 "state_mb": live[0].optimizer_state_bytes / 2**20 if live else None,
             }
         )
-    rows.sort(key=lambda r: (-r["grokked"], r["grok_step_median"] if r["grok_step_median"] is not None else math.inf))
+    rows.sort(key=lambda r: (r["grok_step_median"] if r["grok_step_median"] is not None else math.inf, -r["grokked"]))
     return rows
 
 
@@ -145,16 +152,14 @@ def _flops(x):
     return f"{x:.0f}"
 
 
-def print_summary(
-    results: dict[str, list[RunResult]], title: str, total_wall: float | None = None, metric: str = "test"
-) -> None:
+def print_summary(results: dict[str, list[RunResult]], title: str, total_wall: float | None = None) -> None:
     rows = summarize(results)
-    width = 124
+    width = 131
     print("\n" + "=" * width)
     print(f"  GROKKING RACE | {title}")
     print("=" * width)
     print(
-        f"  {'#':>2} {'Optimizer':<12} {'Grokked':>8} {'Steps':>8} {'Seconds':>9} {'FLOPs':>9} "
+        f"  {'#':>2} {'Optimizer':<19} {'Grokked':>8} {'Steps':>8} {'Seconds':>9} {'FLOPs':>9} "
         f"{'Final test acc':>16} {'ms/step':>9} {'FLOPs/step':>11} {'MFU':>6} {'State MB':>9}"
     )
     print("  " + "-" * (width - 2))
@@ -163,15 +168,27 @@ def print_summary(
         test = "-" if r["test_acc_mean"] is None else f"{r['test_acc_mean']:.4f}±{r['test_acc_std']:.4f}"
         mfu = "-" if r["mfu"] is None else f"{100 * r['mfu']:.1f}%"
         print(
-            f"  {i:>2} {r['optimizer']:<12} {r['grokked']:>4}/{ok:<3} {_fmt(r['grok_step_median'], ',.0f'):>8} "
+            f"  {i:>2} {r['optimizer']:<19} {r['grokked']:>4}/{ok:<3} {_fmt(r['grok_step_median'], ',.0f'):>8} "
             f"{_fmt(r['grok_time_median'], '.1f'):>9} {_flops(r['grok_flops_median']):>9} {test:>16} "
             f"{_fmt(r['ms_per_step'], '.2f'):>9} {_flops(r['flops_per_step']):>11} {mfu:>6} "
             f"{_fmt(r['state_mb'], '.1f'):>9}"
         )
     print("  " + "-" * (width - 2))
-    print(f"  Steps / Seconds / FLOPs: to grok, median over grokked seeds. Grokked = {metric} accuracy held >= the")
-    print("  threshold for `patience` evals. Seconds = training iterations only (evals excluded). FLOPs = matmul")
-    print("  FLOPs of everything each iteration runs (extra SAM/meta passes, Newton-Schulz, amplifiers).")
+    print("  Steps / Seconds / FLOPs: to grok, median over all seeds with a seed that did not grok counting as")
+    print("  never ('-' = half or more did not grok). Grokked = test accuracy held >= the threshold for `patience`")
+    print("  evals. Seconds = training iterations only (evals excluded). FLOPs = matmul FLOPs of everything each")
+    print("  iteration runs (extra SAM/meta passes, Newton-Schulz, amplifiers).")
+    diverged = [f"{r['optimizer']} ({r['diverged']})" for r in rows if r["diverged"]]
+    if diverged:
+        print("  Diverged (non-finite loss): " + ", ".join(diverged))
+    approx = [
+        f"{n} s{r.seed}: {r.flops_approx_steps}" for n, runs in results.items() for r in runs if r.flops_approx_steps
+    ]
+    if approx:
+        print(
+            "  FLOPs approximate on some iterations (an idle MoE expert changed which parameters had gradients): "
+            + ", ".join(approx)
+        )
     crashes = [(n, r) for n, runs in results.items() for r in runs if r.crashed]
     if crashes:
         print(f"  CRASHES ({len(crashes)}):")

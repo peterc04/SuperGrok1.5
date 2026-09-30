@@ -8,7 +8,10 @@ Grokking
     A run has grokked at step ``s`` if **test** accuracy is >= ``threshold``
     (0.95) at the eval at step ``s`` and at the next ``patience - 1`` evals
     (default 50 evals x 10 steps: held for 500 steps). A single spike does not
-    count. The val split is recorded and can be used instead (``grok_metric="val"``).
+    count. There are two splits, train and test (``tasks.py``); test is only
+    ever evaluated, never trained on. Train loss and accuracy are logged on
+    the examples the optimizer takes gradient steps on (its meta slice, if it
+    has one, excluded).
 
 Cost to grok, three ways
     steps (optimizer updates), wall-clock seconds spent in training iterations
@@ -19,9 +22,13 @@ Cost to grok, three ways
     Newton-Schulz iterations, amplifier networks. Each distinct kind of iteration
     an optimizer performs (``opt.upcoming_step_kind()``, e.g. a NeuralGrok meta
     step vs a plain step) is measured exactly the first time it occurs; later
-    iterations of that kind reuse the count. The counter's own overhead is kept
-    out of the timing: a measured iteration is charged the median time of the
-    unmeasured iterations of the same kind.
+    iterations of that kind reuse the count. If a later iteration of the same
+    kind had gradients on a different set of parameters (an idle MoE expert),
+    its FLOPs are approximate and counted in ``flops_approx_steps``. The
+    counter's own overhead is kept out of the timing: a measured iteration is
+    charged the median time of the unmeasured iterations of the same kind, or,
+    for a kind that never recurs, the best-timed kind's median scaled by the
+    FLOP ratio.
 
 Optimizer hooks (class attributes)
     ``needs_closure``: ``step()`` gets ``closure``, which zeroes the grads,
@@ -30,8 +37,11 @@ Optimizer hooks (class attributes)
     ``needs_meta_loss``: ``step()`` gets ``meta_loss(params) -> Tensor``, the
     differentiable loss on a held-out meta batch with ``params`` (aligned with
     the optimizer's parameters, group by group) substituted into the model. The
-    meta batch is carved out of the training split (``meta_frac``), so val and
-    test never drive training. ``needs_train_meta_loss``: also
+    meta batch is carved out of the training split (``meta_frac``); the
+    optimizer trains on the rest, and test data never drives training. With
+    ``same_train_data`` every optimizer trains on that same rest, so the data is
+    matched exactly (off by default: then optimizers without a held-out signal
+    train on the whole train split). ``needs_train_meta_loss``: also
     ``train_meta_loss(params)``, the training cross-entropy at substituted
     parameters. ``uses_step_loss``: ``step()`` gets the iteration's ``loss``.
     ``wants_losses``: after every evaluation the loop calls
@@ -65,16 +75,16 @@ from .tasks import Task, carve_meta_split
 class RunConfig:
     preset: str = "tiny"
     device: str = "cpu"
-    dtype: str = "fp32"  # fp32 | bf16 (autocast on CUDA)
+    dtype: str = "fp32"  # fp32 | bf16 (autocast for training and evaluation; master weights stay fp32)
     compile: bool = False
     max_steps: int = 20_000
     eval_every: int = 10
     threshold: float = 0.95
     patience: int = 50
-    grok_metric: str = "test"  # accuracy that defines grokking and stops the run: test | val
     eval_batch: int = 0  # >0: evaluate in chunks of this many examples
     micro_batches: int = 1  # split the full batch into this many chunks and accumulate gradients (memory only)
     meta_frac: float = 0.10
+    same_train_data: bool = False  # True: every optimizer trains on the same inner split (meta slice held out for all)
     param_policy: str = "uniform"  # uniform (decay everything) | deepseek (DeepSeek's per-role decay / lr)
     model_overrides: dict = field(default_factory=dict)  # deepseek_v41.Config fields, e.g. engram_vocab_size
     peak_flops: float | None = None  # device peak FLOP/s for MFU (e.g. 989e12 for H100 SXM bf16 dense)
@@ -88,19 +98,22 @@ def _sync(device):
 
 
 def _autocast(cfg: RunConfig, device):
-    if cfg.dtype == "bf16" and device.type == "cuda":
-        return torch.autocast("cuda", dtype=torch.bfloat16)
+    if cfg.dtype == "bf16":
+        return torch.autocast(device.type, dtype=torch.bfloat16)
+    if cfg.dtype != "fp32":
+        raise ValueError(f"dtype must be fp32 or bf16, got {cfg.dtype!r}")
     return nullcontext()
 
 
 @torch.no_grad()
-def evaluate(model, x, y, num_classes: int, chunk: int = 0) -> tuple[float, float]:
-    """(mean cross-entropy, accuracy of argmax over the first ``num_classes`` logits)."""
+def evaluate(model, x, y, num_classes: int, chunk: int = 0, amp=None) -> tuple[float, float]:
+    """(mean cross-entropy, accuracy of argmax over the first ``num_classes`` logits), under ``amp`` if given."""
     n = len(y)
     chunk = n if chunk <= 0 else chunk
     loss_sum, correct = 0.0, 0
     for i in range(0, n, chunk):
-        logits = model(x[i : i + chunk]).float()
+        with amp if amp is not None else nullcontext():
+            logits = model(x[i : i + chunk]).float()
         loss_sum += F.cross_entropy(logits, y[i : i + chunk], reduction="sum").item()
         correct += (logits[:, :num_classes].argmax(-1) == y[i : i + chunk]).sum().item()
     return loss_sum / n, correct / n
@@ -122,11 +135,9 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         seed=seed,
         task=task.name,
         frac_train=0.0,
-        val_ratio=0.0,
         preset=cfg.preset,
         dtype=cfg.dtype,
         hparams=hp,
-        grok_metric=cfg.grok_metric,
     )
 
     # Same init for every optimizer: construction is seeded by the run seed only.
@@ -145,9 +156,10 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     t = task.to(device)
     x_tr, y_tr = t.x_train, t.y_train
     x_meta = y_meta = None
-    if getattr(opt, "needs_meta_loss", False) or getattr(opt, "wants_losses", False):
+    if getattr(opt, "needs_meta_loss", False) or getattr(opt, "wants_losses", False) or cfg.same_train_data:
         x_tr, y_tr, x_meta, y_meta = carve_meta_split(t.x_train.cpu(), t.y_train.cpu(), cfg.meta_frac, seed)
         x_tr, y_tr, x_meta, y_meta = (a.to(device) for a in (x_tr, y_tr, x_meta, y_meta))
+    r.train_examples, r.meta_examples = len(y_tr), 0 if y_meta is None else len(y_meta)
 
     param_list = [p for g in opt.param_groups for p in g["params"]]
     name_of = {p: n for n, p in model.named_parameters()}
@@ -164,7 +176,8 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
             for xb, yb in chunks:
                 with amp:
                     logits, aux = fwd(xb, return_aux=True)  # aux: the MoE sequence-wise balance loss
-                loss = F.cross_entropy(logits.float(), yb) * (len(yb) / len(y_tr)) + aux / len(chunks)
+                # both terms are means over the chunk's sequences: weight by chunk size for the full-batch mean
+                loss = (F.cross_entropy(logits.float(), yb) + aux) * (len(yb) / len(y_tr))
                 loss.backward()
                 total = total + loss.detach()
         return total
@@ -203,9 +216,14 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         model.update_router_bias()
         return loss
 
+    def grad_signature() -> int:  # which parameters got a gradient (idle MoE experts get none)
+        return sum(p.numel() for p in param_list if p.grad is not None)
+
     stopper = EarlyStopper(cfg.threshold, cfg.patience)
     flop_table: dict = {}  # step kind -> FLOPs of one iteration of that kind
+    flop_sig: dict = {}  # step kind -> grad_signature() of the measured iteration
     step_kinds, step_times = [], []  # per iteration; time None where the FLOP counter was running
+    counter_times: dict = {}  # step kind -> wall time of the measured iteration (includes counter overhead)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     model.train()
@@ -222,29 +240,33 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
             with FlopCounterMode(display=False) as counter:
                 loss = iteration()
             flop_table[kind] = counter.get_total_flops()
+            flop_sig[kind] = grad_signature()
         else:
             loss = iteration()
         _sync(device)
         step_kinds.append(kind)
         step_times.append(None if measure else time.perf_counter() - t0)
+        if measure:
+            counter_times[kind] = time.perf_counter() - t0
+        elif grad_signature() != flop_sig[kind]:
+            r.flops_approx_steps += 1  # a different set of parameters had gradients than when this kind was counted
 
         if not torch.isfinite(loss):
             r.stopping_reason = "non_finite_loss"
             break
         if evaluating:
             model.eval()
-            tl, ta = evaluate(fwd, t.x_train, t.y_train, task.num_classes, cfg.eval_batch)
-            vl, va = evaluate(fwd, t.x_val, t.y_val, task.num_classes, cfg.eval_batch)
-            el, ea = evaluate(fwd, t.x_test, t.y_test, task.num_classes, cfg.eval_batch)
-            if getattr(opt, "wants_losses", False):  # the split the optimizer trains on vs its held-out slice
-                il, ia = evaluate(fwd, x_tr, y_tr, task.num_classes, cfg.eval_batch)
-                ml = evaluate(fwd, x_meta, y_meta, task.num_classes, cfg.eval_batch)[0]
-                opt.set_losses(il, ml, train_acc=ia)
+            # "train" = the examples this optimizer takes gradient steps on (its meta slice excluded)
+            tl, ta = evaluate(fwd, x_tr, y_tr, task.num_classes, cfg.eval_batch, amp)
+            el, ea = evaluate(fwd, t.x_test, t.y_test, task.num_classes, cfg.eval_batch, amp)
+            if getattr(opt, "wants_losses", False):  # its training examples vs its held-out slice
+                ml = evaluate(fwd, x_meta, y_meta, task.num_classes, cfg.eval_batch, amp)[0]
+                opt.set_losses(tl, ml, train_acc=ta)
             model.train()
             r.steps.append(step)
             for k, v in zip(
-                ("train_losses", "train_accs", "val_losses", "val_accs", "test_losses", "test_accs"),
-                (tl, ta, vl, va, el, ea),
+                ("train_losses", "train_accs", "test_losses", "test_accs"),
+                (tl, ta, el, ea),
             ):
                 getattr(r, k).append(v)
             diag = getattr(opt, "diagnostics", None)
@@ -252,12 +274,11 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
                 r.diagnostics.append({"step": step, **diag()})
             if cfg.progress and (step == 1 or step % (cfg.eval_every * 50) == 0):
                 print(
-                    f"    [{opt_name} s{seed}] step {step:>6}  train {ta:.3f}  val {va:.3f}  test {ea:.3f}  "
-                    f"loss {tl:.4f}",
+                    f"    [{opt_name} s{seed}] step {step:>6}  train {ta:.3f}  test {ea:.3f}  loss {tl:.4f}",
                     flush=True,
                 )
-            if stopper.update(ea if cfg.grok_metric == "test" else va, step):
-                r.stopping_reason = f"{cfg.grok_metric}_acc_held"
+            if stopper.update(ea, step):
+                r.stopping_reason = "test_acc_held"
                 break
     else:
         r.stopping_reason = "max_steps"
@@ -267,12 +288,15 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     for k, dt in zip(step_kinds, step_times):
         if dt is not None:
             by_kind.setdefault(k, []).append(dt)
-    measured = [dt for dt in step_times if dt is not None]
-    fallback = statistics.median(measured) if measured else 0.0
-    times = [
-        dt if dt is not None else (statistics.median(by_kind[k]) if k in by_kind else fallback)
-        for k, dt in zip(step_kinds, step_times)
-    ]
+    kind_time = {k: statistics.median(v) for k, v in by_kind.items()}
+    ref = max(by_kind, key=lambda k: len(by_kind[k]), default=None)
+    for k in flop_table:  # a kind never timed without the counter: scale the best-timed kind by FLOPs
+        if k not in kind_time:
+            if ref is not None and flop_table[ref] > 0:
+                kind_time[k] = kind_time[ref] * flop_table[k] / flop_table[ref]
+            else:
+                kind_time[k] = counter_times[k]  # nothing else to go on (a run of one iteration per kind)
+    times = [dt if dt is not None else kind_time[k] for k, dt in zip(step_kinds, step_times)]
     cum_time, cum_flops, acc_t, acc_f = [], [], 0.0, 0
     for k, dt in zip(step_kinds, times):
         acc_t += dt
@@ -294,15 +318,14 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     if device.type == "cuda":
         r.peak_mem_bytes = torch.cuda.max_memory_allocated(device)
     r.optimizer_state_bytes = state_bytes(opt)
-    r.best_metric_acc = stopper.best
+    r.best_test_acc = stopper.best
     r.first_cross_step = stopper.first_cross_step
     r.grokked = stopper.grok_step is not None
     if r.steps:
-        r.final_train_acc, r.final_val_acc = r.train_accs[-1], r.val_accs[-1]
+        r.final_train_acc = r.train_accs[-1]
         r.final_test_loss, r.final_test_acc = r.test_losses[-1], r.test_accs[-1]
     if r.grokked:
         r.grok_step = stopper.grok_step
         r.grok_train_time = cum_time[r.grok_step - 1]
         r.grok_flops = cum_flops[r.grok_step - 1]
-        r.grok_val_acc = r.val_accs[r.steps.index(r.grok_step)]
     return r

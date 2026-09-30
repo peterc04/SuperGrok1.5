@@ -330,3 +330,58 @@ class SuperGrok11Reference:
                 self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * g * g
                 m_hat, v_hat = self.m[i] / (1 - b1**t), self.v[i] / (1 - self.b2**t)
                 p.copy_(p - self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.wd * p))
+
+
+def original_make_data(p=97, frac_train=0.5, seed=42):
+    """make_data of the original race scripts (grokking_race_v1/v2, identical in both), verbatim."""
+    import random
+
+    rng = random.Random(seed)
+    op_tok, eq_tok = p, p + 1
+    pairs, labels = [], []
+    for a in range(p):
+        for b in range(1, p):
+            b_inv = pow(b, p - 2, p)
+            pairs.append([a, op_tok, b, eq_tok])
+            labels.append((a * b_inv) % p)
+    c = list(zip(pairs, labels))
+    rng.shuffle(c)
+    pairs, labels = zip(*c)
+    n = int(len(pairs) * frac_train)
+    x = torch.tensor(pairs, dtype=torch.long)
+    y = torch.tensor(labels, dtype=torch.long)
+    return x[:n], y[:n], x[n:], y[n:]
+
+
+def original_make_sequential_division_data(p=97, chain_length=3, frac_train=0.5, seed=42):
+    """make_sequential_division_data of the original race scripts, verbatim."""
+    import random
+
+    rng = random.Random(seed)
+    op_tok, eq_tok = p, p + 1
+    target_size = p * (p - 1)
+    seen = set()
+    pairs, labels = [], []
+    while len(pairs) < target_size:
+        a = rng.randint(0, p - 1)
+        bs = tuple(rng.randint(1, p - 1) for _ in range(chain_length))
+        key = (a, *bs)
+        if key in seen:
+            continue
+        seen.add(key)
+        result = a
+        for b in bs:
+            result = (result * pow(b, p - 2, p)) % p
+        seq = [a]
+        for b in bs:
+            seq.extend([op_tok, b])
+        seq.append(eq_tok)
+        pairs.append(seq)
+        labels.append(result)
+    combined = list(zip(pairs, labels))
+    rng.shuffle(combined)
+    pairs, labels = zip(*combined)
+    n = int(len(pairs) * frac_train)
+    x = torch.tensor(pairs, dtype=torch.long)
+    y = torch.tensor(labels, dtype=torch.long)
+    return x[:n], y[:n], x[n:], y[n:]
