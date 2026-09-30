@@ -152,6 +152,7 @@ def block_layer_ids(names: Sequence[str]) -> list[int]:
 
 
 class SuperGrok11(torch.optim.Optimizer):
+    flops_depend_on_routing = True  # phi runs on each gradient present; meta backward follows the routing
     needs_closure = True
     needs_meta_loss = True
     needs_train_meta_loss = True

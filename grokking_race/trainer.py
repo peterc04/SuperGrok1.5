@@ -23,15 +23,16 @@ Cost to grok, three ways
     eigendecompositions (9 n^3 each, a formula the counter lacks). Each distinct kind of iteration
     an optimizer performs (``opt.upcoming_step_kind()``, e.g. a NeuralGrok meta
     step vs a plain step) is measured exactly the first time it occurs; later
-    iterations of that kind reuse the count. An optimizer's own work can depend
-    on MoE routing (an idle expert gets no gradient, so Muon skips its
-    Newton-Schulz; a meta step differentiates only through the experts its
-    held-out batch reaches), so a kind is counted again whenever the iteration's
-    routing and gradient sets are new for it, until two different ones have
-    given the same count (the kind does not depend on them) or 16 counts are
-    reached. Iterations charged a count made under different routing are
-    reported in ``flops_approx_steps``; at the race's full batch every expert
-    gets tokens and there are none. The
+    iterations of that kind reuse the count. The model's own FLOPs do not
+    depend on MoE routing, but some optimizers' do (they declare
+    ``flops_depend_on_routing``: an idle expert gets no gradient, so Muon skips
+    its Newton-Schulz; a meta step differentiates only through the experts its
+    held-out batch reaches). For those, a kind is counted again whenever the
+    iteration's routing trace and gradient sets are new for it, up to 64 counts
+    per kind; an iteration whose combination was never counted is charged the
+    kind's first count and reported in ``flops_approx_steps``. At the race's
+    full batch every expert gets tokens, so there are none. A test checks every
+    optimizer against counting every iteration. The
     counter's own overhead is kept out of the timing: a measured iteration is
     charged the median time of the unmeasured iterations of the same kind, or,
     for a kind that never recurs, the best-timed kind's median scaled by the
@@ -108,7 +109,7 @@ def _eigh_flops(a_shape, *args, out_shape=None, **kwargs) -> int:
     return 9 * n**3 * math.prod(batch)
 
 
-MAX_FLOP_COUNTS_PER_KIND = 16  # FLOP-counted iterations per step kind, at most
+MAX_FLOP_COUNTS_PER_KIND = 64  # FLOP-counted iterations per step kind, at most
 
 # FLOP formulas the counter lacks, for work some optimizers do (Shampoo's inverse roots)
 EXTRA_FLOP_FORMULAS = {torch.ops.aten._linalg_eigh: _eigh_flops}
@@ -247,8 +248,8 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     trace = getattr(model, "routing_trace", None) or nullcontext
 
     stopper = EarlyStopper(cfg.threshold, cfg.patience)
-    flop_table: dict = {}  # (step kind, gradient signature) -> FLOPs of one such iteration
-    flop_invariant: set = set()  # kinds counted under two gradient signatures with equal FLOPs
+    flop_table: dict = {}  # step kind, or (kind, routing and gradient signature) -> FLOPs of one such iteration
+    routing_dependent = getattr(opt, "flops_depend_on_routing", False)
     n_measured: dict = {}  # step kind -> FLOP-counted iterations so far
     step_kinds, step_sigs, step_times = [], [], []  # per iteration; time None where the counter was running
     iter_flops: list = []  # per iteration, only with cfg.flop_count_every_step
@@ -263,13 +264,13 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         if hasattr(opt, "track_stats"):  # per-step diagnostics only where they are read
             opt.track_stats = evaluating
         kind = opt.upcoming_step_kind() if hasattr(opt, "upcoming_step_kind") else "step"
-        # count FLOPs for a kind's first iteration, and again whenever the set of parameters with a gradient
-        # (idle MoE experts get none) is new for the kind, unless the kind has shown its FLOPs do not depend on it
+        # count FLOPs for a kind's first iteration and, for optimizers whose own work depends on routing,
+        # again whenever the kind's latest routing and gradient signature has not been counted
         measure = (
             cfg.flop_count_every_step
             or kind not in n_measured
             or (
-                kind not in flop_invariant
+                routing_dependent
                 and (kind, last_sig[kind]) not in flop_table
                 and n_measured[kind] < MAX_FLOP_COUNTS_PER_KIND
             )
@@ -295,10 +296,8 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
             iter_flops.append(flops)
             counter_times.setdefault(kind, time.perf_counter() - t0)
             n_measured[kind] = n_measured.get(kind, 0) + 1
+            flop_table.setdefault(kind, flops)
             flop_table[(kind, sig)] = flops
-            seen = {v for (k, _s), v in flop_table.items() if k == kind}
-            if len(seen) == 1 and sum(k == kind for k, _s in flop_table) > 1:
-                flop_invariant.add(kind)
 
         if not torch.isfinite(loss):
             r.stopping_reason = "non_finite_loss"
@@ -337,19 +336,18 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     for k, dt in zip(step_kinds, step_times):
         if dt is not None:
             by_kind.setdefault(k, []).append(dt)
-    kind_flops = {}  # step kind -> FLOPs of its first counted iteration
-    for (k, _s), v in flop_table.items():
-        kind_flops.setdefault(k, v)
+    kind_flops = {k: v for k, v in flop_table.items() if not isinstance(k, tuple)}  # first count per kind
     if cfg.flop_count_every_step:
         charged = iter_flops
+    elif not routing_dependent:
+        charged = [kind_flops[k] for k in step_kinds]
     else:
         charged = []
         for k, s in zip(step_kinds, step_sigs):
             f = flop_table.get((k, s))
-            if f is None:  # a gradient set this kind was never counted with
+            if f is None:  # routing / gradients this kind was never counted with
                 f = kind_flops[k]
-                if k not in flop_invariant:
-                    r.flops_approx_steps += 1
+                r.flops_approx_steps += 1
             charged.append(f)
     kind_time = {k: statistics.median(v) for k, v in by_kind.items()}
     ref = max(by_kind, key=lambda k: len(by_kind[k]), default=None)

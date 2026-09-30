@@ -70,6 +70,8 @@ def newton_schulz(
 
 
 class Muon(torch.optim.Optimizer):
+    flops_depend_on_routing = True  # Newton-Schulz runs for each matrix with a gradient
+
     def __init__(
         self,
         params,

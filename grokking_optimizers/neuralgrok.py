@@ -63,7 +63,8 @@ class NeuralAmplifier(nn.Module):
 
 
 class NeuralGrok(torch.optim.Optimizer):
-    needs_closure = True
+    flops_depend_on_routing = True  # the amplifier runs on each gradient present; the meta step's backward only
+    needs_closure = True  # reaches the experts its held-out batch routes to
     needs_meta_loss = True
 
     def __init__(

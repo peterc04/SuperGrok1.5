@@ -104,6 +104,8 @@ def matrix_inverse_root(a: Tensor, root: float, epsilon: float) -> Tensor:
 
 
 class Shampoo(torch.optim.Optimizer):
+    flops_depend_on_routing = True  # factor updates and preconditioning run for each parameter with a gradient
+
     def __init__(
         self,
         params,

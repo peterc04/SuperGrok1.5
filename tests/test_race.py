@@ -11,6 +11,7 @@ from references import original_make_data, original_make_sequential_division_dat
 from torch.utils.flop_counter import FlopCounterMode
 
 from deepseek_v41 import build_model
+from grokking_optimizers import OPTIMIZERS
 from grokking_race.__main__ import main
 from grokking_race.results import EarlyStopper
 from grokking_race.tasks import carve_meta_split, chained_division, make_task, modular_division
@@ -196,11 +197,25 @@ def test_bf16_autocast_runs_on_cpu():
     assert r.error is None and r.total_steps == 4 and all(math.isfinite(x) for x in r.train_losses)
 
 
-def test_flop_accounting_equals_counting_every_step_with_idle_experts():
-    """At p = 11 some MoE experts get no tokens on some steps, which changes Muon's own work (no Newton-Schulz
-    for them). Counting per (step kind, set of parameters with gradients) must equal counting every step."""
+# small settings that reach every kind of step within a few iterations
+QUICK = {
+    "neuralgrok": {"amp_hidden_dims": (8,), "meta_every": 2},
+    "supergrok11": {"warmup_steps": 1, "warmup_ramp": 1, "meta_update_freq": 2, "sam_every": 3},
+    "shampoo": {"precondition_frequency": 2},
+    "looksam": {"k": 2},
+}
+
+
+@pytest.mark.parametrize("name", list(OPTIMIZERS))
+def test_flop_accounting_equals_counting_every_iteration(name):
+    """At p = 11 some MoE experts get no tokens on some steps. That never changes the model's FLOPs, but it
+    changes the work of optimizers that declare flops_depend_on_routing. The race's accounting must equal
+    counting every iteration, or say where it could not."""
     t = modular_division(11, 0.5, seed=0)
-    fast = train_one("muon", 0, t, _cfg(max_steps=10, eval_every=1, patience=100))
-    exact = train_one("muon", 0, t, _cfg(max_steps=10, eval_every=1, patience=100, flop_count_every_step=True))
-    assert fast.test_accs == exact.test_accs  # the counter does not change the numbers
-    assert fast.eval_flops == exact.eval_flops and fast.flops_approx_steps == 0
+    kw = dict(max_steps=6, eval_every=1, patience=100, hparams=QUICK)
+    fast = train_one(name, 0, t, _cfg(**kw))
+    exact = train_one(name, 0, t, _cfg(**kw, flop_count_every_step=True))
+    assert fast.test_accs == exact.test_accs  # counting does not change the numbers
+    assert fast.eval_flops == exact.eval_flops or fast.flops_approx_steps > 0
+    if not getattr(OPTIMIZERS[name].cls, "flops_depend_on_routing", False):
+        assert fast.eval_flops == exact.eval_flops and fast.flops_approx_steps == 0
