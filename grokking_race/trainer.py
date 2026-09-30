@@ -24,11 +24,14 @@ Cost to grok, three ways
     an optimizer performs (``opt.upcoming_step_kind()``, e.g. a NeuralGrok meta
     step vs a plain step) is measured exactly the first time it occurs; later
     iterations of that kind reuse the count. An optimizer's own work can depend
-    on which parameters have a gradient (an idle MoE expert gets none: Muon
-    then skips its Newton-Schulz), so a kind is counted again whenever that set
-    is new for it, until two sets have given the same count (the kind does not
-    depend on it) or 16 counts are reached; iterations charged a count made
-    with a different set are reported in ``flops_approx_steps``. The
+    on MoE routing (an idle expert gets no gradient, so Muon skips its
+    Newton-Schulz; a meta step differentiates only through the experts its
+    held-out batch reaches), so a kind is counted again whenever the iteration's
+    routing and gradient sets are new for it, until two different ones have
+    given the same count (the kind does not depend on them) or 16 counts are
+    reached. Iterations charged a count made under different routing are
+    reported in ``flops_approx_steps``; at the race's full batch every expert
+    gets tokens and there are none. The
     counter's own overhead is kept out of the timing: a measured iteration is
     charged the median time of the unmeasured iterations of the same kind, or,
     for a kind that never recurs, the best-timed kind's median scaled by the
@@ -220,8 +223,11 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
                 total = total + F.cross_entropy(logits.float(), yb) * (len(yb) / len(y_tr))
         return total
 
+    pre_step_sig = [None]  # which parameters had a gradient when step() was called
+
     def iteration():
         loss = closure()
+        pre_step_sig[0] = grad_signature()
         kwargs = {}
         if getattr(opt, "needs_closure", False):
             kwargs["closure"] = inner_closure
@@ -235,8 +241,10 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
         model.update_router_bias()
         return loss
 
-    def grad_signature() -> int:  # which parameters got a gradient (idle MoE experts get none)
-        return sum(p.numel() for p in param_list if p.grad is not None)
+    def grad_signature() -> tuple:  # which parameters have a gradient (idle MoE experts get none)
+        return tuple(p.grad is not None for p in param_list)
+
+    trace = getattr(model, "routing_trace", None) or nullcontext
 
     stopper = EarlyStopper(cfg.threshold, cfg.patience)
     flop_table: dict = {}  # (step kind, gradient signature) -> FLOPs of one such iteration
@@ -245,7 +253,7 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
     step_kinds, step_sigs, step_times = [], [], []  # per iteration; time None where the counter was running
     iter_flops: list = []  # per iteration, only with cfg.flop_count_every_step
     counter_times: dict = {}  # step kind -> wall time of its first counted iteration (includes counter overhead)
-    last_sig = None
+    last_sig: dict = {}  # step kind -> signature of its latest iteration (the best guess for its next one)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     model.train()
@@ -262,19 +270,23 @@ def train_one(opt_name: str, seed: int, task: Task, cfg: RunConfig) -> RunResult
             or kind not in n_measured
             or (
                 kind not in flop_invariant
-                and (kind, last_sig) not in flop_table
+                and (kind, last_sig[kind]) not in flop_table
                 and n_measured[kind] < MAX_FLOP_COUNTS_PER_KIND
             )
         )
         _sync(device)
         t0 = time.perf_counter()
-        if measure:
-            with FlopCounterMode(display=False, custom_mapping=EXTRA_FLOP_FORMULAS) as counter:
+        with trace() as route_log:
+            if measure:
+                with FlopCounterMode(display=False, custom_mapping=EXTRA_FLOP_FORMULAS) as counter:
+                    loss = iteration()
+            else:
                 loss = iteration()
-        else:
-            loss = iteration()
         _sync(device)
-        sig = last_sig = grad_signature()
+        # An optimizer's own work can depend on which experts every forward of the iteration reached (a meta
+        # step differentiates only through the experts its held-out batch uses), on the gradients it was given
+        # and on those it computed itself: key the count on all three.
+        sig = last_sig[kind] = (tuple(route_log or ()), pre_step_sig[0], grad_signature())
         step_kinds.append(kind)
         step_sigs.append(sig)
         step_times.append(None if measure else time.perf_counter() - t0)

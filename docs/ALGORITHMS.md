@@ -449,6 +449,25 @@ term already −0.014 and 7% of coordinates sign-flipped):
 5. Removing the constant (zero-mean φ) prevents the collapse, but then the meta-net learns
    nothing (correction ~4e-10 of the gradient): AdamW again.
 
+**Seen in the race setting.** One CPU run of the race itself: DeepSeek-V4.1-Flash
+`tiny`, modular division mod 23, 50% train, seed 42, 4,000 steps, with the code as it
+stood before the fixes above (same mechanism). SuperGrok 1.1 memorized its training
+examples by step 100.
+
+| step | ‖correction‖ / ‖g‖ | coordinates whose sign it flips | train acc |
+|---|---|---|---|
+| 200 | 0.05 | 46% | 0.90 (all it trains on) |
+| 1,100 | 1.02 | 45% | 0.90 |
+| 1,200 | | | 0.07 (chance) |
+| 4,000 | 15 | 48% | 0.07 |
+
+Training collapsed at step ~1,150, when the correction's norm reached the
+gradient's, and never recovered: the loss sits at 3.12 ≈ ln 23. The learned
+constant `r · b2` grew from −1.2e-5 (step 200) to −6.2e-5 (step 1,200) and then held,
+negative all along. AdamW and the
+frozen control memorized and held on the same data. None of the three grokked in
+4,000 steps at this small modulus; that takes the GPU race at p = 97.
+
 Opt-in variants for experiments, none claimed to help until the race says so:
 `meta_grad="first_order"` (matches the exact meta-gradient to cosine 1.0 and needs only
 chunk-sized memory; required above ~1e8 parameters); `max_correction_ratio` (caps each

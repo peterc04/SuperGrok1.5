@@ -241,3 +241,17 @@ def test_mhc_mixing_stays_fp32_under_bf16_autocast():
         got_post, got_pre = Block.hc_post(x, res, post, comb), Block.hc_pre(res, post)
     assert got_post.dtype == torch.float32 and torch.equal(got_post, want_post)
     assert got_pre.dtype == torch.float32 and torch.equal(got_pre, want_pre)
+
+
+def test_routing_trace_records_every_moe_forward():
+    torch.manual_seed(0)
+    model = build_model("tiny", vocab_size=13, max_seq_len=8)
+    n_moe = sum(1 for m in model.modules() if type(m).__name__ == "MoE")
+    x = torch.randint(0, 13, (4, 8))
+    with model.routing_trace() as log:
+        model(x)
+        model(x[:1])
+    assert len(log) == 2 * n_moe and all(isinstance(e, tuple) and e for e in log)
+    assert all(m.route_log is None for m in model.modules() if hasattr(m, "route_log"))
+    model(x)  # outside the context nothing is recorded
+    assert len(log) == 2 * n_moe

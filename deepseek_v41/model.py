@@ -412,14 +412,18 @@ class MoE(nn.Module):
             Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit) for _ in range(cfg.n_routed_experts)
         )
         self.shared_experts = Expert(cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit)
+        self.route_log: list | None = None  # set by Transformer.routing_trace()
 
     def forward(self, x):
         shape = x.shape
         x = x.reshape(-1, self.dim)
         weights, indices = self.gate(x, seq_len=shape[1] if len(shape) == 3 else None)
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        used = torch.unique(indices).tolist()
+        if self.route_log is not None:
+            self.route_log.append(tuple(used))
         # only experts that received tokens run, so unrouted experts keep grad=None this step
-        for e in torch.unique(indices).tolist():
+        for e in used:
             tok, slot = torch.where(indices == e)
             y = y.index_add(0, tok, self.experts[e](x[tok], weights[tok, slot, None]).float())
         y = y + self.shared_experts(x).float()
@@ -714,6 +718,25 @@ class Transformer(nn.Module):
         return logits, aux
 
     # ---- training utilities ----
+    @contextmanager
+    def routing_trace(self):
+        """Collects, for every MoE forward inside the context, the experts that received tokens.
+
+        The model's own FLOPs do not depend on routing, but an optimizer's can
+        (work skipped for idle experts, or a meta step differentiating only
+        through the experts its held-out batch reaches); the race keys its FLOP
+        counts on this trace.
+        """
+        log: list = []
+        moes = [m for m in self.modules() if isinstance(m, MoE)]
+        for m in moes:
+            m.route_log = log
+        try:
+            yield log
+        finally:
+            for m in moes:
+                m.route_log = None
+
     @contextmanager
     def frozen_router_stats(self):
         """Forwards inside this context do not count toward the router's load statistics.
